@@ -1,0 +1,94 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 10 10 15;
+    --foreground: 248 249 250;
+    --card: 15 15 46;
+    --card-foreground: 248 249 250;
+    --border: 45 45 122;
+  }
+
+  * {
+    @apply border-pitch-indigo-soft/30;
+  }
+
+  body {
+    @apply bg-pitch-black text-pitch-white font-sans antialiased;
+    background-image: radial-gradient(
+      ellipse 80% 60% at 50% -20%,
+      rgba(26, 26, 78, 0.4) 0%,
+      transparent 100%
+    );
+  }
+
+  ::selection {
+    @apply bg-pitch-green/30 text-white;
+  }
+
+  ::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-pitch-indigo-deep;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-pitch-indigo-soft rounded-full;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-pitch-indigo-deep/60 backdrop-blur-md border border-pitch-indigo-soft/20 rounded-2xl;
+  }
+
+  .pitch-button {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+      font-medium text-sm transition-all duration-200 focus-visible:outline-none
+      focus-visible:ring-2 focus-visible:ring-pitch-green disabled:opacity-50
+      disabled:pointer-events-none;
+  }
+
+  .pitch-button-primary {
+    @apply pitch-button bg-pitch-green text-white hover:bg-pitch-green-light
+      shadow-glow hover:shadow-lg active:scale-[0.98];
+  }
+
+  .pitch-button-secondary {
+    @apply pitch-button bg-pitch-indigo-soft/30 text-pitch-white border
+      border-pitch-indigo-soft/40 hover:bg-pitch-indigo-soft/50;
+  }
+
+  .pitch-button-ghost {
+    @apply pitch-button text-pitch-muted hover:text-pitch-white hover:bg-pitch-indigo-deep;
+  }
+
+  .stat-card {
+    @apply glass-card p-4 flex flex-col gap-1;
+  }
+
+  .event-pill {
+    @apply inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}

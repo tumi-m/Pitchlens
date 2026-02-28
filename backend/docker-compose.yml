@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      target: final
+    ports:
+      - "8080:8080"
+    environment:
+      - ENV=development
+      - PORT=8080
+      - API_SECRET_KEY=${API_SECRET_KEY}
+      - ROBOFLOW_API_KEY=${ROBOFLOW_API_KEY}
+      - ROBOFLOW_WORKSPACE=${ROBOFLOW_WORKSPACE}
+      - ROBOFLOW_PROJECT=${ROBOFLOW_PROJECT}
+      - ROBOFLOW_VERSION=${ROBOFLOW_VERSION:-9}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
+      - FRAME_SUBSAMPLE=${FRAME_SUBSAMPLE:-5}
+      - PIPELINE_WORKERS=${PIPELINE_WORKERS:-2}
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./service-account.json:/app/service-account.json:ro
+      - ./app:/app/app  # hot-reload in dev
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Uncomment for GPU support (requires nvidia-container-toolkit)
+  # api-gpu:
+  #   extends: api
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
