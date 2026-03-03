@@ -1,0 +1,75 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    function isValidEmail() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function hasRole(role) {
+      return request.auth.token.role == role || request.auth.token.role == 'club-owner';
+    }
+
+    // ── Users ─────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isAuthenticated() && isOwner(userId);
+      allow create: if isAuthenticated() && isOwner(userId)
+        && request.resource.data.keys().hasAll(['email', 'teams', 'preferences', 'role'])
+        && request.resource.data.role in ['player', 'coach', 'club-owner'];
+      allow update: if isAuthenticated() && isOwner(userId)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['email', 'createdAt']);
+      allow delete: if false; // soft-delete only via Cloud Function
+    }
+
+    // ── Teams ─────────────────────────────────────────────────────────────
+    match /teams/{teamId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.players.size() <= 20;
+      allow update: if isAuthenticated()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.players.size() <= 20;
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // ── Matches ───────────────────────────────────────────────────────────
+    match /matches/{matchId} {
+      // Owner can read their match
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+
+      // Only owner can create; status must start as 'uploading'
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'uploading';
+
+      // Owner can update title/metadata; Cloud Functions update status/stats
+      // (functions use admin SDK which bypasses rules)
+      allow update: if isAuthenticated()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        // Prevent client from changing status directly
+        && request.resource.data.status == resource.data.status;
+
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // ── Audit log (append-only) ────────────────────────────────────────
+    match /audit/{logId} {
+      allow read: if false; // admin only
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}

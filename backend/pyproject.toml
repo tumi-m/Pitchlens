@@ -1,0 +1,65 @@
+[tool.poetry]
+name = "pitchlens-backend"
+version = "0.1.0"
+description = "Pitchlens AI Analytics Engine — GPU-accelerated five-a-side soccer analytics"
+authors = ["Pitchlens Team <hello@pitchlens.app>"]
+readme = "README.md"
+python = "^3.11"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.111.0"
+uvicorn = {extras = ["standard"], version = "^0.30.1"}
+pydantic = "^2.8.0"
+pydantic-settings = "^2.3.4"
+
+# Firebase
+firebase-admin = "^6.5.0"
+
+# HTTP client
+requests = "^2.32.3"
+httpx = "^0.27.0"
+
+# Computer vision
+opencv-python-headless = "^4.10.0"
+supervision = "^0.22.0"
+
+# AI / ML
+torch = {version = "^2.3.1", source = "pytorch-cpu"}  # Override for GPU in Dockerfile
+torchvision = {version = "^0.18.1", source = "pytorch-cpu"}
+ultralytics = "^8.2.54"  # YOLOv8
+
+# Roboflow inference
+inference-sdk = "^0.18.1"
+
+# Analytics
+numpy = "^1.26.4"
+scipy = "^1.14.0"
+scikit-learn = "^1.5.1"
+
+# Async
+anyio = "^4.4.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.1"
+pytest-asyncio = "^0.23.8"
+httpx = "^0.27.0"
+ruff = "^0.5.4"
+mypy = "^1.11.0"
+
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "supplemental"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

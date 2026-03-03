@@ -1,0 +1,25 @@
+{
+  "name": "pitchlens-functions",
+  "description": "Firebase Cloud Functions for Pitchlens",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "engines": { "node": "20" },
+  "main": "lib/index.js",
+  "dependencies": {
+    "firebase-admin": "^12.2.0",
+    "firebase-functions": "^5.0.1",
+    "axios": "^1.7.2",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.5.3"
+  },
+  "private": true
+}
