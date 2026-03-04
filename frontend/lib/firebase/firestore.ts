@@ -14,6 +14,7 @@ import {
   serverTimestamp,
   Timestamp,
 } from 'firebase/firestore';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 import { db } from './config';
 import type { Match, Team, UserProfile } from '@/lib/types';
 
@@ -104,6 +105,12 @@ export function subscribeToUserMatches(userId: string, callback: (matches: Match
   return onSnapshot(q, (snap) => {
     callback(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Match)));
   });
+}
+
+export async function reprocessMatch(matchId: string): Promise<void> {
+  const functions = getFunctions();
+  const fn = httpsCallable(functions, 'reprocessMatch');
+  await fn({ matchId });
 }
 
 export { serverTimestamp, Timestamp };
