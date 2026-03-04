@@ -146,7 +146,7 @@ export default function UploadPage() {
               >
                 <div>
                   <h1 className="text-3xl font-bold text-pitch-white mb-2">Upload a Match</h1>
-                  <p className="text-pitch-muted">Upload your five-a-side footage for AI-powered analytics.</p>
+                  <p className="text-pitch-muted">Upload your football match footage for AI-powered analytics via Roboflow YOLOv8.</p>
                 </div>
 
                 {/* Drop zone */}
@@ -189,7 +189,7 @@ export default function UploadPage() {
                         <p className="text-pitch-white font-medium">
                           {isDragActive ? 'Drop it here' : 'Drag & drop your match video'}
                         </p>
-                        <p className="text-pitch-muted text-sm mt-1">MP4 format · Max 500MB · 1080p recommended</p>
+                        <p className="text-pitch-muted text-sm mt-1">MP4 format · Max 500MB · 1080p recommended · 5-a-side or 11-a-side</p>
                       </div>
                       <span className="pitch-button-secondary text-sm px-5 py-2">Browse Files</span>
                     </div>
@@ -214,13 +214,20 @@ export default function UploadPage() {
                   ))}
                 </div>
 
-                <button
-                  onClick={handleUpload}
-                  disabled={!file || !user}
-                  className="pitch-button-primary w-full py-3.5 text-base"
-                >
-                  {!user ? 'Sign in to Upload' : !file ? 'Select a video first' : 'Analyse Match'}
-                </button>
+                <div className="space-y-3">
+                  <button
+                    onClick={handleUpload}
+                    disabled={!file || !user}
+                    className="pitch-button-primary w-full py-3.5 text-base"
+                  >
+                    {!user ? 'Sign in to Upload' : !file ? 'Select a video first' : '⚽ Analyse Match'}
+                  </button>
+                  <p className="text-center text-pitch-muted text-xs">
+                    Powered by{' '}
+                    <a href="https://roboflow.com" target="_blank" rel="noopener noreferrer" className="text-pitch-indigo-glow hover:underline">Roboflow</a>
+                    {' '}YOLOv8 · ByteTrack · jsPDF
+                  </p>
+                </div>
               </motion.div>
             )}
 
