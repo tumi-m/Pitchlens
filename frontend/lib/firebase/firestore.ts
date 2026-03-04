@@ -113,4 +113,13 @@ export async function reprocessMatch(matchId: string): Promise<void> {
   await fn({ matchId });
 }
 
+export async function saveMatchStats(matchId: string, stats: any): Promise<void> {
+  await updateDoc(doc(db, 'matches', matchId), {
+    status: 'completed',
+    stats,
+    processingProgress: 100,
+    updatedAt: serverTimestamp(),
+  });
+}
+
 export { serverTimestamp, Timestamp };
