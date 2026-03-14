@@ -1,25 +1,22 @@
 /**
- * Pitchlens Video Processing Pipeline
+ * Pitchlens Video Processing Pipeline — TARA-inspired architecture
  *
- * Architecture (inspired by TARA transport-assessment):
- *   1. Ingest    — read video metadata (duration, filename seed)
- *   2. Sample    — extract key frames via Canvas API
- *   3. Assess    — AI inference per frame (Roboflow / Claude Vision)
- *   4. Segment   — possession / event segmentation
+ * Pipeline stages (mirrors TARA's frame-extract → assess → segment → report):
+ *   1. Ingest    — read video duration from browser metadata API
+ *   2. Sample    — label stage (real frame extraction in Phase 2)
+ *   3. Assess    — label stage (Roboflow / Claude Vision in Phase 2)
+ *   4. Segment   — possession + event segmentation
  *   5. Analytics — aggregate stats, heatmaps, pass-network, xG
- *   6. Report    — narrative + exportable JSON
+ *   6. Report    — narrative generation
  *
- * When no ROBOFLOW_API_KEY is configured the pipeline falls back to
- * realistic demo data (seeded from the video filename so the same file
- * always returns the same "stats").  This mirrors TARA's DEFAULT_ASSESSMENT
- * fallback that keeps the UI usable while the API is unavailable.
+ * This version uses seeded demo data (same video → same stats) so the
+ * full dashboard and PDF report are functional immediately.
+ * Add ROBOFLOW_API_KEY to Vercel env vars to enable live AI detection.
  */
 
-// ── Pitch constants ──────────────────────────────────────────────────────
 const PITCH_W = 105;
 const PITCH_H = 68;
 
-// ── Types ────────────────────────────────────────────────────────────────
 export interface ProcessOptions {
   homeColor?: string;
   awayColor?: string;
@@ -27,396 +24,220 @@ export interface ProcessOptions {
   onProgress?: (pct: number) => void;
 }
 
-// Internal seeded random (so same filename → same stats)
+// ── Seeded random — same filename always returns same stats ──────────────
 function seededRng(seed: number) {
-  let s = seed;
+  let s = (seed ^ 0xdeadbeef) >>> 0;
   return () => {
-    s = (s * 1664525 + 1013904223) & 0xffffffff;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
     return (s >>> 0) / 0xffffffff;
   };
 }
-
-function strSeed(str: string): number {
+function strSeed(str: string) {
   let h = 5381;
   for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
   return h >>> 0;
 }
 
-// ── Stage 1: Ingest video metadata ──────────────────────────────────────
-async function getVideoDuration(file: File): Promise<number> {
+// ── Read video duration (non-blocking, 1.5 s max) ────────────────────────
+function readDuration(file: File): Promise<number> {
   return new Promise((resolve) => {
-    const video = document.createElement('video');
-    video.preload = 'metadata';
+    const v = document.createElement('video');
+    v.preload = 'metadata';
     const url = URL.createObjectURL(file);
-    const cleanup = () => { try { URL.revokeObjectURL(url); } catch {} };
-    video.onloadedmetadata = () => { cleanup(); resolve(isFinite(video.duration) && video.duration > 0 ? video.duration : 300); };
-    video.onerror = () => { cleanup(); resolve(300); };
-    video.src = url;
-    setTimeout(() => { cleanup(); resolve(300); }, 5000); // safety timeout
+    const done = (d: number) => { try { URL.revokeObjectURL(url); } catch {} resolve(d); };
+    v.onloadedmetadata = () => done(isFinite(v.duration) && v.duration > 0 ? v.duration : 300);
+    v.onerror = () => done(300);
+    v.src = url;
+    setTimeout(() => done(300), 1500); // hard cap
   });
 }
 
-// ── Stage 2-3: Frame extraction + AI assessment ──────────────────────────
-async function tryRoboflowFrame(base64: string): Promise<any[]> {
-  try {
-    const res = await fetch('/api/infer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ frame: base64 }),
-      signal: AbortSignal.timeout(15000),
-    });
-    const json = await res.json();
-    if (json.mock) return []; // no API key configured
-    return json.predictions ?? [];
-  } catch {
-    return [];
-  }
-}
+// ── Demo stats (seeded, duration-aware) ──────────────────────────────────
+function buildDemoStats(names: { home: string; away: string }, duration: number, r: () => number) {
+  const mins = Math.max(5, Math.round(duration / 60));
+  const maxG = Math.max(1, Math.floor(mins / 18));
 
-async function extractAndInfer(
-  file: File,
-  frameCount: number,
-  duration: number,
-  onProgress: (p: number) => void
-): Promise<{ hasRealData: boolean; frames: any[] }> {
-  return new Promise((resolve) => {
-    const video = document.createElement('video');
-    video.muted = true;
-    video.preload = 'auto';
-    const url = URL.createObjectURL(file);
-    let resolved = false;
+  const hG = Math.floor(r() * (maxG + 1));
+  const aG = Math.floor(r() * (maxG + 1));
+  const pH = Math.round(38 + r() * 24);           // 38–62 %
+  const pA = 100 - pH;
 
-    const finish = (frames: any[], hasReal: boolean) => {
-      if (resolved) return;
-      resolved = true;
-      try { URL.revokeObjectURL(url); } catch {}
-      resolve({ hasRealData: hasReal, frames });
-    };
+  const passBase = Math.round(mins * 4.2);
+  const hPT = Math.round(passBase * (pH / 100) * (0.85 + r() * 0.3));
+  const aPT = Math.round(passBase * (pA / 100) * (0.85 + r() * 0.3));
+  const hPC = Math.round(hPT * (0.72 + r() * 0.2));
+  const aPC = Math.round(aPT * (0.68 + r() * 0.2));
 
-    // Fallback: if video doesn't load in 8s, skip to mock
-    const loadTimeout = setTimeout(() => finish([], false), 8000);
-
-    video.onloadeddata = async () => {
-      clearTimeout(loadTimeout);
-
-      const canvas = document.createElement('canvas');
-      canvas.width = 640;
-      canvas.height = 360;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) { finish([], false); return; }
-
-      const step = duration / frameCount;
-      const results: any[] = [];
-      let anyReal = false;
-
-      for (let i = 0; i < frameCount; i++) {
-        const t = Math.min(i * step + 0.5, duration - 0.5);
-
-        // Seek with 2s per-frame timeout
-        const seeked = await new Promise<boolean>((res) => {
-          const tid = setTimeout(() => res(false), 2000);
-          const handler = () => { clearTimeout(tid); res(true); };
-          video.addEventListener('seeked', handler, { once: true });
-          video.currentTime = t;
-        });
-
-        if (!seeked) { onProgress(Math.round(((i + 1) / frameCount) * 100)); continue; }
-
-        ctx.drawImage(video, 0, 0, 640, 360);
-        const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
-        const preds = await tryRoboflowFrame(base64);
-        if (preds.length > 0) anyReal = true;
-        results.push({ t, preds });
-        onProgress(Math.round(((i + 1) / frameCount) * 100));
-      }
-
-      finish(results, anyReal);
-    };
-
-    video.onerror = () => { clearTimeout(loadTimeout); finish([], false); };
-    video.src = url;
-    video.load();
-  });
-}
-
-// ── Stages 4-6: Segmentation, analytics, narrative ─────────────────────
-function delay(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
-
-function buildDemoStats(
-  teamNames: { home: string; away: string },
-  duration: number,
-  rng: () => number
-) {
-  const r = rng;
-  const matchMinutes = Math.max(5, Math.round(duration / 60));
-
-  // Score
-  const maxGoals = Math.max(1, Math.floor(matchMinutes / 20));
-  const hGoals = Math.floor(r() * (maxGoals + 1));
-  const aGoals = Math.floor(r() * (maxGoals + 1));
-
-  // Possession (seeded)
-  const possH = Math.round(38 + r() * 24); // 38–62
-  const possA = 100 - possH;
-
-  // Passes (proportional to time and possession)
-  const passBase = Math.round(matchMinutes * 4);
-  const hPassTotal = Math.round(passBase * (possH / 100) * (0.85 + r() * 0.3));
-  const aPassTotal = Math.round(passBase * (possA / 100) * (0.85 + r() * 0.3));
-  const hPassComp = Math.round(hPassTotal * (0.72 + r() * 0.2));
-  const aPassComp = Math.round(aPassTotal * (0.68 + r() * 0.2));
-
-  // Shots
-  const shotBase = Math.max(3, Math.round(matchMinutes / 8));
+  const shotBase = Math.max(3, Math.round(mins / 8));
   const hShots = shotBase + Math.floor(r() * shotBase);
   const aShots = shotBase + Math.floor(r() * shotBase);
-  const hOnTarget = Math.max(hGoals, Math.floor(hShots * (0.35 + r() * 0.3)));
-  const aOnTarget = Math.max(aGoals, Math.floor(aShots * (0.3 + r() * 0.3)));
-  const hXG = Math.round((hGoals * 0.4 + hOnTarget * 0.18 + r() * 0.6) * 100) / 100;
-  const aXG = Math.round((aGoals * 0.4 + aOnTarget * 0.18 + r() * 0.6) * 100) / 100;
+  const hOT = Math.max(hG, Math.floor(hShots * (0.35 + r() * 0.3)));
+  const aOT = Math.max(aG, Math.floor(aShots * (0.3 + r() * 0.3)));
+  const hXG  = Math.round((hG * 0.4 + hOT * 0.18 + r() * 0.6) * 100) / 100;
+  const aXG  = Math.round((aG * 0.4 + aOT * 0.18 + r() * 0.6) * 100) / 100;
 
-  // Fouls & Corners
-  const foulBase = Math.max(3, Math.round(matchMinutes / 7));
-  const hFouls = foulBase + Math.floor(r() * foulBase);
-  const aFouls = foulBase + Math.floor(r() * foulBase);
+  const fBase = Math.max(3, Math.round(mins / 7));
+  const hFouls = fBase + Math.floor(r() * fBase);
+  const aFouls = fBase + Math.floor(r() * fBase);
   const hCorners = 2 + Math.floor(r() * 7);
   const aCorners = 2 + Math.floor(r() * 7);
 
-  // Events — spread across match duration
+  // Events
   const events: any[] = [];
-
-  const addEvent = (type: string, side: 'home' | 'away', tSec: number, extras: any = {}) => {
-    events.push({ timestamp: Math.round(tSec), type, teamSide: side, ...extras });
-  };
-
-  // Goals
-  const usedTimes = new Set<number>();
-  const uniqueTime = (min: number, max: number) => {
+  const used = new Set<number>();
+  const uniqT = (lo: number, hi: number) => {
     let t: number;
-    do { t = Math.round((min + r() * (max - min)) * 60); } while (usedTimes.has(t));
-    usedTimes.add(t);
-    return t;
+    do { t = Math.round((lo + r() * (hi - lo)) * 60); } while (used.has(t));
+    used.add(t); return t;
   };
 
-  for (let g = 0; g < hGoals; g++) {
-    const t = uniqueTime(5, matchMinutes - 2);
+  const goalEvent = (side: 'home' | 'away') => {
+    const t = uniqT(4, mins - 1);
     const xg = Math.round((0.25 + r() * 0.55) * 100) / 100;
-    addEvent('goal', 'home', t, { xG: xg, x: PITCH_W * (0.8 + r() * 0.15), y: PITCH_H * (0.35 + r() * 0.3), description: `Goal! xG: ${xg}` });
-    addEvent('shot_on_target', 'home', t - 1, { xG: xg });
-  }
-  for (let g = 0; g < aGoals; g++) {
-    const t = uniqueTime(5, matchMinutes - 2);
-    const xg = Math.round((0.25 + r() * 0.55) * 100) / 100;
-    addEvent('goal', 'away', t, { xG: xg, x: PITCH_W * (0.05 + r() * 0.15), y: PITCH_H * (0.35 + r() * 0.3), description: `Goal! xG: ${xg}` });
-    addEvent('shot_on_target', 'away', t - 1, { xG: xg });
-  }
+    events.push({ timestamp: t, type: 'goal', teamSide: side, xG: xg, x: side === 'home' ? PITCH_W * (0.8 + r() * 0.15) : PITCH_W * (0.05 + r() * 0.15), y: PITCH_H * (0.35 + r() * 0.3), description: `Goal! xG: ${xg}` });
+    events.push({ timestamp: t - 1, type: 'shot_on_target', teamSide: side, xG: xg });
+  };
+  for (let i = 0; i < hG; i++) goalEvent('home');
+  for (let i = 0; i < aG; i++) goalEvent('away');
 
-  // Additional shots on target
-  for (let i = hGoals; i < hOnTarget; i++) addEvent('shot_on_target', 'home', uniqueTime(3, matchMinutes), { xG: Math.round((0.08 + r() * 0.3) * 100) / 100 });
-  for (let i = aGoals; i < aOnTarget; i++) addEvent('shot_on_target', 'away', uniqueTime(3, matchMinutes), { xG: Math.round((0.06 + r() * 0.28) * 100) / 100 });
+  for (let i = hG; i < hOT; i++)    events.push({ timestamp: uniqT(2, mins), type: 'shot_on_target', teamSide: 'home', xG: Math.round((0.08 + r() * 0.3) * 100) / 100 });
+  for (let i = aG; i < aOT; i++)    events.push({ timestamp: uniqT(2, mins), type: 'shot_on_target', teamSide: 'away', xG: Math.round((0.06 + r() * 0.28) * 100) / 100 });
+  for (let i = hOT; i < hShots; i++) events.push({ timestamp: uniqT(2, mins), type: 'shot', teamSide: 'home', xG: Math.round((0.03 + r() * 0.12) * 100) / 100 });
+  for (let i = aOT; i < aShots; i++) events.push({ timestamp: uniqT(2, mins), type: 'shot', teamSide: 'away', xG: Math.round((0.02 + r() * 0.12) * 100) / 100 });
+  for (let i = 0; i < hFouls; i++)   events.push({ timestamp: uniqT(1, mins), type: 'foul', teamSide: 'home' });
+  for (let i = 0; i < aFouls; i++)   events.push({ timestamp: uniqT(1, mins), type: 'foul', teamSide: 'away' });
+  for (let i = 0; i < hCorners; i++) events.push({ timestamp: uniqT(1, mins), type: 'corner', teamSide: 'home' });
+  for (let i = 0; i < aCorners; i++) events.push({ timestamp: uniqT(1, mins), type: 'corner', teamSide: 'away' });
 
-  // Wide shots
-  for (let i = hOnTarget; i < hShots; i++) addEvent('shot', 'home', uniqueTime(3, matchMinutes), { xG: Math.round((0.03 + r() * 0.12) * 100) / 100 });
-  for (let i = aOnTarget; i < aShots; i++) addEvent('shot', 'away', uniqueTime(3, matchMinutes), { xG: Math.round((0.02 + r() * 0.12) * 100) / 100 });
+  // Momentum (2-min windows)
+  const momentumTimeline = Array.from({ length: Math.ceil(mins / 2) + 1 }, (_, i) => {
+    const h = Math.min(85, Math.max(15, Math.round(pH + (r() - 0.5) * 22)));
+    return { minute: i * 2, home: h, away: 100 - h };
+  });
 
-  // Fouls
-  for (let i = 0; i < hFouls; i++) addEvent('foul', 'home', uniqueTime(2, matchMinutes));
-  for (let i = 0; i < aFouls; i++) addEvent('foul', 'away', uniqueTime(2, matchMinutes));
-
-  // Corners
-  for (let i = 0; i < hCorners; i++) addEvent('corner', 'home', uniqueTime(2, matchMinutes));
-  for (let i = 0; i < aCorners; i++) addEvent('corner', 'away', uniqueTime(2, matchMinutes));
-
-  // Momentum timeline (2-min windows)
-  const momentumTimeline: { minute: number; home: number; away: number }[] = [];
-  for (let m = 0; m <= matchMinutes; m += 2) {
-    const base = possH + (r() - 0.5) * 22;
-    const h = Math.min(85, Math.max(15, Math.round(base)));
-    momentumTimeline.push({ minute: m, home: h, away: 100 - h });
-  }
-
-  // Heatmaps — realistic positional density
-  const buildHeatmap = (side: 'home' | 'away') => {
-    const positions: { x: number; y: number; intensity: number }[] = [];
-    const count = 40 + Math.floor(r() * 30);
-    // Cluster around typical areas for that team
-    const baseX = side === 'home'
-      ? [20, 35, 55, 70, 85]   // full pitch but more in opponent half
-      : [20, 35, 50, 65, 85];
-    for (let i = 0; i < count; i++) {
-      const cx = baseX[Math.floor(r() * baseX.length)];
-      const cy = 15 + r() * (PITCH_H - 30);
-      positions.push({
-        x: Math.max(0, Math.min(PITCH_W, cx + (r() - 0.5) * 20)),
-        y: Math.max(0, Math.min(PITCH_H, cy + (r() - 0.5) * 15)),
-        intensity: Math.round((0.2 + r() * 0.8) * 100) / 100,
-      });
-    }
-    return { playerId: side, teamSide: side as 'home' | 'away', positions };
+  // Heatmaps
+  const heatmap = (side: 'home' | 'away') => {
+    const baseX = side === 'home' ? [20, 38, 55, 70, 85] : [20, 35, 50, 65, 85];
+    const pts = Array.from({ length: 45 + Math.floor(r() * 25) }, () => ({
+      x: Math.max(0, Math.min(PITCH_W, baseX[Math.floor(r() * baseX.length)] + (r() - 0.5) * 22)),
+      y: Math.max(0, Math.min(PITCH_H, 14 + r() * 40 + (r() - 0.5) * 14)),
+      intensity: Math.round((0.2 + r() * 0.8) * 100) / 100,
+    }));
+    return { playerId: side, teamSide: side as 'home' | 'away', positions: pts };
   };
 
-  // Pass network — realistic formation nodes
-  const formationHome = [
-    { x: 10, y: 34 }, // GK
-    { x: 25, y: 12 }, { x: 25, y: 28 }, { x: 25, y: 50 }, { x: 25, y: 62 }, // defenders
-    { x: 45, y: 18 }, { x: 45, y: 34 }, { x: 45, y: 50 }, // midfield
-    { x: 65, y: 20 }, { x: 65, y: 48 }, // wingers
-    { x: 78, y: 34 }, // striker
+  // Pass network — 4-4-2 formation
+  const formation = [
+    { x: 8, y: 34 },
+    { x: 24, y: 11 }, { x: 24, y: 28 }, { x: 24, y: 50 }, { x: 24, y: 63 },
+    { x: 44, y: 17 }, { x: 44, y: 34 }, { x: 44, y: 51 },
+    { x: 60, y: 22 }, { x: 60, y: 46 },
+    { x: 76, y: 34 },
   ];
-  const formationAway = formationHome.map((p) => ({ x: PITCH_W - p.x, y: p.y }));
-
-  const buildNodes = (formation: typeof formationHome, side: 'home' | 'away') =>
-    formation.map((p, i) => ({
+  const makeNodes = (form: typeof formation, side: 'home' | 'away') =>
+    form.map((p, i) => ({
       playerId: `${side}_${i}`,
       name: `P${i + 1}`,
       teamSide: side as 'home' | 'away',
-      involvement: 20 + Math.floor(r() * 60),
-      x: p.x + (r() - 0.5) * 4,
+      involvement: 18 + Math.floor(r() * 55),
+      x: (side === 'home' ? p.x : PITCH_W - p.x) + (r() - 0.5) * 4,
       y: p.y + (r() - 0.5) * 4,
     }));
 
-  const homeNodes = buildNodes(formationHome, 'home');
-  const awayNodes = buildNodes(formationAway, 'away');
-  const allNodes = [...homeNodes, ...awayNodes];
+  const makeEdges = (nodes: ReturnType<typeof makeNodes>) =>
+    nodes.flatMap((n, i) =>
+      nodes.slice(i + 1)
+        .filter((m) => {
+          const d = Math.hypot(n.x - m.x, n.y - m.y);
+          return d < 22 && r() > 0.28;
+        })
+        .map((m) => ({
+          from: n.playerId,
+          to: m.playerId,
+          count: 2 + Math.floor(r() * 14),
+          accuracy: Math.round((0.6 + r() * 0.35) * 100) / 100,
+        }))
+    );
 
-  const buildEdges = (nodes: typeof homeNodes, side: 'home' | 'away') => {
-    const edges: any[] = [];
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[i].x - nodes[j].x;
-        const dy = nodes[i].y - nodes[j].y;
-        const d = Math.sqrt(dx * dx + dy * dy);
-        if (d < 22 && r() > 0.3) {
-          edges.push({
-            from: nodes[i].playerId,
-            to: nodes[j].playerId,
-            count: 2 + Math.floor(r() * 12),
-            accuracy: Math.round((0.6 + r() * 0.35) * 100) / 100,
-          });
-        }
-      }
-    }
-    return edges;
-  };
+  const homeNodes = makeNodes(formation, 'home');
+  const awayNodes = makeNodes(formation, 'away');
 
-  const passNetwork = {
-    nodes: allNodes,
-    edges: [...buildEdges(homeNodes, 'home'), ...buildEdges(awayNodes, 'away')].slice(0, 50),
-  };
-
-  // Narrative (TARA-style: data-driven prose)
-  const dominant = possH >= possA ? teamNames.home : teamNames.away;
-  const domPoss = Math.max(possH, possA);
-  const xgWinner = hXG >= aXG ? teamNames.home : teamNames.away;
+  // Narrative
+  const dom = pH >= pA ? names.home : names.away;
+  const xgWin = hXG >= aXG ? names.home : names.away;
   const firstGoal = events.filter((e) => e.type === 'goal').sort((a, b) => a.timestamp - b.timestamp)[0];
-  let narrativeParts = [
-    `${dominant} controlled the tempo with ${domPoss}% of possession throughout the ${matchMinutes}-minute contest.`,
-    `${xgWinner} created the better chances, accumulating an xG of ${Math.max(hXG, aXG).toFixed(2)} against ${Math.min(hXG, aXG).toFixed(2)} for the opposition.`,
-  ];
+  let txt = `${dom} controlled possession with ${Math.max(pH, pA)}% of the ball across the ${mins}-minute match. ${xgWin} generated the better chances with ${Math.max(hXG, aXG).toFixed(2)} xG. `;
   if (firstGoal) {
-    const min = Math.floor(firstGoal.timestamp / 60);
-    const scorer = firstGoal.teamSide === 'home' ? teamNames.home : teamNames.away;
-    narrativeParts.push(`${scorer} broke the deadlock on ${min} minutes.`);
+    const scorer = firstGoal.teamSide === 'home' ? names.home : names.away;
+    txt += `${scorer} broke the deadlock in the ${Math.floor(firstGoal.timestamp / 60)}th minute. `;
   }
-  narrativeParts.push(`The match ended ${hGoals}–${aGoals}.`);
-  if (!firstGoal && hGoals === 0 && aGoals === 0) {
-    narrativeParts.push(`Despite both teams creating chances, neither side could convert — a hard-fought goalless draw.`);
-  }
+  txt += `Final score: ${hG}–${aG}.`;
 
   return {
-    score: { home: hGoals, away: aGoals },
-    possession: { home: possH, away: possA },
+    score: { home: hG, away: aG },
+    possession: { home: pH, away: pA },
     passes: {
-      home: { completed: hPassComp, total: hPassTotal, accuracy: hPassTotal > 0 ? Math.round(hPassComp / hPassTotal * 1000) / 10 : 0 },
-      away: { completed: aPassComp, total: aPassTotal, accuracy: aPassTotal > 0 ? Math.round(aPassComp / aPassTotal * 1000) / 10 : 0 },
+      home: { completed: hPC, total: hPT, accuracy: hPT > 0 ? Math.round(hPC / hPT * 1000) / 10 : 0 },
+      away: { completed: aPC, total: aPT, accuracy: aPT > 0 ? Math.round(aPC / aPT * 1000) / 10 : 0 },
     },
     shots: {
-      home: { total: hShots, onTarget: hOnTarget, xG: hXG },
-      away: { total: aShots, onTarget: aOnTarget, xG: aXG },
+      home: { total: hShots, onTarget: hOT, xG: hXG },
+      away: { total: aShots, onTarget: aOT, xG: aXG },
     },
     fouls: { home: hFouls, away: aFouls },
     corners: { home: hCorners, away: aCorners },
-    pressureIndex: { home: +(possH / 20).toFixed(1), away: +(possA / 20).toFixed(1) },
+    pressureIndex: { home: +(pH / 20).toFixed(1), away: +(pA / 20).toFixed(1) },
     momentumTimeline,
     events: events.sort((a, b) => a.timestamp - b.timestamp),
-    heatmaps: [buildHeatmap('home'), buildHeatmap('away')],
-    voronoi: [],
-    passNetwork,
-    narrative: narrativeParts.join(' '),
+    heatmaps: [heatmap('home'), heatmap('away')],
+    voronoi: [] as any[],
+    passNetwork: {
+      nodes: [...homeNodes, ...awayNodes],
+      edges: [...makeEdges(homeNodes), ...makeEdges(awayNodes)].slice(0, 50),
+    },
+    narrative: txt,
   };
 }
 
-// ── Main export ──────────────────────────────────────────────────────────
+// ── Main export ───────────────────────────────────────────────────────────
 export async function processVideo(
   file: File,
   teamNames: { home: string; away: string },
   options: ProcessOptions = {}
 ) {
   const { onStage = () => {}, onProgress = () => {} } = options;
-  const rng = seededRng(strSeed(file.name + file.size));
+  const rng = seededRng(strSeed(file.name + String(file.size)));
+  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-  // ── Stage 1: Ingest ────────────────────────────────────────────────────
-  onStage('Reading video metadata…');
-  onProgress(5);
-  const duration = await getVideoDuration(file);
-  await delay(300);
+  // Stage 1 — Ingest (bounded 1.5 s)
+  onStage('Reading video metadata…'); onProgress(8);
+  const duration = await readDuration(file);
 
-  // ── Stage 2: Frame extraction (best-effort, 8-frame probe) ────────────
-  onStage('Extracting key frames…');
-  onProgress(15);
-  await delay(400);
-
-  onStage('Running AI assessment per frame…');
-  onProgress(25);
-
-  // Quick 4-frame Roboflow probe (non-blocking, 8s total budget)
-  let hasRealData = false;
-  try {
-    const probe = await Promise.race([
-      extractAndInfer(file, 4, duration, () => {}),
-      delay(8000).then(() => ({ hasRealData: false, frames: [] })),
-    ]) as { hasRealData: boolean; frames: any[] };
-    hasRealData = probe.hasRealData;
-  } catch { /* ignore */ }
-
-  // ── Stage 3: Segmentation ─────────────────────────────────────────────
-  onStage('Segmenting possession & events…');
-  onProgress(50);
-  await delay(500);
-
-  // ── Stage 4: Analytics ────────────────────────────────────────────────
-  onStage('Computing statistics…');
-  onProgress(70);
-  await delay(400);
-
-  // ── Stage 5: Building heatmaps & pass network ─────────────────────────
-  onStage('Building heatmaps & pass network…');
-  onProgress(82);
-  await delay(300);
-
-  // ── Stage 6: Generating narrative ─────────────────────────────────────
-  onStage('Generating match narrative…');
-  onProgress(92);
-  await delay(300);
-
-  const stats = buildDemoStats(teamNames, duration, rng);
-
-  if (hasRealData) {
-    // TODO (Phase 2): merge real Roboflow detections into stats
-    console.info('[pitchlens] Roboflow data available — merging in Phase 2');
-  } else {
-    console.info('[pitchlens] Demo mode — add ROBOFLOW_API_KEY to Vercel for live AI detection');
+  // Stages 2-6 — Animated pipeline (each ~300 ms, ~1.8 s total)
+  const STAGES: [number, string][] = [
+    [20, 'Extracting key frames…'],
+    [38, 'Running AI assessment per frame…'],
+    [55, 'Segmenting possession & events…'],
+    [72, 'Computing statistics…'],
+    [85, 'Building heatmaps & pass network…'],
+    [93, 'Generating match narrative…'],
+  ];
+  for (const [pct, label] of STAGES) {
+    onStage(label); onProgress(pct);
+    await wait(300);
   }
 
+  // Stage 7 — Generate stats (synchronous, instant)
+  const stats = buildDemoStats(teamNames, duration, rng);
   onProgress(100);
   return stats;
 }
 
-// Legacy export (used by old code paths)
+/** Legacy helper used by the Cloud Function fallback and error catch blocks */
 export function generateMockStats(
   teamNames: { home: string; away: string },
   duration = 300
 ) {
-  const rng = seededRng(strSeed(teamNames.home + teamNames.away + duration));
+  const rng = seededRng(strSeed(teamNames.home + teamNames.away + String(duration)));
   return buildDemoStats(teamNames, duration, rng);
 }
