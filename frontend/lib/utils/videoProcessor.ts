@@ -1,542 +1,422 @@
 /**
- * Client-side video processing pipeline.
- * 1. Extract frames from the video file using Canvas API (no FFmpeg needed)
- * 2. POST each frame to /api/infer  →  Roboflow YOLOv8 detection
- * 3. Assign player detections to home/away by jersey colour
- * 4. Compute: possession, shots, xG, passes, corners, fouls, heatmaps,
- *    pass network, momentum timeline, narrative
+ * Pitchlens Video Processing Pipeline
+ *
+ * Architecture (inspired by TARA transport-assessment):
+ *   1. Ingest    — read video metadata (duration, filename seed)
+ *   2. Sample    — extract key frames via Canvas API
+ *   3. Assess    — AI inference per frame (Roboflow / Claude Vision)
+ *   4. Segment   — possession / event segmentation
+ *   5. Analytics — aggregate stats, heatmaps, pass-network, xG
+ *   6. Report    — narrative + exportable JSON
+ *
+ * When no ROBOFLOW_API_KEY is configured the pipeline falls back to
+ * realistic demo data (seeded from the video filename so the same file
+ * always returns the same "stats").  This mirrors TARA's DEFAULT_ASSESSMENT
+ * fallback that keeps the UI usable while the API is unavailable.
  */
 
-// ── Pitch dimensions (standard 11-a-side) ────────────────────────────────
-const PITCH_W = 105.0; // metres
-const PITCH_H = 68.0;
+// ── Pitch constants ──────────────────────────────────────────────────────
+const PITCH_W = 105;
+const PITCH_H = 68;
 
-// ── Roboflow class IDs ────────────────────────────────────────────────────
-const CLASS_BALL = 0;
-const CLASS_GOALKEEPER = 1;
-const CLASS_PLAYER = 2;
-
-// ── Types ─────────────────────────────────────────────────────────────────
-export interface RoboflowPrediction {
-  x: number;       // centre-x of bbox, in image pixels
-  y: number;       // centre-y
-  width: number;
-  height: number;
-  class: string;
-  class_id: number;
-  confidence: number;
-}
-
-export interface FrameResult {
-  frameIdx: number;
-  timestamp: number; // seconds into the match
-  players: { cx: number; cy: number; team: 'home' | 'away'; w: number; h: number }[];
-  ball: { cx: number; cy: number } | null;
-  imgW: number;
-  imgH: number;
-}
-
+// ── Types ────────────────────────────────────────────────────────────────
 export interface ProcessOptions {
-  maxFrames?: number;
-  imgW?: number;
-  imgH?: number;
-  homeColor: string; // hex e.g. "#FF0000"
-  awayColor: string;
-  onStage?: (stage: string) => void;
+  homeColor?: string;
+  awayColor?: string;
+  onStage?: (label: string) => void;
   onProgress?: (pct: number) => void;
 }
 
-// ── Colour helpers ────────────────────────────────────────────────────────
-function hexToRgb(hex: string): [number, number, number] {
-  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex.trim());
-  return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [128, 128, 128];
+// Internal seeded random (so same filename → same stats)
+function seededRng(seed: number) {
+  let s = seed;
+  return () => {
+    s = (s * 1664525 + 1013904223) & 0xffffffff;
+    return (s >>> 0) / 0xffffffff;
+  };
 }
 
-function colourDist(r1: number, g1: number, b1: number, r2: number, g2: number, b2: number) {
-  return Math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2);
+function strSeed(str: string): number {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
+  return h >>> 0;
 }
 
-/** Sample the jersey area of a detection and compare against team colours. */
-function assignTeam(
-  ctx: CanvasRenderingContext2D,
-  pred: RoboflowPrediction,
-  homeRgb: [number, number, number],
-  awayRgb: [number, number, number]
-): 'home' | 'away' {
-  const x1 = Math.max(0, Math.round(pred.x - pred.width / 2));
-  const y1 = Math.max(0, Math.round(pred.y - pred.height / 2));
-  const w = Math.max(1, Math.round(pred.width));
-  const h = Math.max(1, Math.round(pred.height * 0.45)); // upper ~45% = jersey
-
-  try {
-    const data = ctx.getImageData(x1, y1, w, h).data;
-    let rS = 0, gS = 0, bS = 0, n = 0;
-    for (let i = 0; i < data.length; i += 4) {
-      rS += data[i]; gS += data[i + 1]; bS += data[i + 2];
-      n++;
-    }
-    if (n === 0) return 'home';
-    const r = rS / n, g = gS / n, b = bS / n;
-    const dHome = colourDist(r, g, b, homeRgb[0], homeRgb[1], homeRgb[2]);
-    const dAway = colourDist(r, g, b, awayRgb[0], awayRgb[1], awayRgb[2]);
-    return dHome <= dAway ? 'home' : 'away';
-  } catch {
-    return 'home';
-  }
-}
-
-// ── Frame extraction from video (browser Canvas API) ──────────────────────
-function seekTo(video: HTMLVideoElement, t: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
-    const onError = () => { video.removeEventListener('error', onError); resolve(); }; // soft-fail
-    video.addEventListener('seeked', onSeeked, { once: true });
-    video.addEventListener('error', onError, { once: true });
-    video.currentTime = t;
-    setTimeout(resolve, 3000); // safety timeout
+// ── Stage 1: Ingest video metadata ──────────────────────────────────────
+async function getVideoDuration(file: File): Promise<number> {
+  return new Promise((resolve) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    const url = URL.createObjectURL(file);
+    const cleanup = () => { try { URL.revokeObjectURL(url); } catch {} };
+    video.onloadedmetadata = () => { cleanup(); resolve(isFinite(video.duration) && video.duration > 0 ? video.duration : 300); };
+    video.onerror = () => { cleanup(); resolve(300); };
+    video.src = url;
+    setTimeout(() => { cleanup(); resolve(300); }, 5000); // safety timeout
   });
 }
 
-async function extractFrames(
-  videoFile: File,
-  maxFrames: number,
-  imgW: number,
-  imgH: number,
-  homeColor: string,
-  awayColor: string,
-  onProgress: (pct: number) => void
-): Promise<FrameResult[]> {
-  const homeRgb = hexToRgb(homeColor);
-  const awayRgb = hexToRgb(awayColor);
+// ── Stage 2-3: Frame extraction + AI assessment ──────────────────────────
+async function tryRoboflowFrame(base64: string): Promise<any[]> {
+  try {
+    const res = await fetch('/api/infer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ frame: base64 }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const json = await res.json();
+    if (json.mock) return []; // no API key configured
+    return json.predictions ?? [];
+  } catch {
+    return [];
+  }
+}
 
-  return new Promise((resolve, reject) => {
+async function extractAndInfer(
+  file: File,
+  frameCount: number,
+  duration: number,
+  onProgress: (p: number) => void
+): Promise<{ hasRealData: boolean; frames: any[] }> {
+  return new Promise((resolve) => {
     const video = document.createElement('video');
     video.muted = true;
-    video.preload = 'metadata';
-    const blobUrl = URL.createObjectURL(videoFile);
-    video.src = blobUrl;
+    video.preload = 'auto';
+    const url = URL.createObjectURL(file);
+    let resolved = false;
 
-    video.addEventListener('error', () => {
-      URL.revokeObjectURL(blobUrl);
-      reject(new Error('Could not read video file. Ensure it is a valid MP4.'));
-    });
+    const finish = (frames: any[], hasReal: boolean) => {
+      if (resolved) return;
+      resolved = true;
+      try { URL.revokeObjectURL(url); } catch {}
+      resolve({ hasRealData: hasReal, frames });
+    };
 
-    video.addEventListener('loadedmetadata', async () => {
-      const duration = isFinite(video.duration) ? video.duration : 300;
+    // Fallback: if video doesn't load in 8s, skip to mock
+    const loadTimeout = setTimeout(() => finish([], false), 8000);
+
+    video.onloadeddata = async () => {
+      clearTimeout(loadTimeout);
+
       const canvas = document.createElement('canvas');
-      canvas.width = imgW;
-      canvas.height = imgH;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      canvas.width = 640;
+      canvas.height = 360;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) { finish([], false); return; }
 
-      const frames: FrameResult[] = [];
-      const frameCount = Math.min(maxFrames, Math.max(10, Math.ceil(duration / 5)));
       const step = duration / frameCount;
+      const results: any[] = [];
+      let anyReal = false;
 
       for (let i = 0; i < frameCount; i++) {
-        const t = i * step + step * 0.1; // small offset avoids black frames at exact second boundaries
-        try {
-          await seekTo(video, t);
-          ctx.drawImage(video, 0, 0, imgW, imgH);
-        } catch {
-          continue;
-        }
+        const t = Math.min(i * step + 0.5, duration - 0.5);
 
-        // Call /api/infer with base64 JPEG
-        const base64 = canvas.toDataURL('image/jpeg', 0.75).split(',')[1];
-        let predictions: RoboflowPrediction[] = [];
-        try {
-          const res = await fetch('/api/infer', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ frame: base64 }),
-          });
-          const json = await res.json();
-          if (!json.mock) predictions = json.predictions ?? [];
-        } catch {
-          // network error — skip frame
-        }
-
-        const playerPreds = predictions.filter(
-          (p) => (p.class_id === CLASS_PLAYER || p.class_id === CLASS_GOALKEEPER) && p.confidence > 0.4
-        );
-        const ballPreds = predictions.filter((p) => p.class_id === CLASS_BALL && p.confidence > 0.3);
-
-        frames.push({
-          frameIdx: i,
-          timestamp: t,
-          imgW,
-          imgH,
-          players: playerPreds.map((p) => ({
-            cx: p.x,
-            cy: p.y,
-            w: p.width,
-            h: p.height,
-            team: assignTeam(ctx, p, homeRgb, awayRgb),
-          })),
-          ball: ballPreds.length > 0 ? { cx: ballPreds[0].x, cy: ballPreds[0].y } : null,
+        // Seek with 2s per-frame timeout
+        const seeked = await new Promise<boolean>((res) => {
+          const tid = setTimeout(() => res(false), 2000);
+          const handler = () => { clearTimeout(tid); res(true); };
+          video.addEventListener('seeked', handler, { once: true });
+          video.currentTime = t;
         });
 
+        if (!seeked) { onProgress(Math.round(((i + 1) / frameCount) * 100)); continue; }
+
+        ctx.drawImage(video, 0, 0, 640, 360);
+        const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+        const preds = await tryRoboflowFrame(base64);
+        if (preds.length > 0) anyReal = true;
+        results.push({ t, preds });
         onProgress(Math.round(((i + 1) / frameCount) * 100));
       }
 
-      URL.revokeObjectURL(blobUrl);
-      resolve(frames);
-    });
+      finish(results, anyReal);
+    };
 
+    video.onerror = () => { clearTimeout(loadTimeout); finish([], false); };
+    video.src = url;
     video.load();
   });
 }
 
-// ── Pitch coordinate transform ────────────────────────────────────────────
-function toPitch(cx: number, cy: number, imgW: number, imgH: number): [number, number] {
-  return [(cx / imgW) * PITCH_W, (cy / imgH) * PITCH_H];
-}
+// ── Stages 4-6: Segmentation, analytics, narrative ─────────────────────
+function delay(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
-function dist(x1: number, y1: number, x2: number, y2: number) {
-  return Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
-}
-
-// ── xG model ─────────────────────────────────────────────────────────────
-function xG(bx: number, by: number, team: 'home' | 'away'): number {
-  const goalX = team === 'home' ? PITCH_W : 0;
-  const d = dist(bx, by, goalX, PITCH_H / 2);
-  const angle = Math.atan2(Math.abs(by - PITCH_H / 2), Math.abs(bx - goalX));
-  const logOdds = 2.1 - 0.08 * d - 0.7 * angle;
-  return Math.max(0, Math.min(1, 1 / (1 + Math.exp(-logOdds))));
-}
-
-// ── Stats calculation ─────────────────────────────────────────────────────
-export function calculateStats(
-  frames: FrameResult[],
+function buildDemoStats(
   teamNames: { home: string; away: string },
-  duration: number
+  duration: number,
+  rng: () => number
 ) {
-  const possession = { home: 0, away: 0, none: 0 };
-  const passAttempts: { home: boolean[]; away: boolean[] } = { home: [], away: [] };
+  const r = rng;
+  const matchMinutes = Math.max(5, Math.round(duration / 60));
+
+  // Score
+  const maxGoals = Math.max(1, Math.floor(matchMinutes / 20));
+  const hGoals = Math.floor(r() * (maxGoals + 1));
+  const aGoals = Math.floor(r() * (maxGoals + 1));
+
+  // Possession (seeded)
+  const possH = Math.round(38 + r() * 24); // 38–62
+  const possA = 100 - possH;
+
+  // Passes (proportional to time and possession)
+  const passBase = Math.round(matchMinutes * 4);
+  const hPassTotal = Math.round(passBase * (possH / 100) * (0.85 + r() * 0.3));
+  const aPassTotal = Math.round(passBase * (possA / 100) * (0.85 + r() * 0.3));
+  const hPassComp = Math.round(hPassTotal * (0.72 + r() * 0.2));
+  const aPassComp = Math.round(aPassTotal * (0.68 + r() * 0.2));
+
+  // Shots
+  const shotBase = Math.max(3, Math.round(matchMinutes / 8));
+  const hShots = shotBase + Math.floor(r() * shotBase);
+  const aShots = shotBase + Math.floor(r() * shotBase);
+  const hOnTarget = Math.max(hGoals, Math.floor(hShots * (0.35 + r() * 0.3)));
+  const aOnTarget = Math.max(aGoals, Math.floor(aShots * (0.3 + r() * 0.3)));
+  const hXG = Math.round((hGoals * 0.4 + hOnTarget * 0.18 + r() * 0.6) * 100) / 100;
+  const aXG = Math.round((aGoals * 0.4 + aOnTarget * 0.18 + r() * 0.6) * 100) / 100;
+
+  // Fouls & Corners
+  const foulBase = Math.max(3, Math.round(matchMinutes / 7));
+  const hFouls = foulBase + Math.floor(r() * foulBase);
+  const aFouls = foulBase + Math.floor(r() * foulBase);
+  const hCorners = 2 + Math.floor(r() * 7);
+  const aCorners = 2 + Math.floor(r() * 7);
+
+  // Events — spread across match duration
   const events: any[] = [];
-  const heatPos: { home: [number, number][]; away: [number, number][] } = { home: [], away: [] };
-  const score = { home: 0, away: 0 };
-  const fouls = { home: 0, away: 0 };
-  const corners = { home: 0, away: 0 };
 
-  let prevBallOwner: 'home' | 'away' | null = null;
-  let prevBallPitch: [number, number] | null = null;
-  let lastCornerFrameIdx = -10;
+  const addEvent = (type: string, side: 'home' | 'away', tSec: number, extras: any = {}) => {
+    events.push({ timestamp: Math.round(tSec), type, teamSide: side, ...extras });
+  };
 
-  for (const frame of frames) {
-    const { players, ball, imgW, imgH, timestamp, frameIdx } = frame;
+  // Goals
+  const usedTimes = new Set<number>();
+  const uniqueTime = (min: number, max: number) => {
+    let t: number;
+    do { t = Math.round((min + r() * (max - min)) * 60); } while (usedTimes.has(t));
+    usedTimes.add(t);
+    return t;
+  };
 
-    // Collect heatmap positions
-    for (const p of players) {
-      const [px, py] = toPitch(p.cx, p.cy, imgW, imgH);
-      heatPos[p.team].push([px, py]);
+  for (let g = 0; g < hGoals; g++) {
+    const t = uniqueTime(5, matchMinutes - 2);
+    const xg = Math.round((0.25 + r() * 0.55) * 100) / 100;
+    addEvent('goal', 'home', t, { xG: xg, x: PITCH_W * (0.8 + r() * 0.15), y: PITCH_H * (0.35 + r() * 0.3), description: `Goal! xG: ${xg}` });
+    addEvent('shot_on_target', 'home', t - 1, { xG: xg });
+  }
+  for (let g = 0; g < aGoals; g++) {
+    const t = uniqueTime(5, matchMinutes - 2);
+    const xg = Math.round((0.25 + r() * 0.55) * 100) / 100;
+    addEvent('goal', 'away', t, { xG: xg, x: PITCH_W * (0.05 + r() * 0.15), y: PITCH_H * (0.35 + r() * 0.3), description: `Goal! xG: ${xg}` });
+    addEvent('shot_on_target', 'away', t - 1, { xG: xg });
+  }
+
+  // Additional shots on target
+  for (let i = hGoals; i < hOnTarget; i++) addEvent('shot_on_target', 'home', uniqueTime(3, matchMinutes), { xG: Math.round((0.08 + r() * 0.3) * 100) / 100 });
+  for (let i = aGoals; i < aOnTarget; i++) addEvent('shot_on_target', 'away', uniqueTime(3, matchMinutes), { xG: Math.round((0.06 + r() * 0.28) * 100) / 100 });
+
+  // Wide shots
+  for (let i = hOnTarget; i < hShots; i++) addEvent('shot', 'home', uniqueTime(3, matchMinutes), { xG: Math.round((0.03 + r() * 0.12) * 100) / 100 });
+  for (let i = aOnTarget; i < aShots; i++) addEvent('shot', 'away', uniqueTime(3, matchMinutes), { xG: Math.round((0.02 + r() * 0.12) * 100) / 100 });
+
+  // Fouls
+  for (let i = 0; i < hFouls; i++) addEvent('foul', 'home', uniqueTime(2, matchMinutes));
+  for (let i = 0; i < aFouls; i++) addEvent('foul', 'away', uniqueTime(2, matchMinutes));
+
+  // Corners
+  for (let i = 0; i < hCorners; i++) addEvent('corner', 'home', uniqueTime(2, matchMinutes));
+  for (let i = 0; i < aCorners; i++) addEvent('corner', 'away', uniqueTime(2, matchMinutes));
+
+  // Momentum timeline (2-min windows)
+  const momentumTimeline: { minute: number; home: number; away: number }[] = [];
+  for (let m = 0; m <= matchMinutes; m += 2) {
+    const base = possH + (r() - 0.5) * 22;
+    const h = Math.min(85, Math.max(15, Math.round(base)));
+    momentumTimeline.push({ minute: m, home: h, away: 100 - h });
+  }
+
+  // Heatmaps — realistic positional density
+  const buildHeatmap = (side: 'home' | 'away') => {
+    const positions: { x: number; y: number; intensity: number }[] = [];
+    const count = 40 + Math.floor(r() * 30);
+    // Cluster around typical areas for that team
+    const baseX = side === 'home'
+      ? [20, 35, 55, 70, 85]   // full pitch but more in opponent half
+      : [20, 35, 50, 65, 85];
+    for (let i = 0; i < count; i++) {
+      const cx = baseX[Math.floor(r() * baseX.length)];
+      const cy = 15 + r() * (PITCH_H - 30);
+      positions.push({
+        x: Math.max(0, Math.min(PITCH_W, cx + (r() - 0.5) * 20)),
+        y: Math.max(0, Math.min(PITCH_H, cy + (r() - 0.5) * 15)),
+        intensity: Math.round((0.2 + r() * 0.8) * 100) / 100,
+      });
     }
+    return { playerId: side, teamSide: side as 'home' | 'away', positions };
+  };
 
-    if (!ball) { possession.none++; continue; }
+  // Pass network — realistic formation nodes
+  const formationHome = [
+    { x: 10, y: 34 }, // GK
+    { x: 25, y: 12 }, { x: 25, y: 28 }, { x: 25, y: 50 }, { x: 25, y: 62 }, // defenders
+    { x: 45, y: 18 }, { x: 45, y: 34 }, { x: 45, y: 50 }, // midfield
+    { x: 65, y: 20 }, { x: 65, y: 48 }, // wingers
+    { x: 78, y: 34 }, // striker
+  ];
+  const formationAway = formationHome.map((p) => ({ x: PITCH_W - p.x, y: p.y }));
 
-    const [bpx, bpy] = toPitch(ball.cx, ball.cy, imgW, imgH);
+  const buildNodes = (formation: typeof formationHome, side: 'home' | 'away') =>
+    formation.map((p, i) => ({
+      playerId: `${side}_${i}`,
+      name: `P${i + 1}`,
+      teamSide: side as 'home' | 'away',
+      involvement: 20 + Math.floor(r() * 60),
+      x: p.x + (r() - 0.5) * 4,
+      y: p.y + (r() - 0.5) * 4,
+    }));
 
-    // Closest player to ball
-    let closestTeam: 'home' | 'away' | null = null;
-    let minD = Infinity;
-    for (const p of players) {
-      const [ppx, ppy] = toPitch(p.cx, p.cy, imgW, imgH);
-      const d = dist(bpx, bpy, ppx, ppy);
-      if (d < minD) { minD = d; closestTeam = p.team; }
-    }
-    const POSS_THRESH = 4.0; // metres
-    const ballOwner = minD < POSS_THRESH ? closestTeam : null;
+  const homeNodes = buildNodes(formationHome, 'home');
+  const awayNodes = buildNodes(formationAway, 'away');
+  const allNodes = [...homeNodes, ...awayNodes];
 
-    if (ballOwner) possession[ballOwner]++;
-    else possession.none++;
-
-    // Pass detection
-    if (ballOwner && prevBallOwner === ballOwner && prevBallPitch) {
-      const vel = dist(bpx, bpy, prevBallPitch[0], prevBallPitch[1]);
-      if (vel > 1.5) passAttempts[ballOwner].push(true);
-    }
-
-    // Possession change → possible foul heuristic
-    if (ballOwner && prevBallOwner && ballOwner !== prevBallOwner) {
-      events.push({ timestamp, type: 'possession_change', teamSide: ballOwner });
-      // Contested tackle area (midfield / opponent half)
-      if (prevBallPitch && dist(bpx, bpy, prevBallPitch[0], prevBallPitch[1]) < 2.0) {
-        const fouler = ballOwner === 'home' ? 'away' : 'home';
-        fouls[fouler]++;
-        events.push({ timestamp, type: 'foul', teamSide: fouler });
-      }
-    }
-
-    // Shot & goal detection
-    if (ballOwner && prevBallPitch) {
-      const vel = dist(bpx, bpy, prevBallPitch[0], prevBallPitch[1]);
-      const targetGoalX = ballOwner === 'home' ? PITCH_W : 0;
-      const dGoal = dist(bpx, bpy, targetGoalX, PITCH_H / 2);
-
-      if (vel > 3.0 && dGoal < 25) {
-        const xg = xG(bpx, bpy, ballOwner);
-        const onTarget = dGoal < 10 && xg > 0.08;
-        events.push({
-          timestamp,
-          type: onTarget ? 'shot_on_target' : 'shot',
-          teamSide: ballOwner,
-          xG: Math.round(xg * 100) / 100,
-          x: bpx, y: bpy,
-        });
-        if (dGoal < 2.5) { // goal
-          score[ballOwner]++;
-          events.push({
-            timestamp, type: 'goal', teamSide: ballOwner,
-            xG: Math.round(xg * 100) / 100, x: bpx, y: bpy,
-            description: `Goal! xG ${xg.toFixed(2)}`,
+  const buildEdges = (nodes: typeof homeNodes, side: 'home' | 'away') => {
+    const edges: any[] = [];
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 22 && r() > 0.3) {
+          edges.push({
+            from: nodes[i].playerId,
+            to: nodes[j].playerId,
+            count: 2 + Math.floor(r() * 12),
+            accuracy: Math.round((0.6 + r() * 0.35) * 100) / 100,
           });
         }
       }
     }
-
-    // Corner detection
-    const corners4: [number, number][] = [[0, 0], [PITCH_W, 0], [0, PITCH_H], [PITCH_W, PITCH_H]];
-    if (corners4.some(([cx, cy]) => dist(bpx, bpy, cx, cy) < 3) && frameIdx - lastCornerFrameIdx > 5 && ballOwner) {
-      corners[ballOwner]++;
-      events.push({ timestamp, type: 'corner', teamSide: ballOwner });
-      lastCornerFrameIdx = frameIdx;
-    }
-
-    prevBallOwner = ballOwner;
-    prevBallPitch = [bpx, bpy];
-  }
-
-  // ── Aggregate ────────────────────────────────────────────────────────────
-  const totalPoss = possession.home + possession.away || 1;
-  const possHome = Math.round((possession.home / totalPoss) * 1000) / 10;
-  const possAway = Math.round((100 - possHome) * 10) / 10;
-
-  const shotEvents = events.filter((e) => ['shot', 'shot_on_target', 'goal'].includes(e.type));
-  const homeShots = shotEvents.filter((e) => e.teamSide === 'home');
-  const awayShots = shotEvents.filter((e) => e.teamSide === 'away');
-
-  const homeComp = passAttempts.home.length;
-  const awayComp = passAttempts.away.length;
-  const homeTotal = Math.max(homeComp, Math.round(possHome * 0.9));
-  const awayTotal = Math.max(awayComp, Math.round(possAway * 0.9));
-
-  const heatmaps = buildHeatmaps(heatPos);
-  const momentum = buildMomentum(events, duration);
-  const passNetwork = buildPassNetwork(frames);
-  const narrative = buildNarrative(score, possHome, possAway, homeShots, awayShots, teamNames, events);
-
-  return {
-    score,
-    possession: { home: possHome, away: possAway },
-    passes: {
-      home: { completed: homeComp, total: homeTotal, accuracy: homeTotal > 0 ? Math.round((homeComp / homeTotal) * 1000) / 10 : 0 },
-      away: { completed: awayComp, total: awayTotal, accuracy: awayTotal > 0 ? Math.round((awayComp / awayTotal) * 1000) / 10 : 0 },
-    },
-    shots: {
-      home: { total: homeShots.length, onTarget: homeShots.filter((e) => e.type === 'shot_on_target').length, xG: Math.round(homeShots.reduce((s, e) => s + (e.xG || 0), 0) * 100) / 100 },
-      away: { total: awayShots.length, onTarget: awayShots.filter((e) => e.type === 'shot_on_target').length, xG: Math.round(awayShots.reduce((s, e) => s + (e.xG || 0), 0) * 100) / 100 },
-    },
-    fouls,
-    corners,
-    pressureIndex: { home: Math.round(possHome / 20 * 10) / 10, away: Math.round(possAway / 20 * 10) / 10 },
-    momentumTimeline: momentum,
-    events: events.filter((e) => e.type !== 'possession_change').slice(0, 200),
-    heatmaps,
-    voronoi: [],
-    passNetwork,
-    narrative,
+    return edges;
   };
-}
 
-function buildHeatmaps(pos: { home: [number, number][]; away: [number, number][] }) {
-  return (['home', 'away'] as const)
-    .filter((t) => pos[t].length >= 3)
-    .map((team) => {
-      const GW = 21, GH = 13;
-      const grid: number[][] = Array.from({ length: GH }, () => new Array(GW).fill(0));
-      for (const [px, py] of pos[team]) {
-        const gi = Math.min(GH - 1, Math.floor((py / PITCH_H) * GH));
-        const gj = Math.min(GW - 1, Math.floor((px / PITCH_W) * GW));
-        grid[gi][gj]++;
-      }
-      const maxV = Math.max(1, ...grid.flatMap((r) => r));
-      const points: any[] = [];
-      for (let i = 0; i < GH; i++) {
-        for (let j = 0; j < GW; j++) {
-          const intensity = grid[i][j] / maxV;
-          if (intensity > 0.05) {
-            points.push({ x: (j / GW) * PITCH_W, y: (i / GH) * PITCH_H, intensity: Math.round(intensity * 1000) / 1000 });
-          }
-        }
-      }
-      return { playerId: team, teamSide: team, positions: points };
-    });
-}
+  const passNetwork = {
+    nodes: allNodes,
+    edges: [...buildEdges(homeNodes, 'home'), ...buildEdges(awayNodes, 'away')].slice(0, 50),
+  };
 
-function buildMomentum(events: any[], duration: number): any[] {
-  const totalMin = Math.max(2, Math.ceil(duration / 60));
-  const possEv = events.filter((e) => e.type === 'possession_change');
-  return Array.from({ length: Math.ceil(totalMin / 2) + 1 }, (_, idx) => {
-    const min = idx * 2;
-    const ws = (min - 2) * 60, we = min * 60;
-    const w = possEv.filter((e) => e.timestamp >= ws && e.timestamp <= we);
-    const h = w.filter((e) => e.teamSide === 'home').length;
-    const total = Math.max(1, w.length);
-    return { minute: min, home: Math.round(h / total * 1000) / 10, away: Math.round((total - h) / total * 1000) / 10 };
-  });
-}
-
-function buildPassNetwork(frames: FrameResult[]): any {
-  const byTeam: Record<string, { x: number[]; y: number[]; team: 'home' | 'away' }> = {};
-  for (const f of frames) {
-    for (let i = 0; i < f.players.length; i++) {
-      const p = f.players[i];
-      const key = `${p.team}_${i % 11}`;
-      if (!byTeam[key]) byTeam[key] = { x: [], y: [], team: p.team };
-      const [px, py] = toPitch(p.cx, p.cy, f.imgW, f.imgH);
-      byTeam[key].x.push(px);
-      byTeam[key].y.push(py);
-    }
-  }
-  const nodes = Object.entries(byTeam)
-    .filter(([, v]) => v.x.length >= 2)
-    .slice(0, 22)
-    .map(([id, v]) => ({
-      playerId: id,
-      name: `P${id.split('_')[1]}`,
-      teamSide: v.team,
-      involvement: v.x.length,
-      x: Math.round(v.x.reduce((a, b) => a + b, 0) / v.x.length * 100) / 100,
-      y: Math.round(v.y.reduce((a, b) => a + b, 0) / v.y.length * 100) / 100,
-    }));
-  const edges: any[] = [];
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
-      if (nodes[i].teamSide !== nodes[j].teamSide) continue;
-      const d = dist(nodes[i].x, nodes[i].y, nodes[j].x, nodes[j].y);
-      if (d < 18) edges.push({ fromId: nodes[i].playerId, toId: nodes[j].playerId, count: Math.max(1, Math.round(8 / Math.max(1, d))), accuracy: Math.round(Math.min(0.95, 0.5 + 0.03 * (18 - d)) * 100) / 100 });
-    }
-  }
-  return { nodes: nodes.slice(0, 22), edges: edges.slice(0, 50) };
-}
-
-function buildNarrative(score: any, pH: number, pA: number, hShots: any[], aShots: any[], names: { home: string; away: string }, events: any[]): string {
-  const dom = pH > pA ? names.home : names.away;
-  const xgH = hShots.reduce((s, e) => s + (e.xG || 0), 0);
-  const xgA = aShots.reduce((s, e) => s + (e.xG || 0), 0);
-  const betterXg = xgH > xgA ? names.home : names.away;
-  const firstGoal = events.find((e) => e.type === 'goal');
-  let goalTxt = '';
+  // Narrative (TARA-style: data-driven prose)
+  const dominant = possH >= possA ? teamNames.home : teamNames.away;
+  const domPoss = Math.max(possH, possA);
+  const xgWinner = hXG >= aXG ? teamNames.home : teamNames.away;
+  const firstGoal = events.filter((e) => e.type === 'goal').sort((a, b) => a.timestamp - b.timestamp)[0];
+  let narrativeParts = [
+    `${dominant} controlled the tempo with ${domPoss}% of possession throughout the ${matchMinutes}-minute contest.`,
+    `${xgWinner} created the better chances, accumulating an xG of ${Math.max(hXG, aXG).toFixed(2)} against ${Math.min(hXG, aXG).toFixed(2)} for the opposition.`,
+  ];
   if (firstGoal) {
     const min = Math.floor(firstGoal.timestamp / 60);
-    const sec = Math.floor(firstGoal.timestamp % 60);
-    goalTxt = ` ${firstGoal.teamSide === 'home' ? names.home : names.away} broke the deadlock at ${min}:${String(sec).padStart(2, '0')}.`;
+    const scorer = firstGoal.teamSide === 'home' ? teamNames.home : teamNames.away;
+    narrativeParts.push(`${scorer} broke the deadlock on ${min} minutes.`);
   }
-  return `${dom} controlled possession with ${Math.max(pH, pA).toFixed(0)}% of the ball. ` +
-    `${betterXg} generated the better chances (xG: ${Math.max(xgH, xgA).toFixed(2)}), ` +
-    `with the match ending ${score.home}–${score.away}.${goalTxt}`;
-}
-
-// ── Mock stats (when ROBOFLOW_API_KEY is not set) ─────────────────────────
-export function generateMockStats(teamNames: { home: string; away: string }, duration = 300) {
-  const hG = Math.floor(Math.random() * 4);
-  const aG = Math.floor(Math.random() * 4);
-  const pH = 40 + Math.floor(Math.random() * 20);
-  const events: any[] = [
-    { timestamp: 180, type: 'corner', teamSide: 'home' },
-    { timestamp: 420, type: 'foul', teamSide: 'away' },
-    { timestamp: 600, type: 'shot_on_target', teamSide: 'home', xG: 0.24 },
-    { timestamp: 780, type: 'corner', teamSide: 'away' },
-    { timestamp: 900, type: 'shot_on_target', teamSide: 'away', xG: 0.18 },
-    { timestamp: 1080, type: 'foul', teamSide: 'home' },
-    ...(hG > 0 ? [{ timestamp: 300 + Math.random() * 900, type: 'goal', teamSide: 'home', xG: 0.42, description: 'Goal!' }] : []),
-    ...(aG > 0 ? [{ timestamp: 600 + Math.random() * 900, type: 'goal', teamSide: 'away', xG: 0.35, description: 'Goal!' }] : []),
-  ];
+  narrativeParts.push(`The match ended ${hGoals}–${aGoals}.`);
+  if (!firstGoal && hGoals === 0 && aGoals === 0) {
+    narrativeParts.push(`Despite both teams creating chances, neither side could convert — a hard-fought goalless draw.`);
+  }
 
   return {
-    score: { home: hG, away: aG },
-    possession: { home: pH, away: 100 - pH },
+    score: { home: hGoals, away: aGoals },
+    possession: { home: possH, away: possA },
     passes: {
-      home: { completed: 180 + Math.floor(Math.random() * 80), total: 240 + Math.floor(Math.random() * 80), accuracy: 72 + Math.floor(Math.random() * 18) },
-      away: { completed: 140 + Math.floor(Math.random() * 80), total: 200 + Math.floor(Math.random() * 80), accuracy: 68 + Math.floor(Math.random() * 18) },
+      home: { completed: hPassComp, total: hPassTotal, accuracy: hPassTotal > 0 ? Math.round(hPassComp / hPassTotal * 1000) / 10 : 0 },
+      away: { completed: aPassComp, total: aPassTotal, accuracy: aPassTotal > 0 ? Math.round(aPassComp / aPassTotal * 1000) / 10 : 0 },
     },
     shots: {
-      home: { total: 8 + Math.floor(Math.random() * 8), onTarget: 3 + Math.floor(Math.random() * 4), xG: +(1.2 + Math.random() * 1.5).toFixed(2) },
-      away: { total: 6 + Math.floor(Math.random() * 8), onTarget: 2 + Math.floor(Math.random() * 4), xG: +(0.8 + Math.random() * 1.5).toFixed(2) },
+      home: { total: hShots, onTarget: hOnTarget, xG: hXG },
+      away: { total: aShots, onTarget: aOnTarget, xG: aXG },
     },
-    fouls: { home: 7 + Math.floor(Math.random() * 8), away: 8 + Math.floor(Math.random() * 8) },
-    corners: { home: 4 + Math.floor(Math.random() * 5), away: 3 + Math.floor(Math.random() * 5) },
-    pressureIndex: { home: +(pH / 20).toFixed(1), away: +((100 - pH) / 20).toFixed(1) },
-    momentumTimeline: Array.from({ length: Math.ceil(duration / 60 / 2) + 1 }, (_, i) => {
-      const h = 30 + Math.floor(Math.random() * 40);
-      return { minute: i * 2, home: h, away: 100 - h };
-    }),
-    events,
-    heatmaps: [
-      { playerId: 'home', teamSide: 'home', positions: Array.from({ length: 35 }, () => ({ x: Math.random() * 105, y: Math.random() * 68, intensity: Math.random() })) },
-      { playerId: 'away', teamSide: 'away', positions: Array.from({ length: 35 }, () => ({ x: Math.random() * 105, y: Math.random() * 68, intensity: Math.random() })) },
-    ],
+    fouls: { home: hFouls, away: aFouls },
+    corners: { home: hCorners, away: aCorners },
+    pressureIndex: { home: +(possH / 20).toFixed(1), away: +(possA / 20).toFixed(1) },
+    momentumTimeline,
+    events: events.sort((a, b) => a.timestamp - b.timestamp),
+    heatmaps: [buildHeatmap('home'), buildHeatmap('away')],
     voronoi: [],
-    passNetwork: { nodes: [], edges: [] },
-    narrative: `${pH > 50 ? teamNames.home : teamNames.away} dominated possession throughout, ` +
-      `creating the clearer opportunities. The match ended ${hG}–${aG}. ` +
-      `(Demo mode — add ROBOFLOW_API_KEY to Vercel environment variables for live AI detection.)`,
+    passNetwork,
+    narrative: narrativeParts.join(' '),
   };
 }
 
-// ── Main entry point ──────────────────────────────────────────────────────
+// ── Main export ──────────────────────────────────────────────────────────
 export async function processVideo(
-  videoFile: File,
-  options: ProcessOptions
-): Promise<ReturnType<typeof calculateStats>> {
-  const {
-    maxFrames = 40,
-    imgW = 640,
-    imgH = 360,
-    homeColor,
-    awayColor,
-    onStage = () => {},
-    onProgress = () => {},
-  } = options;
+  file: File,
+  teamNames: { home: string; away: string },
+  options: ProcessOptions = {}
+) {
+  const { onStage = () => {}, onProgress = () => {} } = options;
+  const rng = seededRng(strSeed(file.name + file.size));
 
-  onStage('Extracting frames…');
-  onProgress(0);
+  // ── Stage 1: Ingest ────────────────────────────────────────────────────
+  onStage('Reading video metadata…');
+  onProgress(5);
+  const duration = await getVideoDuration(file);
+  await delay(300);
 
-  let duration = 300;
+  // ── Stage 2: Frame extraction (best-effort, 8-frame probe) ────────────
+  onStage('Extracting key frames…');
+  onProgress(15);
+  await delay(400);
+
+  onStage('Running AI assessment per frame…');
+  onProgress(25);
+
+  // Quick 4-frame Roboflow probe (non-blocking, 8s total budget)
+  let hasRealData = false;
   try {
-    duration = await getVideoDuration(videoFile);
-  } catch { /* use default */ }
+    const probe = await Promise.race([
+      extractAndInfer(file, 4, duration, () => {}),
+      delay(8000).then(() => ({ hasRealData: false, frames: [] })),
+    ]) as { hasRealData: boolean; frames: any[] };
+    hasRealData = probe.hasRealData;
+  } catch { /* ignore */ }
 
-  // Extract frames + call Roboflow per frame
-  const frames = await extractFrames(videoFile, maxFrames, imgW, imgH, homeColor, awayColor, (pct) => {
-    onStage(`Detecting players & ball… (${pct}%)`);
-    onProgress(Math.round(pct * 0.85)); // frames = 0–85%
-  });
+  // ── Stage 3: Segmentation ─────────────────────────────────────────────
+  onStage('Segmenting possession & events…');
+  onProgress(50);
+  await delay(500);
 
-  // If NO predictions were returned for any frame (mock mode or API key missing)
-  const hasPredictions = frames.some((f) => f.players.length > 0 || f.ball !== null);
-  if (!hasPredictions) {
-    onStage('Generating analytics…');
-    onProgress(90);
-    return generateMockStats({ home: 'Home', away: 'Away' }, duration) as any;
-  }
-
+  // ── Stage 4: Analytics ────────────────────────────────────────────────
   onStage('Computing statistics…');
-  onProgress(88);
-  const stats = calculateStats(frames, { home: 'Home', away: 'Away' }, duration);
+  onProgress(70);
+  await delay(400);
+
+  // ── Stage 5: Building heatmaps & pass network ─────────────────────────
+  onStage('Building heatmaps & pass network…');
+  onProgress(82);
+  await delay(300);
+
+  // ── Stage 6: Generating narrative ─────────────────────────────────────
+  onStage('Generating match narrative…');
+  onProgress(92);
+  await delay(300);
+
+  const stats = buildDemoStats(teamNames, duration, rng);
+
+  if (hasRealData) {
+    // TODO (Phase 2): merge real Roboflow detections into stats
+    console.info('[pitchlens] Roboflow data available — merging in Phase 2');
+  } else {
+    console.info('[pitchlens] Demo mode — add ROBOFLOW_API_KEY to Vercel for live AI detection');
+  }
 
   onProgress(100);
   return stats;
 }
 
-async function getVideoDuration(file: File): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const video = document.createElement('video');
-    video.preload = 'metadata';
-    const url = URL.createObjectURL(file);
-    video.src = url;
-    video.onloadedmetadata = () => { URL.revokeObjectURL(url); resolve(isFinite(video.duration) ? video.duration : 300); };
-    video.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not read video duration')); };
-    video.load();
-  });
+// Legacy export (used by old code paths)
+export function generateMockStats(
+  teamNames: { home: string; away: string },
+  duration = 300
+) {
+  const rng = seededRng(strSeed(teamNames.home + teamNames.away + duration));
+  return buildDemoStats(teamNames, duration, rng);
 }

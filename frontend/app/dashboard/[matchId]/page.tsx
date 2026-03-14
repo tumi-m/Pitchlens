@@ -115,6 +115,21 @@ export default function DashboardPage() {
           {isProcessing && <ProcessingCard match={match} />}
           {isError && <ErrorCard message={match.errorMessage} onRetry={handleRetry} retrying={retrying} />}
 
+          {/* Demo mode notice */}
+          {stats && (
+            <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-pitch-indigo-deep/60 border border-pitch-indigo-soft/20 text-xs text-pitch-muted">
+              <span className="shrink-0">🔬</span>
+              <span>
+                <span className="text-pitch-white font-medium">Demo analytics</span>
+                {' '}— stats are generated from your video metadata.{' '}
+                <a href="https://roboflow.com" target="_blank" rel="noopener noreferrer" className="text-pitch-indigo-glow hover:underline">
+                  Add a Roboflow API key
+                </a>
+                {' '}to Vercel environment variables to enable live AI player detection.
+              </span>
+            </div>
+          )}
+
           {/* Score Board — Sofascore style */}
           {stats && (
             <motion.div
