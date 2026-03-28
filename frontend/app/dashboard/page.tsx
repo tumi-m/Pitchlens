@@ -116,7 +116,7 @@ function MatchCard({ match }: { match: Match }) {
 
       <div className="mt-3 flex items-center justify-between">
         <p className="text-pitch-muted text-xs">
-          {match.createdAt?.toDate ? format(match.createdAt.toDate(), 'dd MMM yyyy') : '—'}
+          {match.createdAt?.toDate ? format(match.createdAt.toDate(), 'dd MMM yyyy') : match.createdAt?.seconds ? format(new Date(match.createdAt.seconds * 1000), 'dd MMM yyyy') : format(new Date(), 'dd MMM yyyy')}
         </p>
         {match.status === 'completed' && (
           <span className="text-pitch-green text-xs font-medium group-hover:underline">View Analysis →</span>

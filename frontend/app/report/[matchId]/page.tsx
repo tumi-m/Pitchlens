@@ -91,7 +91,12 @@ export default function ReportPage() {
     }
   };
 
-  const matchDate = match.createdAt?.toDate ? format(match.createdAt.toDate(), 'EEEE, d MMMM yyyy') : '—';
+  let matchDate = '—';
+  try {
+    if (match.createdAt?.toDate) matchDate = format(match.createdAt.toDate(), 'EEEE, d MMMM yyyy');
+    else if (match.createdAt?.seconds) matchDate = format(new Date(match.createdAt.seconds * 1000), 'EEEE, d MMMM yyyy');
+    else matchDate = format(new Date(), 'EEEE, d MMMM yyyy');
+  } catch { matchDate = format(new Date(), 'EEEE, d MMMM yyyy'); }
   const keyEvents = stats.events
     .filter((e: any) => ['goal', 'shot_on_target', 'corner', 'foul'].includes(e.type))
     .sort((a: any, b: any) => a.timestamp - b.timestamp)

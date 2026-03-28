@@ -99,6 +99,8 @@ export interface Match {
   awayTeamId?: string;
   homeTeamName: string;
   awayTeamName: string;
+  homeTeamColor?: string;
+  awayTeamColor?: string;
   videoUrls: string[];
   status: MatchStatus;
   errorMessage?: string;
