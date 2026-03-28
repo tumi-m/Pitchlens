@@ -45,6 +45,12 @@ function getAllLocalMatches(userId?: string): Match[] {
   return all;
 }
 
+/** Public: synchronously write match skeleton to localStorage (instant, never blocks) */
+export function saveMatchLocally(id: string, data: Partial<Match>) {
+  const now = { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 };
+  setLocalMatch(id, { ...data, createdAt: now, updatedAt: now } as any);
+}
+
 /** Detect if Firebase is actually configured (not demo) */
 function isFirebaseConfigured(): boolean {
   const key = process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
@@ -186,21 +192,22 @@ export async function reprocessMatch(matchId: string): Promise<void> {
 }
 
 export async function saveMatchStats(matchId: string, stats: any): Promise<void> {
-  if (!isFirebaseConfigured()) {
-    setLocalMatch(matchId, {
-      status: 'completed',
-      stats,
-      processingProgress: 100,
-      updatedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
-    } as any);
-    return;
-  }
-  await updateDoc(doc(db, 'matches', matchId), {
+  // Always save locally first — instant, never blocks the UI
+  setLocalMatch(matchId, {
     status: 'completed',
     stats,
     processingProgress: 100,
-    updatedAt: serverTimestamp(),
-  });
+    updatedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
+  } as any);
+  // Then try Firebase in the background — ignore any error
+  if (isFirebaseConfigured()) {
+    updateDoc(doc(db, 'matches', matchId), {
+      status: 'completed',
+      stats,
+      processingProgress: 100,
+      updatedAt: serverTimestamp(),
+    }).catch(() => { /* Firebase unavailable — localStorage already has the data */ });
+  }
 }
 
 export { serverTimestamp, Timestamp };

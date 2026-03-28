@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, Film, X, Plus, Trash2, Loader2, CheckCircle2, Zap } from 'lucide-react';
 import { Navbar } from '@/components/ui/Navbar';
 import { useAuthContext } from '@/components/auth/AuthProvider';
-import { createMatch, saveMatchStats } from '@/lib/firebase/firestore';
+import { saveMatchLocally, saveMatchStats } from '@/lib/firebase/firestore';
 import { processVideo, generateMockStats } from '@/lib/utils/videoProcessor';
 import { SOCCER_TRIVIA, formatFileSize } from '@/lib/utils/analytics';
 import { cn } from '@/lib/utils/cn';
@@ -70,39 +70,32 @@ export default function UploadPage() {
   };
 
   const handleAnalyse = async () => {
-    if (!file || !user) { toast.error('Please sign in and select a video'); return; }
+    if (!file) { toast.error('Please select a video'); return; }
+
+    // Generate ID locally — instant, never blocks
+    const id = 'match_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    setMatchId(id);
+
+    // Save skeleton to localStorage immediately (synchronous)
+    saveMatchLocally(id, {
+      userId: user?.uid ?? 'guest',
+      title: `${homeTeam} vs ${awayTeam}`,
+      homeTeamName: homeTeam,
+      awayTeamName: awayTeam,
+      homeTeamColor: homeColor,
+      awayTeamColor: awayColor,
+      videoUrls: [],
+      status: 'processing',
+      processingProgress: 0,
+    });
 
     setStage('processing');
-    setProgress(0);
-    setStageName('Creating match…');
+    setProgress(5);
+    setStageName('Reading video…');
 
     const triviaTimer = setInterval(() => setTriviaIndex((i) => (i + 1) % SOCCER_TRIVIA.length), 6000);
 
-    let id = '';
     try {
-      id = await createMatch({
-        userId: user.uid,
-        title: `${homeTeam} vs ${awayTeam}`,
-        homeTeamName: homeTeam,
-        awayTeamName: awayTeam,
-        homeTeamColor: homeColor,
-        awayTeamColor: awayColor,
-        videoUrls: [],
-        status: 'processing',
-        processingProgress: 0,
-      });
-      setMatchId(id);
-    } catch (err: any) {
-      clearInterval(triviaTimer);
-      toast.error(`Failed to create match: ${err.message}`);
-      setStage('form');
-      return;
-    }
-
-    try {
-      setStageName('Reading video…');
-      setProgress(3);
-
       const teamNames = { home: homeTeam, away: awayTeam };
       const stats = await processVideo(file, teamNames, {
         homeColor,
@@ -113,7 +106,7 @@ export default function UploadPage() {
 
       setStageName('Saving results…');
       setProgress(97);
-      await saveMatchStats(id, stats);
+      saveMatchStats(id, stats); // fire-and-forget, never await
 
       clearInterval(triviaTimer);
       setProgress(100);
@@ -122,13 +115,11 @@ export default function UploadPage() {
     } catch (err: any) {
       clearInterval(triviaTimer);
       console.error('Processing error:', err);
-      // Guaranteed fallback — always show the dashboard with demo data
-      try {
-        const mock = generateMockStats({ home: homeTeam, away: awayTeam });
-        await saveMatchStats(id, mock);
-        setTimeout(() => router.push(`/dashboard/${id}`), 1500);
-      } catch { /* ignore */ }
+      const mock = generateMockStats({ home: homeTeam, away: awayTeam });
+      saveMatchStats(id, mock); // fire-and-forget
+      setProgress(100);
       setStage('done');
+      setTimeout(() => router.push(`/dashboard/${id}`), 1500);
     }
   };
 
