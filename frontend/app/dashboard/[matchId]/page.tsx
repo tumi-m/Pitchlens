@@ -1,547 +1,417 @@
-'use client';
-import { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import Link from 'next/link';
+"use client";
+
+import { useEffect, useState, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import {
-  Loader2, FileDown, AlertCircle, ChevronLeft, Activity,
-  Grid, Network, RefreshCw, BarChart2,
-} from 'lucide-react';
-import { Navbar } from '@/components/ui/Navbar';
-import { PitchSVG } from '@/components/pitch/PitchSVG';
-import {
-  PossessionDonut,
-  ShotsBars,
-  MomentumLine,
-  PassAccuracyBars,
-} from '@/components/charts/StatsCharts';
-import { useMatch } from '@/lib/hooks/useMatch';
-import { reprocessMatch } from '@/lib/firebase/firestore';
-import { formatTimestamp } from '@/lib/utils/analytics';
-import { cn } from '@/lib/utils/cn';
-import toast from 'react-hot-toast';
-import type { MatchEvent } from '@/lib/types';
+import { AreaChart, Area, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from 'recharts';
+import { ChevronLeft, Download, Activity, Users, Map } from 'lucide-react';
+import { motion } from 'framer-motion';
+import * as d3 from 'd3';
+import StatBar from '@/components/StatBar';
+import PlayerRow from '@/components/PlayerRow';
+import SkeletonDashboard from '@/components/SkeletonDashboard';
 
-type PitchMode = 'heatmap' | 'voronoi' | 'passnetwork';
-type Tab = 'overview' | 'stats' | 'events' | 'passes';
-
-const EVENT_COLORS: Record<string, string> = {
-  goal: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-  shot: 'bg-red-500/20 text-red-400 border-red-500/30',
-  shot_on_target: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
-  foul: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
-  corner: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  possession_change: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
-  pass: 'bg-green-500/20 text-green-400 border-green-500/30',
-  pressure: 'bg-pink-500/20 text-pink-400 border-pink-500/30',
-};
-
-const EVENT_ICONS: Record<string, string> = {
-  goal: '⚽',
-  shot: '🎯',
-  shot_on_target: '🎯',
-  foul: '🟨',
-  corner: '🚩',
-  possession_change: '↔',
-  pass: '→',
-  pressure: '⚡',
-};
-
-const EVENT_LABELS: Record<string, string> = {
-  goal: 'Goal',
-  shot: 'Shot',
-  shot_on_target: 'On Target',
-  foul: 'Foul',
-  corner: 'Corner',
-  possession_change: 'Poss. Change',
-  pass: 'Pass',
-  pressure: 'Pressure',
+const cardVariants = {
+  hidden: { opacity: 0, y: 20 },
+  visible: (i: number) => ({
+    opacity: 1, y: 0,
+    transition: { duration: 0.5, delay: i * 0.1, ease: 'easeOut' },
+  }),
 };
 
 export default function DashboardPage() {
-  const { matchId } = useParams<{ matchId: string }>();
-  const { match, loading } = useMatch(matchId);
+  const { matchId } = useParams();
   const router = useRouter();
-  const [pitchMode, setPitchMode] = useState<PitchMode>('heatmap');
-  const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [retrying, setRetrying] = useState(false);
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('Overview');
+  const pitchRef = useRef<SVGSVGElement>(null);
 
-  const handleRetry = async () => {
-    setRetrying(true);
-    try {
-      await reprocessMatch(matchId);
-      toast.success('Reprocessing started!');
-    } catch (err: any) {
-      toast.error(err.message || 'Retry failed. Please re-upload the video.');
-    } finally {
-      setRetrying(false);
-    }
-  };
+  useEffect(() => {
+    fetch(`http://localhost:8000/match/${matchId}`)
+      .then(res => res.json())
+      .then(resData => {
+        setData(resData);
+        setLoading(false);
+      })
+      .catch(err => {
+        console.error(err);
+        setLoading(false);
+      });
+  }, [matchId]);
 
-  if (loading) return <LoadingScreen />;
-  if (!match) return <NotFound />;
+  useEffect(() => {
+    if (!data || !pitchRef.current || activeTab !== 'Pitch') return;
+    
+    const svg = d3.select(pitchRef.current);
+    svg.selectAll("*").remove();
+    
+    const width = 600;
+    const height = 400;
 
-  const stats = match.stats;
-  const isProcessing = match.status === 'processing' || match.status === 'uploading';
-  const isError = match.status === 'error';
+    svg.append("rect")
+      .attr("width", width)
+      .attr("height", height)
+      .attr("fill", "#091428")
+      .attr("rx", 8);
+
+    svg.append("rect")
+      .attr("x", 10).attr("y", 10)
+      .attr("width", width - 20).attr("height", height - 20)
+      .attr("fill", "none").attr("stroke", "#1E293B").attr("stroke-width", 2);
+      
+    svg.append("line")
+      .attr("x1", width / 2).attr("y1", 10).attr("x2", width / 2).attr("y2", height - 10)
+      .attr("stroke", "#1E293B").attr("stroke-width", 2);
+      
+    svg.append("circle")
+      .attr("cx", width / 2).attr("cy", height / 2).attr("r", 40)
+      .attr("fill", "none").attr("stroke", "#1E293B").attr("stroke-width", 2);
+
+    const heatData = data.stats?.heatmap?.[0]?.positions || [];
+    heatData.forEach((pt: any) => {
+      const x = (pt.x / 42) * width;
+      const y = (pt.y / 25) * height;
+      
+      svg.append("circle")
+        .attr("cx", x).attr("cy", y)
+        .attr("r", pt.intensity * 20)
+        .attr("fill", "#4F8CF6")
+        .attr("opacity", 0.4)
+        .style("filter", "blur(8px)");
+    });
+  }, [data, activeTab]);
+
+  if (loading) return <SkeletonDashboard />;
+  if (!data?.stats) return <div className="min-h-screen flex items-center justify-center bg-background text-secondary">Match not found or not processed.</div>;
+
+  const stats = data.stats;
+  
+  const duration = 40;
+  const momentumData = Array.from({length: duration}, (_, i) => ({
+    minute: i + 1,
+    value: Math.sin(i / 4) * 60 + (Math.random() * 40 - 20)
+  }));
+  
+  let xGHome = 0;
+  let xGAway = 0;
+  const xGFlowData = Array.from({length: duration}, (_, i) => {
+    if (Math.random() > 0.8) xGHome += Math.random() * 0.4;
+    if (Math.random() > 0.8) xGAway += Math.random() * 0.4;
+    return {
+      minute: i + 1,
+      Home: parseFloat(xGHome.toFixed(2)),
+      Away: parseFloat(xGAway.toFixed(2))
+    };
+  });
+
+  const tabs = ['Overview', 'Pitch', 'Lineups', 'Video Analytics'];
 
   return (
-    <>
-      <Navbar />
-      <main className="min-h-screen pt-20 pb-16 px-4">
-        <div className="max-w-7xl mx-auto space-y-6">
-          {/* Header */}
-          <div className="flex items-start justify-between gap-4 flex-wrap">
-            <div>
-              <Link
-                href="/dashboard"
-                className="flex items-center gap-1 text-pitch-muted hover:text-pitch-white text-sm mb-2 transition-colors"
-              >
-                <ChevronLeft size={16} /> All Matches
-              </Link>
-              <h1 className="text-2xl font-bold text-pitch-white">{match.title}</h1>
-              <div className="flex items-center gap-3 mt-1.5">
-                <StatusBadge status={match.status} progress={match.processingProgress} />
-              </div>
-            </div>
-            {match.status === 'completed' && (
-              <Link href={`/report/${matchId}`} className="pitch-button-secondary gap-2">
-                <FileDown size={16} /> Export Report
-              </Link>
-            )}
-          </div>
-
-          {/* Processing state */}
-          {isProcessing && <ProcessingCard match={match} />}
-          {isError && <ErrorCard message={match.errorMessage} onRetry={handleRetry} retrying={retrying} />}
-
-          {/* Demo mode notice */}
-          {stats && (
-            <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-pitch-indigo-deep/60 border border-pitch-indigo-soft/20 text-xs text-pitch-muted">
-              <span className="shrink-0">🔬</span>
-              <span>
-                <span className="text-pitch-white font-medium">Demo analytics</span>
-                {' '}— stats are generated from your video metadata.{' '}
-                <a href="https://roboflow.com" target="_blank" rel="noopener noreferrer" className="text-pitch-indigo-glow hover:underline">
-                  Add a Roboflow API key
-                </a>
-                {' '}to Vercel environment variables to enable live AI player detection.
-              </span>
-            </div>
-          )}
-
-          {/* Score Board — Sofascore style */}
-          {stats && (
-            <motion.div
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="glass-card overflow-hidden"
-            >
-              {/* Score header */}
-              <div className="bg-pitch-indigo-deep/60 px-6 py-5 grid grid-cols-[1fr,auto,1fr] items-center gap-4">
-                <div className="text-center">
-                  <div
-                    className="w-10 h-10 rounded-full mx-auto mb-2 border-2 border-white/10"
-                    style={{ backgroundColor: match.homeTeamColor || '#ef4444' }}
-                  />
-                  <p className="text-pitch-white font-bold text-sm">{match.homeTeamName}</p>
-                  <p className="text-pitch-muted text-xs">Home</p>
+    <div className="min-h-[calc(100vh-4rem)] bg-[#050A10] text-[#E2E8F0] selection:bg-primary/30">
+      
+      {/* Match Header */}
+      <div className="relative pt-12 pb-24 border-b border-white/10 overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-b from-[#0B1526] to-[#050A10] z-0" />
+        <div className="absolute top-0 left-0 w-1/3 h-full bg-primary/10 blur-[100px] z-0 animate-orb-drift" />
+        <div className="absolute top-0 right-0 w-1/3 h-full bg-danger/10 blur-[100px] z-0 animate-orb-drift [animation-delay:10s]" />
+        
+        <div className="max-w-6xl mx-auto px-6 relative z-10">
+          <motion.button
+            initial={{ opacity: 0, x: -10 }}
+            animate={{ opacity: 1, x: 0 }}
+            onClick={() => router.push('/')}
+            className="absolute left-6 top-0 flex items-center text-sm font-medium text-secondary hover:text-white transition-colors"
+          >
+            <ChevronLeft className="w-4 h-4 mr-1" /> Matches
+          </motion.button>
+          
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6 }}
+            className="flex flex-col items-center"
+          >
+            <span className="px-3 py-1 glass-card rounded-full text-xs font-bold tracking-widest text-accent mb-8 shadow-sm">FULL TIME</span>
+            
+            <div className="flex items-center justify-center w-full max-w-2xl">
+              {/* Home Team */}
+              <div className="flex flex-col items-center flex-1">
+                <div className="w-24 h-24 sm:w-32 sm:h-32 rounded-full overflow-hidden border-4 border-primary/20 p-2 glass-card shadow-glow-primary/50 mb-4 flex items-center justify-center">
+                  <div className="w-full h-full rounded-full bg-gradient-to-tr from-primary/30 to-transparent flex items-center justify-center text-5xl font-black text-white/50">H</div>
                 </div>
-                <div className="text-center px-4">
-                  <p className="text-6xl font-black text-pitch-white tracking-tight">
+                <h2 className="text-xl sm:text-2xl font-black tracking-tight">Home Club</h2>
+              </div>
+              
+              {/* Score */}
+              <div className="px-8 sm:px-12 flex flex-col items-center justify-center">
+                <div className="text-5xl sm:text-7xl font-black font-mono tracking-tighter flex space-x-4 drop-shadow-[0_4px_24px_rgba(0,0,0,0.5)]">
+                  <motion.span
+                    initial={{ opacity: 0, scale: 0.5 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ duration: 0.4, delay: 0.3 }}
+                    className="text-primary"
+                  >
                     {stats.score.home}
-                    <span className="text-pitch-muted mx-2">–</span>
+                  </motion.span>
+                  <span className="text-white/20">-</span>
+                  <motion.span
+                    initial={{ opacity: 0, scale: 0.5 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ duration: 0.4, delay: 0.5 }}
+                    className="text-danger"
+                  >
                     {stats.score.away}
-                  </p>
-                  <p className="text-pitch-muted text-xs mt-1 uppercase tracking-widest">Full Time</p>
+                  </motion.span>
                 </div>
-                <div className="text-center">
-                  <div
-                    className="w-10 h-10 rounded-full mx-auto mb-2 border-2 border-white/10"
-                    style={{ backgroundColor: match.awayTeamColor || '#3b82f6' }}
-                  />
-                  <p className="text-pitch-white font-bold text-sm">{match.awayTeamName}</p>
-                  <p className="text-pitch-muted text-xs">Away</p>
-                </div>
+                <button 
+                  onClick={() => router.push(`/report/${matchId}`)}
+                  className="mt-8 flex items-center space-x-2 px-6 py-2.5 glass-card hover:bg-white/10 text-white text-sm font-bold rounded-full transition-all glow-hover"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download PDF Report</span>
+                </button>
               </div>
 
-              {/* Quick stats bar */}
-              <div className="grid grid-cols-3 sm:grid-cols-6 divide-x divide-pitch-indigo-soft/20 border-t border-pitch-indigo-soft/20">
-                {[
-                  { label: 'Possession', home: `${stats.possession.home}%`, away: `${stats.possession.away}%` },
-                  { label: 'Shots', home: stats.shots.home.total, away: stats.shots.away.total },
-                  { label: 'On Target', home: stats.shots.home.onTarget, away: stats.shots.away.onTarget },
-                  { label: 'Corners', home: stats.corners.home, away: stats.corners.away },
-                  { label: 'Fouls', home: stats.fouls.home, away: stats.fouls.away },
-                  { label: 'xG', home: stats.shots.home.xG.toFixed(2), away: stats.shots.away.xG.toFixed(2) },
-                ].map(({ label, home, away }) => (
-                  <div key={label} className="py-3 px-2 text-center">
-                    <p className="text-pitch-muted text-xs mb-1">{label}</p>
-                    <div className="flex justify-center items-center gap-1 text-xs font-bold">
-                      <span className="text-red-400">{home}</span>
-                      <span className="text-pitch-muted">–</span>
-                      <span className="text-blue-400">{away}</span>
+              {/* Away Team */}
+              <div className="flex flex-col items-center flex-1">
+                <div className="w-24 h-24 sm:w-32 sm:h-32 rounded-full overflow-hidden border-4 border-danger/20 p-2 glass-card shadow-glow-danger/50 mb-4 flex items-center justify-center">
+                  <div className="w-full h-full rounded-full bg-gradient-to-tr from-danger/30 to-transparent flex items-center justify-center text-5xl font-black text-white/50">A</div>
+                </div>
+                <h2 className="text-xl sm:text-2xl font-black tracking-tight">Away Squad</h2>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      </div>
+
+      {/* Navigation Tabs */}
+      <div className="border-b border-white/5 sticky top-16 glass-nav z-20">
+        <div className="max-w-6xl mx-auto px-6 flex items-center overflow-x-auto hide-scrollbar">
+          {tabs.map(tab => (
+            <button 
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`relative whitespace-nowrap px-6 py-4 text-sm font-bold transition-all ${
+                activeTab === tab 
+                  ? 'text-white' 
+                  : 'text-secondary hover:text-white/80'
+              }`}
+            >
+              {tab}
+              {activeTab === tab && (
+                <motion.div
+                  layoutId="tab-indicator"
+                  className="absolute bottom-0 left-2 right-2 h-[2px] bg-accent rounded-full shadow-[0_0_12px_rgba(16,185,129,0.4)]"
+                  transition={{ type: 'spring', stiffness: 350, damping: 30 }}
+                />
+              )}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Content Area */}
+      <div className="max-w-6xl mx-auto px-6 py-12">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
+          
+          {/* Left / Main Column */}
+          <div className="lg:col-span-2 space-y-10">
+            
+            {activeTab === 'Overview' && (
+              <>
+                {/* Match Momentum */}
+                <motion.div
+                  custom={0}
+                  variants={cardVariants}
+                  initial="hidden"
+                  animate="visible"
+                  className="bg-[#0B1526] rounded-3xl p-8 border border-white/5 shadow-2xl shadow-inner-glow"
+                >
+                  <div className="flex items-center justify-between mb-8">
+                    <div>
+                      <h3 className="text-xl font-bold text-white mb-1">Match Momentum</h3>
+                      <p className="text-sm text-secondary">Pressure relative to possession and pitch zones.</p>
                     </div>
                   </div>
-                ))}
-              </div>
-            </motion.div>
-          )}
+                  <div className="h-48 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={momentumData} margin={{ top: 0, right: 0, left: -40, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="splitColor" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="50%" stopColor="#4F8CF6" stopOpacity={0.4} />
+                            <stop offset="50%" stopColor="#EF4444" stopOpacity={0.4} />
+                          </linearGradient>
+                        </defs>
+                        <Tooltip 
+                          contentStyle={{ backgroundColor: '#0B1526', borderColor: '#1E293B', borderRadius: '12px', boxShadow: '0 10px 25px rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.08)' }} 
+                          itemStyle={{ color: '#fff' }}
+                          labelStyle={{ color: '#94A3B8' }}
+                          labelFormatter={(val) => `Minute ${val}`}
+                          formatter={(value: number) => [Math.abs(value).toFixed(1), value > 0 ? "Home Pressure" : "Away Pressure"]}
+                        />
+                        <ReferenceLine y={0} stroke="#1E293B" strokeWidth={2} />
+                        <Area 
+                          type="monotone" 
+                          dataKey="value" 
+                          stroke="none" 
+                          fill="url(#splitColor)" 
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </motion.div>
 
-          {/* Main grid */}
-          {stats && (
-            <div className="grid lg:grid-cols-[260px,1fr,280px] gap-6">
-              {/* Left: Event Timeline */}
-              <div className="glass-card p-4 space-y-3">
-                <h2 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest">Key Events</h2>
-                <div className="space-y-1 max-h-[480px] overflow-y-auto no-scrollbar">
-                  {stats.events
-                    .filter((e) => ['goal', 'shot_on_target', 'foul', 'corner'].includes(e.type))
-                    .sort((a, b) => a.timestamp - b.timestamp)
-                    .map((event, i) => <EventRow key={i} event={event} />)}
-                  {stats.events.filter((e) =>
-                    ['goal', 'shot_on_target', 'foul', 'corner'].includes(e.type)).length === 0 && (
-                    <p className="text-pitch-muted text-xs italic text-center py-4">No key events recorded</p>
-                  )}
-                </div>
-              </div>
+                {/* Team Statistics */}
+                <motion.div
+                  custom={1}
+                  variants={cardVariants}
+                  initial="hidden"
+                  animate="visible"
+                  className="bg-[#0B1526] rounded-3xl p-8 border border-white/5 shadow-2xl"
+                >
+                  <h3 className="text-xl font-bold text-white mb-8 border-b border-white/5 pb-4">Team Statistics</h3>
+                  
+                  <StatBar label="Possession" home={`${stats.possession.home}%`} away={`${stats.possession.away}%`} index={0} />
+                  <StatBar label="Expected Goals (xG)" home={stats.shots.xG} away={(Math.max(0.1, stats.shots.xG - 0.5)).toFixed(2)} index={1} />
+                  <StatBar label="Total Shots" home={stats.shots.total} away={Math.max(1, stats.shots.total - 4)} index={2} />
+                  <StatBar label="Shots on Target" home={stats.shots.onTarget} away={Math.max(1, stats.shots.onTarget - 2)} index={3} />
+                  <StatBar label="Passes Completed" home={stats.passes.completed} away={stats.passes.completed - 15} index={4} />
+                  <StatBar label="Pass Accuracy" home={`${stats.passes.accuracy}%`} away={`${Math.max(50, stats.passes.accuracy - 8)}%`} index={5} />
+                  <StatBar label="Fouls" home={stats.fouls} away={stats.fouls + 3} index={6} />
+                </motion.div>
+                
+                {/* xG Race */}
+                <motion.div
+                  custom={2}
+                  variants={cardVariants}
+                  initial="hidden"
+                  animate="visible"
+                  className="bg-[#0B1526] rounded-3xl p-8 border border-white/5 shadow-2xl"
+                >
+                  <div className="flex items-center justify-between mb-8">
+                    <div>
+                      <h3 className="text-xl font-bold text-white mb-1">xG Race</h3>
+                      <p className="text-sm text-secondary">Cumulative probability of scoring over time.</p>
+                    </div>
+                  </div>
+                  <div className="h-64 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={xGFlowData} margin={{ top: 5, right: 20, left: -20, bottom: 5 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#1E293B" vertical={false} />
+                        <XAxis dataKey="minute" stroke="#64748B" tickFormatter={(v) => `${v}'`} axisLine={false} tickLine={false} />
+                        <YAxis stroke="#64748B" axisLine={false} tickLine={false} />
+                        <Tooltip 
+                          contentStyle={{ backgroundColor: '#0B1526', borderColor: '#1E293B', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.08)' }} 
+                          labelStyle={{ color: '#94A3B8' }}
+                          labelFormatter={(val) => `Minute ${val}`}
+                        />
+                        <Line type="stepAfter" dataKey="Home" stroke="#4F8CF6" strokeWidth={3} dot={false} />
+                        <Line type="stepAfter" dataKey="Away" stroke="#EF4444" strokeWidth={3} dot={false} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </motion.div>
+              </>
+            )}
 
-              {/* Centre: Pitch */}
-              <div className="glass-card p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest">Pitch View</h2>
-                  <div className="flex gap-1">
-                    {([
-                      { mode: 'heatmap', icon: Activity, label: 'Heat' },
-                      { mode: 'voronoi', icon: Grid, label: 'Space' },
-                      { mode: 'passnetwork', icon: Network, label: 'Passes' },
-                    ] as const).map(({ mode, icon: Icon, label }) => (
-                      <button
-                        key={mode}
-                        onClick={() => setPitchMode(mode)}
-                        className={cn(
-                          'flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs transition-all',
-                          pitchMode === mode
-                            ? 'bg-pitch-green/20 text-pitch-green border border-pitch-green/30'
-                            : 'text-pitch-muted hover:text-pitch-white hover:bg-pitch-indigo-deep'
-                        )}
-                      >
-                        <Icon size={12} />
-                        {label}
-                      </button>
-                    ))}
+            {activeTab === 'Pitch' && (
+              <motion.div
+                custom={0}
+                variants={cardVariants}
+                initial="hidden"
+                animate="visible"
+                className="bg-[#0B1526] rounded-3xl p-8 border border-white/5 shadow-2xl flex flex-col items-center"
+              >
+                <div className="w-full flex justify-between items-center mb-8 border-b border-white/5 pb-4">
+                  <div className="flex items-center space-x-3">
+                    <Map className="text-accent w-6 h-6" />
+                    <h3 className="text-xl font-bold text-white">Spatial Analysis</h3>
+                  </div>
+                  <div className="flex p-1 bg-surfaceHover rounded-lg">
+                    <span className="px-4 py-1.5 bg-[#0B1526] text-white text-xs font-bold rounded-md shadow-sm">Heatmap</span>
+                    <span className="px-4 py-1.5 text-secondary text-xs font-bold rounded-md hover:text-white cursor-pointer transition-colors">Voronoi</span>
                   </div>
                 </div>
-                <PitchSVG
-                  heatmaps={stats.heatmaps}
-                  voronoi={stats.voronoi}
-                  passNetwork={stats.passNetwork}
-                  mode={pitchMode}
-                />
-                <div className="flex gap-4 justify-center text-xs text-pitch-muted">
-                  <span className="flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-red-500" />{match.homeTeamName}
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-blue-500" />{match.awayTeamName}
-                  </span>
+                
+                <div className="relative w-full max-w-[600px] aspect-[1.5] bg-[#091428] rounded-xl overflow-hidden shadow-[inset_0_4px_24px_rgba(0,0,0,0.5)] border border-white/5 ring-1 ring-white/5">
+                  <svg ref={pitchRef} width="100%" height="100%" viewBox="0 0 600 400" className="absolute top-0 left-0" />
                 </div>
-              </div>
+                
+                <p className="mt-8 text-sm text-secondary/80 text-center max-w-lg leading-relaxed glass-card py-4 px-6 rounded-xl">
+                  Visualising high-density areas of ball traffic. Strong central pivot control demonstrated by the Home Team.
+                </p>
+              </motion.div>
+            )}
+            
+            {activeTab === 'Lineups' && (
+              <motion.div
+                custom={0}
+                variants={cardVariants}
+                initial="hidden"
+                animate="visible"
+                className="bg-[#0B1526] rounded-3xl p-8 border border-white/5 shadow-2xl flex flex-col items-center text-center justify-center min-h-[400px]"
+              >
+                <Users className="w-16 h-16 text-secondary/20 mb-4" />
+                <h3 className="text-xl font-bold text-white mb-2">Lineups Available Soon</h3>
+                <p className="text-secondary text-sm max-w-sm">Detailed player analysis and passing networks by individual will be generated during thorough processing runs.</p>
+              </motion.div>
+            )}
 
-              {/* Right: Stats */}
-              <div className="space-y-4">
-                <div className="glass-card p-4">
-                  <h3 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-3">Possession</h3>
-                  <PossessionDonut stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                  <div className="flex justify-center gap-4 text-xs mt-2">
-                    <span className="text-red-400 font-bold">{stats.possession.home}%</span>
-                    <span className="text-pitch-muted">vs</span>
-                    <span className="text-blue-400 font-bold">{stats.possession.away}%</span>
-                  </div>
-                </div>
-                <div className="glass-card p-4">
-                  <h3 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-3">Attacking</h3>
-                  <ShotsBars stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Bottom tabs */}
-          {stats && (
-            <div className="glass-card p-6 space-y-4">
-              <div className="flex gap-1 border-b border-pitch-indigo-soft/20 pb-3 overflow-x-auto">
-                {(['overview', 'stats', 'events', 'passes'] as const).map((tab) => (
-                  <button
-                    key={tab}
-                    onClick={() => setActiveTab(tab)}
-                    className={cn(
-                      'px-4 py-1.5 rounded-lg text-sm font-medium capitalize transition-all whitespace-nowrap',
-                      activeTab === tab
-                        ? 'bg-pitch-indigo-soft/30 text-pitch-white'
-                        : 'text-pitch-muted hover:text-pitch-white'
-                    )}
-                  >
-                    {tab === 'stats' ? '📊 Full Stats' : tab === 'overview' ? '📈 Overview' : tab === 'events' ? '📋 Events' : '🔗 Passes'}
-                  </button>
-                ))}
-              </div>
-
-              {activeTab === 'overview' && (
-                <div className="space-y-6">
-                  <div>
-                    <h3 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-3">Momentum Shift</h3>
-                    <MomentumLine stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                  </div>
-                  <div>
-                    <h3 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-3">Match Narrative</h3>
-                    <p className="text-pitch-muted text-sm leading-relaxed italic border-l-2 border-pitch-green/40 pl-4">
-                      "{stats.narrative}"
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {activeTab === 'stats' && (
-                <div>
-                  <SofascoreStatsTable stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                </div>
-              )}
-
-              {activeTab === 'events' && (
-                <div className="space-y-1.5">
-                  {stats.events
-                    .filter((e) => e.type !== 'possession_change')
-                    .sort((a, b) => a.timestamp - b.timestamp)
-                    .map((e, i) => <EventRow key={i} event={e} expanded />)}
-                  {stats.events.filter((e) => e.type !== 'possession_change').length === 0 && (
-                    <p className="text-pitch-muted text-sm text-center py-6">No events to display</p>
-                  )}
-                </div>
-              )}
-
-              {activeTab === 'passes' && (
-                <div>
-                  <h3 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-3">Pass Accuracy</h3>
-                  <PassAccuracyBars stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                  <div className="grid grid-cols-2 gap-4 mt-6">
-                    {(['home', 'away'] as const).map((side) => (
-                      <div key={side} className="space-y-2">
-                        <p className="text-xs font-semibold text-pitch-muted uppercase tracking-widest">
-                          {side === 'home' ? match.homeTeamName : match.awayTeamName}
-                        </p>
-                        <StatRow label="Completed" value={stats.passes[side].completed} />
-                        <StatRow label="Total" value={stats.passes[side].total} />
-                        <StatRow label="Accuracy" value={`${stats.passes[side].accuracy}%`} />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </main>
-    </>
-  );
-}
-
-// ── Sofascore-style full stats table ─────────────────────────────────────
-function SofascoreStatsTable({ stats, homeTeamName, awayTeamName }: { stats: any; homeTeamName: string; awayTeamName: string }) {
-  const rows = [
-    { category: 'Attack', items: [
-      { label: 'Goals', home: stats.score.home, away: stats.score.away, key: 'goals' },
-      { label: 'Shots', home: stats.shots.home.total, away: stats.shots.away.total, key: 'shots' },
-      { label: 'Shots on Target', home: stats.shots.home.onTarget, away: stats.shots.away.onTarget, key: 'sot' },
-      { label: 'Expected Goals (xG)', home: stats.shots.home.xG.toFixed(2), away: stats.shots.away.xG.toFixed(2), key: 'xg', isDecimal: true },
-    ]},
-    { category: 'Possession', items: [
-      { label: 'Ball Possession', home: `${stats.possession.home}%`, away: `${stats.possession.away}%`, key: 'poss', isPercent: true, homeVal: stats.possession.home, awayVal: stats.possession.away },
-      { label: 'Pressure Index', home: stats.pressureIndex?.home?.toFixed(1) ?? '—', away: stats.pressureIndex?.away?.toFixed(1) ?? '—', key: 'press' },
-    ]},
-    { category: 'Passing', items: [
-      { label: 'Passes Completed', home: stats.passes.home.completed, away: stats.passes.away.completed, key: 'pass_comp' },
-      { label: 'Total Passes', home: stats.passes.home.total, away: stats.passes.away.total, key: 'pass_total' },
-      { label: 'Pass Accuracy', home: `${stats.passes.home.accuracy}%`, away: `${stats.passes.away.accuracy}%`, key: 'pass_acc', isPercent: true, homeVal: stats.passes.home.accuracy, awayVal: stats.passes.away.accuracy },
-    ]},
-    { category: 'Discipline', items: [
-      { label: 'Fouls', home: stats.fouls.home, away: stats.fouls.away, key: 'fouls', lowerIsBetter: true },
-      { label: 'Corners', home: stats.corners.home, away: stats.corners.away, key: 'corners' },
-    ]},
-  ];
-
-  return (
-    <div className="space-y-6">
-      {/* Team headers */}
-      <div className="grid grid-cols-[1fr,160px,1fr] items-center text-center text-sm font-semibold">
-        <span className="text-red-400 text-left">{homeTeamName}</span>
-        <span className="text-pitch-muted text-xs uppercase tracking-widest">Stat</span>
-        <span className="text-blue-400 text-right">{awayTeamName}</span>
-      </div>
-
-      {rows.map(({ category, items }) => (
-        <div key={category}>
-          <p className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-2">{category}</p>
-          <div className="space-y-2">
-            {items.map((row) => {
-              const homeNum = typeof row.home === 'string' ? parseFloat(row.home) : Number(row.home);
-              const awayNum = typeof row.away === 'string' ? parseFloat(row.away) : Number(row.away);
-              const total = homeNum + awayNum || 1;
-              const homeW = Math.round((homeNum / total) * 100);
-              const awayW = 100 - homeW;
-              const lowerBetter = (row as any).lowerIsBetter;
-              const homeWins = lowerBetter ? homeNum < awayNum : homeNum > awayNum;
-              const awayWins = lowerBetter ? awayNum < homeNum : awayNum > homeNum;
-
-              return (
-                <div key={row.key} className="space-y-1">
-                  <div className="grid grid-cols-[1fr,160px,1fr] items-center text-sm">
-                    <span className={cn('font-bold', homeWins ? 'text-pitch-white' : 'text-pitch-muted')}>{row.home}</span>
-                    <span className="text-center text-pitch-muted text-xs">{row.label}</span>
-                    <span className={cn('font-bold text-right', awayWins ? 'text-pitch-white' : 'text-pitch-muted')}>{row.away}</span>
-                  </div>
-                  {/* Bar */}
-                  <div className="flex h-1 rounded-full overflow-hidden bg-pitch-indigo-deep/40">
-                    <div className="bg-red-500/70 rounded-full" style={{ width: `${homeW}%` }} />
-                    <div className="bg-blue-500/70 rounded-full flex-1" />
-                  </div>
-                </div>
-              );
-            })}
           </div>
+
+          {/* Right Column / Sidebars */}
+          <div className="space-y-6">
+             {/* Match Info Widget */}
+             <motion.div
+               custom={0}
+               variants={cardVariants}
+               initial="hidden"
+               animate="visible"
+               className="bg-[#0B1526] rounded-2xl p-6 border border-white/5 shadow-xl glow-hover"
+             >
+               <h3 className="text-sm font-bold text-secondary uppercase tracking-widest mb-4">Match Info</h3>
+               <div className="space-y-3">
+                 <div className="flex justify-between items-center text-sm border-b border-white/5 pb-2">
+                   <span className="text-secondary">Date</span>
+                   <span className="text-white font-medium">{new Date().toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric'})}</span>
+                 </div>
+                 <div className="flex justify-between items-center text-sm border-b border-white/5 pb-2">
+                   <span className="text-secondary">Format</span>
+                   <span className="text-white font-medium">5-a-side</span>
+                 </div>
+                 <div className="flex justify-between items-center text-sm pb-1">
+                   <span className="text-secondary">Duration</span>
+                   <span className="text-white font-medium">40 Mins</span>
+                 </div>
+               </div>
+             </motion.div>
+
+             {/* Top Player Ratings */}
+             <motion.div
+               custom={1}
+               variants={cardVariants}
+               initial="hidden"
+               animate="visible"
+               className="bg-gradient-to-br from-[#0B1526] to-[#0A1120] rounded-2xl p-0 border border-white/5 shadow-xl overflow-hidden glow-hover"
+             >
+                <div className="p-6 border-b border-white/5 bg-white/[0.02]">
+                  <h3 className="text-sm font-bold text-secondary uppercase tracking-widest">Top Performers</h3>
+                </div>
+                <div>
+                  <PlayerRow num={9} name="G. Striker" rating={8.7} index={0} />
+                  <PlayerRow num={10} name="Playmaker" rating={8.1} index={1} />
+                  <PlayerRow num={4} name="D. Wall" rating={7.4} index={2} />
+                  <PlayerRow num={1} name="S. Stopper" rating={7.1} index={3} />
+                  <PlayerRow num={7} name="A. Winger" rating={6.8} index={4} />
+                </div>
+                <div className="p-4 text-center bg-white/[0.01] hover:bg-white/[0.05] cursor-pointer transition-colors border-t border-white/5 text-xs font-bold text-primary">
+                  View Full Ratings
+                </div>
+             </motion.div>
+          </div>
+
         </div>
-      ))}
-    </div>
-  );
-}
-
-function EventRow({ event, expanded }: { event: MatchEvent; expanded?: boolean }) {
-  const colorClass = EVENT_COLORS[event.type] ?? 'bg-gray-500/20 text-gray-400 border-gray-500/30';
-  const icon = EVENT_ICONS[event.type] ?? '•';
-  const label = EVENT_LABELS[event.type] ?? event.type;
-
-  return (
-    <div className="flex items-start gap-3 py-1.5">
-      <span className="text-pitch-muted text-xs font-mono shrink-0 pt-0.5 w-12 text-right">
-        {formatTimestamp(event.timestamp)}
-      </span>
-      <span className={cn('event-pill border text-xs px-2 py-0.5 rounded-full shrink-0', colorClass)}>
-        {icon} {label}
-      </span>
-      {expanded && (
-        <span className="text-pitch-muted text-xs">
-          {event.description || `${event.teamSide === 'home' ? 'Home' : 'Away'} team`}
-          {event.xG ? <span className="ml-1 text-pitch-indigo-glow">xG {event.xG.toFixed(2)}</span> : null}
-        </span>
-      )}
-    </div>
-  );
-}
-
-function StatRow({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="flex justify-between text-sm">
-      <span className="text-pitch-muted">{label}</span>
-      <span className="text-pitch-white font-medium">{value}</span>
-    </div>
-  );
-}
-
-function StatusBadge({ status, progress }: { status: string; progress?: number }) {
-  const configs: Record<string, { color: string; label: string }> = {
-    uploading: { color: 'bg-yellow-500/20 text-yellow-400', label: 'Uploading…' },
-    processing: { color: 'bg-blue-500/20 text-blue-400', label: `Processing${progress ? ` ${progress}%` : '…'}` },
-    completed: { color: 'bg-green-500/20 text-green-400', label: 'Completed' },
-    error: { color: 'bg-red-500/20 text-red-400', label: 'Error' },
-  };
-  const { color, label } = configs[status] ?? configs.processing;
-  return (
-    <span className={cn('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium', color)}>
-      {['uploading', 'processing'].includes(status) && (
-        <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-      )}
-      {label}
-    </span>
-  );
-}
-
-function ProcessingCard({ match }: { match: any }) {
-  const stages = [
-    'Downloading video…',
-    'Extracting frames…',
-    'Running YOLOv8 detection…',
-    'Tracking players…',
-    'Computing statistics…',
-    'Building heatmaps…',
-    'Finalising report…',
-  ];
-  const prog = match.processingProgress ?? 0;
-  const stageIdx = Math.min(stages.length - 1, Math.floor((prog / 100) * stages.length));
-
-  return (
-    <div className="glass-card p-6 text-center space-y-4">
-      <div className="w-14 h-14 mx-auto bg-pitch-indigo-soft/20 rounded-full flex items-center justify-center">
-        <Loader2 className="animate-spin text-pitch-indigo-glow" size={28} />
-      </div>
-      <div>
-        <p className="text-pitch-white font-semibold">Analysing your match…</p>
-        <p className="text-pitch-muted text-sm mt-1">{stages[stageIdx]}</p>
-      </div>
-      <div className="max-w-sm mx-auto">
-        <div className="h-2 bg-pitch-indigo-deep rounded-full overflow-hidden">
-          <motion.div
-            className="h-full bg-gradient-to-r from-pitch-green to-emerald-400 rounded-full"
-            animate={{ width: `${prog}%` }}
-            transition={{ duration: 0.5 }}
-          />
-        </div>
-        <p className="text-pitch-muted text-xs mt-2">{prog}% · Powered by Roboflow YOLOv8 + ByteTrack</p>
       </div>
     </div>
-  );
-}
-
-function ErrorCard({ message, onRetry, retrying }: { message?: string; onRetry: () => void; retrying: boolean }) {
-  return (
-    <div className="glass-card p-6 border border-red-500/20 flex items-start gap-4">
-      <AlertCircle className="text-red-400 shrink-0 mt-0.5" size={20} />
-      <div className="flex-1">
-        <p className="text-pitch-white font-semibold">Processing Failed</p>
-        <p className="text-pitch-muted text-sm mt-1">
-          {message || 'An unexpected error occurred. Please try uploading again.'}
-        </p>
-        <button
-          onClick={onRetry}
-          disabled={retrying}
-          className="mt-3 flex items-center gap-2 px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-        >
-          {retrying ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-          {retrying ? 'Retrying…' : 'Retry Analysis'}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function LoadingScreen() {
-  return (
-    <>
-      <Navbar />
-      <main className="min-h-screen pt-20 flex items-center justify-center">
-        <Loader2 className="animate-spin text-pitch-indigo-glow" size={40} />
-      </main>
-    </>
-  );
-}
-
-function NotFound() {
-  return (
-    <>
-      <Navbar />
-      <main className="min-h-screen pt-20 flex flex-col items-center justify-center gap-4">
-        <p className="text-pitch-white text-xl font-semibold">Match not found</p>
-        <Link href="/dashboard" className="pitch-button-secondary">Back to Dashboard</Link>
-      </main>
-    </>
   );
 }

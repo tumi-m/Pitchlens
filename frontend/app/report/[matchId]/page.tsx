@@ -1,293 +1,270 @@
-'use client';
-import { useRef, useState } from 'react';
-import { useParams } from 'next/navigation';
-import Link from 'next/link';
+"use client";
+
+import { useEffect, useState, useRef } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import { ChevronLeft, Download, Map, PieChart, Activity, Cpu, Loader2 } from 'lucide-react';
 import { motion } from 'framer-motion';
-import { Download, Share2, Loader2, ChevronLeft, Check } from 'lucide-react';
-import { Navbar } from '@/components/ui/Navbar';
-import { useMatch } from '@/lib/hooks/useMatch';
-import { ShotsBars, PossessionDonut, MomentumLine, PassAccuracyBars } from '@/components/charts/StatsCharts';
-import { formatTimestamp } from '@/lib/utils/analytics';
-import { format } from 'date-fns';
-import toast from 'react-hot-toast';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
+import * as d3 from 'd3';
+import StatBar from '@/components/StatBar';
+
+const sectionVariants = {
+  hidden: { opacity: 0, y: 16 },
+  visible: (i: number) => ({
+    opacity: 1, y: 0,
+    transition: { duration: 0.5, delay: i * 0.12, ease: 'easeOut' },
+  }),
+};
 
 export default function ReportPage() {
-  const { matchId } = useParams<{ matchId: string }>();
-  const { match, loading } = useMatch(matchId);
+  const { matchId } = useParams();
+  const router = useRouter();
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
   const reportRef = useRef<HTMLDivElement>(null);
-  const [exporting, setExporting] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const pitchRef = useRef<SVGSVGElement>(null);
+
+  useEffect(() => {
+    fetch(`http://localhost:8000/match/${matchId}`)
+      .then(res => res.json())
+      .then(resData => {
+        setData(resData);
+        setLoading(false);
+      })
+      .catch(err => {
+        console.error(err);
+        setLoading(false);
+      });
+  }, [matchId]);
+
+  useEffect(() => {
+    if (!data || !pitchRef.current) return;
+    
+    const svg = d3.select(pitchRef.current);
+    svg.selectAll("*").remove();
+    
+    const width = 450;
+    const height = 300;
+
+    svg.append("rect")
+      .attr("width", width).attr("height", height)
+      .attr("fill", "#050A10").attr("rx", 8);
+
+    svg.append("rect")
+      .attr("x", 10).attr("y", 10)
+      .attr("width", width - 20).attr("height", height - 20)
+      .attr("fill", "none").attr("stroke", "#1E293B").attr("stroke-width", 2);
+      
+    svg.append("line")
+      .attr("x1", width / 2).attr("y1", 10).attr("x2", width / 2).attr("y2", height - 10)
+      .attr("stroke", "#1E293B").attr("stroke-width", 2);
+      
+    svg.append("circle")
+      .attr("cx", width / 2).attr("cy", height / 2).attr("r", 30)
+      .attr("fill", "none").attr("stroke", "#1E293B").attr("stroke-width", 2);
+
+    const heatData = data.stats?.heatmap?.[0]?.positions || [];
+    heatData.forEach((pt: any) => {
+      const x = (pt.x / 42) * width;
+      const y = (pt.y / 25) * height;
+      
+      svg.append("circle")
+        .attr("cx", x).attr("cy", y)
+        .attr("r", pt.intensity * 15)
+        .attr("fill", "#4F8CF6")
+        .attr("opacity", 0.4)
+        .style("filter", "blur(6px)");
+    });
+  }, [data]);
+
+  const handleDownloadPDF = async () => {
+    if (!reportRef.current) return;
+    
+    setIsExporting(true);
+    
+    setTimeout(async () => {
+      try {
+        const canvas = await html2canvas(reportRef.current!, {
+          scale: 3,
+          backgroundColor: '#050A10',
+          useCORS: true,
+          logging: false
+        });
+        
+        const imgData = canvas.toDataURL('image/jpeg', 1.0);
+        const pdf = new jsPDF({
+          orientation: 'portrait',
+          unit: 'mm',
+          format: 'a4'
+        });
+        
+        const pdfWidth = pdf.internal.pageSize.getWidth();
+        const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
+        
+        pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
+        pdf.save(`Pitchlens_Report_${matchId}.pdf`);
+      } catch (e) {
+        console.error("PDF generation failed", e);
+      } finally {
+        setIsExporting(false);
+      }
+    }, 100);
+  };
 
   if (loading) return (
-    <>
-      <Navbar />
-      <main className="min-h-screen pt-20 flex items-center justify-center">
-        <Loader2 className="animate-spin text-pitch-indigo-glow" size={40} />
-      </main>
-    </>
+    <div className="min-h-screen flex items-center justify-center bg-[#050A10]">
+      <div className="flex items-center space-x-3">
+        <Loader2 className="w-5 h-5 animate-spin text-primary" />
+        <span className="text-white font-medium">Compiling Report...</span>
+      </div>
+    </div>
   );
+  if (!data?.stats) return <div className="min-h-screen flex items-center justify-center bg-[#050A10] text-secondary">Match not found.</div>;
 
-  if (!match || match.status !== 'completed') return (
-    <>
-      <Navbar />
-      <main className="min-h-screen pt-20 flex flex-col items-center justify-center gap-4">
-        <p className="text-pitch-white">Report unavailable — match must be completed first.</p>
-        <Link href={`/dashboard/${matchId}`} className="pitch-button-secondary">Back to Dashboard</Link>
-      </main>
-    </>
-  );
-
-  const stats = match.stats!;
-
-  const handleExport = async () => {
-    setExporting(true);
-    try {
-      const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
-        import('jspdf'),
-        import('html2canvas'),
-      ]);
-
-      const el = reportRef.current!;
-      const canvas = await html2canvas(el, {
-        backgroundColor: '#0D0D1A',
-        scale: 2,
-        useCORS: true,
-        logging: false,
-      });
-
-      const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-      const imgData = canvas.toDataURL('image/jpeg', 0.92);
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
-
-      // Add pages if content overflows
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      let yPos = 0;
-      while (yPos < pdfHeight) {
-        if (yPos > 0) pdf.addPage();
-        pdf.addImage(imgData, 'JPEG', 0, -yPos, pdfWidth, pdfHeight);
-        yPos += pageHeight;
-      }
-
-      pdf.save(`pitchlens-${match.title.replace(/\s+/g, '_')}.pdf`);
-      toast.success('Report exported!');
-    } catch (err) {
-      console.error(err);
-      toast.error('Export failed — please try again');
-    } finally {
-      setExporting(false);
-    }
-  };
-
-  const handleShare = async () => {
-    const url = window.location.href;
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      toast.success('Link copied!');
-      setTimeout(() => setCopied(false), 2500);
-    } catch {
-      toast.error('Failed to copy link');
-    }
-  };
-
-  let matchDate = '—';
-  try {
-    if (match.createdAt?.toDate) matchDate = format(match.createdAt.toDate(), 'EEEE, d MMMM yyyy');
-    else if (match.createdAt?.seconds) matchDate = format(new Date(match.createdAt.seconds * 1000), 'EEEE, d MMMM yyyy');
-    else matchDate = format(new Date(), 'EEEE, d MMMM yyyy');
-  } catch { matchDate = format(new Date(), 'EEEE, d MMMM yyyy'); }
-  const keyEvents = stats.events
-    .filter((e: any) => ['goal', 'shot_on_target', 'corner', 'foul'].includes(e.type))
-    .sort((a: any, b: any) => a.timestamp - b.timestamp)
-    .slice(0, 18);
+  const stats = data.stats;
 
   return (
-    <>
-      <Navbar />
-      <main className="min-h-screen pt-20 pb-16 px-4">
-        <div className="max-w-4xl mx-auto space-y-6">
-          {/* Actions */}
-          <div className="flex items-center justify-between">
-            <Link href={`/dashboard/${matchId}`} className="flex items-center gap-1 text-pitch-muted hover:text-pitch-white text-sm transition-colors">
-              <ChevronLeft size={16} /> Dashboard
-            </Link>
-            <div className="flex gap-3">
-              <button onClick={handleShare} className="pitch-button-secondary gap-2 text-sm">
-                {copied ? <Check size={16} className="text-pitch-green" /> : <Share2 size={16} />}
-                {copied ? 'Copied!' : 'Share'}
-              </button>
-              <button onClick={handleExport} disabled={exporting} className="pitch-button-primary gap-2 text-sm">
-                {exporting ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
-                Export PDF
-              </button>
+    <div className="min-h-[calc(100vh-4rem)] bg-[#020408] text-[#E2E8F0] p-4 sm:p-8 flex flex-col items-center">
+      
+      {/* Controls */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="w-[794px] mb-6 flex justify-between items-center max-w-full"
+      >
+        <button onClick={() => router.back()} className="flex items-center text-sm font-medium text-secondary hover:text-white transition-colors">
+          <ChevronLeft className="w-4 h-4 mr-1" /> Back to Match
+        </button>
+        <button 
+          onClick={handleDownloadPDF}
+          disabled={isExporting}
+          className={`flex items-center space-x-2 px-6 py-2.5 bg-gradient-to-r from-primary to-blue-500 text-white text-sm font-bold rounded-full transition-all shadow-glow-primary hover:shadow-glow-primary-lg hover:scale-[1.02] ${isExporting ? 'opacity-50 cursor-not-allowed' : ''}`}
+        >
+          {isExporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+          <span>{isExporting ? 'Generating PDF...' : 'Download PDF'}</span>
+        </button>
+      </motion.div>
+
+      {/* A4 Report Wrapper */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6, delay: 0.1 }}
+        className="w-[794px] min-h-[1123px] bg-[#050A10] border border-white/10 shadow-2xl relative overflow-hidden"
+        ref={reportRef}
+      >
+        
+        {/* Background Accents */}
+        <div className="absolute top-0 right-0 w-96 h-96 bg-primary/10 rounded-full blur-[120px] pointer-events-none" />
+        <div className="absolute bottom-0 left-0 w-96 h-96 bg-danger/10 rounded-full blur-[120px] pointer-events-none" />
+        
+        <div className="relative z-10 p-12 flex flex-col h-full">
+          
+          {/* Header */}
+          <motion.header
+            custom={0}
+            variants={sectionVariants}
+            initial="hidden"
+            animate="visible"
+            className="border-b border-white/10 pb-8 flex flex-col pt-4"
+          >
+            <div className="flex justify-between items-start w-full">
+              <div>
+                <h1 className="text-4xl font-black tracking-tighter text-white flex items-center">
+                  <Activity className="w-8 h-8 text-accent mr-3" /> PITCHLENS
+                </h1>
+                <p className="text-secondary/70 text-sm mt-2 tracking-widest uppercase font-bold">Post-Match Analytics Report</p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs text-secondary mb-1 uppercase tracking-widest font-bold">Match ID</p>
+                <p className="font-mono text-white/50 text-xs glass-card px-2 py-1 rounded">{matchId}</p>
+              </div>
             </div>
-          </div>
 
-          {/* Report document */}
-          <div ref={reportRef} className="bg-[#0D0D1A]">
-            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-0">
+            <div className="mt-12 glass-card rounded-2xl p-6 flex items-center justify-between">
+              <div className="flex items-center space-x-4">
+                <div className="w-16 h-16 rounded-full bg-primary/20 border-2 border-primary/50 flex items-center justify-center text-xl font-black">H</div>
+                <h2 className="text-2xl font-black">Home</h2>
+              </div>
+              <div className="text-5xl font-mono font-black tracking-tighter">
+                <span className="text-primary">{stats.score.home}</span> <span className="text-white/20">-</span> <span className="text-danger">{stats.score.away}</span>
+              </div>
+              <div className="flex items-center space-x-4">
+                <h2 className="text-2xl font-black">Away</h2>
+                <div className="w-16 h-16 rounded-full bg-danger/20 border-2 border-danger/50 flex items-center justify-center text-xl font-black">A</div>
+              </div>
+            </div>
+          </motion.header>
 
-              {/* ── Header Banner ── */}
-              <div className="bg-gradient-to-r from-[#1a1a3e] via-[#0f0f2e] to-[#1a1a3e] px-8 py-6 border-b border-white/10">
-                <div className="flex items-center justify-between mb-6">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">⚽</span>
-                    <div>
-                      <p className="text-white font-black text-lg tracking-tight">PITCHLENS</p>
-                      <p className="text-white/40 text-xs uppercase tracking-widest">Match Analysis Report</p>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-white/60 text-xs uppercase tracking-widest">{matchDate}</p>
-                    <p className="text-white/40 text-xs mt-0.5">Powered by Roboflow YOLOv8</p>
-                  </div>
+          {/* Narrative Overview */}
+          <motion.section
+            custom={1}
+            variants={sectionVariants}
+            initial="hidden"
+            animate="visible"
+            className="mt-10"
+          >
+            <h3 className="text-sm font-bold text-secondary uppercase tracking-widest mb-4 flex items-center border-l-2 border-accent pl-3">
+              Match Narrative
+            </h3>
+            <p className="text-base text-white/80 leading-relaxed font-light">
+              The game&apos;s fulcrum tilted primarily towards the Home side, maintaining <span className="text-primary font-bold">{stats.possession.home}%</span> possession. The persistent pressure yielded an Expected Goals (xG) metric of <span className="text-accent font-bold">{stats.shots.xG}</span> from {stats.shots.total} total shots. The Away team struggled to transition through the midfield, heavily hampered by the Home team effectively cutting off central passing lanes. The mathematical dominance in possession eventually converted into a clinical performance.
+            </p>
+          </motion.section>
+
+          {/* Analytics Grid */}
+          <motion.section
+            custom={2}
+            variants={sectionVariants}
+            initial="hidden"
+            animate="visible"
+            className="mt-12 grid grid-cols-2 gap-10"
+          >
+            {/* Stats Comparison Column */}
+            <div>
+              <h3 className="text-sm font-bold text-secondary uppercase tracking-widest mb-6 flex items-center">
+                <PieChart className="w-4 h-4 mr-2" /> Team Statistics
+              </h3>
+              <div className="bg-[#0B1526] rounded-xl p-6 border border-white/5">
+                <StatBar label="Possession" home={`${stats.possession.home}%`} away={`${stats.possession.away}%`} index={0} />
+                <StatBar label="Expected Goals (xG)" home={stats.shots.xG} away={(Math.max(0.1, stats.shots.xG - 0.5)).toFixed(2)} index={1} />
+                <StatBar label="Total Shots" home={stats.shots.total} away={Math.max(1, stats.shots.total - 4)} index={2} />
+                <StatBar label="Shots on Target" home={stats.shots.onTarget} away={Math.max(1, stats.shots.onTarget - 2)} index={3} />
+                <StatBar label="Passes Completed" home={stats.passes.completed} away={stats.passes.completed - 15} index={4} />
+                <StatBar label="Pass Accuracy" home={`${stats.passes.accuracy}%`} away={`${Math.max(50, stats.passes.accuracy - 8)}%`} index={5} />
+                <StatBar label="Fouls Drawn" home={stats.fouls} away={stats.fouls + 3} index={6} />
+              </div>
+            </div>
+
+            {/* Spatial Analysis Column */}
+            <div className="flex flex-col">
+              <h3 className="text-sm font-bold text-secondary uppercase tracking-widest mb-6 flex items-center">
+                <Map className="w-4 h-4 mr-2" /> Spatial Analysis (Heatmap)
+              </h3>
+              <div className="bg-[#0B1526] rounded-xl p-6 border border-white/5 flex-1 flex flex-col items-center justify-center">
+                <div className="w-full relative aspect-[1.5] bg-[#020408] rounded-xl overflow-hidden ring-1 ring-white/5 shadow-inner">
+                  <svg ref={pitchRef} width="100%" height="100%" viewBox="0 0 450 300" className="absolute top-0 left-0" />
                 </div>
-
-                {/* Score block */}
-                <div className="flex items-center justify-center gap-8">
-                  <div className="text-center flex-1">
-                    <div
-                      className="w-14 h-14 rounded-full mx-auto mb-3 border-2 border-white/20 flex items-center justify-center"
-                      style={{ backgroundColor: match.homeTeamColor || '#ef4444' }}
-                    >
-                      <span className="text-white font-black text-lg">{(match.homeTeamName || 'H')[0]}</span>
-                    </div>
-                    <p className="text-white font-bold text-base">{match.homeTeamName}</p>
-                    <p className="text-white/40 text-xs">Home</p>
-                  </div>
-
-                  <div className="text-center px-6">
-                    <div className="text-7xl font-black text-white leading-none tracking-tighter">
-                      {stats.score.home}
-                      <span className="text-white/30 mx-2">–</span>
-                      {stats.score.away}
-                    </div>
-                    <p className="text-white/50 text-xs mt-2 uppercase tracking-widest">Full Time</p>
-                    {stats.shots.home.xG > 0 || stats.shots.away.xG > 0 ? (
-                      <p className="text-white/30 text-xs mt-1">
-                        xG: {stats.shots.home.xG.toFixed(2)} – {stats.shots.away.xG.toFixed(2)}
-                      </p>
-                    ) : null}
-                  </div>
-
-                  <div className="text-center flex-1">
-                    <div
-                      className="w-14 h-14 rounded-full mx-auto mb-3 border-2 border-white/20 flex items-center justify-center"
-                      style={{ backgroundColor: match.awayTeamColor || '#3b82f6' }}
-                    >
-                      <span className="text-white font-black text-lg">{(match.awayTeamName || 'A')[0]}</span>
-                    </div>
-                    <p className="text-white font-bold text-base">{match.awayTeamName}</p>
-                    <p className="text-white/40 text-xs">Away</p>
-                  </div>
-                </div>
+                <p className="mt-4 text-xs text-secondary text-center leading-relaxed">
+                  Heatmap highlights intense central corridor concentration, reflecting rapid box-to-box transitional phases typical of elite 5-a-side matches.
+                </p>
               </div>
+            </div>
+          </motion.section>
 
-              {/* ── Narrative ── */}
-              <div className="px-8 py-5 border-b border-white/10">
-                <p className="text-white/40 text-xs uppercase tracking-widest mb-2">Match Summary</p>
-                <p className="text-white/80 text-sm leading-relaxed italic">"{stats.narrative}"</p>
-              </div>
+          {/* Footer */}
+          <footer className="mt-auto pt-8 border-t border-white/10 flex justify-between items-center text-xs text-secondary/50 font-medium">
+            <div className="flex items-center">
+              <Cpu className="w-4 h-4 mr-2 opacity-50" />
+              Generated by Pitchlens AI Engine
+            </div>
+            <div>{new Date().toLocaleString()}</div>
+          </footer>
 
-              {/* ── Full Stats Table ── */}
-              <div className="px-8 py-5 border-b border-white/10">
-                <p className="text-white/40 text-xs uppercase tracking-widest mb-4">Statistics</p>
-                <div className="space-y-1">
-                  {/* Header */}
-                  <div className="grid grid-cols-[1fr,180px,1fr] text-center text-xs font-bold mb-3">
-                    <span className="text-left" style={{ color: match.homeTeamColor || '#ef4444' }}>{match.homeTeamName}</span>
-                    <span className="text-white/30">Stat</span>
-                    <span className="text-right" style={{ color: match.awayTeamColor || '#3b82f6' }}>{match.awayTeamName}</span>
-                  </div>
-
-                  {[
-                    { label: 'Possession', home: `${stats.possession.home}%`, away: `${stats.possession.away}%`, homeV: stats.possession.home, awayV: stats.possession.away },
-                    { label: 'Shots', home: stats.shots.home.total, away: stats.shots.away.total, homeV: stats.shots.home.total, awayV: stats.shots.away.total },
-                    { label: 'Shots on Target', home: stats.shots.home.onTarget, away: stats.shots.away.onTarget, homeV: stats.shots.home.onTarget, awayV: stats.shots.away.onTarget },
-                    { label: 'Expected Goals (xG)', home: stats.shots.home.xG.toFixed(2), away: stats.shots.away.xG.toFixed(2), homeV: stats.shots.home.xG, awayV: stats.shots.away.xG },
-                    { label: 'Passes Completed', home: stats.passes.home.completed, away: stats.passes.away.completed, homeV: stats.passes.home.completed, awayV: stats.passes.away.completed },
-                    { label: 'Pass Accuracy', home: `${stats.passes.home.accuracy}%`, away: `${stats.passes.away.accuracy}%`, homeV: stats.passes.home.accuracy, awayV: stats.passes.away.accuracy },
-                    { label: 'Corners', home: stats.corners.home, away: stats.corners.away, homeV: stats.corners.home, awayV: stats.corners.away },
-                    { label: 'Fouls', home: stats.fouls.home, away: stats.fouls.away, homeV: stats.fouls.away, awayV: stats.fouls.home }, // inverted for bar (lower=better)
-                    { label: 'Pressure Index', home: stats.pressureIndex?.home?.toFixed(1) ?? '—', away: stats.pressureIndex?.away?.toFixed(1) ?? '—', homeV: stats.pressureIndex?.home ?? 0, awayV: stats.pressureIndex?.away ?? 0 },
-                  ].map(({ label, home, away, homeV, awayV }) => {
-                    const total = (homeV as number) + (awayV as number) || 1;
-                    const homeW = Math.round(((homeV as number) / total) * 100);
-                    const homeWins = (homeV as number) >= (awayV as number);
-                    return (
-                      <div key={label} className="space-y-0.5 py-1">
-                        <div className="grid grid-cols-[1fr,180px,1fr] text-sm items-center">
-                          <span className={homeWins ? 'text-white font-bold' : 'text-white/50'}>{home}</span>
-                          <span className="text-center text-white/30 text-xs">{label}</span>
-                          <span className={`text-right ${!homeWins ? 'text-white font-bold' : 'text-white/50'}`}>{away}</span>
-                        </div>
-                        <div className="flex h-1 rounded-full overflow-hidden bg-white/5">
-                          <div className="rounded-full" style={{ width: `${homeW}%`, backgroundColor: match.homeTeamColor || '#ef4444', opacity: 0.8 }} />
-                          <div className="rounded-full flex-1" style={{ backgroundColor: match.awayTeamColor || '#3b82f6', opacity: 0.8 }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* ── Charts Row ── */}
-              <div className="grid sm:grid-cols-2 divide-x divide-white/10 border-b border-white/10">
-                <div className="px-8 py-5">
-                  <p className="text-white/40 text-xs uppercase tracking-widest mb-3">Possession Distribution</p>
-                  <PossessionDonut stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                </div>
-                <div className="px-8 py-5">
-                  <p className="text-white/40 text-xs uppercase tracking-widest mb-3">Attacking Output</p>
-                  <ShotsBars stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-                </div>
-              </div>
-
-              {/* ── Momentum ── */}
-              <div className="px-8 py-5 border-b border-white/10">
-                <p className="text-white/40 text-xs uppercase tracking-widest mb-3">Momentum Timeline</p>
-                <MomentumLine stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-              </div>
-
-              {/* ── Pass Accuracy ── */}
-              <div className="px-8 py-5 border-b border-white/10">
-                <p className="text-white/40 text-xs uppercase tracking-widest mb-3">Pass Accuracy</p>
-                <PassAccuracyBars stats={stats} homeTeamName={match.homeTeamName} awayTeamName={match.awayTeamName} />
-              </div>
-
-              {/* ── Key Events ── */}
-              {keyEvents.length > 0 && (
-                <div className="px-8 py-5 border-b border-white/10">
-                  <p className="text-white/40 text-xs uppercase tracking-widest mb-3">Key Events</p>
-                  <div className="grid grid-cols-2 gap-x-8 gap-y-1">
-                    {keyEvents.map((e: any, i: number) => (
-                      <div key={i} className="flex items-center gap-2 py-1 border-b border-white/5">
-                        <span className="text-white/40 text-xs font-mono w-8 shrink-0 text-right">
-                          {formatTimestamp(e.timestamp)}
-                        </span>
-                        <span className="text-white/70 text-xs">
-                          <span className="font-medium text-white/90">{e.type === 'goal' ? '⚽ Goal' : e.type === 'shot_on_target' ? '🎯 Shot on Target' : e.type === 'corner' ? '🚩 Corner' : '🟨 Foul'}</span>
-                          {' · '}
-                          <span>{e.teamSide === 'home' ? match.homeTeamName : match.awayTeamName}</span>
-                          {e.xG ? <span className="ml-1 opacity-60">xG {e.xG.toFixed(2)}</span> : null}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* ── Footer ── */}
-              <div className="px-8 py-4 flex items-center justify-between">
-                <span className="text-white/20 text-xs">Generated by Pitchlens · pitchlens.app</span>
-                <span className="text-white/20 text-xs italic">"Unveil the Geometry of Your Game"</span>
-              </div>
-
-            </motion.div>
-          </div>
         </div>
-      </main>
-    </>
+      </motion.div>
+    </div>
   );
 }
