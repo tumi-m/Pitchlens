@@ -332,49 +332,65 @@ export async function processVideo(
   const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
   const duration = estimateDuration(file);
 
-  onStage('Extracting key frames…'); onProgress(15);
-  await wait(200);
-
-  // Try real Roboflow inference if /api/infer is available
-  let allPredictions: any[][] = [];
-  let usedRealInference = false;
-
-  try {
-    onStage('Running AI detection…'); onProgress(25);
-    const frames = await extractFrames(file, 8);
-
-    if (frames.length > 0) {
-      onStage(`Analysing ${frames.length} frames with YOLOv8…`); onProgress(35);
-      const results = await Promise.all(frames.map((f) => inferFrame(f)));
-      const realResults = results.filter((r) => r.length > 0);
-
-      if (realResults.length > 0) {
-        allPredictions = results;
-        usedRealInference = true;
-      }
+  // ── Stage labels (always animate regardless of inference path) ────────
+  const animateStages = async () => {
+    const stages: [number, string][] = [
+      [15, 'Extracting key frames…'],
+      [30, 'Running AI detection…'],
+      [50, 'Segmenting possession & events…'],
+      [68, 'Computing statistics…'],
+      [82, 'Building heatmaps & pass network…'],
+      [93, 'Generating match narrative…'],
+    ];
+    for (const [pct, label] of stages) {
+      onStage(label); onProgress(pct);
+      await wait(350);
     }
-  } catch {
-    // Inference failed — fall through to demo stats
+  };
+
+  // ── Real inference pipeline (best-effort, non-blocking) ───────────────
+  const attemptInference = async (): Promise<any[][] | null> => {
+    try {
+      const frames = await extractFrames(file, 6); // max 6 frames
+      if (frames.length === 0) return null;
+      const results = await Promise.all(frames.map((f) => inferFrame(f)));
+      const hasReal = results.some((r) => r.length > 0);
+      return hasReal ? results : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // ── Race: animation always wins after ~2.5s; inference upgrades result ─
+  // Both run in parallel. We await the animation (guaranteed fast).
+  // Inference gets a hard 12s window — if it finishes in time, great.
+  const INFERENCE_TIMEOUT = 12_000;
+  let inferenceResult: any[][] | null = null;
+
+  const inferenceRace = Promise.race([
+    attemptInference(),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), INFERENCE_TIMEOUT)),
+  ]).then((r) => { inferenceResult = r; });
+
+  // Run animation — this is what the user sees
+  await animateStages();
+
+  // Give inference a tiny extra window if animation finished first
+  if (inferenceResult === null) {
+    await Promise.race([
+      inferenceRace,
+      wait(800), // max 0.8s extra wait after animation
+    ]);
   }
 
-  onStage('Segmenting possession & events…'); onProgress(55);
-  await wait(250);
+  onProgress(98);
 
-  onStage('Computing statistics…'); onProgress(70);
-  await wait(250);
-
-  onStage('Building heatmaps & pass network…'); onProgress(82);
-  await wait(200);
-
-  onStage('Generating match narrative…'); onProgress(92);
-  await wait(200);
-
-  const stats = usedRealInference
-    ? statsFromDetections(allPredictions, teamNames, homeColor, awayColor, duration, rng)
+  const stats = inferenceResult
+    ? statsFromDetections(inferenceResult, teamNames, homeColor, awayColor, duration, rng)
     : buildDemoStats(teamNames, duration, rng);
 
   onProgress(100);
-  return { ...stats, _source: usedRealInference ? 'roboflow' : 'demo' };
+  return { ...stats, _source: inferenceResult ? 'roboflow' : 'demo' };
 }
 
 /** Legacy export used by error catch blocks */
