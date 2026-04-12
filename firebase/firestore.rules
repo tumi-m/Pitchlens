@@ -1,0 +1,25 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Users can read and write only their own document
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Teams can be read by anyone authenticated, but only created/edited by owners
+    match /teams/{teamId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update, delete: if request.auth != null && resource.data.ownerId == request.auth.uid;
+    }
+    
+    // Matches can only be accessed by the user who uploaded them
+    match /matches/{matchId} {
+      allow read, update: if request.auth != null && resource.data.userId == request.auth.uid;
+      // Creation happens via cloud functions or the backend usually, but for MVP:
+      allow create: if request.auth != null;
+    }
+  }
+}

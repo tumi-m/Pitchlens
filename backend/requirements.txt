@@ -1,0 +1,10 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+opencv-python==4.8.1.78
+scipy==1.11.3
+python-multipart==0.0.6
+# Phase 1: YOLOv11m support requires >=8.3.0; BoT-SORT built into ultralytics
+ultralytics>=8.3.0
+# supervision >=0.21 works; upgrade to >=0.23 to unlock sv.BotSORT directly
+supervision>=0.21.0
+numpy>=1.24.0
