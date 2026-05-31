@@ -112,7 +112,7 @@ export default function HomePage() {
                     Get Started Free <ArrowRight size={18} />
                   </button>
                 )}
-                <Link href="#features" className="pitch-button-secondary text-base px-7 py-3.5">
+                <Link href="#how-it-works" className="pitch-button-secondary text-base px-7 py-3.5">
                   How It Works
                 </Link>
               </div>
@@ -134,9 +134,113 @@ export default function HomePage() {
             </motion.div>
           </div>
 
-          <a href="#features" className="absolute bottom-8 left-1/2 -translate-x-1/2 text-pitch-muted hover:text-pitch-white transition-colors">
+          <a href="#how-it-works" className="absolute bottom-8 left-1/2 -translate-x-1/2 text-pitch-muted hover:text-pitch-white transition-colors">
             <ChevronDown size={24} className="animate-bounce" />
           </a>
+        </section>
+
+        {/* How It Works */}
+        <section id="how-it-works" className="py-24 px-4 bg-pitch-indigo-deep/20">
+          <div className="max-w-5xl mx-auto">
+            <div className="text-center mb-16">
+              <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full
+                bg-pitch-green/10 border border-pitch-green/30 text-pitch-green text-xs
+                font-medium mb-6">
+                Simple · Fast · Professional
+              </div>
+              <h2 className="text-4xl font-bold text-pitch-white mb-4">How It Works</h2>
+              <p className="text-pitch-muted text-lg max-w-xl mx-auto">
+                From raw footage to professional analytics in three steps — no hardware, no setup.
+              </p>
+            </div>
+
+            <div className="grid md:grid-cols-3 gap-8 relative">
+              {/* Connector line (desktop) */}
+              <div className="hidden md:block absolute top-16 left-[calc(16.67%+1rem)] right-[calc(16.67%+1rem)] h-px bg-gradient-to-r from-pitch-green/20 via-pitch-indigo-glow/40 to-pitch-green/20" />
+
+              {[
+                {
+                  step: '01',
+                  icon: (
+                    <svg viewBox="0 0 40 40" className="w-6 h-6 text-pitch-green" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="6" y="10" width="28" height="20" rx="3"/>
+                      <circle cx="20" cy="20" r="5"/>
+                      <path d="M6 15 L4 15 L4 25 L6 25"/>
+                      <path d="M34 15 L36 15 L36 25 L34 25"/>
+                      <rect x="17" y="8" width="6" height="3" rx="1"/>
+                    </svg>
+                  ),
+                  title: 'Record Your Match',
+                  description: 'Film with any smartphone from the touchline or an elevated angle. No special equipment needed — a 10-minute clip is enough.',
+                  badge: 'Any device',
+                },
+                {
+                  step: '02',
+                  icon: (
+                    <svg viewBox="0 0 40 40" className="w-6 h-6 text-pitch-green" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M20 8 L20 26"/>
+                      <path d="M14 20 L20 26 L26 20"/>
+                      <rect x="8" y="28" width="24" height="5" rx="2"/>
+                      <path d="M28 14 C32 14 34 16 34 20"/>
+                      <circle cx="34" cy="10" r="3"/>
+                    </svg>
+                  ),
+                  title: 'Upload or Paste a Link',
+                  description: 'Drag your video file directly, or paste a Google Drive share link. No large uploads needed — we fetch it server-side.',
+                  badge: 'File or Google Drive',
+                },
+                {
+                  step: '03',
+                  icon: (
+                    <svg viewBox="0 0 40 40" className="w-6 h-6 text-pitch-green" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="6" y="8" width="28" height="24" rx="3"/>
+                      <path d="M12 18 L18 24 L28 14"/>
+                      <path d="M12 28 L28 28"/>
+                      <path d="M12 32 L20 32"/>
+                    </svg>
+                  ),
+                  title: 'Get Professional Analytics',
+                  description: 'YOLOv8 detects every player and the ball. Receive xG maps, possession heatmaps, pass networks, and a downloadable PDF report — in under 60 seconds.',
+                  badge: 'Results in < 60s',
+                },
+              ].map(({ step, icon, title, description, badge }, i) => (
+                <motion.div
+                  key={step}
+                  initial={{ opacity: 0, y: 24 }}
+                  whileInView={{ opacity: 1, y: 0 }}
+                  viewport={{ once: true }}
+                  transition={{ delay: i * 0.15, duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
+                  className="relative flex flex-col items-center text-center group"
+                >
+                  {/* Step circle */}
+                  <div className="relative z-10 w-14 h-14 rounded-2xl bg-pitch-indigo-deep border border-pitch-green/30
+                    flex items-center justify-center mb-6 group-hover:border-pitch-green/60
+                    group-hover:bg-pitch-green/10 transition-all duration-300 shadow-lg">
+                    {icon}
+                    <span className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-pitch-green
+                      text-pitch-black text-[10px] font-black flex items-center justify-center">
+                      {i + 1}
+                    </span>
+                  </div>
+
+                  <div className="glass-card p-6 w-full hover:border-pitch-green/20 transition-all duration-300">
+                    <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full
+                      bg-pitch-green/10 text-pitch-green text-[11px] font-medium mb-3">
+                      {badge}
+                    </div>
+                    <h3 className="text-lg font-semibold text-pitch-white mb-2">{title}</h3>
+                    <p className="text-pitch-muted text-sm leading-relaxed">{description}</p>
+                  </div>
+                </motion.div>
+              ))}
+            </div>
+
+            <div className="mt-12 text-center">
+              <Link href="/upload" className="pitch-button-primary text-base px-8 py-3.5">
+                Analyse Your Match Now <ArrowRight size={18} />
+              </Link>
+            </div>
+          </div>
         </section>
 
         {/* Features */}

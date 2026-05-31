@@ -20,11 +20,12 @@ export async function POST(request: NextRequest) {
     }
 
     const response = await fetch(
-      `https://detect.roboflow.com/${ROBOFLOW_PROJECT}/${ROBOFLOW_VERSION}?api_key=${apiKey}`,
+      `https://detect.roboflow.com/${ROBOFLOW_PROJECT}/${ROBOFLOW_VERSION}` +
+      `?api_key=${apiKey}&confidence=35&overlap=30&format=json`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: frame, // raw base64 JPEG (no data URI prefix)
+        body: frame,
       }
     );
 
