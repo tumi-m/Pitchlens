@@ -1,5 +1,5 @@
 'use client';
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -42,15 +42,26 @@ export default function UploadPage() {
   const [triviaIndex, setTriviaIndex] = useState(0);
   const [matchId, setMatchId] = useState<string | null>(null);
 
+  // Invalidates any in-flight Google Drive fetch when the user switches
+  // tabs or starts a new fetch — a stale response must not overwrite state.
+  const fetchGeneration = useRef(0);
+
   const onDrop = useCallback((accepted: File[]) => {
     const f = accepted[0];
     if (!f) return;
     if (f.size > MAX_SIZE) { toast.error('File exceeds 500 MB limit'); return; }
+    fetchGeneration.current++;
     setFile(f);
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
+    onDropRejected: (rejections) => {
+      const reason = rejections[0]?.errors[0]?.code;
+      if (reason === 'file-invalid-type') toast.error('Unsupported format — use MP4, MOV, AVI or MKV');
+      else if (reason === 'too-many-files') toast.error('Please upload a single video file');
+      else toast.error('That file can’t be used — try an MP4 video');
+    },
     accept: { 'video/*': ['.mp4', '.mov', '.avi', '.mkv'] },
     maxFiles: 1,
     disabled: stage !== 'form',
@@ -67,25 +78,37 @@ export default function UploadPage() {
     }
 
     if (inputMode === 'gdrive') {
+      const generation = ++fetchGeneration.current;
       setFetchingUrl(true);
       try {
         toast.loading('Fetching from Google Drive…', { id: 'gdrive' });
         const res = await fetch(`/api/fetch-video?type=gdrive&url=${encodeURIComponent(urlInput)}`);
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.error || 'Failed to fetch');
+          let message = `Fetch failed (${res.status})`;
+          try {
+            const err = await res.json();
+            if (err?.error) message = err.error;
+          } catch { /* non-JSON error body (e.g. proxy/timeout page) */ }
+          throw new Error(message);
         }
         const blob = await res.blob();
+        // User switched tabs / picked a file / re-fetched while we downloaded
+        if (generation !== fetchGeneration.current) return;
         const fileName = 'drive-match-' + Date.now() + '.mp4';
         const videoFile = new File([blob], fileName, { type: 'video/mp4' });
         if (videoFile.size > MAX_SIZE) throw new Error('File exceeds 500 MB limit');
+        if (videoFile.size < 1024) throw new Error('Drive returned an empty file — check the sharing settings');
         setFile(videoFile);
         setUrlInput('');
         toast.success('Video loaded from Google Drive!', { id: 'gdrive' });
       } catch (err: any) {
-        toast.error(err.message || 'Failed to load video', { id: 'gdrive' });
+        if (generation === fetchGeneration.current) {
+          toast.error(err.message || 'Failed to load video', { id: 'gdrive' });
+        } else {
+          toast.dismiss('gdrive');
+        }
       } finally {
-        setFetchingUrl(false);
+        if (generation === fetchGeneration.current) setFetchingUrl(false);
       }
     }
   };
@@ -184,7 +207,7 @@ export default function UploadPage() {
                   ]).map(({ mode, icon: Icon, label }) => (
                     <button
                       key={mode}
-                      onClick={() => { setInputMode(mode); setFile(null); setUrlInput(''); }}
+                      onClick={() => { fetchGeneration.current++; setFetchingUrl(false); setInputMode(mode); setFile(null); setUrlInput(''); }}
                       className={cn(
                         'flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all',
                         inputMode === mode
