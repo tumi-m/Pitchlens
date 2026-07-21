@@ -6,6 +6,12 @@ export const runtime = 'nodejs';
 const ROBOFLOW_PROJECT = process.env.ROBOFLOW_PROJECT ?? 'football-players-detection-3zvbc';
 const ROBOFLOW_VERSION = process.env.ROBOFLOW_VERSION ?? '9';
 
+/** Preflight: lets the client know whether real inference is available,
+ *  so it can decide how long to wait for YOLOv8 vs falling back to demo stats. */
+export async function GET() {
+  return NextResponse.json({ configured: !!process.env.ROBOFLOW_API_KEY });
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { frame } = await request.json();
@@ -20,11 +26,12 @@ export async function POST(request: NextRequest) {
     }
 
     const response = await fetch(
-      `https://detect.roboflow.com/${ROBOFLOW_PROJECT}/${ROBOFLOW_VERSION}?api_key=${apiKey}`,
+      `https://detect.roboflow.com/${ROBOFLOW_PROJECT}/${ROBOFLOW_VERSION}` +
+      `?api_key=${apiKey}&confidence=35&overlap=30&format=json`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: frame, // raw base64 JPEG (no data URI prefix)
+        body: frame,
       }
     );
 

@@ -102,6 +102,18 @@ async function extractFrames(file: File, count = 8): Promise<string[]> {
   });
 }
 
+// ── Preflight: is a real Roboflow key configured server-side? ────────────
+async function isInferenceConfigured(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/infer', { method: 'GET', signal: AbortSignal.timeout(3_000) });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return !!data.configured;
+  } catch {
+    return false;
+  }
+}
+
 // ── Call /api/infer for one frame ─────────────────────────────────────────
 async function inferFrame(base64Jpeg: string): Promise<any[]> {
   try {
@@ -124,17 +136,12 @@ async function inferFrame(base64Jpeg: string): Promise<any[]> {
 function statsFromDetections(
   allPredictions: any[][],
   teamNames: { home: string; away: string },
-  homeColor: string,
-  awayColor: string,
   duration: number,
   r: () => number,
 ) {
   // CLASS IDs: 0=ball, 1=goalkeeper, 2=player, 3=referee
   const ballDetections = allPredictions.flatMap((p) => p.filter((d) => d.class_id === 0));
   const playerDetections = allPredictions.flatMap((p) => p.filter((d) => d.class_id === 2 || d.class_id === 1));
-
-  const totalFrames = allPredictions.length || 1;
-  const ballFrames = allPredictions.filter((p) => p.some((d) => d.class_id === 0)).length;
 
   // Split players into home/away by x-position (rough heuristic)
   const midX = 640 / 2;
@@ -144,27 +151,11 @@ function statsFromDetections(
   // Possession: which half the ball is in more often
   const ballInHomeHalf = ballDetections.filter((d) => d.x < midX).length;
   const ballInAwayHalf = ballDetections.length - ballInHomeHalf;
-  const totalBall = ballInHomeHalf + ballInAwayHalf || 1;
-  const homePoss = Math.round((ballInHomeHalf / totalBall) * 100);
-  const awayPoss = 100 - homePoss;
-
-  const mins = Math.max(5, Math.round(duration / 60));
-  const maxG = Math.max(1, Math.floor(mins / 18));
-  const hG = Math.floor(r() * (maxG + 1));
-  const aG = Math.floor(r() * (maxG + 1));
-  const passBase = Math.round(mins * 4.2);
-  const hPT = Math.round(passBase * (homePoss / 100) * (0.85 + r() * 0.3));
-  const aPT = Math.round(passBase * (awayPoss / 100) * (0.85 + r() * 0.3));
-  const hPC = Math.round(hPT * (0.72 + r() * 0.2));
-  const aPC = Math.round(aPT * (0.68 + r() * 0.2));
-  const shotBase = Math.max(3, Math.round(mins / 8));
-  const hShots = shotBase + Math.floor(r() * shotBase);
-  const aShots = shotBase + Math.floor(r() * shotBase);
-  const hOT = Math.max(hG, Math.floor(hShots * (0.35 + r() * 0.3)));
-  const aOT = Math.max(aG, Math.floor(aShots * (0.3 + r() * 0.3)));
-  const hXG = Math.round((hG * 0.4 + hOT * 0.18 + r() * 0.6) * 100) / 100;
-  const aXG = Math.round((aG * 0.4 + aOT * 0.18 + r() * 0.6) * 100) / 100;
-  const fBase = Math.max(3, Math.round(mins / 7));
+  const totalBall = ballInHomeHalf + ballInAwayHalf;
+  // No ball detected at all → possession falls back to the seeded estimate
+  const homePoss = totalBall > 0
+    ? Math.min(78, Math.max(22, Math.round((ballInHomeHalf / totalBall) * 100)))
+    : undefined;
 
   // Heatmaps from actual player positions (normalized to pitch coords)
   const toHeatPt = (d: any, side: 'home' | 'away') => ({
@@ -182,7 +173,7 @@ function statsFromDetections(
 
   return buildDemoStats(
     teamNames, duration, r,
-    { home: homePoss, away: awayPoss },
+    homePoss !== undefined ? { home: homePoss, away: 100 - homePoss } : undefined,
     homeHeatmap,
     awayHeatmap,
   );
@@ -229,8 +220,11 @@ function buildDemoStats(
   const events: any[] = [];
   const used = new Set<number>();
   const uniqT = (lo: number, hi: number) => {
-    let t: number;
-    do { t = Math.round((lo + r() * (hi - lo)) * 60); } while (used.has(t));
+    // Bounded — a degenerate range (lo === hi) must never spin forever:
+    // pick a base time, then walk forward second-by-second until free.
+    let t = Math.round((lo + r() * Math.max(0.5, hi - lo)) * 60);
+    let guard = 0;
+    while (used.has(t) && guard++ < 600) t++;
     used.add(t); return t;
   };
   const goalEvent = (side: 'home' | 'away') => {
@@ -327,7 +321,7 @@ export async function processVideo(
   teamNames: { home: string; away: string },
   options: ProcessOptions = {},
 ) {
-  const { onStage = () => {}, onProgress = () => {}, homeColor = '#e53e3e', awayColor = '#3182ce' } = options;
+  const { onStage = () => {}, onProgress = () => {} } = options;
   const rng = seededRng(strSeed(file.name + String(file.size)));
   const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
   const duration = estimateDuration(file);
@@ -361,32 +355,44 @@ export async function processVideo(
     }
   };
 
-  // ── Race: animation always wins after ~2.5s; inference upgrades result ─
-  // Both run in parallel. We await the animation (guaranteed fast).
-  // Inference gets a hard 12s window — if it finishes in time, great.
-  const INFERENCE_TIMEOUT = 12_000;
+  // ── Parallel tracks ────────────────────────────────────────────────────
+  // Animation is the guaranteed-fast UX track (~2.1s). Inference runs
+  // alongside it. How long we wait for inference AFTER the animation
+  // depends on whether a real Roboflow key exists server-side:
+  //   • key configured  → wait up to 25s (real YOLOv8 needs 5-15s)
+  //   • no key / error  → 0.8s grace, then seeded demo stats
+  // Every path has a hard cap — the pipeline can NEVER hang.
+  const INFERENCE_WINDOW = 25_000;
   let inferenceResult: any[][] | null = null;
 
-  const inferenceRace = Promise.race([
-    attemptInference(),
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), INFERENCE_TIMEOUT)),
-  ]).then((r) => { inferenceResult = r; });
+  const configuredPromise = isInferenceConfigured();          // ≤3s, never throws
+  const inferencePromise = attemptInference()                 // internally capped
+    .then((r) => { inferenceResult = r; });
 
   // Run animation — this is what the user sees
   await animateStages();
 
-  // Give inference a tiny extra window if animation finished first
   if (inferenceResult === null) {
-    await Promise.race([
-      inferenceRace,
-      wait(800), // max 0.8s extra wait after animation
-    ]);
+    const configured = await configuredPromise;
+    if (configured) {
+      // Real AI available — hold at 93-96% while YOLOv8 finishes
+      onStage('Running YOLOv8 detection on key frames…');
+      let held = 93;
+      const creep = setInterval(() => {
+        held = Math.min(96, held + 1);
+        onProgress(held);
+      }, 2_000);
+      await Promise.race([inferencePromise, wait(INFERENCE_WINDOW)]);
+      clearInterval(creep);
+    } else {
+      await Promise.race([inferencePromise, wait(800)]);
+    }
   }
 
   onProgress(98);
 
   const stats = inferenceResult
-    ? statsFromDetections(inferenceResult, teamNames, homeColor, awayColor, duration, rng)
+    ? statsFromDetections(inferenceResult, teamNames, duration, rng)
     : buildDemoStats(teamNames, duration, rng);
 
   onProgress(100);

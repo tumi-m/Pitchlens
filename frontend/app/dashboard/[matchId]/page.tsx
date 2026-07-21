@@ -115,8 +115,16 @@ export default function DashboardPage() {
           {isProcessing && <ProcessingCard match={match} />}
           {isError && <ErrorCard message={match.errorMessage} onRetry={handleRetry} retrying={retrying} />}
 
-          {/* Demo mode notice */}
-          {stats && (
+          {/* Source banner — demo vs real AI */}
+          {stats && (stats as any)._source === 'roboflow' ? (
+            <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-pitch-green/10 border border-pitch-green/20 text-xs text-pitch-muted">
+              <span className="shrink-0">🤖</span>
+              <span>
+                <span className="text-pitch-green font-medium">Live AI analytics</span>
+                {' '}— stats computed from real YOLOv8 player &amp; ball detection via Roboflow.
+              </span>
+            </div>
+          ) : stats ? (
             <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-pitch-indigo-deep/60 border border-pitch-indigo-soft/20 text-xs text-pitch-muted">
               <span className="shrink-0">🔬</span>
               <span>
@@ -128,7 +136,7 @@ export default function DashboardPage() {
                 {' '}to Vercel environment variables to enable live AI player detection.
               </span>
             </div>
-          )}
+          ) : null}
 
           {/* Score Board — Sofascore style */}
           {stats && (

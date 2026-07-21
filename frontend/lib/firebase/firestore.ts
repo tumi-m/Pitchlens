@@ -32,7 +32,16 @@ function setLocalMatch(id: string, data: Partial<Match>) {
   if (typeof window === 'undefined') return;
   const all = getLocalMatches();
   all[id] = { ...(all[id] || {}), ...data, id } as Match;
-  localStorage.setItem(LS_KEY, JSON.stringify(all));
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(all));
+  } catch {
+    // Quota exceeded — evict the oldest half of other matches and retry once
+    const others = Object.values(all)
+      .filter((m) => m.id !== id)
+      .sort((a: any, b: any) => (a.createdAt?.seconds ?? 0) - (b.createdAt?.seconds ?? 0));
+    others.slice(0, Math.ceil(others.length / 2)).forEach((m) => delete all[m.id]);
+    try { localStorage.setItem(LS_KEY, JSON.stringify(all)); } catch { /* give up silently */ }
+  }
 }
 
 function getLocalMatch(id: string): Match | null {
@@ -40,7 +49,8 @@ function getLocalMatch(id: string): Match | null {
 }
 
 function getAllLocalMatches(userId?: string): Match[] {
-  const all = Object.values(getLocalMatches());
+  const all = Object.values(getLocalMatches())
+    .sort((a: any, b: any) => (b.createdAt?.seconds ?? 0) - (a.createdAt?.seconds ?? 0));
   if (userId) return all.filter((m) => m.userId === userId);
   return all;
 }
@@ -150,25 +160,49 @@ export async function getUserMatches(userId: string): Promise<Match[]> {
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as Match));
 }
 
-export function subscribeToMatch(matchId: string, callback: (match: Match) => void) {
+export function subscribeToMatch(matchId: string, callback: (match: Match | null) => void) {
+  // localStorage is the source of truth for client-side processed matches —
+  // always poll it, even when Firebase is configured (processing happens in
+  // the browser, so local data lands before/without Firestore).
+  // Emits null when the match isn't found, so consumers can stop loading
+  // (e.g. a shared link opened in a different browser). Only emits on change
+  // to avoid re-rendering the dashboard at 2Hz.
+  let lastJson: string | undefined;
+  const emitLocal = () => {
+    const m = getLocalMatch(matchId);
+    const j = m ? JSON.stringify(m) : 'null';
+    if (j !== lastJson) { lastJson = j; callback(m); }
+  };
+  emitLocal();
+  const interval = setInterval(emitLocal, 500);
+
   if (!isFirebaseConfigured()) {
-    // Poll localStorage for updates
-    const check = () => {
-      const m = getLocalMatch(matchId);
-      if (m) callback(m);
-    };
-    check();
-    const interval = setInterval(check, 500);
     return () => clearInterval(interval);
   }
-  return onSnapshot(doc(db, 'matches', matchId), (snap) => {
-    if (snap.exists()) callback({ id: snap.id, ...snap.data() } as Match);
-  });
+
+  const unsub = onSnapshot(
+    doc(db, 'matches', matchId),
+    (snap) => {
+      if (!snap.exists()) return;
+      // Local data (fresher — written by the in-browser pipeline) wins on merge
+      const local = getLocalMatch(matchId);
+      const merged = { id: snap.id, ...snap.data(), ...(local ?? {}) } as Match;
+      const j = JSON.stringify(merged);
+      if (j !== lastJson) { lastJson = j; callback(merged); }
+    },
+    () => { /* permissions/offline — localStorage polling still covers us */ }
+  );
+  return () => { clearInterval(interval); unsub(); };
 }
 
 export function subscribeToUserMatches(userId: string, callback: (matches: Match[]) => void) {
   if (!isFirebaseConfigured()) {
-    const check = () => callback(getAllLocalMatches(userId));
+    let lastJson: string | undefined;
+    const check = () => {
+      const list = getAllLocalMatches(userId);
+      const j = JSON.stringify(list);
+      if (j !== lastJson) { lastJson = j; callback(list); }
+    };
     check();
     const interval = setInterval(check, 1000);
     return () => clearInterval(interval);
@@ -179,9 +213,17 @@ export function subscribeToUserMatches(userId: string, callback: (matches: Match
     orderBy('createdAt', 'desc'),
     limit(20)
   );
-  return onSnapshot(q, (snap) => {
-    callback(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Match)));
-  });
+  return onSnapshot(
+    q,
+    (snap) => {
+      // Merge remote with locally-processed matches (dedupe by id, local wins)
+      const merged = new Map<string, Match>();
+      snap.docs.forEach((d) => merged.set(d.id, { id: d.id, ...d.data() } as Match));
+      getAllLocalMatches(userId).forEach((m) => merged.set(m.id, m));
+      callback(Array.from(merged.values()));
+    },
+    () => callback(getAllLocalMatches(userId))
+  );
 }
 
 export async function reprocessMatch(matchId: string): Promise<void> {
@@ -199,14 +241,18 @@ export async function saveMatchStats(matchId: string, stats: any): Promise<void>
     processingProgress: 100,
     updatedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
   } as any);
-  // Then try Firebase in the background — ignore any error
+  // Then try Firebase in the background — ignore any error.
+  // setDoc+merge (not updateDoc): the doc may not exist yet, since match
+  // skeletons are created in localStorage only.
   if (isFirebaseConfigured()) {
-    updateDoc(doc(db, 'matches', matchId), {
+    const local = getLocalMatch(matchId);
+    setDoc(doc(db, 'matches', matchId), {
+      ...(local ?? {}),
       status: 'completed',
       stats,
       processingProgress: 100,
       updatedAt: serverTimestamp(),
-    }).catch(() => { /* Firebase unavailable — localStorage already has the data */ });
+    }, { merge: true }).catch(() => { /* Firebase unavailable — localStorage already has the data */ });
   }
 }
 

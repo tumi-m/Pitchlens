@@ -53,31 +53,34 @@ export function PossessionDonut({ stats, homeTeamName, awayTeamName }: StatsChar
 }
 
 export function ShotsBars({ stats, homeTeamName, awayTeamName }: StatsChartsProps) {
+  // Identical team names would collapse into a single object key/series
+  const homeKey = homeTeamName === awayTeamName ? `${homeTeamName} (H)` : homeTeamName;
+  const awayKey = homeTeamName === awayTeamName ? `${awayTeamName} (A)` : awayTeamName;
   const data = [
     {
       metric: 'Total Shots',
-      [homeTeamName]: stats.shots.home.total,
-      [awayTeamName]: stats.shots.away.total,
+      [homeKey]: stats.shots.home.total,
+      [awayKey]: stats.shots.away.total,
     },
     {
       metric: 'On Target',
-      [homeTeamName]: stats.shots.home.onTarget,
-      [awayTeamName]: stats.shots.away.onTarget,
+      [homeKey]: stats.shots.home.onTarget,
+      [awayKey]: stats.shots.away.onTarget,
     },
     {
       metric: 'xG',
-      [homeTeamName]: parseFloat(stats.shots.home.xG.toFixed(2)),
-      [awayTeamName]: parseFloat(stats.shots.away.xG.toFixed(2)),
+      [homeKey]: parseFloat(stats.shots.home.xG.toFixed(2)),
+      [awayKey]: parseFloat(stats.shots.away.xG.toFixed(2)),
     },
     {
       metric: 'Fouls',
-      [homeTeamName]: stats.fouls.home,
-      [awayTeamName]: stats.fouls.away,
+      [homeKey]: stats.fouls.home,
+      [awayKey]: stats.fouls.away,
     },
     {
       metric: 'Corners',
-      [homeTeamName]: stats.corners.home,
-      [awayTeamName]: stats.corners.away,
+      [homeKey]: stats.corners.home,
+      [awayKey]: stats.corners.away,
     },
   ];
 
@@ -91,8 +94,8 @@ export function ShotsBars({ stats, homeTeamName, awayTeamName }: StatsChartsProp
           <Tooltip
             contentStyle={{ background: '#0F0F2E', border: '1px solid rgba(79,79,186,0.3)', borderRadius: '8px', color: '#F8F9FA' }}
           />
-          <Bar dataKey={homeTeamName} fill={HOME_COLOR} radius={[4, 4, 0, 0]} />
-          <Bar dataKey={awayTeamName} fill={AWAY_COLOR} radius={[4, 4, 0, 0]} />
+          <Bar dataKey={homeKey} fill={HOME_COLOR} radius={[4, 4, 0, 0]} />
+          <Bar dataKey={awayKey} fill={AWAY_COLOR} radius={[4, 4, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </div>

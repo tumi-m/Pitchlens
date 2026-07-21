@@ -3,9 +3,10 @@ import { useRef, useEffect, useState } from 'react';
 import * as d3 from 'd3';
 import type { PlayerHeatmap, VoronoiFrame, PassNetwork } from '@/lib/types';
 
-// Five-a-side pitch: 42m × 25m
-const PITCH_WIDTH = 42;
-const PITCH_HEIGHT = 25;
+// Data coordinate space — MUST match lib/utils/videoProcessor.ts
+// (PITCH_W/PITCH_H there): stats positions are generated on a 105×68 grid.
+const PITCH_WIDTH = 105;
+const PITCH_HEIGHT = 68;
 
 type ViewMode = 'heatmap' | 'voronoi' | 'passnetwork';
 
@@ -53,8 +54,13 @@ export function PitchSVG({
 
     if (mode === 'heatmap' && heatmaps.length > 0) {
       renderHeatmap(layer, heatmaps, scaleX, scaleY, homeColor, awayColor);
-    } else if (mode === 'voronoi' && voronoi.length > 0) {
-      renderVoronoi(layer, voronoi[0], scaleX, scaleY, width, height, homeColor, awayColor);
+    } else if (mode === 'voronoi') {
+      if (voronoi.length > 0) {
+        renderVoronoi(layer, voronoi[0], scaleX, scaleY, width, height, homeColor, awayColor);
+      } else if (passNetwork && passNetwork.nodes.length > 0) {
+        // No precomputed frames — derive space control from player positions
+        renderVoronoiFromNodes(layer, passNetwork, scaleX, scaleY, width, height, homeColor, awayColor);
+      }
     } else if (mode === 'passnetwork' && passNetwork) {
       renderPassNetwork(layer, passNetwork, scaleX, scaleY, homeColor, awayColor);
     }
@@ -114,17 +120,17 @@ function PitchMarkings({ w, h, sx, sy }: { w: number; h: number; sx: (x: number)
       <circle cx={w / 2} cy={h / 2} r={Math.min(w, h) * 0.1} />
       <circle cx={w / 2} cy={h / 2} r={2} fill={stroke} />
 
-      {/* Goal areas (6m boxes) */}
-      <rect x={2} y={sy(8)} width={sx(5)} height={sy(9)} />
-      <rect x={w - sx(5) - 2} y={sy(8)} width={sx(5)} height={sy(9)} />
+      {/* Goal areas (values in the 105×68 data space) */}
+      <rect x={2} y={sy(22)} width={sx(12.5)} height={sy(24)} />
+      <rect x={w - sx(12.5) - 2} y={sy(22)} width={sx(12.5)} height={sy(24)} />
 
       {/* Goals */}
-      <rect x={0} y={sy(10)} width={8} height={sy(5)} fill="rgba(255,255,255,0.15)" stroke={stroke} />
-      <rect x={w - 8} y={sy(10)} width={8} height={sy(5)} fill="rgba(255,255,255,0.15)" stroke={stroke} />
+      <rect x={0} y={sy(27)} width={8} height={sy(14)} fill="rgba(255,255,255,0.15)" stroke={stroke} />
+      <rect x={w - 8} y={sy(27)} width={8} height={sy(14)} fill="rgba(255,255,255,0.15)" stroke={stroke} />
 
       {/* Penalty spots */}
-      <circle cx={sx(6)} cy={h / 2} r={3} fill={stroke} />
-      <circle cx={w - sx(6)} cy={h / 2} r={3} fill={stroke} />
+      <circle cx={sx(15)} cy={h / 2} r={3} fill={stroke} />
+      <circle cx={w - sx(15)} cy={h / 2} r={3} fill={stroke} />
     </g>
   );
 }
@@ -183,6 +189,42 @@ function renderVoronoi(
   });
 }
 
+function renderVoronoiFromNodes(
+  layer: d3.Selection<SVGGElement, unknown, null, undefined>,
+  network: PassNetwork,
+  scaleX: (x: number) => number,
+  scaleY: (y: number) => number,
+  width: number,
+  height: number,
+  homeColor: string,
+  awayColor: string
+) {
+  const pts: [number, number][] = network.nodes.map((n) => [scaleX(n.x), scaleY(n.y)]);
+  const delaunay = d3.Delaunay.from(pts);
+  const vor = delaunay.voronoi([0, 0, width, height]);
+
+  network.nodes.forEach((node, i) => {
+    const cell = vor.renderCell(i);
+    if (!cell) return;
+    const color = node.teamSide === 'home' ? homeColor : awayColor;
+    layer
+      .append('path')
+      .attr('d', cell)
+      .attr('fill', color)
+      .attr('opacity', 0.14)
+      .attr('stroke', color)
+      .attr('stroke-width', 1)
+      .attr('stroke-opacity', 0.45);
+    layer
+      .append('circle')
+      .attr('cx', pts[i][0])
+      .attr('cy', pts[i][1])
+      .attr('r', 4)
+      .attr('fill', color)
+      .attr('opacity', 0.9);
+  });
+}
+
 function renderPassNetwork(
   layer: d3.Selection<SVGGElement, unknown, null, undefined>,
   network: PassNetwork,
@@ -211,7 +253,8 @@ function renderPassNetwork(
   // Draw nodes
   network.nodes.forEach((node) => {
     const color = node.teamSide === 'home' ? homeColor : awayColor;
-    const r = 6 + node.involvement * 0.8;
+    // involvement is 18-73 → radius ~8-15px
+    const r = 6 + Math.min(9, node.involvement * 0.12);
 
     const g = layer.append('g')
       .attr('transform', `translate(${scaleX(node.x)},${scaleY(node.y)})`);

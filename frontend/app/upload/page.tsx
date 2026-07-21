@@ -3,7 +3,10 @@ import { useState, useCallback, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, Film, X, Plus, Trash2, Loader2, CheckCircle2, Zap } from 'lucide-react';
+import {
+  Upload, Film, X, Plus, Trash2, Loader2,
+  CheckCircle2, Zap, Link2, Youtube, HardDrive,
+} from 'lucide-react';
 import { Navbar } from '@/components/ui/Navbar';
 import { useAuthContext } from '@/components/auth/AuthProvider';
 import { saveMatchLocally, saveMatchStats } from '@/lib/firebase/firestore';
@@ -14,15 +17,19 @@ import toast from 'react-hot-toast';
 import type { Player } from '@/lib/types';
 
 const MAX_SIZE = 500 * 1024 * 1024;
-
-type Stage = 'form' | 'processing' | 'done';
+type Stage = 'form' | 'fetching' | 'processing' | 'done';
+type InputMode = 'file' | 'youtube' | 'gdrive';
 
 export default function UploadPage() {
   const { user } = useAuthContext();
   const router = useRouter();
 
   const [stage, setStage] = useState<Stage>('form');
+  const [inputMode, setInputMode] = useState<InputMode>('file');
   const [file, setFile] = useState<File | null>(null);
+  const [urlInput, setUrlInput] = useState('');
+  const [fetchingUrl, setFetchingUrl] = useState(false);
+
   const [homeTeam, setHomeTeam] = useState('Home Team');
   const [awayTeam, setAwayTeam] = useState('Away Team');
   const [homeColor, setHomeColor] = useState('#e53e3e');
@@ -35,19 +42,76 @@ export default function UploadPage() {
   const [triviaIndex, setTriviaIndex] = useState(0);
   const [matchId, setMatchId] = useState<string | null>(null);
 
+  // Invalidates any in-flight Google Drive fetch when the user switches
+  // tabs or starts a new fetch — a stale response must not overwrite state.
+  const fetchGeneration = useRef(0);
+
   const onDrop = useCallback((accepted: File[]) => {
     const f = accepted[0];
     if (!f) return;
     if (f.size > MAX_SIZE) { toast.error('File exceeds 500 MB limit'); return; }
+    fetchGeneration.current++;
     setFile(f);
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
+    onDropRejected: (rejections) => {
+      const reason = rejections[0]?.errors[0]?.code;
+      if (reason === 'file-invalid-type') toast.error('Unsupported format — use MP4, MOV, AVI or MKV');
+      else if (reason === 'too-many-files') toast.error('Please upload a single video file');
+      else toast.error('That file can’t be used — try an MP4 video');
+    },
     accept: { 'video/*': ['.mp4', '.mov', '.avi', '.mkv'] },
     maxFiles: 1,
     disabled: stage !== 'form',
   });
+
+  const handleFetchUrl = async () => {
+    if (!urlInput.trim()) { toast.error('Paste a link first'); return; }
+
+    if (inputMode === 'youtube') {
+      // YouTube: can't download server-side without violating ToS
+      // Show download instructions
+      toast.error('Download the YouTube video first, then upload the file. Use yt-dlp or savefrom.net', { duration: 6000 });
+      return;
+    }
+
+    if (inputMode === 'gdrive') {
+      const generation = ++fetchGeneration.current;
+      setFetchingUrl(true);
+      try {
+        toast.loading('Fetching from Google Drive…', { id: 'gdrive' });
+        const res = await fetch(`/api/fetch-video?type=gdrive&url=${encodeURIComponent(urlInput)}`);
+        if (!res.ok) {
+          let message = `Fetch failed (${res.status})`;
+          try {
+            const err = await res.json();
+            if (err?.error) message = err.error;
+          } catch { /* non-JSON error body (e.g. proxy/timeout page) */ }
+          throw new Error(message);
+        }
+        const blob = await res.blob();
+        // User switched tabs / picked a file / re-fetched while we downloaded
+        if (generation !== fetchGeneration.current) return;
+        const fileName = 'drive-match-' + Date.now() + '.mp4';
+        const videoFile = new File([blob], fileName, { type: 'video/mp4' });
+        if (videoFile.size > MAX_SIZE) throw new Error('File exceeds 500 MB limit');
+        if (videoFile.size < 1024) throw new Error('Drive returned an empty file — check the sharing settings');
+        setFile(videoFile);
+        setUrlInput('');
+        toast.success('Video loaded from Google Drive!', { id: 'gdrive' });
+      } catch (err: any) {
+        if (generation === fetchGeneration.current) {
+          toast.error(err.message || 'Failed to load video', { id: 'gdrive' });
+        } else {
+          toast.dismiss('gdrive');
+        }
+      } finally {
+        if (generation === fetchGeneration.current) setFetchingUrl(false);
+      }
+    }
+  };
 
   const addPlayer = (side: 'home' | 'away') => {
     const players = side === 'home' ? homePlayers : awayPlayers;
@@ -72,11 +136,9 @@ export default function UploadPage() {
   const handleAnalyse = async () => {
     if (!file) { toast.error('Please select a video'); return; }
 
-    // Generate ID locally — instant, never blocks
     const id = 'match_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     setMatchId(id);
 
-    // Save skeleton to localStorage immediately (synchronous)
     saveMatchLocally(id, {
       userId: user?.uid ?? 'guest',
       title: `${homeTeam} vs ${awayTeam}`,
@@ -96,8 +158,7 @@ export default function UploadPage() {
     const triviaTimer = setInterval(() => setTriviaIndex((i) => (i + 1) % SOCCER_TRIVIA.length), 6000);
 
     try {
-      const teamNames = { home: homeTeam, away: awayTeam };
-      const stats = await processVideo(file, teamNames, {
+      const stats = await processVideo(file, { home: homeTeam, away: awayTeam }, {
         homeColor,
         awayColor,
         onStage: (s) => setStageName(s),
@@ -106,7 +167,7 @@ export default function UploadPage() {
 
       setStageName('Saving results…');
       setProgress(97);
-      saveMatchStats(id, stats); // fire-and-forget, never await
+      saveMatchStats(id, stats);
 
       clearInterval(triviaTimer);
       setProgress(100);
@@ -114,9 +175,9 @@ export default function UploadPage() {
       setTimeout(() => router.push(`/dashboard/${id}`), 1500);
     } catch (err: any) {
       clearInterval(triviaTimer);
-      console.error('Processing error:', err);
+      console.error(err);
       const mock = generateMockStats({ home: homeTeam, away: awayTeam });
-      saveMatchStats(id, mock); // fire-and-forget
+      saveMatchStats(id, mock);
       setProgress(100);
       setStage('done');
       setTimeout(() => router.push(`/dashboard/${id}`), 1500);
@@ -133,49 +194,154 @@ export default function UploadPage() {
             {stage === 'form' && (
               <motion.div key="form" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }} className="space-y-8">
                 <div>
-                  <h1 className="text-3xl font-bold text-pitch-white mb-2">Upload a Match</h1>
-                  <p className="text-pitch-muted">Frames are extracted in your browser and analysed via Roboflow YOLOv8 — no upload wait time.</p>
+                  <h1 className="text-3xl font-bold text-pitch-white mb-2">Analyse a Match</h1>
+                  <p className="text-pitch-muted">Upload a video or paste a Google Drive link. Frames are analysed via Roboflow YOLOv8 in your browser.</p>
                 </div>
 
-                {/* Drop zone */}
-                <div
-                  {...getRootProps()}
-                  className={cn(
-                    'border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all',
-                    isDragActive ? 'border-pitch-green bg-pitch-green/5' : 'border-pitch-indigo-soft/40 hover:border-pitch-indigo-glow/60 hover:bg-pitch-indigo-deep/30',
-                    file && 'border-pitch-green/50 bg-pitch-green/5'
-                  )}
-                >
-                  <input {...getInputProps()} />
-                  {file ? (
-                    <div className="flex flex-col items-center gap-3">
-                      <div className="w-14 h-14 bg-pitch-green/20 rounded-xl flex items-center justify-center">
-                        <Film size={28} className="text-pitch-green" />
-                      </div>
-                      <div>
-                        <p className="text-pitch-white font-medium">{file.name}</p>
-                        <p className="text-pitch-muted text-sm">{formatFileSize(file.size)}</p>
-                      </div>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setFile(null); }}
-                        className="flex items-center gap-1.5 text-pitch-muted hover:text-red-400 text-sm transition-colors"
-                      >
-                        <X size={14} /> Remove
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex flex-col items-center gap-4">
-                      <motion.div animate={{ y: isDragActive ? -8 : 0 }} className="w-16 h-16 bg-pitch-indigo-soft/20 rounded-2xl flex items-center justify-center">
-                        <Upload size={32} className="text-pitch-indigo-glow" />
-                      </motion.div>
-                      <div>
-                        <p className="text-pitch-white font-medium">{isDragActive ? 'Drop it here' : 'Drag & drop your match video'}</p>
-                        <p className="text-pitch-muted text-sm mt-1">MP4 · MOV · Max 500 MB · 5-a-side or 11-a-side</p>
-                      </div>
-                      <span className="pitch-button-secondary text-sm px-5 py-2">Browse Files</span>
-                    </div>
-                  )}
+                {/* Source tabs */}
+                <div className="flex gap-1 p-1 bg-pitch-indigo-deep/60 rounded-xl border border-pitch-indigo-soft/20">
+                  {([
+                    { mode: 'file' as const, icon: Upload, label: 'Upload File' },
+                    { mode: 'youtube' as const, icon: Youtube, label: 'YouTube' },
+                    { mode: 'gdrive' as const, icon: HardDrive, label: 'Google Drive' },
+                  ]).map(({ mode, icon: Icon, label }) => (
+                    <button
+                      key={mode}
+                      onClick={() => { fetchGeneration.current++; setFetchingUrl(false); setInputMode(mode); setFile(null); setUrlInput(''); }}
+                      className={cn(
+                        'flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all',
+                        inputMode === mode
+                          ? 'bg-pitch-indigo-soft/40 text-pitch-white shadow-sm'
+                          : 'text-pitch-muted hover:text-pitch-white'
+                      )}
+                    >
+                      <Icon size={15} />
+                      <span className="hidden sm:inline">{label}</span>
+                    </button>
+                  ))}
                 </div>
+
+                {/* File drop zone */}
+                {inputMode === 'file' && (
+                  <div
+                    {...getRootProps()}
+                    className={cn(
+                      'border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all',
+                      isDragActive ? 'border-pitch-green bg-pitch-green/5' : 'border-pitch-indigo-soft/40 hover:border-pitch-indigo-glow/60 hover:bg-pitch-indigo-deep/30',
+                      file && 'border-pitch-green/50 bg-pitch-green/5'
+                    )}
+                  >
+                    <input {...getInputProps()} />
+                    {file ? (
+                      <div className="flex flex-col items-center gap-3">
+                        <div className="w-14 h-14 bg-pitch-green/20 rounded-xl flex items-center justify-center">
+                          <Film size={28} className="text-pitch-green" />
+                        </div>
+                        <div>
+                          <p className="text-pitch-white font-medium">{file.name}</p>
+                          <p className="text-pitch-muted text-sm">{formatFileSize(file.size)}</p>
+                        </div>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setFile(null); }}
+                          className="flex items-center gap-1.5 text-pitch-muted hover:text-red-400 text-sm transition-colors"
+                        >
+                          <X size={14} /> Remove
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center gap-4">
+                        <motion.div animate={{ y: isDragActive ? -8 : 0 }} className="w-16 h-16 bg-pitch-indigo-soft/20 rounded-2xl flex items-center justify-center">
+                          <Upload size={32} className="text-pitch-indigo-glow" />
+                        </motion.div>
+                        <div>
+                          <p className="text-pitch-white font-medium">{isDragActive ? 'Drop it here' : 'Drag & drop your match video'}</p>
+                          <p className="text-pitch-muted text-sm mt-1">MP4 · MOV · AVI · MKV · Max 500 MB</p>
+                        </div>
+                        <span className="pitch-button-secondary text-sm px-5 py-2">Browse Files</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* YouTube input */}
+                {inputMode === 'youtube' && (
+                  <div className="glass-card p-6 space-y-4">
+                    <div className="flex items-center gap-3 mb-2">
+                      <div className="w-10 h-10 bg-red-500/20 rounded-xl flex items-center justify-center">
+                        <Youtube size={20} className="text-red-400" />
+                      </div>
+                      <div>
+                        <p className="text-pitch-white font-medium text-sm">YouTube Video</p>
+                        <p className="text-pitch-muted text-xs">Download the video first, then upload the file</p>
+                      </div>
+                    </div>
+                    <input
+                      type="url"
+                      value={urlInput}
+                      onChange={(e) => setUrlInput(e.target.value)}
+                      placeholder="https://youtube.com/watch?v=..."
+                      className="w-full bg-pitch-black/40 border border-pitch-indigo-soft/20 rounded-xl px-4 py-3 text-pitch-white text-sm focus:outline-none focus:border-pitch-green/50 transition-colors"
+                    />
+                    <div className="rounded-xl bg-amber-500/10 border border-amber-500/20 p-4 text-xs text-amber-300 space-y-2">
+                      <p className="font-medium">How to get the video file:</p>
+                      <ol className="space-y-1 list-decimal list-inside text-amber-200/80">
+                        <li>Go to <span className="font-mono">savefrom.net</span> or <span className="font-mono">yt-dlp</span> on your computer</li>
+                        <li>Paste the YouTube URL and download the MP4</li>
+                        <li>Switch to the <strong>Upload File</strong> tab and select the downloaded file</li>
+                      </ol>
+                    </div>
+                  </div>
+                )}
+
+                {/* Google Drive input */}
+                {inputMode === 'gdrive' && (
+                  <div className="glass-card p-6 space-y-4">
+                    <div className="flex items-center gap-3 mb-2">
+                      <div className="w-10 h-10 bg-blue-500/20 rounded-xl flex items-center justify-center">
+                        <HardDrive size={20} className="text-blue-400" />
+                      </div>
+                      <div>
+                        <p className="text-pitch-white font-medium text-sm">Google Drive Video</p>
+                        <p className="text-pitch-muted text-xs">Share must be set to "Anyone with the link can view"</p>
+                      </div>
+                    </div>
+                    {file ? (
+                      <div className="flex items-center gap-3 p-3 bg-pitch-green/10 border border-pitch-green/20 rounded-xl">
+                        <Film size={18} className="text-pitch-green shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-pitch-white text-sm font-medium truncate">{file.name}</p>
+                          <p className="text-pitch-muted text-xs">{formatFileSize(file.size)}</p>
+                        </div>
+                        <button onClick={() => setFile(null)} className="text-pitch-muted hover:text-red-400 transition-colors">
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex gap-2">
+                          <input
+                            type="url"
+                            value={urlInput}
+                            onChange={(e) => setUrlInput(e.target.value)}
+                            placeholder="https://drive.google.com/file/d/..."
+                            className="flex-1 bg-pitch-black/40 border border-pitch-indigo-soft/20 rounded-xl px-4 py-3 text-pitch-white text-sm focus:outline-none focus:border-pitch-green/50 transition-colors"
+                          />
+                          <button
+                            onClick={handleFetchUrl}
+                            disabled={fetchingUrl || !urlInput.trim()}
+                            className="pitch-button-secondary px-4 py-3 text-sm flex items-center gap-2 disabled:opacity-50"
+                          >
+                            {fetchingUrl ? <Loader2 size={16} className="animate-spin" /> : <Link2 size={16} />}
+                            {fetchingUrl ? 'Loading…' : 'Fetch'}
+                          </button>
+                        </div>
+                        <p className="text-pitch-muted text-xs">
+                          In Google Drive: right-click the video → Share → change to "Anyone with the link" → copy link
+                        </p>
+                      </>
+                    )}
+                  </div>
+                )}
 
                 {/* Team setup */}
                 <div className="grid sm:grid-cols-2 gap-6">
@@ -198,11 +364,11 @@ export default function UploadPage() {
                 <div className="space-y-3">
                   <button
                     onClick={handleAnalyse}
-                    disabled={!file || !user}
+                    disabled={!file}
                     className="pitch-button-primary w-full py-3.5 text-base flex items-center justify-center gap-2"
                   >
                     <Zap size={18} />
-                    {!user ? 'Sign in to Analyse' : !file ? 'Select a video first' : 'Analyse Match'}
+                    {!file ? 'Select or fetch a video first' : 'Analyse Match'}
                   </button>
                   <p className="text-center text-pitch-muted text-xs">
                     Powered by{' '}
