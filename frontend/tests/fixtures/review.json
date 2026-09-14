@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "title": "Portable QA \u2014 Reds vs Blues",
+  "homeTeam": "Reds",
+  "awayTeam": "Blues",
+  "review": {
+    "schemaVersion": 1,
+    "source": "local-video",
+    "fileName": "review.mp4",
+    "fileSize": 223098,
+    "duration": 4,
+    "width": 640,
+    "height": 360,
+    "aiStatus": "not-requested",
+    "frames": [],
+    "events": [
+      {
+        "id": "qa-event",
+        "timestamp": 1,
+        "team": "home",
+        "type": "goal",
+        "source": "manual",
+        "note": "Synthetic portability test"
+      }
+    ],
+    "notes": "Synthetic QA review for import and reconnection testing."
+  }
+}

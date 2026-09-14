@@ -1,3 +1,4 @@
+import { fingerprintVideo } from "@/lib/review/portable";
 import { auth } from "@/lib/firebase/config";
 import type { VideoReview, Detection } from "@/lib/review/types";
 
@@ -62,6 +63,9 @@ export async function processVideo(
     if (
       !Number.isFinite(video.duration) ||
       video.duration <= 0 ||
+      video.duration > 86400 ||
+      video.videoWidth > 16384 ||
+      video.videoHeight > 16384 ||
       !video.videoWidth
     )
       throw new Error("Video duration or dimensions could not be read.");
@@ -69,6 +73,7 @@ export async function processVideo(
       schemaVersion: 1,
       source: "local-video",
       fileName: file.name,
+      videoFingerprint: await fingerprintVideo(file),
       fileSize: file.size,
       duration: video.duration,
       width: video.videoWidth,

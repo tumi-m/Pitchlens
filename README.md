@@ -17,10 +17,10 @@ Open http://localhost:3000. No Firebase account, paid service or environment fil
 1. Choose an MP4, WebM or MOV video up to 500 MB. The browser must support its codec; H.264 MP4 is a good baseline.
 2. Enter the team names and open the review room.
 3. Pause/seek the video and tag goals, shots, saves, passes, fouls or corners. Add an optional note. A goal counts as one shot attempt; do not add a duplicate shot tag for that goal.
-4. Click timeline timestamps to revisit the footage. Remove incorrect tags and save coaching notes.
+4. Click timeline timestamps to revisit the footage. Edit a tag’s time, team, type or note; remove incorrect tags with one-step undo; save coaching notes.
 5. Export the review as JSON. Delete a review to remove its locally stored footage and metadata.
 
-**Data stays on this device:** IndexedDB stores video; localStorage stores review metadata. Clearing browser data removes reviews. Exported JSON contains timestamps, notes, observed counts and optional frame evidence, but not the video. Keep your original footage. JSON import is not implemented yet.
+**Data stays on this device:** IndexedDB stores video; localStorage stores review metadata. Clearing browser data removes reviews. Exported JSON contains timestamps, notes, observed counts and optional frame evidence, but not the video. Keep your original footage. Import the exported JSON from Your Matches, then reconnect the original video. Imports create a separate review and are labelled as supplied, unverified observations. Files up to 3 MB and 10,000 tags are supported.
 
 **Measurements:** duration and resolution come from the video decoder. Event counts come from explicitly labelled manual tags. Untagged events are unknown. The app does not claim automated goals, possession, xG, pass completion or calibrated pitch heatmaps.
 
@@ -48,6 +48,7 @@ Development permits local guest inference. **Production requires Firebase sign-i
 
 ```sh
 cd frontend
+npm run test:unit
 npm run type-check
 npm run lint
 npm run build
@@ -83,3 +84,11 @@ Firebase Functions declare `API_SECRET_KEY` and `PYTHON_API_URL` as secrets. Con
 ## Scope and limitations
 
 No live cloud deployment was performed by this change. Local review is the supported working path. Production inference requires credentials. Real match footage, labelled events, pitch calibration and detector evaluation are required before promising automated football statistics. No speed/accuracy improvement multiplier has been measured.
+
+## Portable reviews
+
+Use **Your Matches → Import review** to open a version 1 JSON export. The importer validates bounds, event identities, embedded JPEG frames and source fields; it ignores supplied user IDs, record IDs, remote URLs and summary totals. Existing reviews are never overwritten. Imported counts are recomputed from the supplied event list.
+
+Choose **Reconnect the original video** in the imported review. Size, decoded duration and dimensions must match. New reviews also include a SHA-256 fingerprint of the first/last 64 KiB plus file size. This bounded sample helps catch wrong clips without reading a 500 MB video into memory, but is not a full-file hash. Older exports have no fingerprint: matching metadata does not prove identical footage. Imported observations remain visibly unverified.
+
+The independent portability unit suite runs without a browser (`npm run test:unit`). The end-to-end suite includes import/reconnection/edit/undo/export and invalid import recovery.

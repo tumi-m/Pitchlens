@@ -2,7 +2,9 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ChevronLeft, Download, Trash2 } from "lucide-react";
+import { EditEvent } from "./EditEvent";
+import { RelinkVideo } from "./RelinkVideo";
+import { ChevronLeft, Download, Trash2, Pencil } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
 import { loadVideo, deleteVideo } from "@/lib/review/videoStore";
 import { saveMatchLocally, removeLocalMatch } from "@/lib/firebase/firestore";
@@ -17,6 +19,9 @@ export function ReviewRoom({ match }: { match: Match }) {
   const review = match.review!;
   const player = useRef<HTMLVideoElement>(null);
   const [url, setUrl] = useState("");
+  const [videoRevision, setVideoRevision] = useState(0);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [removedEvent, setRemovedEvent] = useState<ReviewEvent | null>(null);
   const [videoError, setVideoError] = useState("");
   const [timestamp, setTimestamp] = useState(0);
   const [team, setTeam] = useState<"home" | "away">("home");
@@ -33,6 +38,8 @@ export function ReviewRoom({ match }: { match: Match }) {
     [exportUrl],
   );
   useEffect(() => {
+    setUrl("");
+    setVideoError("");
     let cancelled = false;
     let objectUrl = "";
     loadVideo(match.id)
@@ -56,7 +63,7 @@ export function ReviewRoom({ match }: { match: Match }) {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [match.id]);
+  }, [match.id, videoRevision]);
   function save(next: VideoReview) {
     try {
       saveMatchLocally(match.id, { review: next });
@@ -67,6 +74,10 @@ export function ReviewRoom({ match }: { match: Match }) {
     }
   }
   function tag(type: ReviewEvent["type"]) {
+    if (review.events.length >= 10000) {
+      toast.error("This review has reached its 10,000-tag limit.");
+      return;
+    }
     const event: ReviewEvent = {
       id: crypto.randomUUID(),
       timestamp: Math.min(
@@ -170,6 +181,12 @@ export function ReviewRoom({ match }: { match: Match }) {
               </button>
             </div>
           </header>
+          {review.importedAt && (
+            <p className="rounded-xl bg-amber-500/10 text-amber-200 p-4 text-sm">
+              Imported review. Tags, notes and frame detections came from the
+              supplied file and have not been independently verified.
+            </p>
+          )}
           {exportText && (
             <section
               className="glass-card p-5 space-y-3"
@@ -226,6 +243,13 @@ export function ReviewRoom({ match }: { match: Match }) {
                 />
               </details>
             </section>
+          )}
+          {videoError && (
+            <RelinkVideo
+              matchId={match.id}
+              review={review}
+              onLinked={() => setVideoRevision((n) => n + 1)}
+            />
           )}
           <div className="grid lg:grid-cols-[minmax(0,1fr)_340px] gap-6">
             <section className="space-y-4 min-w-0">
@@ -389,6 +413,31 @@ export function ReviewRoom({ match }: { match: Match }) {
                     back to the footage.
                   </p>
                 )}
+                {removedEvent && (
+                  <button
+                    className="pitch-button-secondary mb-3"
+                    onClick={() => {
+                      if (review.events.length >= 10000) {
+                        toast.error("Tag limit reached.");
+                        return;
+                      }
+                      if (
+                        save({
+                          ...review,
+                          events: [
+                            ...review.events.filter(
+                              (e) => e.id !== removedEvent.id,
+                            ),
+                            removedEvent,
+                          ].sort((a, b) => a.timestamp - b.timestamp),
+                        })
+                      )
+                        setRemovedEvent(null);
+                    }}
+                  >
+                    Undo last removal
+                  </button>
+                )}
                 <ol className="space-y-3 max-h-[520px] overflow-y-auto">
                   {review.events.map((event) => (
                     <li
@@ -409,20 +458,52 @@ export function ReviewRoom({ match }: { match: Match }) {
                             : match.awayTeamName}
                         </span>
                         <button
+                          aria-label={`Edit ${event.type} at ${time(event.timestamp)}`}
+                          onClick={() => setEditingId(event.id)}
+                          className="text-pitch-muted hover:text-pitch-white"
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        <button
                           aria-label={`Remove ${event.type} at ${time(event.timestamp)}`}
-                          onClick={() =>
-                            save({
-                              ...review,
-                              events: review.events.filter(
-                                (e) => e.id !== event.id,
-                              ),
-                            })
-                          }
+                          onClick={() => {
+                            if (
+                              save({
+                                ...review,
+                                events: review.events.filter(
+                                  (e) => e.id !== event.id,
+                                ),
+                              })
+                            ) {
+                              setRemovedEvent(event);
+                              setEditingId(null);
+                            }
+                          }}
                           className="text-pitch-muted hover:text-red-400"
                         >
                           <Trash2 size={14} />
                         </button>
                       </div>
+                      {editingId === event.id && (
+                        <EditEvent
+                          key={event.id}
+                          event={event}
+                          duration={review.duration}
+                          names={{
+                            home: match.homeTeamName,
+                            away: match.awayTeamName,
+                          }}
+                          onCancel={() => setEditingId(null)}
+                          onSave={(edited) =>
+                            save({
+                              ...review,
+                              events: review.events
+                                .map((e) => (e.id === edited.id ? edited : e))
+                                .sort((a, b) => a.timestamp - b.timestamp),
+                            })
+                          }
+                        />
+                      )}
                       {event.note && (
                         <p className="text-xs text-pitch-muted mt-2 break-words">
                           {event.note}

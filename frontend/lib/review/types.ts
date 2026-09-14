@@ -11,6 +11,8 @@ export interface VideoReview {
   schemaVersion: 1;
   source: "local-video";
   fileName: string;
+  videoFingerprint?: string;
+  importedAt?: string;
   fileSize: number;
   duration: number;
   width: number;

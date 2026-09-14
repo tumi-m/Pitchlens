@@ -9,7 +9,7 @@ The repository was a visually developed prototype with three competing processin
 1. **Invented outcomes:** the browser seeded random goals, fouls, passes, xG and narratives from filename/size. Even a failed video could become a completed match. Removed that processing path; corrupt videos fail visibly. New reviews contain real metadata and user-tagged evidence.
 2. **Misleading AI provenance:** six frame detections were mixed with simulated statistics and labelled live analytics. New AI output is restricted to actual sample-frame boxes, labels and confidence. It makes no claims about team identity or match outcomes.
 3. **No usable playback:** uploaded footage was not retained in the primary flow. Added IndexedDB video persistence, playback after reload and timestamp navigation.
-4. **No correction loop:** users could not fix generated claims. Added removable manual tags, notes, observation counts and structured JSON export.
+4. **No correction loop:** users could not fix generated claims. Added editable manual tags (time, team, type and note), undo for the last removal, notes, observation counts and structured JSON export/import with original-video reconnection.
 5. **Fake authentication:** a forged guest object was presented as a Firebase user. Restored real auth subscriptions and made local guest review explicit without a fake account.
 6. **Silent storage loss:** storage quota failures deleted older matches and could still silently fail. Removed eviction; persistence errors are surfaced. New videos are cleaned up if metadata saving fails.
 7. **Conflicting sources:** remote snapshots could alternate with local null values; browser writes tried to bypass the intended server-owned stats model. Added explicit local subscriptions and removed background client stats uploads.
@@ -27,8 +27,8 @@ The repository was a visually developed prototype with three competing processin
 
 ## Priority 1 — Trust and a complete coaching workflow
 
-- **Evidence-first event editing:** extend removable tags to editable time/team/type, player attribution, keyboard shortcuts, undo/redo and bulk review. Acceptance: every exported event links to a playable source timestamp and has an author/source.
-- **Import and portable projects:** add schema-validated JSON import, file hashes, video relinking and ZIP project export. Acceptance: move a review between two browsers without losing tags, notes or timestamps.
+- **Evidence-first event editing:** Editable time/team/type/notes and single-removal undo now work. Next add player attribution, keyboard shortcuts, full undo/redo and bulk review. Acceptance: every exported event links to a playable source timestamp and has an author/source.
+- **Import and portable projects:** Schema-validated JSON import and video relinking now work. New videos use a bounded first/last-chunk fingerprint; next add full-file hashing and ZIP project export. Acceptance: move a review between two browsers without losing tags, notes or timestamps.
 - **Reliable storage:** move review metadata and frame images into IndexedDB as well; show disk usage and request persistent storage. Acceptance: quota exhaustion leaves every existing review intact and identifies the unsaved item.
 - **Useful coach outputs:** generate a concise printable report, selected video clips and a practice checklist from reviewed moments. Acceptance: the report distinguishes reviewed counts from unknown match totals and includes source provenance.
 - **Accessibility:** conduct keyboard-only and screen-reader passes, label video alternatives, support captions where available, test 200% zoom and touch targets. Acceptance: WCAG AA contrast and no blocked core operation without a mouse.
