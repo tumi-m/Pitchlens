@@ -1,4 +1,5 @@
 'use client';
+import { ReviewRoom } from '@/components/review/ReviewRoom';
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
@@ -81,6 +82,8 @@ export default function DashboardPage() {
   if (loading) return <LoadingScreen />;
   if (!match) return <NotFound />;
 
+  if (match.review) return <ReviewRoom key={match.id} match={match} />;
+
   const stats = match.stats;
   const isProcessing = match.status === 'processing' || match.status === 'uploading';
   const isError = match.status === 'error';
@@ -115,28 +118,7 @@ export default function DashboardPage() {
           {isProcessing && <ProcessingCard match={match} />}
           {isError && <ErrorCard message={match.errorMessage} onRetry={handleRetry} retrying={retrying} />}
 
-          {/* Source banner — demo vs real AI */}
-          {stats && (stats as any)._source === 'roboflow' ? (
-            <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-pitch-green/10 border border-pitch-green/20 text-xs text-pitch-muted">
-              <span className="shrink-0">🤖</span>
-              <span>
-                <span className="text-pitch-green font-medium">Live AI analytics</span>
-                {' '}— stats computed from real YOLOv8 player &amp; ball detection via Roboflow.
-              </span>
-            </div>
-          ) : stats ? (
-            <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-pitch-indigo-deep/60 border border-pitch-indigo-soft/20 text-xs text-pitch-muted">
-              <span className="shrink-0">🔬</span>
-              <span>
-                <span className="text-pitch-white font-medium">Demo analytics</span>
-                {' '}— stats are generated from your video metadata.{' '}
-                <a href="https://roboflow.com" target="_blank" rel="noopener noreferrer" className="text-pitch-indigo-glow hover:underline">
-                  Add a Roboflow API key
-                </a>
-                {' '}to Vercel environment variables to enable live AI player detection.
-              </span>
-            </div>
-          ) : null}
+          {stats && <div role="alert" className="p-4 rounded-xl bg-amber-500/10 text-amber-200 text-sm">Legacy / unverified analytics. These results may contain simulated values and must not be treated as measured match statistics. Upload the video again to create a review based on your observations.</div>}
 
           {/* Score Board — Sofascore style */}
           {stats && (
@@ -304,7 +286,7 @@ export default function DashboardPage() {
                   <div>
                     <h3 className="text-xs font-semibold text-pitch-muted uppercase tracking-widest mb-3">Match Narrative</h3>
                     <p className="text-pitch-muted text-sm leading-relaxed italic border-l-2 border-pitch-green/40 pl-4">
-                      "{stats.narrative}"
+                      &ldquo;{stats.narrative}&rdquo;
                     </p>
                   </div>
                 </div>

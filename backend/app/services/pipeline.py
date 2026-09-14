@@ -23,7 +23,6 @@ from collections import defaultdict
 import cv2
 import numpy as np
 import requests
-import torch
 from scipy.spatial import Voronoi
 from scipy.stats import gaussian_kde
 from sklearn.cluster import KMeans
@@ -76,10 +75,14 @@ BALL_PROXIMITY_M = 1.0  # metres — possession threshold
 def _download_video(url: str, dest: Path) -> None:
     """Stream-download video to disk."""
     logger.info(f"Downloading video from URL → {dest}")
-    with requests.get(url, stream=True, timeout=60) as r:
+    with requests.get(url, stream=True, timeout=60, allow_redirects=False) as r:
+        if r.status_code != 200:
+            raise RuntimeError("Video download was rejected")
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):  # 1MB chunks
+                if f.tell() + len(chunk) > 500 * 1024 * 1024:
+                    raise RuntimeError("Video exceeds 500 MB")
                 f.write(chunk)
     logger.info(f"Download complete ({dest.stat().st_size / 1e6:.1f} MB)")
 
@@ -104,31 +107,16 @@ def _probe_video(path: Path) -> Dict[str, Any]:
 
 
 def _load_model():
-    """Load Roboflow-hosted YOLOv8 model via the inference SDK."""
-    try:
-        from inference import get_model
-        model = get_model(
-            model_id=f"{ROBOFLOW_PROJECT}/{ROBOFLOW_VERSION}",
-            api_key=ROBOFLOW_API_KEY,
-        )
-        logger.info("Roboflow inference model loaded")
-        return model, "inference"
-    except Exception as e:
-        logger.warning(f"inference SDK unavailable ({e}), falling back to ultralytics YOLOv8n")
-        from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
-        return model, "ultralytics"
+    """Use the installed SDK and the configured football class mapping."""
+    if not ROBOFLOW_API_KEY:
+        raise RuntimeError("ROBOFLOW_API_KEY is required; no substitute model is used")
+    from inference_sdk import InferenceHTTPClient
+    return InferenceHTTPClient(api_url="https://detect.roboflow.com", api_key=ROBOFLOW_API_KEY), "http"
 
 
 def _infer_frame(model, frame: np.ndarray, model_type: str) -> sv.Detections:
-    """Run inference on a single frame, return supervision Detections."""
-    if model_type == "inference":
-        results = model.infer(frame, confidence=0.35)[0]
-        detections = sv.Detections.from_inference(results)
-    else:
-        results = model(frame, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(results)
-    return detections
+    result = model.infer(frame, model_id=f"{ROBOFLOW_PROJECT}/{ROBOFLOW_VERSION}")
+    return sv.Detections.from_inference(result)
 
 
 def _cluster_teams_by_jersey(
@@ -146,7 +134,7 @@ def _cluster_teams_by_jersey(
     features = []
     valid_ids = []
     for crop, tid in zip(frames_crops, track_ids):
-        if crop is None or crop.size == 0:
+        if crop is None or crop.size == 0 or crop.shape[0] < 2:
             continue
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         # Use upper half of crop (jersey, not shorts)
@@ -192,12 +180,12 @@ def _homography_to_pitch(
 
 def _compute_xg(x: float, y: float, goal_x: float = PITCH_WIDTH) -> float:
     """
-    Logistic regression xG model calibrated for five-a-side.
+    Experimental distance/angle heuristic; not a calibrated xG model.
     Features: distance to goal, angle to goal.
     """
     dist = math.sqrt((x - goal_x) ** 2 + (y - PITCH_HEIGHT / 2) ** 2)
     angle = math.atan2(abs(y - PITCH_HEIGHT / 2), abs(x - goal_x))
-    # Coefficients from calibration on five-a-side datasets
+    # Hand-selected coefficients; there is no calibration dataset in this repository.
     log_odds = 1.8 - 0.12 * dist - 0.9 * angle
     return 1 / (1 + math.exp(-log_odds))
 
@@ -373,7 +361,7 @@ class MatchPipeline:
     ) -> MatchAnalytics:
         """Frame-by-frame processing with ByteTrack."""
 
-        tracker = sv.ByteTrack(frame_rate=int(fps))
+        tracker = sv.ByteTrack(frame_rate=max(1, round(fps / FRAME_SUBSAMPLE)))
         cap = cv2.VideoCapture(str(video_path))
 
         # Accumulation buffers
@@ -427,7 +415,8 @@ class MatchPipeline:
                 x1, y1, x2, y2 = map(int, bbox)
                 crop = frame[max(0, y1):y2, max(0, x1):x2]
                 if crop.size > 0:
-                    track_crops.append((int(tid), crop))
+                    if len(track_crops) < 500:
+                        track_crops.append((int(tid), crop.copy()))
 
             # Map to pitch coords
             current_positions: Dict[int, Tuple[float, float]] = {}
@@ -511,12 +500,12 @@ class MatchPipeline:
 
             # Corner detection (ball near corner flag + out of play)
             if ball_pitch_pos:
-                near_corner = any(
+                near_corner = any([
                     math.sqrt(ball_pitch_pos[0]**2 + ball_pitch_pos[1]**2) < 2,
                     math.sqrt((ball_pitch_pos[0] - PITCH_WIDTH)**2 + ball_pitch_pos[1]**2) < 2,
                     math.sqrt(ball_pitch_pos[0]**2 + (ball_pitch_pos[1] - PITCH_HEIGHT)**2) < 2,
                     math.sqrt((ball_pitch_pos[0] - PITCH_WIDTH)**2 + (ball_pitch_pos[1] - PITCH_HEIGHT)**2) < 2,
-                )
+                ])
                 if near_corner and len(events) > 0 and events[-1].type != "corner":
                     events.append(MatchEvent(
                         timestamp=timestamp,
@@ -543,6 +532,9 @@ class MatchPipeline:
                 self.progress_callback(prog, f"Analysing frame {frame_idx}")
 
         cap.release()
+
+        if not processed or not track_positions:
+            raise RuntimeError("No players were detected; match statistics are unavailable")
 
         # Jersey clustering (use last 500 crops for efficiency)
         self.progress_callback(91, "Clustering jersey colours")
@@ -577,7 +569,7 @@ class MatchPipeline:
         poss_home = (possession_frames["home"] / max(1, total_frames - possession_frames["none"])) * 100
         poss_away = 100 - poss_home
 
-        shot_events = [e for e in events if e.type in ("shot", "shot_on_target", "goal")]
+        shot_events = [e for e in events if e.type in ("shot", "shot_on_target")]
         goal_events = [e for e in events if e.type == "goal"]
 
         home_shots = [e for e in shot_events if e.teamSide == "home"]

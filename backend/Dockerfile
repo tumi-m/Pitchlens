@@ -4,7 +4,7 @@ FROM python:3.11-slim AS builder
 # System deps for OpenCV, FFmpeg, and PyTorch
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Poetry
 RUN pip install --no-cache-dir poetry==1.8.3
 ENV POETRY_NO_INTERACTION=1 \
-    POETRY_VENV_IN_PROJECT=1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
     POETRY_CACHE_DIR=/tmp/poetry_cache
 
 WORKDIR /app
@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11-distutils \
     python3-pip \
     ffmpeg \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \

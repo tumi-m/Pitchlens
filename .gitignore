@@ -1,0 +1,13 @@
+node_modules/
+.next/
+*.tsbuildinfo
+.env*
+!.env.example
+service-account*.json
+__pycache__/
+.pytest_cache/
+.venv*/
+firebase/functions/lib/
+frontend/test-results/
+frontend/playwright-report/
+.DS_Store

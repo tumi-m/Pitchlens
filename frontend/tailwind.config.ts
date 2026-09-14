@@ -20,13 +20,13 @@ const config: Config = {
             glow: '#4F4FBA',
           },
           green: {
-            DEFAULT: '#1A6B3A',
+            DEFAULT: '#65E6A4',
             light: '#2ECC71',
             neon: '#39FF14',
             field: '#2D5A27',
           },
           white: '#F8F9FA',
-          muted: '#6B7280',
+          muted: '#A1A9BB',
           accent: '#8B5CF6',
         },
         xg: {

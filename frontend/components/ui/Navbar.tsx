@@ -44,7 +44,7 @@ export function Navbar() {
 
           {/* Desktop nav */}
           <nav className="hidden md:flex items-center gap-1">
-            {user && navLinks.map(({ href, label, icon: Icon }) => (
+            {navLinks.map(({ href, label, icon: Icon }) => (
               <Link
                 key={href}
                 href={href}
@@ -62,22 +62,16 @@ export function Navbar() {
           </nav>
 
           <div className="flex items-center gap-2">
-            <button
-              onClick={toggleTheme}
-              className="p-2 rounded-lg text-pitch-muted hover:text-pitch-white hover:bg-pitch-indigo-deep transition-all"
-              aria-label="Toggle theme"
-            >
-              {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
-            </button>
 
-            {user ? (
+
+            {!process.env.NEXT_PUBLIC_FIREBASE_API_KEY ? <span className="text-xs text-pitch-muted hidden md:block">Local workspace</span> : user ? (
               <div className="hidden md:flex items-center gap-2">
                 <div className="w-8 h-8 rounded-full bg-pitch-indigo-soft flex items-center justify-center text-xs font-bold text-pitch-white overflow-hidden">
                   {user.photoURL
                     ? <img src={user.photoURL} alt="avatar" className="w-full h-full object-cover" />
                     : (user.email?.[0] ?? 'U').toUpperCase()}
                 </div>
-                <button onClick={handleLogout} className="pitch-button-ghost text-sm">
+                <button aria-label="Sign out" onClick={handleLogout} className="pitch-button-ghost text-sm">
                   <LogOut size={16} />
                 </button>
               </div>
@@ -105,7 +99,7 @@ export function Navbar() {
             exit={{ opacity: 0, height: 0 }}
             className="md:hidden border-t border-pitch-indigo-soft/20 bg-pitch-black/95 px-4 py-3 space-y-1"
           >
-            {user && navLinks.map(({ href, label, icon: Icon }) => (
+            {navLinks.map(({ href, label, icon: Icon }) => (
               <Link
                 key={href}
                 href={href}
@@ -116,7 +110,7 @@ export function Navbar() {
                 {label}
               </Link>
             ))}
-            {user
+            {!process.env.NEXT_PUBLIC_FIREBASE_API_KEY ? null : user
               ? <button onClick={handleLogout} className="flex items-center gap-2 px-3 py-2.5 text-sm text-pitch-muted hover:text-pitch-white w-full">
                   <LogOut size={16} /> Sign Out
                 </button>

@@ -14,29 +14,11 @@ import type { Match } from '@/lib/types';
 
 export default function DashboardIndexPage() {
   const { user, loading: authLoading } = useAuthContext();
-  const { matches, loading } = useUserMatches(user?.uid);
+  const { matches, loading } = useUserMatches(user?.uid ?? 'guest');
   const [authOpen, setAuthOpen] = useState(false);
 
   if (authLoading) return <LoadingScreen />;
 
-  if (!user) {
-    return (
-      <>
-        <Navbar />
-        <main className="min-h-screen pt-24 flex flex-col items-center justify-center gap-6 px-4">
-          <div className="text-center max-w-md">
-            <div className="w-16 h-16 bg-pitch-indigo-soft/20 rounded-2xl flex items-center justify-center mx-auto mb-6">
-              <BarChart3 size={32} className="text-pitch-indigo-glow" />
-            </div>
-            <h1 className="text-3xl font-bold text-pitch-white mb-3">Your Match Dashboard</h1>
-            <p className="text-pitch-muted mb-6">Sign in to view your match analytics and upload new footage.</p>
-            <button onClick={() => setAuthOpen(true)} className="pitch-button-primary">Sign In to Continue</button>
-          </div>
-          <AuthModal isOpen={authOpen} onClose={() => setAuthOpen(false)} />
-        </main>
-      </>
-    );
-  }
 
   return (
     <>
@@ -46,7 +28,7 @@ export default function DashboardIndexPage() {
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-3xl font-bold text-pitch-white">Your Matches</h1>
-              <p className="text-pitch-muted mt-1">{matches.length} match{matches.length !== 1 ? 'es' : ''} analysed</p>
+              <p className="text-pitch-muted mt-1">{matches.length} saved review{matches.length !== 1 ? 's' : ''} · This device</p>
             </div>
             <Link href="/upload" className="pitch-button-primary gap-2">
               <Plus size={16} /> New Match
@@ -103,6 +85,7 @@ function MatchCard({ match }: { match: Match }) {
         {match.title}
       </h3>
 
+      {match.review && <p className="text-sm text-pitch-muted mt-3">{Math.floor(match.review.duration / 60)}:{String(Math.floor(match.review.duration % 60)).padStart(2, '0')} · {match.review.events.length} tagged moments</p>}
       {match.stats && (
         <div className="flex items-center gap-2 mt-2">
           <span className="text-2xl font-black text-pitch-white">{match.stats.score.home}</span>

@@ -2,6 +2,7 @@
 Match processing router — POST /process-match
 """
 import asyncio
+import secrets
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -10,7 +11,6 @@ from fastapi import APIRouter, HTTPException, Security, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from app.models.match import ProcessMatchRequest, ProcessMatchResponse, MatchStatus
-from app.services.pipeline import MatchPipeline
 from app.services.firestore_client import (
     update_match_status,
     write_match_analytics,
@@ -31,7 +31,7 @@ _executor = ThreadPoolExecutor(max_workers=int(os.getenv("PIPELINE_WORKERS", "2"
 def _verify_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
     if not API_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Server misconfiguration: missing API_SECRET_KEY")
-    if credentials.credentials != API_SECRET_KEY:
+    if not secrets.compare_digest(credentials.credentials, API_SECRET_KEY):
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
     return credentials.credentials
 
@@ -54,6 +54,7 @@ def _run_pipeline(match_id: str, video_url: str, team_colors=None, user_id: str 
             logger.warning(f"Progress update failed: {e}")
 
     try:
+        from app.services.pipeline import MatchPipeline
         pipeline = MatchPipeline(progress_callback=progress_cb)
         analytics = pipeline.run(match_id, video_url, team_colors)
 
@@ -69,17 +70,18 @@ def _run_pipeline(match_id: str, video_url: str, team_colors=None, user_id: str 
         logger.info(f"Pipeline succeeded for match {match_id}")
 
     except Exception as exc:
-        logger.exception(f"Pipeline failed for match {match_id}: {exc}")
+        logger.error("Pipeline failed for match %s (%s)", match_id, type(exc).__name__)
         try:
             update_match_status(
                 match_id,
                 MatchStatus.ERROR,
-                error_message=f"Processing failed: {str(exc)[:200]}",
+                error_message="Experimental processing failed. Check engine configuration and video compatibility.",
             )
             if user_id:
-                append_audit_log(match_id, user_id, "pipeline_failed", {"error": str(exc)[:200]})
+                append_audit_log(match_id, user_id, "pipeline_failed", {"errorType": type(exc).__name__})
         except Exception as inner:
             logger.error(f"Failed to update error status: {inner}")
+        raise
 
 
 @router.post("/process-match", response_model=ProcessMatchResponse)
@@ -89,9 +91,11 @@ async def process_match(
     token: str = Security(_verify_token),
 ):
     """
-    Accepts a match processing request, immediately queues it, and returns.
-    The pipeline runs asynchronously — Firestore is updated on completion.
+    Research processing keeps the HTTP request alive until completion.
+    Firestore is updated throughout; use a durable queue before scaling.
     """
+    if os.getenv("ENABLE_EXPERIMENTAL_ANALYTICS") != "true":
+        raise HTTPException(status_code=503, detail="Experimental analytics are disabled. Use the video review room.")
     logger.info(f"Received process-match request for matchId={request.matchId}")
 
     # Update status to processing immediately
@@ -110,11 +114,14 @@ async def process_match(
         request.teamColors,
         request.userId or "",
     )
-    loop.run_in_executor(_executor, fn)
+    try:
+        await loop.run_in_executor(_executor, fn)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Match processing failed")
 
-    return ProcessMatchResponse(status="queued", message="Match queued for processing")
+    return ProcessMatchResponse(status="completed", message="Experimental analysis completed; calibration is not validated")
 
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "pitchlens-api"}
+    return {"status": "ok", "service": "pitchlens-api", "experimentalAnalyticsEnabled": os.getenv("ENABLE_EXPERIMENTAL_ANALYTICS") == "true"}

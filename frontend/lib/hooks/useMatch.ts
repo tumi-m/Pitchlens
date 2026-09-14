@@ -9,7 +9,8 @@ export function useMatch(matchId: string) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!matchId) return;
+    setMatch(null); setLoading(true);
+    if (!matchId) { setLoading(false); return; }
     const unsub = subscribeToMatch(matchId, (m) => {
       setMatch(m);
       setLoading(false);
@@ -25,6 +26,7 @@ export function useUserMatches(userId: string | undefined) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setMatches([]); setLoading(true);
     if (!userId) { setLoading(false); return; }
     const unsub = subscribeToUserMatches(userId, (m) => {
       setMatches(m);

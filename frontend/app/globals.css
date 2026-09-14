@@ -56,7 +56,7 @@
   }
 
   .pitch-button-primary {
-    @apply pitch-button bg-pitch-green text-white hover:bg-pitch-green-light
+    @apply pitch-button bg-pitch-green text-pitch-black hover:bg-pitch-green-light
       shadow-glow hover:shadow-lg active:scale-[0.98];
   }
 
@@ -92,3 +92,10 @@
     scrollbar-width: none;
   }
 }
+
+@layer components {
+  .pitch-input { @apply bg-pitch-black border border-pitch-indigo-soft/50 rounded-xl px-4 py-3 text-pitch-white focus:outline-none focus:ring-2 focus:ring-pitch-green; }
+}
+button:focus-visible, a:focus-visible { outline: 2px solid #65e6a4; outline-offset: 4px; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }

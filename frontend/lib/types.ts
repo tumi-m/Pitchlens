@@ -1,3 +1,4 @@
+import type { VideoReview } from '@/lib/review/types';
 import { Timestamp } from 'firebase/firestore';
 
 // ── Auth / User ────────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ export interface Match {
   errorMessage?: string;
   processingProgress?: number;
   stats?: MatchStats;
+  review?: VideoReview;
   duration?: number; // seconds
   createdAt: Timestamp;
   updatedAt: Timestamp;

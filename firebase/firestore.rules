@@ -24,9 +24,9 @@ service cloud.firestore {
       allow read: if isAuthenticated() && isOwner(userId);
       allow create: if isAuthenticated() && isOwner(userId)
         && request.resource.data.keys().hasAll(['email', 'teams', 'preferences', 'role'])
-        && request.resource.data.role in ['player', 'coach', 'club-owner'];
+        && request.resource.data.role == 'player';
       allow update: if isAuthenticated() && isOwner(userId)
-        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['email', 'createdAt']);
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['email', 'createdAt', 'role']);
       allow delete: if false; // soft-delete only via Cloud Function
     }
 
@@ -51,7 +51,8 @@ service cloud.firestore {
       // Only owner can create; status must start as 'uploading'
       allow create: if isAuthenticated()
         && request.resource.data.userId == request.auth.uid
-        && request.resource.data.status == 'uploading';
+        && request.resource.data.status == 'uploading'
+        && !request.resource.data.keys().hasAny(['stats', 'review', 'errorMessage', 'storagePath']);
 
       // Owner can update title/metadata; Cloud Functions update status/stats
       // (functions use admin SDK which bypasses rules)
@@ -59,7 +60,7 @@ service cloud.firestore {
         && resource.data.userId == request.auth.uid
         && request.resource.data.userId == request.auth.uid
         // Prevent client from changing status directly
-        && request.resource.data.status == resource.data.status;
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title', 'updatedAt']);
 
       allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
     }

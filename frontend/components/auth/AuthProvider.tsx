@@ -1,23 +1,15 @@
-'use client';
-import { createContext, useContext, ReactNode } from 'react';
-import { User } from 'firebase/auth';
-
-interface AuthContextValue {
-  user: User | null;
-  loading: boolean;
-}
-
-const AuthContext = createContext<AuthContextValue>({ user: null, loading: false });
-
-// Auth is bypassed for now — mock a guest user so upload/dashboard are accessible
-const MOCK_USER = { uid: 'guest', email: 'guest@pitchlens.app' } as User;
-
+ 'use client';
+import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { auth } from '@/lib/firebase/config';
+const AuthContext = createContext<{ user: User | null; loading: boolean }>({ user: null, loading: true });
 export function AuthProvider({ children }: { children: ReactNode }) {
-  return (
-    <AuthContext.Provider value={{ user: MOCK_USER, loading: false }}>
-      {children}
-    </AuthContext.Provider>
-  );
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    if (!process.env.NEXT_PUBLIC_FIREBASE_API_KEY) { setLoading(false); return; }
+    return onAuthStateChanged(auth, value => { setUser(value); setLoading(false); }, () => setLoading(false));
+  }, []);
+  return <AuthContext.Provider value={{ user, loading }}>{children}</AuthContext.Provider>;
 }
-
 export const useAuthContext = () => useContext(AuthContext);

@@ -1,6 +1,9 @@
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, List
 from enum import Enum
+import re
+from urllib.parse import urlparse
+import os
 
 
 class TeamColors(BaseModel):
@@ -17,9 +20,18 @@ class ProcessMatchRequest(BaseModel):
     @field_validator("matchId")
     @classmethod
     def match_id_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("matchId cannot be empty")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", v):
+            raise ValueError("Invalid matchId")
         return v
+
+    @field_validator("videoUrl")
+    @classmethod
+    def allowed_video_url(cls, value: str) -> str:
+        url = urlparse(value)
+        bucket = os.getenv("FIREBASE_STORAGE_BUCKET", "")
+        if not bucket or url.scheme != "https" or url.hostname != "storage.googleapis.com" or url.username or url.password or url.port not in (None, 443) or not url.path.startswith(f"/{bucket}/"):
+            raise ValueError("Expected a signed URL for the configured Firebase bucket")
+        return value
 
 
 class ProcessMatchResponse(BaseModel):
@@ -112,8 +124,9 @@ class PassNetworkNode(BaseModel):
 
 
 class PassNetworkEdge(BaseModel):
-    fromId: str
-    toId: str
+    model_config = ConfigDict(populate_by_name=True)
+    fromId: str = Field(alias="from")
+    toId: str = Field(alias="to")
     count: int
     accuracy: float
 
@@ -135,6 +148,7 @@ class PressureIndex(BaseModel):
 
 
 class MatchAnalytics(BaseModel):
+    provenance: str = "experimental-uncalibrated"
     score: ScoreModel
     possession: PossessionModel
     passes: TeamPassStats

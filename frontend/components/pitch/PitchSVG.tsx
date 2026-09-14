@@ -1,5 +1,5 @@
 'use client';
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import type { PlayerHeatmap, VoronoiFrame, PassNetwork } from '@/lib/types';
 
@@ -44,8 +44,8 @@ export function PitchSVG({
   }, []);
 
   const { width, height } = dimensions;
-  const scaleX = (x: number) => (x / PITCH_WIDTH) * width;
-  const scaleY = (y: number) => (y / PITCH_HEIGHT) * height;
+  const scaleX = useCallback((x: number) => (x / PITCH_WIDTH) * width, [width]);
+  const scaleY = useCallback((y: number) => (y / PITCH_HEIGHT) * height, [height]);
 
   useEffect(() => {
     const svg = d3.select(svgRef.current);
@@ -64,7 +64,7 @@ export function PitchSVG({
     } else if (mode === 'passnetwork' && passNetwork) {
       renderPassNetwork(layer, passNetwork, scaleX, scaleY, homeColor, awayColor);
     }
-  }, [mode, heatmaps, voronoi, passNetwork, width, height]);
+  }, [mode, heatmaps, voronoi, passNetwork, width, height, scaleX, scaleY, homeColor, awayColor]);
 
   return (
     <svg
