@@ -28,14 +28,16 @@ export interface VideoReview {
   }>;
   events: ReviewEvent[];
   notes: string;
+  tracking?: Record<string, unknown>;
 }
 export interface ReviewEvent {
   id: string;
   timestamp: number;
   team: "home" | "away";
-  type: "goal" | "shot" | "save" | "pass" | "foul" | "corner";
+  type: "goal" | "shot" | "save" | "pass" | "foul" | "corner" | "turnover";
   note: string;
-  source: "manual";
+  source: "manual" | "cv-candidate";
+  needsReview?: boolean;
 }
 export function summariseEvents(events: ReviewEvent[]) {
   const count = (team: "home" | "away", type: ReviewEvent["type"]) =>
