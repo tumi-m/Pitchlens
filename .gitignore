@@ -11,3 +11,9 @@ firebase/functions/lib/
 frontend/test-results/
 frontend/playwright-report/
 .DS_Store
+backend/models/*.pt
+backend/models/*.download
+backend/.vision/
+backend/.ultralytics/
+backend/.vision-env/
+backend/models/*.onnx

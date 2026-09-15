@@ -1,4 +1,5 @@
 "use client";
+import { VisionJobs } from "@/components/vision/VisionJobs";
 import { ImportReview } from "@/components/review/ImportReview";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -36,8 +37,8 @@ export default function DashboardIndexPage() {
                 Your Matches
               </h1>
               <p className="text-pitch-muted mt-1">
-                {matches.length} saved review{matches.length !== 1 ? "s" : ""} ·
-                This device
+                {matches.length} saved manual review
+                {matches.length !== 1 ? "s" : ""} · This device
               </p>
             </div>
             <div className="flex flex-wrap gap-3 items-start">
@@ -48,6 +49,7 @@ export default function DashboardIndexPage() {
             </div>
           </div>
 
+          <VisionJobs />
           {loading ? (
             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {Array.from({ length: 3 }).map((_, i) => (

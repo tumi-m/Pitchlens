@@ -7,7 +7,7 @@ The repository was a visually developed prototype with three competing processin
 ## What was wrong and what changed
 
 1. **Invented outcomes:** the browser seeded random goals, fouls, passes, xG and narratives from filename/size. Even a failed video could become a completed match. Removed that processing path; corrupt videos fail visibly. New reviews contain real metadata and user-tagged evidence.
-2. **Misleading AI provenance:** six frame detections were mixed with simulated statistics and labelled live analytics. New AI output is restricted to actual sample-frame boxes, labels and confidence. It makes no claims about team identity or match outcomes.
+2. **Misleading AI provenance:** six frame detections were mixed with simulated statistics and labelled live analytics. The legacy sample-frame output is restricted to boxes, labels and confidence. The new local vision path separately processes the whole video with football ball detection, kit grouping and short-term tracking; derived event candidates retain their uncertain provenance.
 3. **No usable playback:** uploaded footage was not retained in the primary flow. Added IndexedDB video persistence, playback after reload and timestamp navigation.
 4. **No correction loop:** users could not fix generated claims. Added editable manual tags (time, team, type and note), undo for the last removal, notes, observation counts and structured JSON export/import with original-video reconnection.
 5. **Fake authentication:** a forged guest object was presented as a Firebase user. Restored real auth subscriptions and made local guest review explicit without a fake account.
@@ -22,8 +22,14 @@ The repository was a visually developed prototype with three competing processin
 14. **Cloud startup failure:** Firestore credentials were resolved at module import. Database initialization is lazy, allowing credential-free health checks.
 15. **Lost background work:** the API returned before its thread completed. It now awaits processing so request-based compute remains active. A durable queue is still the correct production architecture.
 16. **Backend correctness defects:** fixed corner detection's invalid `any` call, duplicate goal/shot aggregation, frontend/backend pass-edge names and tracker subsampling rate. Bounded retained jersey crops. Empty player detection cannot become a successful analysis.
-17. **Unsupported claims:** removed guaranteed sub-minute professional analytics, unsupported subscriptions and retention promises from the homepage. The new design describes the working review room.
+17. **Unsupported claims:** removed guaranteed sub-minute professional analytics, unsupported subscriptions and retention promises from the homepage. The new design describes automatic video inference and its measurement limits, with manual review as a separate mode.
 18. **Delivery quality:** added a repeatable browser suite, real synthetic video fixture, backend contract tests, noninteractive lint configuration, setup examples and ignored secrets/generated files. Updated the framework and vulnerable dependencies.
+
+## September 15 — Automatic inference delivered
+
+The default upload now creates an authenticated local vision job. The worker decodes the video, runs separate player and football-ball neural detectors, estimates background camera motion, associates short-term tracks and groups jersey colours. The report plays the source with time-aligned overlays, exposes missing observations, links possible transfers to footage and exports raw evidence with model checksums. No generative model creates match facts.
+
+The supplied 360p indoor match exposed poor tiny-ball coverage, ID fragmentation and jersey-vote contamination in the first implementation. Camera compensation and current-frame kit assignment address specific tracking faults. A dedicated football ONNX model replaces the generic ball class. Reliable event totals still require independent annotations and evaluation; raising detection coverage alone is not proof of accuracy.
 
 ## Priority 1 — Trust and a complete coaching workflow
 
@@ -69,4 +75,4 @@ The repository was a visually developed prototype with three competing processin
 
 ## What still prevents validated automatic analytics
 
-The repository does not include a representative match-video evaluation set, event labels, a calibrated pitch model, trained/validated xG model or production service configuration. Those are required inputs to demonstrate automatic correctness, accuracy, processing cost and latency. This change makes local review usable and stops false analytics; it does not pretend those missing foundations are solved.
+The repository does not include a representative match-video evaluation set, event labels, a calibrated pitch model, trained/validated xG model or production service configuration. Those are required inputs to demonstrate automatic correctness, accuracy, processing cost and latency. Local video inference now works through the application, with detection overlays, colour grouping, tracking, coverage and temporal event candidates. It does not establish commercial event accuracy or solve the remaining validation/calibration requirements.

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
+import { VisionUpload } from "@/components/vision/VisionUpload";
 import { useDropzone } from "react-dropzone";
 import { useRouter } from "next/navigation";
 import { Upload, Film, ArrowRight, Loader2 } from "lucide-react";
@@ -12,6 +13,7 @@ import { formatFileSize } from "@/lib/utils/analytics";
 
 export default function UploadPage() {
   const router = useRouter();
+  const [manual, setManual] = useState(false);
   const { user } = useAuthContext();
   const [file, setFile] = useState<File | null>(null);
   const [home, setHome] = useState("Home Team");
@@ -102,6 +104,7 @@ export default function UploadPage() {
       active.current = null;
     }
   }
+  if (!manual) return <VisionUpload onManual={() => setManual(true)} />;
   return (
     <>
       <Navbar />

@@ -18,13 +18,13 @@ export default function HomePage() {
                 <span className="text-pitch-green">Improve the next.</span>
               </h1>
               <p className="text-pitch-muted text-lg max-w-lg leading-relaxed mb-8">
-                Turn your match footage into a coaching conversation. Review the
-                play, tag key moments, and keep the evidence beside every
-                observation.
+                Run computer vision across your match footage. Detect players
+                and the ball, follow kit groups, and inspect automatically
+                discovered event candidates.
               </p>
               <div className="flex flex-wrap gap-3">
                 <Link href="/upload" className="pitch-button-primary py-3 px-6">
-                  Review a match <ArrowRight size={18} />
+                  Analyse a match <ArrowRight size={18} />
                 </Link>
                 <Link
                   href="/dashboard"
@@ -39,7 +39,7 @@ export default function HomePage() {
             </div>
             <div className="rounded-3xl border border-pitch-indigo-soft/40 bg-pitch-indigo-deep/30 p-7">
               <div className="flex justify-between text-xs text-pitch-muted mb-6">
-                <span>THE REVIEW ROOM</span>
+                <span>COMPUTER VISION</span>
                 <span>WORKFLOW PREVIEW</span>
               </div>
               <svg
@@ -82,8 +82,8 @@ export default function HomePage() {
                 The build-up matters as much as the finish.
               </p>
               <p className="text-sm text-pitch-muted mt-2">
-                Jump to the footage behind a tag. Add a coaching note. Bring it
-                to the next session.
+                Inspect the detections behind each observation. See where the
+                ball was visible and where the evidence is missing.
               </p>
             </div>
           </section>
@@ -92,12 +92,12 @@ export default function HomePage() {
               {
                 icon: Film,
                 title: "Bring your footage",
-                text: "Open a browser-compatible match video. Keep playback and your review together on this device.",
+                text: "Open an H.264 MP4. The local vision worker processes your footage on this computer.",
               },
               {
                 icon: Flag,
-                title: "Record what happened",
-                text: "Tag goals, shots, saves, passes, fouls and corners at the exact moment. Remove mistakes and save coaching notes.",
+                title: "Detect and track",
+                text: "Automatically detect players and the ball, group kit colours and discover possible passes and turnovers.",
               },
               {
                 icon: Download,

@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { AnalyseSavedVideo } from "@/components/vision/AnalyseSavedVideo";
 import { EditEvent } from "./EditEvent";
 import { RelinkVideo } from "./RelinkVideo";
 import { ChevronLeft, Download, Trash2, Pencil } from "lucide-react";
@@ -151,6 +152,7 @@ export function ReviewRoom({ match }: { match: Match }) {
       <Navbar />
       <main className="pt-24 pb-16 px-4">
         <div className="max-w-7xl mx-auto space-y-7">
+          <AnalyseSavedVideo id={match.id} title={match.title} />
           <header className="flex flex-wrap justify-between gap-4">
             <div>
               <Link

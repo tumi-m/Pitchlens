@@ -9,6 +9,9 @@ test("video review survives reload, tags evidence, exports and deletes", async (
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/upload");
   await page
+    .getByRole("button", { name: "Open manual review instead" })
+    .click();
+  await page
     .getByLabel("Match video")
     .setInputFiles(path.join(__dirname, "fixtures/review.mp4"));
   await page.getByLabel("Home team").fill("Cape Town Reds");
@@ -61,6 +64,9 @@ test("invalid video fails visibly and does not create a fabricated match", async
   page,
 }) => {
   await page.goto("/upload");
+  await page
+    .getByRole("button", { name: "Open manual review instead" })
+    .click();
   await page.getByLabel("Match video").setInputFiles({
     name: "broken.mp4",
     mimeType: "video/mp4",
@@ -89,7 +95,7 @@ test("mobile navigation and review form fit viewport", async ({ page }) => {
   await page.getByRole("button", { name: "Toggle mobile menu" }).click();
   await page.getByRole("link", { name: "Upload", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "Start with the footage." }),
+    page.getByRole("heading", { name: "Let the footage do the talking." }),
   ).toBeVisible();
   expect(
     await page.evaluate(
@@ -122,6 +128,9 @@ test("AI frames show provider observations without fabricated statistics", async
     });
   });
   await page.goto("/upload");
+  await page
+    .getByRole("button", { name: "Open manual review instead" })
+    .click();
   await page
     .getByLabel("Match video")
     .setInputFiles(path.join(__dirname, "fixtures/review.mp4"));
@@ -157,6 +166,9 @@ test("AI service failure preserves usable video review and reports failure", asy
   });
   await page.goto("/upload");
   await page
+    .getByRole("button", { name: "Open manual review instead" })
+    .click();
+  await page
     .getByLabel("Match video")
     .setInputFiles(path.join(__dirname, "fixtures/review.mp4"));
   await page.getByRole("checkbox").check();
@@ -177,36 +189,75 @@ test("AI service failure preserves usable video review and reports failure", asy
   expect(record).not.toHaveProperty("stats");
 });
 
-test('import, reconnect, edit and undo preserve a portable review', async ({ page }) => {
-  await page.goto('/dashboard');
-  await page.getByLabel('Import review file', { exact: true }).setInputFiles(path.join(__dirname, 'fixtures/review.json'));
-  await expect(page.getByRole('heading', { name: 'Portable QA — Reds vs Blues', exact: true })).toBeVisible();
-  await expect(page.getByText('Imported review.', { exact: false })).toBeVisible();
-  await page.getByLabel('Reconnect video file', { exact: true }).setInputFiles(path.join(__dirname, 'fixtures/review.mp4'));
-  await expect(page.getByRole('button', { name: 'goal', exact: true })).toBeEnabled();
-  await page.getByRole('button', { name: 'Edit goal at 0:01', exact: true }).click();
-  await page.getByLabel('Event timestamp in seconds').fill('2.5');
-  await page.getByLabel('Event team', { exact: true }).selectOption('away');
-  await page.getByLabel('Event type', { exact: true }).selectOption('shot');
-  await page.getByLabel('Edit event note', { exact: true }).fill('Corrected QA observation');
-  await page.getByRole('button', { name: 'Save event', exact: true }).click();
-  await expect(page.getByText('Corrected QA observation', { exact: true })).toBeVisible();
+test("import, reconnect, edit and undo preserve a portable review", async ({
+  page,
+}) => {
+  await page.goto("/dashboard");
+  await page
+    .getByLabel("Import review file", { exact: true })
+    .setInputFiles(path.join(__dirname, "fixtures/review.json"));
+  await expect(
+    page.getByRole("heading", {
+      name: "Portable QA — Reds vs Blues",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Imported review.", { exact: false }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Reconnect video file", { exact: true })
+    .setInputFiles(path.join(__dirname, "fixtures/review.mp4"));
+  await expect(
+    page.getByRole("button", { name: "goal", exact: true }),
+  ).toBeEnabled();
+  await page
+    .getByRole("button", { name: "Edit goal at 0:01", exact: true })
+    .click();
+  await page.getByLabel("Event timestamp in seconds").fill("2.5");
+  await page.getByLabel("Event team", { exact: true }).selectOption("away");
+  await page.getByLabel("Event type", { exact: true }).selectOption("shot");
+  await page
+    .getByLabel("Edit event note", { exact: true })
+    .fill("Corrected QA observation");
+  await page.getByRole("button", { name: "Save event", exact: true }).click();
+  await expect(
+    page.getByText("Corrected QA observation", { exact: true }),
+  ).toBeVisible();
   await page.reload();
-  await page.getByRole('button', { name: 'Remove shot at 0:02', exact: true }).click();
-  await expect(page.getByText('Corrected QA observation', { exact: true })).not.toBeVisible();
-  await page.getByRole('button', { name: 'Undo last removal', exact: true }).click();
-  await expect(page.getByText('Corrected QA observation', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Export review', exact: true }).click();
-  await page.getByText('Preview exported data', { exact: true }).click();
-  const data = JSON.parse(await page.getByLabel('Review JSON').inputValue());
-  expect(data.review.events[0]).toMatchObject({ timestamp: 2.5, team: 'away', type: 'shot' });
+  await page
+    .getByRole("button", { name: "Remove shot at 0:02", exact: true })
+    .click();
+  await expect(
+    page.getByText("Corrected QA observation", { exact: true }),
+  ).not.toBeVisible();
+  await page
+    .getByRole("button", { name: "Undo last removal", exact: true })
+    .click();
+  await expect(
+    page.getByText("Corrected QA observation", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Export review", exact: true })
+    .click();
+  await page.getByText("Preview exported data", { exact: true }).click();
+  const data = JSON.parse(await page.getByLabel("Review JSON").inputValue());
+  expect(data.review.events[0]).toMatchObject({
+    timestamp: 2.5,
+    team: "away",
+    type: "shot",
+  });
   expect(data.summary[0].goals).toBe(0);
   expect(data.summary[1].shots).toBe(1);
 });
 
-test('invalid imports leave the workspace unchanged', async ({ page }) => {
-  await page.goto('/dashboard');
-  await page.getByLabel('Import review file', { exact: true }).setInputFiles({ name: 'bad.json', mimeType: 'application/json', buffer: Buffer.from('{"schemaVersion": 99}') });
-  await expect(page.getByRole('alert')).toBeVisible();
-  await expect(page.getByText('No matches yet', { exact: true })).toBeVisible();
+test("invalid imports leave the workspace unchanged", async ({ page }) => {
+  await page.goto("/dashboard");
+  await page.getByLabel("Import review file", { exact: true }).setInputFiles({
+    name: "bad.json",
+    mimeType: "application/json",
+    buffer: Buffer.from('{"schemaVersion": 99}'),
+  });
+  await expect(page.getByRole("alert")).toBeVisible();
+  await expect(page.getByText("No matches yet", { exact: true })).toBeVisible();
 });

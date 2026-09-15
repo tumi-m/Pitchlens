@@ -1,8 +1,14 @@
 # Pitchlens
 
+**Automatic local computer vision is now available.** Start with [the vision setup guide](docs/VISION.md). Upload a video to run player/ball detection, kit grouping, tracking and evidence-linked possession/pass candidates. Manual review remains a secondary workflow.
+
 Football video review grounded in footage.
 
-## Run the working app
+## Automatic analysis
+
+Follow [docs/VISION.md](docs/VISION.md) to install the local model and start the vision worker. The default upload page creates a background analysis job and opens a detection report. Videos/results are stored on this computer, outside browser storage.
+
+## Manual review without a vision worker
 
 Requires Node 20.9+ (Node 22 LTS recommended) and npm.
 
@@ -14,7 +20,7 @@ npm run dev
 
 Open http://localhost:3000. No Firebase account, paid service or environment file is needed for local video review.
 
-1. Choose an MP4, WebM or MOV video up to 500 MB. The browser must support its codec; H.264 MP4 is a good baseline.
+1. Select **Open manual review instead**, then choose an MP4, WebM or MOV video up to 500 MB. The browser must support its codec; H.264 MP4 is a good baseline.
 2. Enter the team names and open the review room.
 3. Pause/seek the video and tag goals, shots, saves, passes, fouls or corners. Add an optional note. A goal counts as one shot attempt; do not add a duplicate shot tag for that goal.
 4. Click timeline timestamps to revisit the footage. Edit a tag’s time, team, type or note; remove incorrect tags with one-step undo; save coaching notes.
@@ -22,11 +28,11 @@ Open http://localhost:3000. No Firebase account, paid service or environment fil
 
 **Data stays on this device:** IndexedDB stores video; localStorage stores review metadata. Clearing browser data removes reviews. Exported JSON contains timestamps, notes, observed counts and optional frame evidence, but not the video. Keep your original footage. Import the exported JSON from Your Matches, then reconnect the original video. Imports create a separate review and are labelled as supplied, unverified observations. Files up to 3 MB and 10,000 tags are supported.
 
-**Measurements:** duration and resolution come from the video decoder. Event counts come from explicitly labelled manual tags. Untagged events are unknown. The app does not claim automated goals, possession, xG, pass completion or calibrated pitch heatmaps.
+**Manual-mode measurements:** duration and resolution come from the video decoder. Event counts come from explicitly labelled manual tags. Untagged events are unknown. This mode does not calculate automatic analytics. The vision mode separately estimates observed possession and pass candidates, with explicit coverage; it does not measure goals, xG or calibrated pitch heatmaps.
 
 ## Optional AI frame inspection
 
-Copy `frontend/.env.example` to `frontend/.env.local` and set `ROBOFLOW_API_KEY` on the server. Restart Next.js. The upload page will offer AI frame inspection.
+Copy `frontend/.env.example` to `frontend/.env.local` and set `ROBOFLOW_API_KEY` on the server. Restart Next.js. The manual upload mode will offer AI frame inspection.
 
 Six evenly spaced JPEG frames are sent to Roboflow. The review shows the returned boxes, class labels, confidence and timestamps. A successful empty result means no objects were detected in that sample. Provider failures are reported as partial/failed; they never create substitute match statistics. Frame positions are camera-image coordinates and are not pitch coordinates.
 
@@ -34,14 +40,16 @@ Development permits local guest inference. **Production requires Firebase sign-i
 
 ## Repository map
 
-- `frontend/app/upload`: decode video, optional frame inspection, persist review.
+- `frontend/app/upload`: automatic vision upload by default; optional manual review.
+- `frontend/app/vision`, `components/vision`, `app/api/vision`: job progress, detection overlays, estimates and local-worker proxy.
+- `backend/app/vision`: local YOLO + football ONNX engine with camera-motion tracking, temporal measurements and authenticated worker.
 - `frontend/components/review/ReviewRoom.tsx`: player, timeline, manual tags, notes, export, deletion.
 - `frontend/lib/review`: typed evidence contract, summary calculations, IndexedDB video storage.
 - `frontend/app/api/infer`: bounded JPEG proxy, explicit errors, production token verification.
 - `frontend/lib/firebase`: optional authentication and legacy cloud access. Local reviews are not silently synced to Firestore.
 - `frontend/app/dashboard` and `report`: current review room; older statistics are clearly labelled unverified, including PDF exports.
 - `firebase`: optional research deployment rules and storage-to-engine dispatch.
-- `backend`: experimental tracking/analytics code; disabled by default and not part of the local review flow.
+- `backend/app/services/pipeline.py`: older experimental cloud analytics; disabled by default and separate from the local vision engine.
 - `docs/IMPROVEMENTS.md`: findings, implemented fixes and phased product/engineering roadmap.
 
 ## Tests
