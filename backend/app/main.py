@@ -8,12 +8,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from app.routers import matches
+from app.routers import local_cv
 
-# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -28,7 +27,6 @@ async def lifespan(app: FastAPI):
     logger.info("Pitchlens API shutting down.")
 
 
-# ── App factory ───────────────────────────────────────────────────────────
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Pitchlens AI Engine",
@@ -39,7 +37,6 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if os.getenv("ENV") != "production" else None,
     )
 
-    # ── Middleware ─────────────────────────────────────────────────────────
     allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
     app.add_middleware(
         CORSMiddleware,
@@ -49,7 +46,6 @@ def create_app() -> FastAPI:
         allow_headers=["Authorization", "Content-Type"],
     )
 
-    # ── Global exception handler ───────────────────────────────────────────
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
         logger.exception(f"Unhandled exception on {request.method} {request.url}: {exc}")
@@ -58,10 +54,9 @@ def create_app() -> FastAPI:
             content={"detail": "Internal server error. The pitch is temporarily unavailable."},
         )
 
-    # ── Routers ────────────────────────────────────────────────────────────
     app.include_router(matches.router, prefix="/api/v1", tags=["matches"])
+    app.include_router(local_cv.router, prefix="/api/v1", tags=["local-cv"])
 
-    # Root redirect to health
     @app.get("/")
     async def root():
         return {"service": "pitchlens-api", "status": "operational", "version": "0.1.0"}
@@ -77,7 +72,7 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8080")),
-        workers=1,  # single worker — GPU not fork-safe
+        workers=1,
         log_level="info",
         reload=os.getenv("ENV") == "development",
     )
