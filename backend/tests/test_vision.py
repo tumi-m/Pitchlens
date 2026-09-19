@@ -285,3 +285,122 @@ def test_weak_detections_sustain_but_cannot_create_tracks():
     assert tracker.update([weak], 0, identity) == []
     known = tracker.update([{**weak, "confidence": 0.8}], 0.2, identity)[0]["id"]
     assert tracker.update([weak], 0.4, identity)[0]["id"] == known
+
+
+def test_ball_tracker_uses_motion_to_reject_a_distant_distractor():
+    from app.vision.ball_tracking import BallTracker
+
+    tracker = BallTracker()
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    def ball(x, confidence=0.8):
+        return {"x": x, "y": 100, "confidence": confidence, "box": [x - 3, 97, x + 3, 103]}
+
+    first = tracker.update([ball(50)], 0, identity, (360, 640))
+    for t, x in [(0.1, 55), (0.2, 60), (0.3, 65)]:
+        assert tracker.update([ball(x)], t, identity, (360, 640))["trackId"] == first["trackId"]
+    found = tracker.update([ball(70, 0.7), ball(550, 0.85)], 0.4, identity, (360, 640))
+    assert found["x"] == 70
+    assert found["observed"] is True
+
+
+def test_ball_tracker_does_not_fill_gaps_and_resets_after_a_cut():
+    from app.vision.ball_tracking import BallTracker
+
+    tracker = BallTracker()
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    ball = {"x": 50, "y": 100, "confidence": 0.8}
+    first = tracker.update([ball], 0, identity, (360, 640))
+    assert tracker.update([], 0.1, identity, (360, 640)) is None
+    assert tracker.update([ball], 0.2, identity, (360, 640))["trackId"] == first["trackId"]
+    assert (
+        tracker.update([ball], 0.3, identity, (360, 640), cut=True)["trackId"] != first["trackId"]
+    )
+
+
+def test_ball_tracker_compensates_camera_pan_and_confirms_weak_candidates():
+    from app.vision.ball_tracking import BallTracker
+
+    tracker = BallTracker()
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    pan = np.array([[1.0, 0.0, 100.0], [0.0, 1.0, 0.0]])
+    assert tracker.update([{"x": 10, "y": 20, "confidence": 0.3}], 0, identity, (360, 640)) is None
+    assert (
+        tracker.update([{"x": 110, "y": 20, "confidence": 0.3}], 0.1, pan, (360, 640))["x"] == 110
+    )
+    assert (
+        tracker.update([{"x": 510, "y": 20, "confidence": 0.3}], 0.2, identity, (360, 640)) is None
+    )
+
+
+def test_ball_identity_switch_is_not_a_transfer():
+    frames = [frame(0), frame(0.2), frame(0.4, [player(2, 1)]), frame(0.6, [player(2, 1)])]
+    for i, f in enumerate(frames):
+        f["ball"]["trackId"] = 1 if i < 2 else 2
+    assert derive_metrics(frames, 5, 0.8)["events"] == []
+
+
+def test_white_and_dark_jerseys_are_not_discarded():
+    from app.vision.engine import jersey
+
+    for value in (25, 230):
+        image = np.full((100, 100, 3), value, dtype=np.uint8)
+        assert jersey(image, [10, 10, 50, 90]) is not None
+
+
+def test_invalid_analysis_options_are_rejected_before_upload(service, monkeypatch, tmp_path):
+    _, client = service
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    monkeypatch.setenv("VISION_MODEL_PATH", str(model))
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(model))
+    for query in ("profile=unknown", "fps=nan", "fps=100"):
+        response = client.post(
+            f"/jobs?{query}", content=b"x", headers={"Content-Type": "video/mp4"}
+        )
+        assert response.status_code == 400
+
+
+def test_tiled_ball_inference_merges_overlap_and_preserves_source_coordinates():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    class Model:
+        def predict(self, image, **kwargs):
+            ys, xs = np.where(image[:, :, 0] > 0)
+            boxes = np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
+            return [SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.array([0.8])))]
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    image = np.zeros((360, 640, 3), np.uint8)
+    image[176:185, 316:325] = 255
+    found = detector.detect(image)
+    assert len(found) == 1
+    assert (found[0]["x"], found[0]["y"]) == (320, 180)
+
+
+def test_role_aware_kit_fit_keeps_light_and_dark_parts_of_a_striped_team():
+    from app.vision.engine import train_colours
+
+    # Representative LAB observations: one white kit and several shades of a striped kit.
+    features = [[245.0, 126.0, 133.0]] * 22 + [[134.0, 119.0, 137.0]] * 12
+    features += [[181.0, 122.0, 132.0]] * 6 + [[105.0, 124.0, 124.0]] * 10
+    centres, _ = train_colours(features, n_clusters=2)
+    dark = assign_team(np.array([105.0, 124.0, 124.0]), centres, use_hue=False)
+    medium = assign_team(np.array([134.0, 119.0, 137.0]), centres, use_hue=False)
+    white = assign_team(np.array([245.0, 126.0, 133.0]), centres, use_hue=False)
+    assert dark == medium and dark >= 0
+    assert white >= 0 and white != dark
+
+
+def test_model_paths_do_not_depend_on_shell_directory(monkeypatch, tmp_path):
+    from app.vision.profiles import model_paths
+
+    monkeypatch.delenv("VISION_MODEL_PATH", raising=False)
+    monkeypatch.delenv("VISION_BALL_MODEL_PATH", raising=False)
+    before = model_paths()
+    monkeypatch.chdir(tmp_path)
+    assert model_paths() == before
+    assert all(p.is_absolute() for p in before)

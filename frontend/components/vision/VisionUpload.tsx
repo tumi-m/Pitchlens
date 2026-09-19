@@ -13,10 +13,13 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [percent, setPercent] = useState(0);
+  const [profiles, setProfiles] = useState<string[]>(["general"]);
+  const [profile, setProfile] = useState("general");
+  const [fps, setFps] = useState("3");
   const xhr = useRef<XMLHttpRequest | null>(null);
   useEffect(() => {
-    visionJson<{ available: boolean }>("health")
-      .then((x) => setAvailable(x.available))
+    visionJson<{ available: boolean; profiles?: string[] }>("health")
+      .then((x) => { setAvailable(x.available); setProfiles(x.profiles ?? ["general"]); })
       .catch(() => setAvailable(false));
     return () => xhr.current?.abort();
   }, []);
@@ -31,7 +34,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         xhr.current = req;
         req.open(
           "POST",
-          `/api/vision/jobs?title=${encodeURIComponent(title.trim() || file.name)}`,
+          `/api/vision/jobs?title=${encodeURIComponent(title.trim() || file.name)}&profile=${profile}&fps=${fps}`,
         );
         req.setRequestHeader(
           "Content-Type",
@@ -163,6 +166,29 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             shows detection coverage and unknown time. Kit groups need your team
             names; automatic pass candidates are estimates. Score, xG and
             physical speed are not yet measured.
+          </p>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <label className="text-sm">Footage type
+              <select className="pitch-input w-full mt-2" value={profile}
+                disabled={busy} onChange={(e) => setProfile(e.target.value)}>
+                <option value="general">Indoor / small-sided · baseline</option>
+                <option value="broadcast" disabled={!profiles.includes("broadcast")}>
+                  Full-pitch broadcast · experimental
+                </option>
+              </select>
+            </label>
+            <label className="text-sm">Analysis detail
+              <select className="pitch-input w-full mt-2" value={fps}
+                disabled={busy} onChange={(e) => setFps(e.target.value)}>
+                <option value="3">Quick · about 3 frames/sec</option>
+                <option value="6">Balanced · about 6 frames/sec</option>
+                <option value="10">Detailed · about 10 frames/sec</option>
+              </select>
+            </label>
+          </div>
+          <p className="text-xs text-pitch-muted">
+            Detailed analysis follows fast movement more closely and takes longer.
+            The broadcast model has not been validated for indoor matches.
           </p>
           {error && (
             <p role="alert" className="text-red-300">

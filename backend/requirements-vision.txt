@@ -4,6 +4,7 @@ uvicorn==0.52.4
 numpy==1.26.4
 opencv-python==4.10.0.84
 scikit-learn==1.9.1
+threadpoolctl==3.6.0
 ultralytics==8.4.152
 torch==2.14.0
 torchvision==0.29.0

@@ -67,9 +67,27 @@ export function VisionReport({ jobId }: { jobId: string }) {
       clearTimeout(timer);
     };
   }, [jobId]);
+  useEffect(() => {
+    const video = player.current;
+    if (!video || !result) return;
+    // Native timeupdate can fire only a few times/second; align boxes to decoded frames.
+    let callback = 0;
+    let stopped = false;
+    const update: VideoFrameRequestCallback = (_, metadata) => {
+      if (stopped) return;
+      setTime(metadata.mediaTime);
+      callback = video.requestVideoFrameCallback(update);
+    };
+    if (typeof video.requestVideoFrameCallback !== "function") return;
+    callback = video.requestVideoFrameCallback(update);
+    return () => {
+      stopped = true;
+      video.cancelVideoFrameCallback(callback);
+    };
+  }, [result]);
   // Binary lookup keeps playback cheap even for a full-length match.
   const frame = useMemo(() => {
-    if (!result) return null;
+    if (!result || !result.frames.length) return null;
     let l = 0,
       r = result.frames.length - 1;
     while (l < r) {

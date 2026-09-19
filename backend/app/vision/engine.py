@@ -11,9 +11,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 from sklearn.cluster import KMeans
+from threadpoolctl import threadpool_limits
 
-from app.vision.ball import BallDetector
+from app.vision.ball import create_ball_detector
+from app.vision.ball_tracking import BallTracker
 from app.vision.metrics import derive_metrics
+from app.vision.profiles import model_paths
 from app.vision.tracking import MotionTracker, camera_motion
 
 
@@ -64,8 +67,8 @@ def jersey(frame, box):
     ]
     if patch.size == 0:
         return None
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    pixels = patch[(hsv[:, :, 1] > 45) & (hsv[:, :, 2] > 55)]
+    # White and dark kits are valid colours too. A saturation gate discarded them.
+    pixels = patch.reshape(-1, 3)
     if len(pixels) < 3:
         return None
     colour = np.median(pixels, axis=0).astype(np.uint8)
@@ -79,11 +82,13 @@ def inside_field(mask, box):
     return 0 <= x < w and 0 <= y < h and bool(mask[y, x]) and y2 - y1 >= 12
 
 
-def train_colours(features):
+def train_colours(features, n_clusters=4):
     if len(features) < 15:
         raise ValueError("Too few visible players to identify kits. Choose a clearer match video.")
     features = np.array(features)
-    km = KMeans(n_clusters=4, n_init=10, random_state=42).fit(features)
+    # Tiny kit datasets suffer severe native-thread overhead on some desktop runtimes.
+    with threadpool_limits(limits=1):
+        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit(features)
     counts = Counter(km.labels_)
     selected = [i for i, _ in counts.most_common(2)]
     centres = km.cluster_centers_[selected]
@@ -96,7 +101,7 @@ def train_colours(features):
     return centres, colours
 
 
-def assign_team(feature, centres):
+def assign_team(feature, centres, use_hue=True):
     if feature is None:
         return -1
     distances = np.linalg.norm(centres - feature, axis=1)
@@ -109,8 +114,10 @@ def assign_team(feature, centres):
     )[0, 0]
     hue = abs(int(feature_hsv[0]) - int(centre_hsv[0]))
     hue = min(hue, 180 - hue)
+    # Hue is unstable for low-saturation colours, including striped navy/white kits.
+    hue_matches = not use_hue or hue <= 16 or (feature_hsv[1] < 80 and centre_hsv[1] < 80)
     return (
-        idx if distances[idx] < 50 and abs(distances[0] - distances[1]) > 12 and hue <= 16 else -1
+        idx if distances[idx] < 50 and abs(distances[0] - distances[1]) > 12 and hue_matches else -1
     )
 
 
@@ -121,6 +128,7 @@ def run_video(
     cancelled=lambda: False,
     sample_fps=3,
     max_seconds=None,
+    profile="general",
 ):
     import torch
     from ultralytics import YOLO, settings
@@ -128,7 +136,7 @@ def run_video(
     settings.update({"sync": False})
     torch.set_num_threads(min(4, os.cpu_count() or 2))
     cv2.setNumThreads(1)
-    model_path = Path(os.environ.get("VISION_MODEL_PATH", "models/yolo11s.pt")).resolve()
+    model_path, ball_path = [p.resolve() for p in model_paths(profile)]
     if not model_path.is_file():
         raise ValueError("Vision weights are missing. Run python scripts/setup_vision.py first.")
     if not math.isfinite(sample_fps) or not 1 <= sample_fps <= 15:
@@ -137,16 +145,15 @@ def run_video(
         raise ValueError("Diagnostic duration must be positive")
     meta = probe(path)
     duration = min(meta["duration"], max_seconds) if max_seconds else meta["duration"]
-    stride = max(1, round(meta["fps"] / sample_fps))
+    stride = max(1, math.ceil(meta["fps"] / sample_fps))
     effective_fps = meta["fps"] / stride
     device = os.getenv("VISION_DEVICE", "cpu")
     model = YOLO(str(model_path))
-    ball_path = Path(os.getenv("VISION_BALL_MODEL_PATH", "models/football-ball.onnx")).resolve()
     if not ball_path.is_file():
         raise ValueError(
             "Football ball weights are missing. Run python scripts/setup_vision.py first."
         )
-    ball_detector = BallDetector(ball_path)
+    ball_detector = create_ball_detector(ball_path, device)
     names = model.names
     people = [
         i for i, n in names.items() if n.lower() in ("person", "player", "goalkeeper", "referee")
@@ -156,7 +163,12 @@ def run_video(
 
     def detect(frame):
         r = model.predict(
-            frame, conf=0.18, imgsz=960, classes=people, device=device, verbose=False
+            frame,
+            conf=0.18,
+            imgsz=1280 if "player" in names.values() else 960,
+            classes=people,
+            device=device,
+            verbose=False,
         )[0]
         boxes = r.boxes.xyxy.cpu().numpy()
         scores = r.boxes.conf.cpu().numpy()
@@ -168,7 +180,7 @@ def run_video(
     features = []
     try:
         # Spread the fit over the video so pre-match lineups do not determine every kit.
-        for t in np.linspace(min(60, duration * 0.1), max(0, duration - 0.5), 24):
+        for index, t in enumerate(np.linspace(min(60, duration * 0.1), max(0, duration - 0.5), 24)):
             if cancelled():
                 raise InterruptedError("Analysis cancelled")
             cap.set(cv2.CAP_PROP_POS_MSEC, float(t * 1000))
@@ -178,15 +190,23 @@ def run_video(
             boxes, scores, classes = detect(frame)
             mask = field_mask(frame)
             for box, c in zip(boxes, classes):
-                if c in people and inside_field(mask, box):
+                if names[c].lower() in ("person", "player") and inside_field(mask, box):
                     f = jersey(frame, box)
                     if f is not None:
                         features.append(f)
+            progress(
+                stage=f"Learning kit colours · sample {index + 1}/24",
+                progress=round(1 + (index + 1) / 24 * 4, 1),
+            )
     finally:
         cap.release()
-    centres, colours = train_colours(features)
+    # A role-aware detector has already removed officials and goalkeepers from fitting.
+    # Four clusters otherwise split one striped kit and discard part of that team.
+    role_aware = "player" in [name.lower() for name in names.values()]
+    centres, colours = train_colours(features, n_clusters=2 if role_aware else 4)
     cap = cv2.VideoCapture(str(path))
     tracker = MotionTracker()
+    ball_tracker = BallTracker()
     frames = []
     scene = 0
     frame_num = 0
@@ -222,7 +242,10 @@ def run_video(
             boxes, scores, classes = detect(frame)
             observations = [
                 {
-                    "team": assign_team(jersey(frame, box), centres),
+                    "team": assign_team(jersey(frame, box), centres, use_hue=not role_aware)
+                    if names[c].lower() in ("person", "player")
+                    else -1,
+                    "role": names[c].lower(),
                     "box": [round(float(x), 1) for x in box],
                     "confidence": round(float(score), 3),
                 }
@@ -232,17 +255,19 @@ def run_video(
             players = tracker.update(observations, t, matrix, cut=cut)
             previous_frame = frame
             previous_boxes = [p["box"] for p in players]
-            candidates = [
-                b
-                for b in ball_detector.detect(frame, threshold=0.15)
-                if mask[int(b["y"]), int(b["x"])]
-            ]
-            candidates.sort(key=lambda b: b["confidence"], reverse=True)
-            ball = candidates[0] if candidates else None
-            if len(candidates) > 1 and candidates[1]["confidence"] > 0.8 * ball["confidence"]:
-                if math.hypot(candidates[1]["x"] - ball["x"], candidates[1]["y"] - ball["y"]) > 15:
-                    ball = None
-            frames.append({"t": round(t, 3), "scene": scene, "players": players, "ball": ball})
+            candidates = ball_detector.detect(frame, threshold=0.15)
+            # Airborne balls can be outside the green surface; temporal association
+            # resolves candidates instead of rejecting them by background colour.
+            ball = ball_tracker.update(candidates, t, matrix, frame.shape, cut=cut)
+            frames.append(
+                {
+                    "t": round(t, 3),
+                    "scene": scene,
+                    "players": players,
+                    "ball": ball,
+                    "ballCandidates": candidates,
+                }
+            )
             if len(frames) % 50 == 0:
                 elapsed = time.monotonic() - started
                 progress(
@@ -264,12 +289,16 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-1.2",
+        "pipelineVersion": "local-vision-1.4",
+        "profile": profile,
         "source": "computer-vision",
+        "videoSha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
         "model": model_path.name,
         "modelSha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
         "ballModel": ball_path.name,
         "ballModelSha256": hashlib.sha256(ball_path.read_bytes()).hexdigest(),
+        "ballInference": "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles",
+        "ballTracking": "camera-compensated-observations",
         "video": meta,
         "analysedDuration": analysed_duration,
         "sampleFps": effective_fps,

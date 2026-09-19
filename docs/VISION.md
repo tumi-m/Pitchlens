@@ -64,3 +64,52 @@ The supplied [Football Analytics library](https://www.dropbox.com/scl/fo/h24qmp5
 Implementation references: [Ultralytics YOLO11](https://docs.ultralytics.com/models/yolo11/), [tracking](https://docs.ultralytics.com/modes/track/), [Roboflow sports](https://github.com/roboflow/sports). Ultralytics code/weights use AGPL-3.0 or an enterprise licence; review those terms before commercial redistribution. The project does not redistribute the model weights.
 
 Ball model source: [acatorcini/yolov9-soccer-ball](https://huggingface.co/acatorcini/yolov9-soccer-ball), revision `b30df5abc9f3eda4a9d326d953be12b3541a14b4`, SHA256 `9fd2031e5bced9dff47a48bae8c6809dd56493124ef8924ae28a3ce26a17a441`. Its model card declares AGPL-3.0. Setup downloads the ONNX data file, not repository Python or pickled third-party code. ONNX Runtime telemetry is disabled. CPU is explicitly selected: CoreML acceleration was tested in this sandbox and crashed; it is not enabled in the product.
+
+## Optional broadcast-football profile (pipeline 1.4)
+
+Run `python scripts/setup_football.py` from the backend folder to install the two
+checksum-pinned models published in Roboflow's official soccer example. This is
+local inference: no API key, account, hosted calls or match upload to Roboflow is
+required. Downloaded weights remain excluded from Git.
+
+The upload screen now offers **Indoor / small-sided · baseline** and **Full-pitch
+broadcast · experimental**, plus 3, 6 or 10 requested frames/second. Sampling uses
+an integer stride and never exceeds the requested rate (25 fps input at a 10 fps
+request produces 8.33 analysed frames/second). Actual sampling appears in the report.
+The broadcast model is a separate choice because its performance on broadcast
+football does not establish indoor accuracy. The indoor baseline remains limited.
+
+The broadcast profile uses a football player/goalkeeper/referee detector and a
+separate ball model on four overlapping half-frame tiles. Referees and goalkeepers
+are excluded from kit fitting and are not automatically assigned to a team.
+White and dark shirts now contribute to kit fitting. Low-saturation striped kits
+use colour distance without an unreliable strict hue gate.
+
+Both profiles now associate ball observations over time with camera compensation.
+Low-confidence candidates need repeated support; competing candidates remain
+unknown. The tracker never fills in a missing detection. Airborne ball candidates
+are no longer discarded because their background is not green. Transfers between
+different ball tracks cannot create event candidates. Stable proximity requires
+at least two samples and a minimum sampled duration of 0.25 seconds. The earlier
+boundaries on unverified events and unmeasured physical statistics still apply.
+
+Use `python scripts/analyse_video.py VIDEO --profile broadcast --fps 6 --output RESULT`
+for a repeatable diagnostic. Model paths now resolve relative to the backend,
+so invoking the script from another working directory also works.
+
+`python scripts/evaluate_ball.py --labels LABELS --model MODEL --output RESULT`
+compares detections with manually annotated ball centres. The labels file holds
+`frames` containing `id`, absolute `image`, `labelStatus`, `ball: [x,y]` and
+`tolerancePx`. Only `visible` labels are scored. Duplicate detections count as
+false positives; uncertain labels are excluded. This is a small localisation
+diagnostic, not mAP, tracking accuracy or full-match validation. Evaluation and
+training must ultimately use separate matches; the downloaded Roboflow example
+clip may overlap the models' training data.
+
+For the role-aware football detector, kit fitting uses two clusters after removing
+referees/goalkeepers. The general-person baseline retains four clusters to allow
+extra kit colours. Striped kits still need visual review; a representative colour
+swatch need not look like the complete shirt pattern.
+
+The report now synchronizes overlays with decoded video-frame callbacks in
+supported browsers. Older browsers retain native time-update handling.

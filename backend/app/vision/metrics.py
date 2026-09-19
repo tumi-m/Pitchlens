@@ -39,7 +39,8 @@ def derive_metrics(frames, sample_fps, duration):
             runs.append(
                 {"key": key, "start": f["t"], "end": f["t"], "samples": 1, "scene": f["scene"]}
             )
-    stable = [r for r in runs if r["key"] is not None and r["samples"] >= 2]
+    minimum_samples = max(2, math.ceil(0.25 * sample_fps))
+    stable = [r for r in runs if r["key"] is not None and r["samples"] >= minimum_samples]
     seconds = [0.0, 0.0]
     timestamps = [f["t"] for f in frames]
     events = []
@@ -57,6 +58,8 @@ def derive_metrics(frames, sample_fps, duration):
         ]
         # A pass candidate needs a visible ball throughout the transfer.
         if not observed or any(f["ball"] is None for f in observed):
+            continue
+        if len({f["ball"]["trackId"] for f in observed if "trackId" in f["ball"]}) > 1:
             continue
         same_team = r["key"][1] == previous["key"][1]
         if same_team:

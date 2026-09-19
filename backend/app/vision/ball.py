@@ -72,3 +72,54 @@ class BallDetector:
                 }
             )
         return found
+
+
+class TiledBallDetector:
+    """Local YOLO weights trained for tiles, including Roboflow's football example."""
+
+    def __init__(self, path, device="cpu"):
+        from ultralytics import YOLO
+
+        self.model = YOLO(str(path))
+        self.classes = [i for i, name in self.model.names.items() if "ball" in name.lower()]
+        if not self.classes:
+            raise ValueError("Ball model must contain a named ball class")
+        self.device = device
+
+    def detect(self, frame, threshold=0.2):
+        h, w = frame.shape[:2]
+        found = []
+        # Four overlapping half-frame crops preserve the training scale at any resolution.
+        for y in sorted({0, max(0, h // 2 - 50)}):
+            for x in sorted({0, max(0, w // 2 - 50)}):
+                tile = frame[y : min(h, y + h // 2 + 50), x : min(w, x + w // 2 + 50)]
+                result = self.model.predict(
+                    tile,
+                    imgsz=640,
+                    conf=threshold,
+                    classes=self.classes,
+                    device=self.device,
+                    verbose=False,
+                )[0]
+                for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+                    box = [box[0] + x, box[1] + y, box[2] + x, box[3] + y]
+                    found.append(
+                        {
+                            "x": (box[0] + box[2]) / 2,
+                            "y": (box[1] + box[3]) / 2,
+                            "box": box,
+                            "confidence": confidence,
+                        }
+                    )
+        if not found:
+            return []
+        boxes = [
+            [b["box"][0], b["box"][1], b["box"][2] - b["box"][0], b["box"][3] - b["box"][1]]
+            for b in found
+        ]
+        keep = cv2.dnn.NMSBoxes(boxes, [b["confidence"] for b in found], threshold, 0.1)
+        return [found[int(i)] for i in np.asarray(keep).reshape(-1)]
+
+
+def create_ball_detector(path, device="cpu"):
+    return BallDetector(path) if Path(path).suffix == ".onnx" else TiledBallDetector(path, device)

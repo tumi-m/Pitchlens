@@ -16,6 +16,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.vision.engine import probe, run_video
+from app.vision.profiles import available_profiles
 
 ROOT = Path(os.getenv("VISION_DATA_DIR", ".vision")).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -73,7 +74,12 @@ def work(directory, status, event):
         status["status"] = "processing"
         update(stage="Opening video", progress=0)
         run_video(
-            directory / "video", directory / "result.json", progress=update, cancelled=event.is_set
+            directory / "video",
+            directory / "result.json",
+            progress=update,
+            cancelled=event.is_set,
+            profile=status.get("profile", "general"),
+            sample_fps=status.get("sampleFps", 3),
         )
         update(status="completed", stage="Analysis complete", progress=100)
     except InterruptedError:
@@ -105,8 +111,8 @@ app.add_event_handler("shutdown", stop_jobs)
 @app.get("/health")
 def health():
     return {
-        "available": Path(os.getenv("VISION_MODEL_PATH", "models/yolo11s.pt")).is_file()
-        and Path(os.getenv("VISION_BALL_MODEL_PATH", "models/football-ball.onnx")).is_file(),
+        "available": "general" in available_profiles(),
+        "profiles": available_profiles(),
         "activeJob": active,
         "mode": "local-computer-vision",
     }
@@ -126,8 +132,17 @@ async def create(request: Request):
         "application/octet-stream",
     ):
         raise HTTPException(415, "Upload a video file")
-    if not health()["available"]:
-        raise HTTPException(503, "Vision models are not installed")
+    profile = request.query_params.get("profile", "general")
+    if profile not in ("general", "broadcast"):
+        raise HTTPException(400, "Unknown footage profile")
+    if profile not in available_profiles():
+        raise HTTPException(503, "The selected vision models are not installed")
+    try:
+        sample_fps = int(request.query_params.get("fps", "3"))
+    except ValueError as exc:
+        raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
+    if sample_fps not in (3, 6, 10):
+        raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
     job_id = uuid.uuid4().hex
     with lock:
         if active is not None:
@@ -145,6 +160,8 @@ async def create(request: Request):
         "status": "uploading",
         "stage": "Receiving video",
         "progress": 0,
+        "profile": profile,
+        "sampleFps": sample_fps,
     }
     write_status(directory, status)
     try:
