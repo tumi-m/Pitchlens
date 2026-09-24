@@ -365,7 +365,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           </div>
           <p className="text-xs text-pitch-muted">
             Detailed analysis follows fast movement more closely and takes longer.
-            The football-trained models come from Roboflow's football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.
+            The football-trained models come from Roboflow&apos;s football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.
           </p>
           {error && (
             <p role="alert" className="text-red-300">
