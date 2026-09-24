@@ -190,7 +190,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   ? ` · about ${clockTime(job.etaSeconds)} remaining`
                   : ""}
               </p>
-              {job.status === "processing" && (
+              {["processing", "uploading"].includes(job.status) && (
                 <button
                   className="pitch-button-secondary"
                   onClick={() =>

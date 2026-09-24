@@ -117,3 +117,20 @@ docker run -p 8100:8100 -e VISION_SERVICE_TOKEN=change-me -e VISION_THREADS=4 \
 
 Put it behind HTTPS (the website refuses a non-loopback `http://` worker) and
 set the three Vercel variables as above.
+
+## YouTube links
+
+The upload page also accepts a YouTube link. The worker fetches the video itself
+with yt-dlp (plus the Deno runtime it now requires), up to 1080p and 500 MB, so
+nothing large passes through the browser or Vercel. Users must confirm they
+filmed the video or have the owner's permission.
+
+Two limits to know about:
+
+- YouTube's terms only allow downloads where YouTube offers a download button.
+  Keep this to footage your users own (their own channel or club uploads).
+- YouTube often blocks downloads from datacenter addresses such as Railway's
+  ("Sign in to confirm you're not a bot"). The job then fails with a message
+  asking the user to upload the file instead. `VISION_YOUTUBE_PROXY` and
+  `VISION_YOUTUBE_COOKIES` exist for operators, but cookies can get the Google
+  account banned; direct upload remains the reliable route.

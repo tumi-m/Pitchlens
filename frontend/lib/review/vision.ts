@@ -279,3 +279,17 @@ async function startAnalysis(id: string, signal?: AbortSignal): Promise<VisionJo
     }
   }
 }
+
+/** The worker downloads the video itself; nothing large passes through the browser. */
+export async function analyseYouTube(
+  url: string,
+  options: { title?: string; profile?: string; fps?: string },
+): Promise<VisionJob> {
+  const query = new URLSearchParams({
+    url,
+    title: options.title || "",
+    profile: options.profile || "general",
+    fps: options.fps || "3",
+  });
+  return visionJson<VisionJob>(`jobs/from-url?${query}`, { method: "POST" });
+}

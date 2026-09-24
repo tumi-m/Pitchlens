@@ -660,3 +660,77 @@ def test_expired_footage_is_not_served_even_before_the_sweep(service, monkeypatc
     assert client.get(f"/jobs/{job}/video").status_code == 404
     assert not (directory / "video").exists()
     assert client.get(f"/jobs/{job}").json()["videoDeleted"] is True
+
+
+# ── YouTube links ─────────────────────────────────────────────────────────
+def test_youtube_links_are_reduced_to_a_single_video_id():
+    from app.vision.youtube import video_id
+
+    for url in (
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://youtube.com/watch?feature=share&v=dQw4w9WgXcQ&t=30",
+        "https://youtu.be/dQw4w9WgXcQ?si=abc",
+        "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        "https://www.youtube.com/live/dQw4w9WgXcQ",
+    ):
+        assert video_id(url) == "dQw4w9WgXcQ"
+    for bad in (
+        "https://evil.example/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com/playlist?list=PL123",
+        "file:///etc/passwd",
+        "",
+    ):
+        with pytest.raises(ValueError):
+            video_id(bad)
+
+
+def test_youtube_job_downloads_then_analyses(hosted, monkeypatch):
+    server, client, submitted = hosted
+    response = client.post(
+        "/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ&owner=" + "c" * 32
+    )
+    assert response.status_code == 200, response.text
+    job = response.json()
+    assert job["status"] == "uploading" and job["title"] == "YouTube match"
+    assert client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).status_code == 409
+    fn, directory, status, event, url = submitted[0]
+    assert url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def fake_download(url, directory, max_bytes, progress, cancelled):
+        progress(stage="Downloading from YouTube", progress=50.0)
+        target = directory / "download.mp4"
+        target.write_bytes(FIXTURE.read_bytes())
+        return target, {"title": "Sunday league final", "duration": 4}
+
+    analysed = []
+    monkeypatch.setattr("app.vision.youtube.download", fake_download)
+    monkeypatch.setattr(server, "work", lambda d, s, e: analysed.append(s["title"]))
+    fn(directory, status, event, url)
+    assert analysed == ["Sunday league final"]
+    assert (directory / "video").read_bytes() == FIXTURE.read_bytes()
+    assert status["video"]["duration"] > 0
+
+
+def test_youtube_block_fails_clearly_and_frees_the_worker(hosted, monkeypatch):
+    server, client, submitted = hosted
+    client.post("/jobs/from-url?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    fn, directory, status, event, url = submitted[0]
+
+    def blocked(*args, **kwargs):
+        from app.vision.youtube import friendly
+
+        raise ValueError(friendly("Sign in to confirm you’re not a bot"))
+
+    monkeypatch.setattr("app.vision.youtube.download", blocked)
+    fn(directory, status, event, url)
+    assert status["status"] == "failed" and "Upload a file" in status["stage"]
+    assert server.active is None
+    assert client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).status_code == 200
+
+
+def test_invalid_youtube_link_is_rejected_before_reserving(hosted):
+    server, client, submitted = hosted
+    r = client.post("/jobs/from-url?url=https://example.com/video.mp4")
+    assert r.status_code == 400 and not submitted and server.active is None
