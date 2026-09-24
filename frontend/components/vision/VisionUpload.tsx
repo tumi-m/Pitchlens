@@ -44,6 +44,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         // Football-trained detector (players, keepers, referees + tiled ball
         // model) beats the general people detector whenever it is installed.
         if (x.profiles?.includes("broadcast")) setProfile("broadcast");
+        // A GPU makes denser sampling affordable: more frames catch more of the ball.
+        if (x.gpu) setFps("6");
         setNeedsCode(!!x.accessRequired && !visionAccessCode());
       })
       .catch(() => setHealth({ available: false }));

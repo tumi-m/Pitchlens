@@ -190,6 +190,8 @@ def run_video(
             imgsz=1280 if "player" in names.values() else 960,
             classes=people,
             device=device,
+            # FP16 on a GPU roughly doubles throughput at no practical accuracy cost.
+            quantize=16 if device.startswith("cuda") else None,
             verbose=False,
         )[0]
         boxes = r.boxes.xyxy.cpu().numpy()
