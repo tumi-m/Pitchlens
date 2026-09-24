@@ -89,6 +89,7 @@ def derive_metrics(frames, sample_fps, duration):
             }
         )
     coverage = sum(seconds)
+    chains = possession_chains(stable, events, dt, duration)
     return {
         "sampledFrames": len(frames),
         "playerFrames": sum(bool(f["players"]) for f in frames),
@@ -99,4 +100,73 @@ def derive_metrics(frames, sample_fps, duration):
         "possessionCoverage": round(coverage / duration * 100, 1) if duration else 0,
         "events": events,
         "trackCount": len({p["id"] for f in frames for p in f["players"]}),
+        "possessions": chains,
     }
+
+
+# A team keeps the ball across brief unseen moments; longer gaps, a scene cut
+# or opponent control end the possession (StatsBomb's possession-sequence idea,
+# adapted to what the camera can observe).
+POSSESSION_GAP = 3.0
+
+
+def possession_chains(stable, events, dt, duration):
+    chains = []
+    for r in stable:
+        team = r["key"][1]
+        start, end = r["start"], min(duration, r["end"] + dt)
+        last = chains[-1] if chains else None
+        if (
+            last
+            and last["team"] == team
+            and last["scene"] == r["scene"]
+            and start - last["end"] <= POSSESSION_GAP
+        ):
+            last["end"] = end
+            last["controlSeconds"] += r["samples"] * dt
+        else:
+            chains.append(
+                {
+                    "team": team,
+                    "start": start,
+                    "end": end,
+                    "scene": r["scene"],
+                    "controlSeconds": r["samples"] * dt,
+                }
+            )
+    for chain in chains:
+        chain["passes"] = sum(
+            1
+            for e in events
+            if e["type"] == "pass-candidate"
+            and e["team"] == chain["team"]
+            and chain["start"] <= e["t"] <= chain["end"]
+        )
+        chain["start"] = round(chain["start"], 2)
+        chain["end"] = round(chain["end"], 2)
+        chain["controlSeconds"] = round(chain["controlSeconds"], 2)
+        del chain["scene"]
+    summary = []
+    for team in (0, 1):
+        own = [c for c in chains if c["team"] == team]
+        lengths = [c["end"] - c["start"] for c in own]
+        regains = sum(1 for e in events if e["type"] == "turnover-candidate" and e["team"] == team)
+        opponent_passes = sum(
+            1 for e in events if e["type"] == "pass-candidate" and e["team"] != team
+        )
+        summary.append(
+            {
+                "count": len(own),
+                "averageSeconds": round(sum(lengths) / len(own), 1) if own else None,
+                "longestSeconds": round(max(lengths), 1) if own else None,
+                "passesPerPossession": (
+                    round(sum(c["passes"] for c in own) / len(own), 2) if own else None
+                ),
+                # Pressing intensity in the spirit of PPDA: opponent passes allowed
+                # per ball won. Lower = more aggressive. Needs regains to mean anything.
+                "passesAllowedPerRegain": (
+                    round(opponent_passes / regains, 1) if regains else None
+                ),
+            }
+        )
+    return {"teams": summary, "chains": chains}

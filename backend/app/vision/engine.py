@@ -335,7 +335,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-1.4",
+        "pipelineVersion": "local-vision-1.5",
         "profile": profile,
         "source": "computer-vision",
         "videoSha256": file_sha256(path),

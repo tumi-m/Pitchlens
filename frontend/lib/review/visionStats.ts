@@ -38,7 +38,26 @@ export type MatchStats = {
   /** 0–10 composite of how much of the video the models could observe. */
   evidenceScore: number;
   minutes: number;
+  possessions: [number | null, number | null];
+  avgPossession: [number | null, number | null];
+  longestPossession: [number | null, number | null];
+  passesPerPossession: [number | null, number | null];
+  passesAllowedPerRegain: [number | null, number | null];
+  /** Plausible range for Kit A's control share given how few possessions were seen. */
+  shareRange: [number, number] | null;
+  /** Cumulative observed control seconds over time, per team: [t, A, B]. */
+  cumulative: [number, number, number][];
 };
+
+/** Wilson score interval: small samples get honest, wide ranges. */
+export function wilson(successes: number, n: number, z = 1.96): [number, number] {
+  if (n <= 0) return [0, 100];
+  const p = successes / n;
+  const denom = 1 + (z * z) / n;
+  const centre = (p + (z * z) / (2 * n)) / denom;
+  const half = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / denom;
+  return [Math.round(Math.max(0, centre - half) * 100), Math.round(Math.min(1, centre + half) * 100)];
+}
 
 const pct = (a: number, b: number) => (b ? Math.round((a / b) * 1000) / 10 : 0);
 
@@ -76,6 +95,29 @@ export function matchStats(result: VisionResult): MatchStats {
         10,
     ) / 10;
   const n = Math.max(1, frames.length);
+  const pos = m.possessions;
+  const pair = <K extends "count" | "averageSeconds" | "longestSeconds" | "passesPerPossession" | "passesAllowedPerRegain">(
+    key: K,
+  ): [number | null, number | null] =>
+    pos ? [pos.teams[0]?.[key] ?? null, pos.teams[1]?.[key] ?? null] : [null, null];
+  // Possessions, not frames, are the independent units: consecutive frames of
+  // one spell are not separate evidence (sample-size lesson from the library).
+  const chainCount = pos?.chains.length ?? 0;
+  const aShare = m.teamSeconds[0] + m.teamSeconds[1] > 0 ? m.teamSeconds[0] / (m.teamSeconds[0] + m.teamSeconds[1]) : 0;
+  const shareRange =
+    chainCount >= 2 ? wilson(Math.round(aShare * chainCount), chainCount) : null;
+  const cumulative: [number, number, number][] = [[0, 0, 0]];
+  if (pos) {
+    let a = 0;
+    let b = 0;
+    for (const c of pos.chains) {
+      cumulative.push([c.start, a, b]);
+      if (c.team === 0) a += c.controlSeconds;
+      else b += c.controlSeconds;
+      cumulative.push([c.end, a, b]);
+    }
+    cumulative.push([result.analysedDuration, a, b]);
+  }
   return {
     controlSeconds: [m.teamSeconds[0] ?? 0, m.teamSeconds[1] ?? 0],
     controlShare: [m.possessionShare[0] ?? null, m.possessionShare[1] ?? null],
@@ -89,5 +131,12 @@ export function matchStats(result: VisionResult): MatchStats {
     momentum,
     evidenceScore,
     minutes,
+    possessions: pair("count"),
+    avgPossession: pair("averageSeconds"),
+    longestPossession: pair("longestSeconds"),
+    passesPerPossession: pair("passesPerPossession"),
+    passesAllowedPerRegain: pair("passesAllowedPerRegain"),
+    shareRange,
+    cumulative,
   };
 }

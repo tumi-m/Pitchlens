@@ -43,6 +43,23 @@ export type VisionResult = {
     possessionShare: (number | null)[];
     possessionCoverage: number;
     trackCount: number;
+    /** Added in pipeline 1.5; older results do not have it. */
+    possessions?: {
+      teams: {
+        count: number;
+        averageSeconds: number | null;
+        longestSeconds: number | null;
+        passesPerPossession: number | null;
+        passesAllowedPerRegain: number | null;
+      }[];
+      chains: {
+        team: number;
+        start: number;
+        end: number;
+        controlSeconds: number;
+        passes: number;
+      }[];
+    };
     events: {
       id: string;
       type: string;
