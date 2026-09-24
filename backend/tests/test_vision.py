@@ -734,3 +734,54 @@ def test_invalid_youtube_link_is_rejected_before_reserving(hosted):
     server, client, submitted = hosted
     r = client.post("/jobs/from-url?url=https://example.com/video.mp4")
     assert r.status_code == 400 and not submitted and server.active is None
+
+
+# ── GPU (Modal) dispatch ──────────────────────────────────────────────────
+def test_gpu_result_is_used_when_modal_is_configured(service, monkeypatch):
+    server, _ = service
+    job = "4" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    status = {"id": job, "status": "processing", "createdAt": 0, "profile": "general"}
+
+    def fake_modal(job_id, output, token, progress, **kw):
+        progress(stage="GPU · Detecting players", progress=50)
+        output.write_text("{}")
+
+    cpu = []
+    monkeypatch.setattr(server.gpu, "modal_enabled", lambda: True)
+    monkeypatch.setattr(server.gpu, "run_on_modal", fake_modal)
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    event = threading.Event()
+    server.work(directory, status, event)
+    assert status["status"] == "completed" and status["engine"] == "gpu" and not cpu
+
+
+def test_cpu_takes_over_when_the_gpu_is_unavailable(service, monkeypatch):
+    server, _ = service
+    job = "5" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    status = {"id": job, "status": "processing", "createdAt": 0}
+
+    def broken(*a, **k):
+        raise server.gpu.GPUUnavailable("bad token")
+
+    cpu = []
+    monkeypatch.setattr(server.gpu, "modal_enabled", lambda: True)
+    monkeypatch.setattr(server.gpu, "run_on_modal", broken)
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    server.work(directory, status, threading.Event())
+    assert cpu == [1] and status["engine"] == "cpu" and status["status"] == "completed"
+
+
+def test_modal_needs_both_tokens_and_can_be_switched_off(monkeypatch):
+    from app.vision import gpu
+
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-x")
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    assert not gpu.modal_enabled()
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-y")
+    assert gpu.modal_enabled()
+    monkeypatch.setenv("VISION_USE_MODAL", "0")
+    assert not gpu.modal_enabled()

@@ -65,6 +65,8 @@ export type VisionHealth = {
   /** The site owner requires an access code before videos can be analysed. */
   accessRequired?: boolean;
   retentionHours?: number | null;
+  /** Analysis runs on a Modal GPU (minutes rather than an hour). */
+  gpu?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
   configured?: boolean;
   detail?: string;
