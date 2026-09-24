@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
+from app.vision import gpu
 from app.vision.engine import probe, run_video
 from app.vision.profiles import available_profiles
 
@@ -107,15 +108,33 @@ def work(directory, status, event):
     try:
         status["status"] = "processing"
         update(stage="Opening video", progress=0)
-        run_video(
-            directory / "video",
-            directory / "result.json",
+        options = dict(
             progress=update,
             cancelled=event.is_set,
             profile=status.get("profile", "general"),
             sample_fps=status.get("sampleFps", 3),
         )
-        update(status="completed", stage="Analysis complete", progress=100)
+        ran_on_gpu = False
+        if gpu.modal_enabled():
+            try:
+                update(stage="Starting a GPU", progress=0)
+                gpu.run_on_modal(
+                    status["id"], directory / "result.json", TOKEN, **options
+                )
+                ran_on_gpu = True
+            except gpu.GPUUnavailable as exc:
+                import logging
+
+                logging.warning("GPU unavailable, using CPU: %s", exc)
+                update(stage="GPU unavailable; analysing on the CPU (slower)", progress=0)
+        if not ran_on_gpu:
+            run_video(directory / "video", directory / "result.json", **options)
+        update(
+            status="completed",
+            stage="Analysis complete",
+            progress=100,
+            engine="gpu" if ran_on_gpu else "cpu",
+        )
     except InterruptedError:
         if stopping:
             # A redeploy or restart is not the user's cancellation: allow a retry.
@@ -278,6 +297,7 @@ def health():
         "maxBytes": MAX_BYTES,
         "maxChunk": MAX_CHUNK,
         "retentionHours": RETENTION_HOURS or None,
+        "gpu": gpu.modal_enabled(),
     }
 
 

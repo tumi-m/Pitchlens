@@ -134,3 +134,15 @@ Two limits to know about:
   asking the user to upload the file instead. `VISION_YOUTUBE_PROXY` and
   `VISION_YOUTUBE_COOKIES` exist for operators, but cookies can get the Google
   account banned; direct upload remains the reliable route.
+
+## GPU analysis with Modal (recommended)
+
+Add `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` (modal.com → Settings → API
+Tokens) to the Railway service variables. Each job's inference then runs on a
+Modal GPU (`VISION_MODAL_GPU`, default `L4`); Railway keeps uploads, storage,
+status and playback. The GPU fetches the video from the worker's public
+address (`RAILWAY_PUBLIC_DOMAIN`, or `VISION_PUBLIC_URL`) with the service
+token. The first job builds the GPU image on Modal (a few minutes, then
+cached). If Modal fails (bad token, no credit), the job falls back to the CPU
+and says so. `VISION_USE_MODAL=0` switches the GPU off. Set a spend limit in
+Modal → Settings → Usage & billing.

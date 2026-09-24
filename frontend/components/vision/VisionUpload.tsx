@@ -333,11 +333,11 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </label>
           )}
           <p className="text-sm text-pitch-muted">
-            On a CPU server, expect analysis to take about as long as the
-            video or longer at the quick setting (a 4-core test took about 1.6
-            minutes per minute of footage). The report shows a live time
-            estimate, and you can leave and come back. It shows detection
-            coverage and unknown time. Kit groups need your team
+            {health?.gpu
+              ? "Analysis runs on a GPU: expect several minutes for a full match (the first run of the day can take a few extra minutes to start). "
+              : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
+            The report shows a live time estimate, and you can leave and come
+            back. It shows detection coverage and unknown time. Kit groups need your team
             names; automatic pass candidates are estimates. Score, xG and
             physical speed are not yet measured.
           </p>
