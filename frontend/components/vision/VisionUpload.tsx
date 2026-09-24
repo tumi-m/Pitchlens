@@ -41,6 +41,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
       .then((r) => r.json().catch(() => ({})))
       .then((x: VisionHealth) => {
         setHealth({ ...x, available: x.available === true });
+        // Football-trained detector (players, keepers, referees + tiled ball
+        // model) beats the general people detector whenever it is installed.
+        if (x.profiles?.includes("broadcast")) setProfile("broadcast");
         setNeedsCode(!!x.accessRequired && !visionAccessCode());
       })
       .catch(() => setHealth({ available: false }));
@@ -345,10 +348,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             <label className="text-sm">Footage type
               <select className="pitch-input w-full mt-2" value={profile}
                 disabled={busy} onChange={(e) => setProfile(e.target.value)}>
-                <option value="general">Indoor / small-sided · baseline</option>
                 <option value="broadcast" disabled={!profiles.includes("broadcast")}>
-                  Full-pitch broadcast · experimental
+                  Football-trained models · recommended
                 </option>
+                <option value="general">General people detector · indoor baseline</option>
               </select>
             </label>
             <label className="text-sm">Analysis detail
@@ -362,7 +365,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           </div>
           <p className="text-xs text-pitch-muted">
             Detailed analysis follows fast movement more closely and takes longer.
-            The broadcast model has not been validated for indoor matches.
+            The football-trained models come from Roboflow's football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.
           </p>
           {error && (
             <p role="alert" className="text-red-300">

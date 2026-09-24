@@ -46,6 +46,31 @@ def friendly(message):
     return "Could not fetch this YouTube video. Download it and use Upload a file instead."
 
 
+def remux(path):
+    """YouTube serves streaming (fragmented) MP4. Rewrite it as a regular MP4 so
+    decoder timestamps, seeking and browser playback all agree. No re-encoding."""
+    import subprocess
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return path
+    target = path.with_name("remuxed.mp4")
+    done = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+         "-map", "0:v:0", "-c", "copy", "-movflags", "+faststart", str(target)],
+        capture_output=True,
+        timeout=600,
+    )
+    if done.returncode != 0 or not target.exists() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        return path
+    path.unlink(missing_ok=True)
+    return target
+
+
 def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=lambda: False):
     """Download the best MP4 video stream up to 1080p. Returns (path, info)."""
     import yt_dlp
@@ -118,7 +143,7 @@ def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=la
         raise ValueError(
             "This video is larger than 500 MB at 1080p. Trim it or upload a shorter clip."
         )
-    return files[0], {
+    return remux(files[0]), {
         "title": info.get("title"),
         "duration": info.get("duration"),
         "height": info.get("height"),

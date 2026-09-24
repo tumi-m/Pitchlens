@@ -266,7 +266,17 @@ def run_video(
             # Phone footage is often variable frame rate: prefer the decoder's
             # presentation time so overlays line up with the video.
             position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            t = position if math.isfinite(position) and position > last_t else frame_num / meta["fps"]
+            index_time = frame_num / meta["fps"]
+            # Trust decoder timestamps only while they agree with the frame count:
+            # fragmented/streaming MP4s can report drifting or offset positions,
+            # which would misplace every overlay box.
+            t = (
+                position
+                if math.isfinite(position)
+                and position > last_t
+                and abs(position - index_time) <= 0.5
+                else index_time
+            )
             if frames and t <= last_t:
                 t = last_t + 1 / meta["fps"]
             last_t = t
