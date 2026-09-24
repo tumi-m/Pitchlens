@@ -87,8 +87,8 @@ export function AuthModal({ isOpen, onClose, defaultMode = 'signin' }: AuthModal
                 </h2>
                 <p className="text-pitch-muted text-sm mt-1">
                   {mode === 'signin'
-                    ? 'Sign in to access your match analytics'
-                    : 'Start unveiling the geometry of your game'}
+                    ? 'Sign in to keep your match reviews'
+                    : 'Create an account to keep your match reviews'}
                 </p>
               </div>
 

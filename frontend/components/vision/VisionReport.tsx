@@ -6,6 +6,7 @@ import {
   VisionResult,
   VisionJob,
   visionJson,
+  VisionError,
   clockTime,
 } from "@/lib/review/vision";
 import { Loader2 } from "lucide-react";
@@ -43,8 +44,14 @@ export function VisionReport({ jobId }: { jobId: string }) {
           loaded = true;
         }
       } catch (e) {
-        if (!stopped)
-          setError(e instanceof Error ? e.message : "Unable to read analysis");
+        if (!stopped) {
+          if (e instanceof VisionError && e.status === 404) {
+            // Permanent: wrong link, or another browser's analysis on a local worker.
+            terminal = true;
+            setError("This analysis was not found on the vision worker.");
+          } else
+            setError(e instanceof Error ? e.message : "Unable to read analysis");
+        }
       } finally {
         if (!stopped && !loaded && !terminal) timer = setTimeout(read, 2000);
       }
@@ -143,7 +150,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
               <p className="text-pitch-muted mt-2">
                 {result
                   ? `${clockTime(result.analysedDuration)} analysed · ${result.metrics.sampledFrames.toLocaleString()} frames · ${result.model}${result.ballModel ? ` + ${result.ballModel}` : ""}`
-                  : "Video analysis runs in the local worker. You can leave this page and return."}
+                  : "Video analysis runs on the vision worker. You can leave this page and return."}
               </p>
             </div>
             {result && (
@@ -246,10 +253,18 @@ export function VisionReport({ jobId }: { jobId: string }) {
               </div>
               <div className="grid lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)] gap-6">
                 <div className="space-y-4">
+                  {job?.videoDeleted && (
+                    <p className="glass-card p-4 text-sm text-pitch-muted" role="status">
+                      The uploaded footage was deleted by the server&apos;s retention
+                      policy. Measurements and timestamps below remain; detection
+                      overlays need the video.
+                    </p>
+                  )}
                   <div
                     className="relative bg-black rounded-2xl overflow-hidden"
                     style={{
                       aspectRatio: `${result.video.width}/${result.video.height}`,
+                      display: job?.videoDeleted ? "none" : undefined,
                     }}
                   >
                     <video
@@ -258,10 +273,11 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       playsInline
                       preload="metadata"
                       className="w-full h-full"
-                      src={`/api/vision/jobs/${jobId}/video`}
+                      src={job?.videoDeleted ? undefined : `/api/vision/jobs/${jobId}/video`}
                       onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
                       onSeeked={(e) => setTime(e.currentTarget.currentTime)}
                       onError={() =>
+                        !job?.videoDeleted &&
                         setError(
                           "Video playback failed. This browser may not support its codec. Use H.264 MP4.",
                         )

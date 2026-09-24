@@ -34,7 +34,7 @@ export default function HomePage() {
                 </Link>
               </div>
               <p className="text-sm text-pitch-muted mt-5">
-                No account needed · Video stays on your device
+                No account needed · Manual review keeps video on your device
               </p>
             </div>
             <div className="rounded-3xl border border-pitch-indigo-soft/40 bg-pitch-indigo-deep/30 p-7">
@@ -92,7 +92,7 @@ export default function HomePage() {
               {
                 icon: Film,
                 title: "Bring your footage",
-                text: "Open an H.264 MP4. The local vision worker processes your footage on this computer.",
+                text: "Upload an H.264 MP4. The Pitchlens vision worker analyses the full video with detection models, not sample statistics.",
               },
               {
                 icon: Flag,

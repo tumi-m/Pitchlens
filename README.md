@@ -1,6 +1,6 @@
 # Pitchlens
 
-**Automatic local computer vision is now available.** Start with [the vision setup guide](docs/VISION.md). Upload a video to run player/ball detection, kit grouping, tracking and evidence-linked possession/pass candidates. Manual review remains a secondary workflow.
+**Automatic computer vision is available.** Run it on your computer with [the vision setup guide](docs/VISION.md), or put it online for the Vercel site with [DEPLOY-VISION.md](docs/DEPLOY-VISION.md). Upload a video to run player/ball detection, kit grouping, tracking and evidence-linked possession/pass candidates. Manual review remains a secondary workflow.
 
 Football video review grounded in footage.
 
@@ -36,7 +36,7 @@ Copy `frontend/.env.example` to `frontend/.env.local` and set `ROBOFLOW_API_KEY`
 
 Six evenly spaced JPEG frames are sent to Roboflow. The review shows the returned boxes, class labels, confidence and timestamps. A successful empty result means no objects were detected in that sample. Provider failures are reported as partial/failed; they never create substitute match statistics. Frame positions are camera-image coordinates and are not pitch coordinates.
 
-Development permits local guest inference. **Production requires Firebase sign-in** and Firebase Admin Application Default Credentials to verify the user's token. Configure the public Firebase web fields and server ADC for the same project. Never put the Roboflow key or service-account private key in a `NEXT_PUBLIC_` variable. The per-process budget is 120 frames/hour with two in-flight requests. Add distributed per-user quotas before scaling across replicas.
+Development permits local guest inference. **Production requires proof of access** because frames spend the owner's Roboflow credits: Firebase sign-in (with Firebase Admin Application Default Credentials to verify the token) when the public Firebase fields are set, otherwise the shared `VISION_ACCESS_CODE`, entered once in the upload form. With neither configured, production reports AI inspection as unavailable instead of failing every frame. Configure the public Firebase web fields and server ADC for the same project. Never put the Roboflow key or service-account private key in a `NEXT_PUBLIC_` variable. The per-process budget is 120 frames/hour with two in-flight requests. Add distributed per-user quotas before scaling across replicas.
 
 ## Repository map
 

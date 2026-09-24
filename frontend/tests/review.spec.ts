@@ -258,6 +258,7 @@ test("invalid imports leave the workspace unchanged", async ({ page }) => {
     mimeType: "application/json",
     buffer: Buffer.from('{"schemaVersion": 99}'),
   });
-  await expect(page.getByRole("alert")).toBeVisible();
+  // Next.js also renders an empty role="alert" route announcer.
+  await expect(page.getByRole("alert").filter({ hasText: /\S/ })).toBeVisible();
   await expect(page.getByText("No matches yet", { exact: true })).toBeVisible();
 });

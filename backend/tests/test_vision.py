@@ -404,3 +404,259 @@ def test_model_paths_do_not_depend_on_shell_directory(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     assert model_paths() == before
     assert all(p.is_absolute() for p in before)
+
+
+# ── Hosted worker: chunked uploads, ownership, retention ──────────────────
+FIXTURE = __import__("pathlib").Path(__file__).resolve().parents[2] / "frontend/tests/fixtures/review.mp4"
+
+
+@pytest.fixture
+def hosted(service, monkeypatch, tmp_path):
+    server, client = service
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    monkeypatch.setenv("VISION_MODEL_PATH", str(model))
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(model))
+    monkeypatch.setattr(server, "upload_activity", {})
+    monkeypatch.setattr(server, "upload_started", {})
+    submitted = []
+    monkeypatch.setattr(server.pool, "submit", lambda *args: submitted.append(args))
+    return server, client, submitted
+
+
+def test_healthz_is_public_and_reveals_nothing(service):
+    server, client = service
+    response = client.get("/healthz", headers={"Authorization": ""})
+    assert response.status_code == 200 and response.json() == {"ok": True}
+    assert client.get("/health", headers={"Authorization": ""}).status_code == 401
+
+
+def test_chunked_upload_resumes_starts_and_scopes_listing_to_owner(hosted):
+    server, client, submitted = hosted
+    data = FIXTURE.read_bytes()
+    owner = "c" * 32
+    created = client.post(
+        f"/jobs?size={len(data)}&owner={owner}&title=Chunked",
+        headers={"Content-Type": "video/mp4"},
+    )
+    assert created.status_code == 200, created.text
+    job = created.json()
+    assert job["status"] == "uploading" and "owner" not in job
+    # Worker is reserved while the browser sends chunks.
+    busy = client.post(f"/jobs?size=10&owner={owner}", headers={"Content-Type": "video/mp4"})
+    assert busy.status_code == 409
+    # Starting before every byte arrives is rejected.
+    assert client.post(f"/jobs/{job['id']}/start").status_code == 409
+    step = 100_000
+    for offset in range(0, len(data), step):
+        r = client.put(f"/jobs/{job['id']}/video?offset={offset}", content=data[offset : offset + step])
+        assert r.status_code == 200 and r.json()["received"] == min(len(data), offset + step)
+    # A retried chunk is acknowledged without being written twice.
+    assert client.put(f"/jobs/{job['id']}/video?offset=0", content=data[:step]).json() == {
+        "received": len(data)
+    }
+    # Partial video is never served during upload.
+    assert client.get(f"/jobs/{job['id']}/video").status_code == 404
+    started = client.post(f"/jobs/{job['id']}/start")
+    assert started.status_code == 200, started.text
+    assert started.json()["status"] == "processing" and started.json()["fileSize"] == len(data)
+    assert len(submitted) == 1
+    assert (server.ROOT / job["id"] / "video").read_bytes() == data
+    assert [j["id"] for j in client.get(f"/jobs?owner={owner}").json()] == [job["id"]]
+    assert client.get(f"/jobs?owner={'d' * 32}").json() == []
+    assert client.get("/jobs?owner=../../etc").status_code == 400
+
+
+def test_out_of_order_chunk_is_rejected_with_resync_offset(hosted):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
+    r = client.put(f"/jobs/{job['id']}/video?offset=4", content=b"4567")
+    assert r.status_code == 409 and "Expected offset 0" in r.json()["detail"]
+    too_big = client.put(f"/jobs/{job['id']}/video?offset=0", content=b"0123456789ABC")
+    assert too_big.status_code == 413
+
+
+def test_cancelled_and_abandoned_uploads_release_the_worker(hosted, monkeypatch):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
+    assert client.post(f"/jobs/{job['id']}/cancel").json() == {"requested": True}
+    assert server.active is None
+    assert not (server.ROOT / job["id"] / "video").exists()
+    assert client.get(f"/jobs/{job['id']}").json()["status"] == "failed"
+
+    abandoned = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
+    monkeypatch.setattr(server, "UPLOAD_IDLE_SECONDS", 0)
+    replacement = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"})
+    assert replacement.status_code == 200
+    assert client.get(f"/jobs/{abandoned['id']}").json()["stage"].startswith("Upload stopped")
+
+
+def test_corrupt_chunked_upload_fails_cleanly(hosted):
+    server, client, submitted = hosted
+    job = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
+    client.put(f"/jobs/{job['id']}/video?offset=0", content=b"not a vid!")
+    response = client.post(f"/jobs/{job['id']}/start")
+    assert response.status_code == 400 and "decoded" in response.json()["detail"]
+    assert server.active is None and not submitted
+
+
+def test_retention_deletes_old_footage_but_keeps_results(service, monkeypatch):
+    server, client = service
+    monkeypatch.setattr(server, "RETENTION_HOURS", 1)
+    old, new = "e" * 32, "f" * 32
+    for job, created in ((old, 0), (new, __import__("time").time())):
+        directory = server.ROOT / job
+        directory.mkdir()
+        (directory / "video").write_bytes(b"video")
+        (directory / "result.json").write_text("{}")
+        server.write_status(directory, {"id": job, "status": "completed", "createdAt": created})
+    server.delete_expired()
+    assert not (server.ROOT / old / "video").exists()
+    assert (server.ROOT / old / "result.json").exists()
+    assert client.get(f"/jobs/{old}").json()["videoDeleted"] is True
+    assert (server.ROOT / new / "video").exists()
+
+
+def test_open_ended_playback_range_is_capped(service, monkeypatch):
+    server, client = service
+    monkeypatch.setattr(server, "RANGE_CAP", 4)
+    job = "a" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "video").write_bytes(b"0123456789")
+    server.write_status(directory, {"id": job, "status": "completed", "createdAt": 0})
+    r = client.get(f"/jobs/{job}/video", headers={"Range": "bytes=2-"})
+    assert r.status_code == 206 and r.content == b"2345"
+    assert r.headers["Content-Range"] == "bytes 2-5/10"
+
+
+def test_allowed_hosts_default_to_loopback_and_are_configurable(monkeypatch):
+    from app.vision import server
+
+    monkeypatch.delenv("VISION_ALLOWED_HOSTS", raising=False)
+    assert server.allowed_hosts() == ["127.0.0.1", "localhost", "testserver"]
+    monkeypatch.setenv("VISION_ALLOWED_HOSTS", "pitchlens.up.railway.app, healthcheck.railway.app")
+    assert server.allowed_hosts() == ["pitchlens.up.railway.app", "healthcheck.railway.app"]
+
+
+def test_restart_marks_in_flight_work_interrupted_and_drops_partial_uploads(service):
+    server, client = service
+    uploading, processing = "1" * 32, "2" * 32
+    for job, state in ((uploading, "uploading"), (processing, "processing")):
+        directory = server.ROOT / job
+        directory.mkdir()
+        (directory / "video").write_bytes(b"partial")
+        server.write_status(directory, {"id": job, "status": state, "createdAt": 0})
+    server.recover_after_restart()
+    assert client.get(f"/jobs/{uploading}").json()["status"] == "interrupted"
+    assert not (server.ROOT / uploading / "video").exists()
+    assert client.get(f"/jobs/{processing}").json()["status"] == "interrupted"
+    assert (server.ROOT / processing / "video").exists()
+
+
+def test_shutdown_during_analysis_is_interrupted_not_user_cancelled(service, monkeypatch):
+    server, _ = service
+    job = "3" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    status = {"id": job, "status": "processing", "createdAt": 0}
+
+    def run_video(*args, cancelled, **kwargs):
+        server.stop_jobs()
+        assert cancelled()
+        raise InterruptedError("Analysis cancelled")
+
+    monkeypatch.setattr(server, "run_video", run_video)
+    monkeypatch.setattr(server, "stopping", False)
+    event = threading.Event()
+    server.cancellations[job] = event
+    server.work(directory, status, event)
+    assert status["status"] == "interrupted"
+
+
+def test_identical_kit_colours_fail_with_a_clear_message():
+    from app.vision.engine import train_colours
+
+    with pytest.raises(ValueError, match="kits could not be separated"):
+        train_colours([[50.0, 10.0, 10.0]] * 20, n_clusters=2)
+
+
+def test_trickling_upload_cannot_hold_the_worker_past_the_deadline(hosted, monkeypatch):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=100", headers={"Content-Type": "video/mp4"}).json()
+    # Still sending data, so never idle — but past the absolute deadline.
+    client.put(f"/jobs/{job['id']}/video?offset=0", content=b"x")
+    monkeypatch.setattr(server, "UPLOAD_MAX_SECONDS", 0)
+    replacement = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"})
+    assert replacement.status_code == 200
+    assert client.get(f"/jobs/{job['id']}").json()["status"] == "failed"
+
+
+def test_late_chunk_after_cancel_does_not_resurrect_the_upload(hosted, monkeypatch):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
+    original = server.receiving
+    calls = {"n": 0}
+
+    def cancel_while_body_arrives(job_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            result = original(job_id)
+            # The user cancels while this chunk's body is still streaming.
+            client.post(f"/jobs/{job_id}/cancel")
+            return result
+        return original(job_id)
+
+    monkeypatch.setattr(server, "receiving", cancel_while_body_arrives)
+    late = client.put(f"/jobs/{job['id']}/video?offset=0", content=b"0123")
+    assert late.status_code == 409
+    assert not (server.ROOT / job["id"] / "video").exists()
+    assert client.get(f"/jobs/{job['id']}").json()["stage"] == "Upload cancelled"
+
+
+def test_duplicate_retry_of_the_same_chunk_is_written_once(hosted):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=8", headers={"Content-Type": "video/mp4"}).json()
+    for _ in range(3):
+        assert client.put(f"/jobs/{job['id']}/video?offset=0", content=b"0123").json() == {
+            "received": 4
+        }
+    assert (server.ROOT / job["id"] / "video").read_bytes() == b"0123"
+
+
+def test_cancel_during_start_probe_never_queues_work(hosted, monkeypatch):
+    server, client, submitted = hosted
+    data = FIXTURE.read_bytes()
+    job = client.post(f"/jobs?size={len(data)}", headers={"Content-Type": "video/mp4"}).json()
+    client.put(f"/jobs/{job['id']}/video?offset=0", content=data)
+    real_probe = server.probe
+
+    def probe_then_cancel(path):
+        meta = real_probe(path)
+        client.post(f"/jobs/{job['id']}/cancel")
+        return meta
+
+    monkeypatch.setattr(server, "probe", probe_then_cancel)
+    assert client.post(f"/jobs/{job['id']}/start").status_code == 409
+    assert not submitted and server.active is None
+
+
+def test_abandoned_upload_is_released_when_anyone_reads_status(hosted, monkeypatch):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
+    monkeypatch.setattr(server, "UPLOAD_IDLE_SECONDS", 0)
+    assert client.get(f"/jobs/{job['id']}").json()["status"] == "failed"
+    assert server.active is None
+
+
+def test_expired_footage_is_not_served_even_before_the_sweep(service, monkeypatch):
+    server, client = service
+    monkeypatch.setattr(server, "RETENTION_HOURS", 1)
+    job = "9" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "video").write_bytes(b"video")
+    server.write_status(directory, {"id": job, "status": "completed", "createdAt": 0})
+    assert client.get(f"/jobs/{job}/video").status_code == 404
+    assert not (directory / "video").exists()
+    assert client.get(f"/jobs/{job}").json()["videoDeleted"] is True

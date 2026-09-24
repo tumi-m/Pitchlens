@@ -1,69 +1,99 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, ScanLine, Loader2 } from "lucide-react";
+import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
-import { visionJson, VisionJob } from "@/lib/review/vision";
+import {
+  VisionHealth,
+  VisionError,
+  uploadToVision,
+  visionAccessCode,
+  setVisionAccessCode,
+} from "@/lib/review/vision";
 
 export function VisionUpload({ onManual }: { onManual: () => void }) {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
-  const [available, setAvailable] = useState<boolean | null>(null);
+  const [health, setHealth] = useState<VisionHealth | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [percent, setPercent] = useState(0);
-  const [profiles, setProfiles] = useState<string[]>(["general"]);
+  const [phase, setPhase] = useState("");
   const [profile, setProfile] = useState("general");
   const [fps, setFps] = useState("3");
-  const xhr = useRef<XMLHttpRequest | null>(null);
+  const [code, setCode] = useState("");
+  const [needsCode, setNeedsCode] = useState(false);
+  const upload = useRef<AbortController | null>(null);
   useEffect(() => {
-    visionJson<{ available: boolean; profiles?: string[] }>("health")
-      .then((x) => { setAvailable(x.available); setProfiles(x.profiles ?? ["general"]); })
-      .catch(() => setAvailable(false));
-    return () => xhr.current?.abort();
+    setCode(visionAccessCode());
+    // Read the body even on 503: it says whether the worker is unset, down or local.
+    fetch("/api/vision/health", { cache: "no-store" })
+      .then((r) => r.json().catch(() => ({})))
+      .then((x: VisionHealth) => {
+        setHealth({ ...x, available: x.available === true });
+        setNeedsCode(!!x.accessRequired && !visionAccessCode());
+      })
+      .catch(() => setHealth({ available: false }));
+    return () => upload.current?.abort();
   }, []);
+  const available = health?.available === true;
+  const hosted = health?.hosted === true;
+  // Local setup instructions only make sense to someone running the site themselves.
+  const local =
+    health?.hosted === false ||
+    (typeof window !== "undefined" &&
+      ["localhost", "127.0.0.1"].includes(window.location.hostname));
+  const retention = health?.retentionHours
+    ? health.retentionHours >= 48
+      ? `${Math.round(health.retentionHours / 24)} days`
+      : `${Math.round(health.retentionHours)} hours`
+    : "";
+  const profiles = health?.profiles ?? ["general"];
   async function submit() {
     if (!file) return;
+    if (health?.accessRequired) {
+      if (!code.trim()) {
+        setNeedsCode(true);
+        setError("Enter the access code first.");
+        return;
+      }
+      setVisionAccessCode(code.trim());
+    }
+    const controller = new AbortController();
+    upload.current = controller;
     setError("");
     setBusy(true);
     setPercent(0);
+    setPhase("Reserving the analysis server");
     try {
-      const job = await new Promise<VisionJob>((resolve, reject) => {
-        const req = new XMLHttpRequest();
-        xhr.current = req;
-        req.open(
-          "POST",
-          `/api/vision/jobs?title=${encodeURIComponent(title.trim() || file.name)}&profile=${profile}&fps=${fps}`,
-        );
-        req.setRequestHeader(
-          "Content-Type",
-          file.type || "application/octet-stream",
-        );
-        req.upload.onprogress = (e) => {
-          if (e.lengthComputable)
-            setPercent(Math.round((e.loaded / e.total) * 100));
-        };
-        req.onload = () => {
-          try {
-            const data = JSON.parse(req.responseText);
-            if (req.status >= 200 && req.status < 300) resolve(data);
-            else reject(new Error(data.detail || "Upload failed"));
-          } catch {
-            reject(new Error("Invalid worker response"));
-          }
-        };
-        req.onerror = () =>
-          reject(new Error("Could not reach the vision worker."));
-        req.onabort = () => reject(new Error("Upload cancelled."));
-        req.send(file);
+      const job = await uploadToVision(file, {
+        title: title.trim() || file.name,
+        profile,
+        fps,
+        signal: controller.signal,
+        onProgress: (p) => {
+          setPercent(p);
+          setPhase(p < 100 ? "Uploading" : "Checking the video");
+        },
       });
-      xhr.current = null;
       router.push(`/vision/${job.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to start analysis");
+      if (e instanceof VisionError && e.code === "access") {
+        setVisionAccessCode("");
+        setCode("");
+        setNeedsCode(true);
+      }
+      setError(
+        e instanceof DOMException && e.name === "AbortError"
+          ? "Upload cancelled. Your file is still selected."
+          : e instanceof Error
+            ? e.message
+            : "Unable to start analysis",
+      );
       setBusy(false);
-      xhr.current = null;
+    } finally {
+      upload.current = null;
     }
   }
   return (
@@ -73,7 +103,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         <div className="max-w-3xl mx-auto space-y-7">
           <div>
             <p className="text-pitch-green text-xs tracking-widest uppercase mb-3">
-              Computer vision · Local processing
+              Computer vision · {hosted ? "Pitchlens analysis server" : "Local processing"}
             </p>
             <h1 className="text-4xl font-bold mb-4">
               Let the footage do the talking.
@@ -96,25 +126,57 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </div>
             ))}
           </div>
-          {available === false && (
+          {health && !available && (
             <div
               role="alert"
               className="border border-amber-500/40 bg-amber-500/10 rounded-xl p-4 text-sm space-y-2"
             >
-              <p className="font-semibold">
-                Start the local vision worker to analyse a match.
-              </p>
-              <p>
-                This runs on your computer with downloaded model weights. No
-                Roboflow key is needed.
-              </p>
-              <code className="block break-all">
-                python scripts/start_vision.py
-              </code>
-              <p>
-                Run from the backend folder after following docs/VISION.md. Then
-                reload this page.
-              </p>
+              {local ? (
+                <>
+                  <p className="font-semibold">
+                    Start the local vision worker to analyse a match.
+                  </p>
+                  <p>
+                    This runs on your computer with downloaded model weights. No
+                    Roboflow key is needed.
+                  </p>
+                  <code className="block break-all">
+                    python scripts/start_vision.py
+                  </code>
+                  <p>
+                    Run from the backend folder after following docs/VISION.md.
+                    Then reload this page.
+                  </p>
+                </>
+              ) : health.configured === false ? (
+                <>
+                  <p className="font-semibold">
+                    Automatic analysis isn&apos;t switched on for this site yet.
+                  </p>
+                  <p>
+                    Manual review works meanwhile. Site owner: see
+                    docs/DEPLOY-VISION.md.
+                  </p>
+                </>
+              ) : !health.detail || /^Cannot reach/.test(health.detail) ? (
+                <>
+                  <p className="font-semibold">
+                    The analysis server is not responding.
+                  </p>
+                  <p>
+                    It may be starting up or redeploying. Reload this page in a
+                    minute, or use manual review.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-semibold">
+                    Automatic analysis is unavailable.
+                  </p>
+                  <p>{health.detail}</p>
+                  <p>Manual review works meanwhile.</p>
+                </>
+              )}
             </div>
           )}
           <label className="block glass-card border-2 border-dashed border-pitch-green/40 p-10 text-center cursor-pointer">
@@ -123,12 +185,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               {file ? file.name : "Choose your match video"}
             </span>
             <span className="text-sm text-pitch-muted block mt-2">
-              MP4 · Up to 500 MB · Video stays on this computer
+              MP4 or MOV (H.264/HEVC) · Up to 500 MB ·{" "}
+              {hosted
+                ? `Uploaded to the Pitchlens analysis server${retention ? `; footage deleted after ${retention}` : ""}`
+                : "Video stays on this computer"}
             </span>
             <input
               aria-label="Video for computer vision"
               type="file"
-              accept="video/mp4,.mp4"
+              accept="video/mp4,video/quicktime,.mp4,.mov"
               disabled={busy}
               className="mt-5 max-w-full text-sm"
               onChange={(e) => {
@@ -139,13 +204,13 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   setError("Video exceeds 500 MB");
                   return;
                 }
-                if (!/\.mp4$/i.test(f.name)) {
+                if (!/\.(mp4|mov)$/i.test(f.name)) {
                   setFile(null);
-                  setError("Choose an MP4 video.");
+                  setError("Choose an MP4 or MOV video.");
                   return;
                 }
                 setFile(f);
-                setTitle(f.name.replace(/\.mp4$/i, ""));
+                setTitle(f.name.replace(/\.(mp4|mov)$/i, ""));
                 setError("");
               }}
             />
@@ -161,9 +226,31 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               disabled={busy}
             />
           </label>
+          {needsCode && (
+            <label className="block text-sm">
+              <span className="flex items-center gap-2">
+                <KeyRound size={15} className="text-pitch-green" /> Access code
+              </span>
+              <input
+                aria-label="Access code"
+                type="password"
+                autoComplete="off"
+                className="pitch-input w-full mt-2"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                disabled={busy}
+              />
+              <span className="text-xs text-pitch-muted block mt-1">
+                Analysis runs on paid servers. Ask the Pitchlens owner for the code.
+              </span>
+            </label>
+          )}
           <p className="text-sm text-pitch-muted">
-            Processing time depends on video length and hardware. The report
-            shows detection coverage and unknown time. Kit groups need your team
+            On a CPU server, expect analysis to take about as long as the
+            video or longer at the quick setting (a 4-core test took about 1.6
+            minutes per minute of footage). The report shows a live time
+            estimate, and you can leave and come back. It shows detection
+            coverage and unknown time. Kit groups need your team
             names; automatic pass candidates are estimates. Score, xG and
             physical speed are not yet measured.
           </p>
@@ -203,9 +290,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             {busy ? (
               <>
                 <Loader2 size={18} className="animate-spin" />
-                {percent < 100
-                  ? `Uploading to local worker · ${percent}%`
-                  : "Opening video…"}
+                {phase === "Uploading" ? `Uploading · ${percent}%` : `${phase}…`}
               </>
             ) : (
               <>
@@ -215,7 +300,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           </button>
           {busy && (
             <button
-              onClick={() => xhr.current?.abort()}
+              onClick={() => upload.current?.abort()}
               className="pitch-button-secondary"
             >
               Cancel upload
