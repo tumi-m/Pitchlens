@@ -20,6 +20,21 @@ from app.vision.profiles import model_paths
 from app.vision.tracking import MotionTracker, camera_motion
 
 
+def file_sha256(path):
+    """Stream the hash: reading a 500 MB match into memory can exhaust a small container."""
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def worker_threads():
+    """Hosted containers can use more cores than the laptop default of four."""
+    default = min(4, os.cpu_count() or 2)
+    try:
+        return max(1, int(os.getenv("VISION_THREADS") or default))
+    except ValueError:
+        return default
+
+
 def probe(path):
     cap = cv2.VideoCapture(str(path))
     try:
@@ -27,6 +42,11 @@ def probe(path):
         count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         width, height = int(cap.get(3)), int(cap.get(4))
         ok, _ = cap.read()
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC) or 0).to_bytes(4, "little")
+        if not ok and fourcc.upper() == b"AV01":
+            raise ValueError(
+                "AV1 video cannot be decoded here. Export or re-save it as an H.264 MP4."
+            )
         if not ok or not math.isfinite(fps) or fps <= 0 or count <= 0:
             raise ValueError("Video cannot be decoded.")
         duration = count / fps
@@ -91,6 +111,8 @@ def train_colours(features, n_clusters=4):
         km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit(features)
     counts = Counter(km.labels_)
     selected = [i for i, _ in counts.most_common(2)]
+    if len(selected) < 2:
+        raise ValueError("The two kits could not be separated reliably by colour.")
     centres = km.cluster_centers_[selected]
     if np.linalg.norm(centres[0] - centres[1]) < 25:
         raise ValueError("The two kits could not be separated reliably by colour.")
@@ -134,7 +156,7 @@ def run_video(
     from ultralytics import YOLO, settings
 
     settings.update({"sync": False})
-    torch.set_num_threads(min(4, os.cpu_count() or 2))
+    torch.set_num_threads(worker_threads())
     cv2.setNumThreads(1)
     model_path, ball_path = [p.resolve() for p in model_paths(profile)]
     if not model_path.is_file():
@@ -213,21 +235,41 @@ def run_video(
     previous_gray = None
     previous_frame = None
     previous_boxes = []
+    last_t = -1.0
     started = time.monotonic()
+    reported = started
+    progress(
+        stage="Detecting players, tracking kits and following the ball",
+        progress=5,
+        processedSeconds=0,
+    )
     try:
         while frame_num / meta["fps"] < duration:
             if cancelled():
                 raise InterruptedError("Analysis cancelled")
             ok = cap.grab()
             if not ok:
+                # Container frame counts are estimates: trimmed clips (edit lists)
+                # routinely declare several seconds more than they hold. The real
+                # end of the stream is the end of the analysis, reported below.
+                if frames:
+                    break
                 raise ValueError("Video decoding stopped before the requested duration.")
             if frame_num % stride:
                 frame_num += 1
                 continue
             ok, frame = cap.retrieve()
             if not ok:
+                if frames:
+                    break
                 raise ValueError("Video decoding stopped before the end.")
-            t = frame_num / meta["fps"]
+            # Phone footage is often variable frame rate: prefer the decoder's
+            # presentation time so overlays line up with the video.
+            position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            t = position if math.isfinite(position) and position > last_t else frame_num / meta["fps"]
+            if frames and t <= last_t:
+                t = last_t + 1 / meta["fps"]
+            last_t = t
             mask = field_mask(frame)
             gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
             matrix, motion_ok = camera_motion(previous_frame, frame, previous_boxes)
@@ -268,8 +310,12 @@ def run_video(
                     "ballCandidates": candidates,
                 }
             )
-            if len(frames) % 50 == 0:
-                elapsed = time.monotonic() - started
+            # Report on wall time, not frame count: a slow CPU host can take
+            # minutes per 50 frames, which looks frozen.
+            now = time.monotonic()
+            if now - reported >= 3:
+                reported = now
+                elapsed = now - started
                 progress(
                     stage="Detecting players, tracking kits and following the ball",
                     progress=round(5 + t / duration * 90, 1),
@@ -285,18 +331,18 @@ def run_video(
             "No on-pitch players detected. This video cannot be analysed by the installed model."
         )
     progress(stage="Measuring temporal observations", progress=96)
-    analysed_duration = min(duration, (frame_num + 1) / meta["fps"])
+    analysed_duration = min(duration, max(frame_num / meta["fps"], last_t))
     metrics = derive_metrics(frames, effective_fps, analysed_duration)
     result = {
         "schemaVersion": 1,
         "pipelineVersion": "local-vision-1.4",
         "profile": profile,
         "source": "computer-vision",
-        "videoSha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        "videoSha256": file_sha256(path),
         "model": model_path.name,
-        "modelSha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+        "modelSha256": file_sha256(model_path),
         "ballModel": ball_path.name,
-        "ballModelSha256": hashlib.sha256(ball_path.read_bytes()).hexdigest(),
+        "ballModelSha256": file_sha256(ball_path),
         "ballInference": "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles",
         "ballTracking": "camera-compensated-observations",
         "video": meta,
@@ -312,7 +358,15 @@ def run_video(
             "Track IDs change after occlusion and cuts; they are not player identities.",
             "Positions are image coordinates. Speed, distance, xG and score are not measured.",
             "Green-surface filtering can include sideline players or miss players near boundaries.",
-        ],
+        ]
+        + (
+            [
+                f"The file declares {meta['duration']:.0f} s but decoding ended at "
+                f"{analysed_duration:.0f} s; results cover the decodable part."
+            ]
+            if analysed_duration < duration * 0.97
+            else []
+        ),
     }
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

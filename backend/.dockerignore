@@ -1,0 +1,8 @@
+.venv*
+.vision
+.ultralytics
+.pytest_cache
+__pycache__
+models
+*.pyc
+.env

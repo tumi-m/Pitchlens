@@ -12,7 +12,9 @@ class BallDetector:
 
         ort.disable_telemetry_events()
         options = ort.SessionOptions()
-        options.intra_op_num_threads = 4
+        from app.vision.engine import worker_threads
+
+        options.intra_op_num_threads = worker_threads()
         options.inter_op_num_threads = 1
         self.session = ort.InferenceSession(
             str(Path(path)), sess_options=options, providers=["CPUExecutionProvider"]

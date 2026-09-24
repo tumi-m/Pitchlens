@@ -10,6 +10,7 @@ import { saveMatchLocally } from "@/lib/firebase/firestore";
 import { saveVideo, deleteVideo } from "@/lib/review/videoStore";
 import { processVideo } from "@/lib/utils/videoProcessor";
 import { formatFileSize } from "@/lib/utils/analytics";
+import { visionAccessCode, setVisionAccessCode } from "@/lib/review/vision";
 
 export default function UploadPage() {
   const router = useRouter();
@@ -20,6 +21,8 @@ export default function UploadPage() {
   const [away, setAway] = useState("Away Team");
   const [inference, setInference] = useState(false);
   const [configured, setConfigured] = useState(false);
+  const [accessRequired, setAccessRequired] = useState(false);
+  const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState("");
@@ -29,7 +32,11 @@ export default function UploadPage() {
     const controller = new AbortController();
     fetch("/api/infer", { signal: controller.signal })
       .then((r) => r.json())
-      .then((d) => setConfigured(d.configured === true))
+      .then((d) => {
+        setConfigured(d.configured === true);
+        setAccessRequired(d.accessRequired === true);
+        setCode(visionAccessCode());
+      })
       .catch(() => {});
     return () => {
       controller.abort();
@@ -58,6 +65,13 @@ export default function UploadPage() {
   });
   async function analyse() {
     if (!file || active.current) return;
+    if (inference && accessRequired) {
+      if (!code.trim()) {
+        setError("Enter the access code to use AI frame inspection.");
+        return;
+      }
+      setVisionAccessCode(code.trim());
+    }
     const controller = new AbortController();
     active.current = controller;
     const id = `local_${crypto.randomUUID()}`;
@@ -176,6 +190,20 @@ export default function UploadPage() {
                 </span>
               </span>
             </label>
+            {inference && accessRequired && (
+              <label className="block text-sm">
+                Access code
+                <input
+                  aria-label="AI access code"
+                  type="password"
+                  autoComplete="off"
+                  className="pitch-input w-full mt-2"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  disabled={busy}
+                />
+              </label>
+            )}
           </div>
           {error && (
             <p

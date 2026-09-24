@@ -1,0 +1,15 @@
+# Railway service for the Pitchlens vision worker.
+# In Railway: set Root Directory to "backend" AND Settings → Config-as-code →
+# Railway Config File to "/backend/railway.toml" (Railway does not look for this
+# file inside the Root Directory). Full steps: docs/DEPLOY-VISION.md
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "vision.Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+# Jobs are serialised in one process and stored on one volume: never scale out.
+numReplicas = 1

@@ -1,5 +1,6 @@
 import { fingerprintVideo } from "@/lib/review/portable";
 import { auth } from "@/lib/firebase/config";
+import { visionAccessCode, setVisionAccessCode } from "@/lib/review/vision";
 import type { VideoReview, Detection } from "@/lib/review/types";
 
 export interface ProcessOptions {
@@ -102,6 +103,7 @@ export async function processVideo(
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("This browser cannot extract video frames.");
       let failures = 0;
+      let lastError = "";
       for (let i = 0; i < 6; i++) {
         signal?.throwIfAborted();
         onStage(`Inspecting sample frame ${i + 1} of 6`);
@@ -121,6 +123,9 @@ export async function processVideo(
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
+                ...(visionAccessCode()
+                  ? { "x-pitchlens-access": visionAccessCode() }
+                  : {}),
                 ...(auth.currentUser
                   ? {
                       Authorization: `Bearer ${await auth.currentUser.getIdToken()}`,
@@ -130,7 +135,20 @@ export async function processVideo(
               body: JSON.stringify({ frame: image.split(",")[1] }),
               signal: controller.signal,
             });
-            if (!res.ok) throw new Error("Frame detection failed");
+            if (!res.ok) {
+              let message = `Frame detection failed (HTTP ${res.status})`;
+              try {
+                const body = await res.json();
+                if (body && typeof body.error === "string" && body.error.trim())
+                  message = body.error.trim();
+                // A rejected code is forgotten so the form asks for it again.
+                if (res.status === 401 && body?.code === "access")
+                  setVisionAccessCode("");
+              } catch {
+                // Non-JSON error body; keep the status-based message.
+              }
+              throw new Error(message);
+            }
             const data = await res.json();
             review.frames.push({
               timestamp,
@@ -143,15 +161,24 @@ export async function processVideo(
             clearTimeout(timeout);
             signal?.removeEventListener("abort", abort);
           }
-        } catch {
+        } catch (err) {
           signal?.throwIfAborted();
           failures++;
+          lastError =
+            err instanceof Error && err.name === "AbortError"
+              ? "the detection request timed out"
+              : err instanceof Error && err.message
+                ? err.message
+                : "unknown error";
         }
         onProgress(20 + Math.round(((i + 1) / 6) * 70));
       }
       review.aiStatus =
         failures === 6 ? "failed" : failures ? "partial" : "completed";
-      review.aiMessage = `${review.frames.length} of 6 sample frames inspected. Detections are image coordinates, not calibrated pitch positions. They do not establish team identity, possession, goals or xG.`;
+      review.aiMessage =
+        failures === 6 || review.frames.length === 0
+          ? `AI frame inspection failed: ${lastError.slice(0, 300).replace(/\.+$/, "") || "unknown error"}. 0 of 6 sample frames inspected. Video review and manual tagging are available.`
+          : `${review.frames.length} of 6 sample frames inspected. Detections are image coordinates, not calibrated pitch positions. They do not establish team identity, possession, goals or xG.`;
     } catch {
       signal?.throwIfAborted();
       review.aiStatus = review.frames.length ? "partial" : "failed";

@@ -5,11 +5,13 @@ import { AuthProvider } from '@/components/auth/AuthProvider';
 
 export const metadata: Metadata = {
   title: { default: 'Pitchlens', template: '%s | Pitchlens' },
-  description: 'Unveil the Geometry of Your Game. Advanced soccer analytics for five-a-side enthusiasts.',
-  keywords: ['soccer analytics', 'five-a-side', 'xG', 'heatmap', 'football tracking'],
+  description:
+    'Computer-vision review of football footage: player and ball detection, kit grouping and evidence-linked pass candidates, plus manual tagging.',
+  keywords: ['soccer analytics', 'five-a-side', 'football tracking'],
   openGraph: {
     title: 'Pitchlens',
-    description: 'Unveil the Geometry of Your Game.',
+    description:
+      'Computer-vision review of football footage: player and ball detection, kit grouping and evidence-linked pass candidates, plus manual tagging.',
     type: 'website',
     siteName: 'Pitchlens',
   },

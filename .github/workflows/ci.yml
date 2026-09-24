@@ -18,8 +18,11 @@ jobs:
       - run: npm run type-check
       - run: npm run lint
       - run: npm run build
-      - run: npx playwright install --with-deps chromium
+      # Review tests play an H.264 MP4 fixture; Google Chrome ships that codec.
+      - run: npx playwright install --with-deps chrome
       - run: npm test
+        env:
+          PLAYWRIGHT_CHANNEL: chrome
   functions:
     runs-on: ubuntu-latest
     defaults:
@@ -29,7 +32,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # firebase-admin 14's Firestore/Storage packages need Node 22; on 20 npm
+          # silently skips them and the build loses their types.
+          node-version: 22
       - run: npm ci
       - run: npm run build
   backend:

@@ -64,7 +64,7 @@ export function Navbar() {
           <div className="flex items-center gap-2">
 
 
-            {!process.env.NEXT_PUBLIC_FIREBASE_API_KEY ? <span className="text-xs text-pitch-muted hidden md:block">Local workspace</span> : user ? (
+            {!process.env.NEXT_PUBLIC_FIREBASE_API_KEY ? <span className="text-xs text-pitch-muted hidden md:block">No sign-in needed</span> : user ? (
               <div className="hidden md:flex items-center gap-2">
                 <div className="w-8 h-8 rounded-full bg-pitch-indigo-soft flex items-center justify-center text-xs font-bold text-pitch-white overflow-hidden">
                   {user.photoURL
