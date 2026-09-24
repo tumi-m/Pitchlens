@@ -73,7 +73,7 @@ test("invalid video fails visibly and does not create a fabricated match", async
     buffer: Buffer.from("this is not a video"),
   });
   await page.getByRole("button", { name: "Open review room" }).click();
-  await expect(page.getByRole("alert")).toContainText("cannot be decoded");
+  await expect(page.getByRole("alert").filter({ hasText: /\S/ })).toContainText("cannot be decoded");
   await page.goto("/dashboard");
   await expect(page.getByText("No matches yet")).toBeVisible();
 });
