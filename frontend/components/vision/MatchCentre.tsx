@@ -69,19 +69,22 @@ function StatRow({
   colours,
   format = (v) => String(v),
   hint,
+  lowerIsBetter = false,
 }: {
   label: string;
   values: [number | null, number | null];
   colours: [string, string];
   format?: (v: number) => string;
   hint?: string;
+  lowerIsBetter?: boolean;
 }) {
   const [a, b] = values;
   const known = a !== null && b !== null;
   const total = known ? a + b : 0;
   const shareA = known && total > 0 ? a / total : 0;
   const shareB = known && total > 0 ? b / total : 0;
-  const leader = known && a !== b ? (a > b ? 0 : 1) : null;
+  const leader =
+    known && a !== b ? ((a > b) !== lowerIsBetter ? 0 : 1) : null;
   const pill = (v: number | null, side: 0 | 1) => (
     <span
       className="min-w-[3.5rem] text-center px-2.5 py-1 rounded-full text-sm font-bold"
@@ -229,7 +232,11 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               )}
             </div>
             <span className="text-xs text-pitch-muted">
-              {shareKnown ? "% of observed control" : "Not enough ball evidence"}
+              {shareKnown
+                ? stats.shareRange
+                  ? `% of observed control · plausible ${stats.shareRange[0]}–${stats.shareRange[1]}% for ${names[0]}`
+                  : "% of observed control"
+                : "Not enough ball evidence"}
             </span>
             <div className="flex items-center gap-2 mt-2 text-xs text-pitch-muted">
               <span>{clockTime(result.analysedDuration)} analysed</span>
@@ -283,7 +290,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               values={shareValues}
               colours={colours}
               format={(v) => `${Math.round(v)}%`}
-              hint="Share of the time the ball was stably next to a player of each kit, among the time it was observed."
+              hint="Share of observed time the ball was stably next to a player of each kit. It describes style, not quality: possession share is a weak guide to who played better."
             />
             <StatRow
               label="Control time"
@@ -295,7 +302,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               label="Pass candidates"
               values={stats.passCandidates}
               colours={colours}
-              hint="Ball moved between two players of the same kit while visible. Unreviewed."
+              hint="Lower bound: only transfers where the ball stayed visible between two players of the same kit are counted. Unreviewed."
             />
             <StatRow
               label="Turnovers won"
@@ -310,6 +317,43 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               format={(v) => v.toFixed(1)}
             />
             <StatRow label="Players tracked (peak)" values={stats.peakPlayers} colours={colours} />
+            {stats.possessions[0] !== null && (
+              <>
+                <StatRow
+                  label="Possessions"
+                  values={stats.possessions}
+                  colours={colours}
+                  hint="Spells of consecutive control by one team. A spell ends when the other team takes the ball, at a camera cut, or after 3 s with the ball unseen (StatsBomb's possession-sequence idea)."
+                />
+                <StatRow
+                  label="Avg possession"
+                  values={stats.avgPossession}
+                  colours={colours}
+                  format={(v) => `${v.toFixed(1)}s`}
+                />
+                <StatRow
+                  label="Longest possession"
+                  values={stats.longestPossession}
+                  colours={colours}
+                  format={(v) => `${v.toFixed(1)}s`}
+                />
+                <StatRow
+                  label="Passes per possession"
+                  values={stats.passesPerPossession}
+                  colours={colours}
+                  format={(v) => v.toFixed(2)}
+                  hint="How much a team combines before losing the ball. Low values mean direct play or quick losses."
+                />
+                <StatRow
+                  label="Passes allowed per ball won"
+                  values={stats.passesAllowedPerRegain}
+                  colours={colours}
+                  format={(v) => v.toFixed(1)}
+                  lowerIsBetter
+                  hint="A pressing proxy, not PPDA: opposition pass candidates per ball won. Lower = the team won the ball back sooner. Single matches are noisy."
+                />
+              </>
+            )}
           </div>
         </section>
 
@@ -367,6 +411,60 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
           </section>
         </div>
       </div>
+
+      {/* Cumulative control (in the style of an xG time plot) */}
+      {stats.cumulative.length > 2 && (
+        <section className={card}>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Control over time</h2>
+            <span className="text-xs text-pitch-muted">Cumulative seconds of observed ball control</span>
+          </div>
+          {(() => {
+            const maxY = Math.max(1, ...stats.cumulative.map(([, a, b]) => Math.max(a, b)));
+            const W = 600;
+            const H = 160;
+            const x = (t: number) => (t / duration) * W;
+            const y = (v: number) => H - (v / maxY) * (H - 12) - 4;
+            const step = (i: 1 | 2) =>
+              stats.cumulative.map(([t, a, b], k) => `${k ? "L" : "M"}${x(t).toFixed(1)},${y(i === 1 ? a : b).toFixed(1)}`).join(" ");
+            const last = stats.cumulative[stats.cumulative.length - 1];
+            const label = (v: number) => (v < 60 ? `${v.toFixed(1)}s` : clockTime(v));
+            return (
+              <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto">
+                {[0.25, 0.5, 0.75].map((f) => (
+                  <line key={f} x1="0" x2={W} y1={H * f} y2={H * f} stroke="rgba(255,255,255,0.06)" />
+                ))}
+                {([1, 2] as const).map((i) => (
+                  <motion.path
+                    key={i}
+                    d={step(i)}
+                    fill="none"
+                    stroke={colours[i - 1]}
+                    strokeWidth="2.5"
+                    strokeLinejoin="round"
+                    initial={{ pathLength: 0 }}
+                    whileInView={{ pathLength: 1 }}
+                    viewport={{ once: true }}
+                    transition={{ duration: 1.6, ease: "easeInOut" }}
+                  />
+                ))}
+                <text x={W - 4} y={y(last[1]) - 6} textAnchor="end" fontSize="12" fill={colours[0]}>{label(last[1])}</text>
+                <text x={W - 4} y={y(last[2]) + 16} textAnchor="end" fontSize="12" fill={colours[1]}>{label(last[2])}</text>
+              </svg>
+            );
+          })()}
+          <div className="flex justify-between text-[11px] text-pitch-muted mt-1">
+            <span>0:00</span>
+            <span>{clockTime(result.analysedDuration)}</span>
+          </div>
+        </section>
+      )}
+
+      <p className="text-xs text-pitch-muted leading-relaxed">
+        How to read this: these figures describe what the cameras saw in this match, not how good either
+        team is. One match is a small sample; possession-style numbers describe style, and passes and
+        turnovers are lower bounds counted only when the ball stayed visible.
+      </p>
 
       {/* Timeline */}
       <section className={card}>

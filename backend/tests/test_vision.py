@@ -785,3 +785,35 @@ def test_modal_needs_both_tokens_and_can_be_switched_off(monkeypatch):
     assert gpu.modal_enabled()
     monkeypatch.setenv("VISION_USE_MODAL", "0")
     assert not gpu.modal_enabled()
+
+
+# ── Possession chains (StatsBomb-style sequences) ─────────────────────────
+def test_possession_chain_survives_a_short_unseen_gap_but_not_a_turnover():
+    a, b = player(1, 0), player(2, 1, x=200)
+    frames = (
+        [frame(t / 5, [a]) for t in range(0, 3)]  # team 0 control 0.0-0.4
+        + [frame(t / 5, [a], ball=False) for t in range(3, 8)]  # 1 s unseen
+        + [frame(t / 5, [a]) for t in range(8, 11)]  # team 0 again: same possession
+        + [frame(t / 5, [b]) for t in range(11, 14)]  # team 1 takes over
+    )
+    chains = derive_metrics(frames, 5, 3)["possessions"]
+    assert [c["team"] for c in chains["chains"]] == [0, 1]
+    assert chains["teams"][0]["count"] == 1 and chains["teams"][1]["count"] == 1
+    assert chains["teams"][0]["longestSeconds"] >= 2
+
+
+def test_long_gap_or_scene_cut_starts_a_new_possession():
+    a = player(1, 0)
+    for gap_frames in (
+        [frame(t / 5, [a], ball=False) for t in range(3, 25)],  # 4.4 s unseen
+        [frame(0.6, [a], scene=1)],
+    ):
+        frames = [frame(t / 5, [a]) for t in range(0, 3)] + gap_frames
+        frames += [frame(5 + t / 5, [a], scene=gap_frames[-1]["scene"]) for t in range(0, 3)]
+        assert derive_metrics(frames, 5, 6)["possessions"]["teams"][0]["count"] == 2
+
+
+def test_pressing_metric_is_withheld_without_regains():
+    out = derive_metrics([frame(t / 5) for t in range(5)], 5, 1)["possessions"]["teams"]
+    assert out[0]["passesAllowedPerRegain"] is None
+    assert out[1]["count"] == 0 and out[1]["averageSeconds"] is None
