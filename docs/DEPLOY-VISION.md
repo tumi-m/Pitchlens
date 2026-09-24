@@ -146,3 +146,12 @@ token. The first job builds the GPU image on Modal (a few minutes, then
 cached). If Modal fails (bad token, no credit), the job falls back to the CPU
 and says so. `VISION_USE_MODAL=0` switches the GPU off. Set a spend limit in
 Modal → Settings → Usage & billing.
+
+### Faster or cheaper GPU runs
+
+- `VISION_MODAL_GPU` on Railway picks the card: `L4` (default, good value),
+  `A10G`, or `L40S` (fastest, about 2–3× the hourly price). Detectors run in
+  FP16 on any GPU.
+- The upload page defaults to 6 analysed frames/second when a GPU is
+  available; 10 fps follows the ball best and costs proportionally more.
+- Modal → Settings → Usage & billing shows the cost per run ("Ephemeral Apps").

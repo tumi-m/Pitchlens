@@ -38,7 +38,14 @@ image = (
     .add_local_file(
         BACKEND / "scripts" / "setup_vision.py", "/root/scripts/setup_vision.py", copy=True
     )
-    .run_commands("python /root/scripts/setup_vision.py")
+    .add_local_file(
+        BACKEND / "scripts" / "setup_football.py", "/root/scripts/setup_football.py", copy=True
+    )
+    .run_commands(
+        "python /root/scripts/setup_vision.py",
+        # Football-trained player + ball models (optional: Drive may refuse).
+        "python /root/scripts/setup_football.py || echo 'football models unavailable'",
+    )
     .env(
         {
             "YOLO_CONFIG_DIR": "/tmp/ultralytics",

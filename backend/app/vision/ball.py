@@ -107,6 +107,7 @@ class TiledBallDetector:
                     conf=threshold,
                     classes=self.classes,
                     device=self.device,
+                    quantize=16 if str(self.device).startswith("cuda") else None,
                     verbose=False,
                 )[0]
                 for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
