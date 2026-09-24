@@ -166,3 +166,36 @@ test("unavailable local vision worker does not silently fall back to a manual re
     page.getByRole("heading", { name: "Start with the footage." }),
   ).toBeVisible();
 });
+
+test("a YouTube link is sent to the worker only after the rights confirmation", async ({
+  page,
+}) => {
+  await page.route("**/api/vision/health", (r) =>
+    r.fulfill({ json: { available: true, hosted: false } }),
+  );
+  let requested = "";
+  await page.route(/\/api\/vision\/jobs\/from-url\?/, (r) => {
+    requested = r.request().url();
+    return r.fulfill({
+      json: { id: ID, title: "YouTube match", status: "uploading",
+        stage: "Waiting to download from YouTube", progress: 0, createdAt: 0 },
+    });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}$`), (r) =>
+    r.fulfill({
+      json: { id: ID, title: "Sunday final", status: "uploading",
+        stage: "Downloading from YouTube", progress: 40, createdAt: 0 },
+    }),
+  );
+  await page.goto("/upload");
+  await page.getByRole("tab", { name: "YouTube link" }).click();
+  const analyse = page.getByRole("button", { name: "Analyse video automatically", exact: true });
+  await page.getByLabel("YouTube video link").fill("https://example.com/clip.mp4");
+  await expect(page.getByText("Paste a link to a single YouTube video")).toBeVisible();
+  await page.getByLabel("YouTube video link").fill("https://youtu.be/dQw4w9WgXcQ");
+  await expect(analyse).toBeDisabled();
+  await page.getByLabel(/I filmed this video/).check();
+  await analyse.click();
+  await expect(page.getByRole("heading", { name: "Downloading from YouTube" })).toBeVisible();
+  expect(new URL(requested).searchParams.get("url")).toBe("https://youtu.be/dQw4w9WgXcQ");
+});

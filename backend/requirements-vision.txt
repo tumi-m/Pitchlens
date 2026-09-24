@@ -10,3 +10,5 @@ torch==2.14.0
 torchvision==0.29.0
 onnxruntime==1.30.0
 scipy==1.17.1
+yt-dlp[default]==2026.8.19
+deno==2.9.7

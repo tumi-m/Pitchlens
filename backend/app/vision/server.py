@@ -403,6 +403,106 @@ async def create(request: Request):
         raise
 
 
+def fetch_and_work(directory, status, event, url):
+    """Runs on the single inference thread: download, decode-check, then analyse."""
+    global active
+    from app.vision.youtube import download
+
+    def update(**kw):
+        status.update(kw)
+        write_status(directory, status)
+
+    handed_over = False
+    try:
+        update(stage="Downloading from YouTube", progress=0)
+        path, info = download(
+            url, directory, MAX_BYTES, progress=update, cancelled=event.is_set
+        )
+        path.replace(directory / "video")
+        size = (directory / "video").stat().st_size
+        metadata = probe(directory / "video")
+        if info.get("title") and status.get("title") == "YouTube match":
+            status["title"] = str(info["title"])[:200]
+        status.pop("receivedBytes", None)
+        status.update(video=metadata, fileSize=size, source=info)
+        handed_over = True
+        work(directory, status, event)
+    except InterruptedError:
+        update(status="cancelled", stage="Download cancelled")
+    except ValueError as exc:
+        update(status="failed", stage=str(exc))
+    except Exception:
+        import logging
+
+        logging.exception("YouTube fetch failed")
+        update(status="failed", stage="Could not fetch this YouTube video.")
+    finally:
+        if not handed_over:
+            for leftover in directory.glob("download.*"):
+                leftover.unlink(missing_ok=True)
+            (directory / "video").unlink(missing_ok=True)
+            with lock:
+                if active == status["id"]:
+                    active = None
+                cancellations.pop(status["id"], None)
+
+
+@app.post("/jobs/from-url")
+async def create_from_url(request: Request):
+    """Analyse a YouTube video by link: the worker downloads it itself."""
+    global active
+    from app.vision.youtube import video_id
+
+    try:
+        vid = video_id(request.query_params.get("url", ""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    profile = request.query_params.get("profile", "general")
+    if profile not in ("general", "broadcast"):
+        raise HTTPException(400, "Unknown footage profile")
+    if profile not in available_profiles():
+        raise HTTPException(503, "The selected vision models are not installed")
+    try:
+        sample_fps = int(request.query_params.get("fps", "3"))
+    except ValueError as exc:
+        raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
+    if sample_fps not in (3, 6, 10):
+        raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
+    owner = request.query_params.get("owner")
+    if owner is not None and not OWNER.fullmatch(owner):
+        raise HTTPException(400, "Invalid owner")
+    await asyncio.to_thread(delete_expired)
+    check_space(MAX_BYTES)
+    job_id = uuid.uuid4().hex
+    with lock:
+        release_stale_upload()
+        if active is not None:
+            raise HTTPException(
+                409, "Another video is being analysed. Wait for it to finish or cancel it."
+            )
+        active = job_id
+        directory = ROOT / job_id
+        directory.mkdir()
+        status = {
+            "id": job_id,
+            "title": request.query_params.get("title", "").strip()[:200] or "YouTube match",
+            "createdAt": time.time(),
+            "status": "uploading",
+            "stage": "Waiting to download from YouTube",
+            "progress": 0,
+            "profile": profile,
+            "sampleFps": sample_fps,
+            "sourceUrl": f"https://www.youtube.com/watch?v={vid}",
+        }
+        if owner:
+            status["owner"] = owner
+        write_status(directory, status)
+        event = threading.Event()
+        cancellations[job_id] = event
+        pool.submit(fetch_and_work, directory, status, event, status["sourceUrl"])
+    return public(status)
+
+
 def receiving(job_id):
     directory = folder(job_id)
     status = json.loads((directory / "status.json").read_text())

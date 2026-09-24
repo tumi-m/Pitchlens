@@ -23,7 +23,7 @@ async function proxy(
   const { path } = await context.params;
   const route = path.join("/");
   if (
-    !/^(health|jobs|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start))?)$/.test(
+    !/^(health|jobs|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start))?)$/.test(
       route,
     )
   )
@@ -118,7 +118,7 @@ async function proxy(
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");
   const owner = request.headers.get("x-pitchlens-owner");
-  if (route === "jobs") {
+  if (route === "jobs" || route === "jobs/from-url") {
     if (owner && OWNER.test(owner)) search.set("owner", owner);
     else if (hosted && request.method === "GET") return Response.json([]);
     else if (hosted)

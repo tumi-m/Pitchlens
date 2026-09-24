@@ -7,6 +7,7 @@ import {
   VisionHealth,
   VisionError,
   uploadToVision,
+  analyseYouTube,
   visionAccessCode,
   setVisionAccessCode,
 } from "@/lib/review/vision";
@@ -14,6 +15,14 @@ import {
 export function VisionUpload({ onManual }: { onManual: () => void }) {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
+  const [source, setSource] = useState<"file" | "youtube">("file");
+  const [link, setLink] = useState("");
+  const [rights, setRights] = useState(false);
+  const linkOk =
+    /^https?:\/\/((www\.|m\.)?youtube\.com\/(watch\?|shorts\/|live\/)|youtu\.be\/)/.test(
+      link.trim(),
+    );
+  const ready = source === "file" ? !!file : linkOk && rights;
   const [title, setTitle] = useState("");
   const [health, setHealth] = useState<VisionHealth | null>(null);
   const [error, setError] = useState("");
@@ -51,7 +60,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     : "";
   const profiles = health?.profiles ?? ["general"];
   async function submit() {
-    if (!file) return;
+    if (!ready) return;
     if (health?.accessRequired) {
       if (!code.trim()) {
         setNeedsCode(true);
@@ -67,6 +76,17 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     setPercent(0);
     setPhase("Reserving the analysis server");
     try {
+      if (source === "youtube") {
+        setPhase("Sending the link to the analysis server");
+        const job = await analyseYouTube(link.trim(), {
+          title: title.trim(),
+          profile,
+          fps,
+        });
+        router.push(`/vision/${job.id}`);
+        return;
+      }
+      if (!file) return;
       const job = await uploadToVision(file, {
         title: title.trim() || file.name,
         profile,
@@ -179,6 +199,33 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               )}
             </div>
           )}
+          <div
+            role="tablist"
+            aria-label="Video source"
+            className="flex gap-1 p-1 rounded-xl border border-pitch-indigo-soft/30 bg-pitch-indigo-deep/40"
+          >
+            {(
+              [
+                ["file", "Upload a file"],
+                ["youtube", "YouTube link"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                role="tab"
+                aria-selected={source === value}
+                disabled={busy}
+                onClick={() => {
+                  setSource(value);
+                  setError("");
+                }}
+                className={`flex-1 py-2.5 rounded-lg text-sm font-medium ${source === value ? "bg-pitch-indigo-soft/50 text-pitch-white" : "text-pitch-muted"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {source === "file" ? (
           <label className="block glass-card border-2 border-dashed border-pitch-green/40 p-10 text-center cursor-pointer">
             <Upload className="mx-auto text-pitch-green mb-4" />
             <span className="block font-semibold break-all">
@@ -215,6 +262,46 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               }}
             />
           </label>
+          ) : (
+            <div className="glass-card p-6 space-y-4">
+              <label className="block text-sm">
+                YouTube video link
+                <input
+                  aria-label="YouTube video link"
+                  type="url"
+                  inputMode="url"
+                  placeholder="https://www.youtube.com/watch?v=…"
+                  className="pitch-input w-full mt-2"
+                  value={link}
+                  onChange={(e) => setLink(e.target.value)}
+                  disabled={busy}
+                />
+              </label>
+              {link.trim() && !linkOk && (
+                <p className="text-sm text-red-300">
+                  Paste a link to a single YouTube video (youtube.com/watch?v=… or youtu.be/…).
+                </p>
+              )}
+              <p className="text-sm text-pitch-muted">
+                The analysis server fetches the best version up to 1080p (under 500 MB,
+                up to three hours) — nothing is downloaded to your device. Public or
+                unlisted videos only. Best results: one fixed, high camera showing the
+                whole pitch, at 1080p.
+              </p>
+              <label className="flex gap-3 items-start text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={rights}
+                  onChange={(e) => setRights(e.target.checked)}
+                  disabled={busy}
+                />
+                <span>
+                  I filmed this video or have the owner&apos;s permission to analyse it.
+                </span>
+              </label>
+            </div>
+          )}
           <label className="block text-sm">
             Match title
             <input
@@ -283,7 +370,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </p>
           )}
           <button
-            disabled={!file || !available || busy}
+            disabled={!ready || !available || busy}
             onClick={submit}
             className="pitch-button-primary w-full py-4"
           >
