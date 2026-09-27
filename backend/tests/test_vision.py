@@ -817,3 +817,14 @@ def test_pressing_metric_is_withheld_without_regains():
     out = derive_metrics([frame(t / 5) for t in range(5)], 5, 1)["possessions"]["teams"]
     assert out[0]["passesAllowedPerRegain"] is None
     assert out[1]["count"] == 0 and out[1]["averageSeconds"] is None
+
+
+def test_gpu_can_copy_installed_weights_but_nothing_else(service, monkeypatch, tmp_path):
+    server, client = service
+    weights = tmp_path / "football-ball.onnx"
+    weights.write_bytes(b"weights")
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(weights))
+    assert client.get("/models/football-ball.onnx").content == b"weights"
+    assert client.get("/models/football-ball.onnx", headers={"Authorization": ""}).status_code == 401
+    assert client.get("/models/status.json").status_code == 404
+    assert client.get("/models/..%2F..%2Fetc%2Fpasswd").status_code == 404

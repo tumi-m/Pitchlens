@@ -614,6 +614,18 @@ def result(job_id: str):
     return FileResponse(path, media_type="application/json", filename="pitchlens-vision.json")
 
 
+@app.get("/models/{name}")
+def model_file(name: str):
+    """Lets the GPU worker copy installed weights it could not download itself."""
+    from app.vision.profiles import model_paths
+
+    for profile in ("general", "broadcast"):
+        for path in model_paths(profile):
+            if path.name == name and path.is_file():
+                return FileResponse(path, media_type="application/octet-stream")
+    raise HTTPException(404, "Model not installed")
+
+
 @app.get("/jobs/{job_id}/video")
 def video(job_id: str, request: Request):
     directory = folder(job_id)
