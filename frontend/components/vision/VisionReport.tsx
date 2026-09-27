@@ -9,8 +9,8 @@ import {
   VisionError,
   clockTime,
 } from "@/lib/review/vision";
-import { Loader2 } from "lucide-react";
 import { MatchCentre } from "@/components/vision/MatchCentre";
+import { AnalysisWait } from "@/components/vision/AnalysisWait";
 import { matchStats } from "@/lib/review/visionStats";
 
 export function VisionReport({ jobId }: { jobId: string }) {
@@ -172,45 +172,14 @@ export function VisionReport({ jobId }: { jobId: string }) {
             </p>
           )}
           {job && job.status !== "completed" && (
-            <section className="glass-card p-6 space-y-4" aria-live="polite">
-              <h2 className="text-xl flex gap-3 items-center">
-                {["processing", "uploading"].includes(job.status) && (
-                  <Loader2 className="animate-spin text-pitch-green" />
-                )}
-                {job.stage}
-              </h2>
-              <progress
-                value={job.progress}
-                max={100}
-                className="w-full accent-green-500"
-              />
-              <p className="text-sm text-pitch-muted">
-                {job.progress}%
-                {job.processedSeconds !== undefined
-                  ? ` · ${clockTime(job.processedSeconds)} processed`
-                  : ""}
-                {job.etaSeconds
-                  ? ` · about ${clockTime(job.etaSeconds)} remaining`
-                  : ""}
-              </p>
-              {["processing", "uploading"].includes(job.status) && (
-                <button
-                  className="pitch-button-secondary"
-                  onClick={() =>
-                    visionJson(`jobs/${jobId}/cancel`, {
-                      method: "POST",
-                    }).catch((e) => setError(e.message))
-                  }
-                >
-                  Cancel analysis
-                </button>
-              )}
-              {["failed", "interrupted", "cancelled"].includes(job.status) && (
-                <Link href="/upload" className="pitch-button-primary">
-                  Try another analysis
-                </Link>
-              )}
-            </section>
+            <AnalysisWait
+              job={job}
+              onCancel={() =>
+                visionJson(`jobs/${jobId}/cancel`, { method: "POST" }).catch((e) =>
+                  setError(e.message),
+                )
+              }
+            />
           )}
           {result && (
             <>

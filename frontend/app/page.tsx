@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { ArrowRight, Film, Flag, Download } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
+import { LivePitch } from "@/components/vision/LivePitch";
 export default function HomePage() {
   return (
     <>
@@ -40,44 +41,9 @@ export default function HomePage() {
             <div className="rounded-3xl border border-pitch-indigo-soft/40 bg-pitch-indigo-deep/30 p-7">
               <div className="flex justify-between text-xs text-pitch-muted mb-6">
                 <span>COMPUTER VISION</span>
-                <span>WORKFLOW PREVIEW</span>
+                <span>LIVE TRACKING PREVIEW</span>
               </div>
-              <svg
-                viewBox="0 0 420 270"
-                className="w-full"
-                role="img"
-                aria-label="Football pitch illustration"
-              >
-                <rect
-                  x="10"
-                  y="10"
-                  width="400"
-                  height="250"
-                  rx="3"
-                  fill="#12322a"
-                  stroke="#4e7868"
-                />
-                <path
-                  d="M210 10v250M10 65h60v140H10M410 65h-60v140h60"
-                  fill="none"
-                  stroke="#4e7868"
-                />
-                <circle cx="210" cy="135" r="36" fill="none" stroke="#4e7868" />
-                <path
-                  d="M120 185L200 155L285 80"
-                  fill="none"
-                  stroke="#65e6a4"
-                  strokeWidth="3"
-                  strokeDasharray="7 7"
-                />
-                {[
-                  [120, 185],
-                  [200, 155],
-                  [285, 80],
-                ].map(([x, y]) => (
-                  <circle key={x} cx={x} cy={y} r="9" fill="#65e6a4" />
-                ))}
-              </svg>
+              <LivePitch />
               <p className="font-semibold mt-6">
                 The build-up matters as much as the finish.
               </p>

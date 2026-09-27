@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
+import { AnimatePresence, motion } from "framer-motion";
 import {
   VisionHealth,
   VisionError,
@@ -231,8 +232,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             ))}
           </div>
           {source === "file" ? (
-          <label className="block glass-card border-2 border-dashed border-pitch-green/40 p-10 text-center cursor-pointer">
-            <Upload className="mx-auto text-pitch-green mb-4" />
+          <label className={`block glass-card border-2 border-dashed p-10 text-center cursor-pointer transition-all duration-300 hover:-translate-y-0.5 hover:border-pitch-green/80 hover:shadow-[0_0_40px_-12px_rgba(46,204,113,0.5)] ${file ? "border-pitch-green/80 bg-pitch-green/5" : "border-pitch-green/40"}`}>
+            <motion.span
+              className="inline-block"
+              animate={file ? { scale: [1, 1.15, 1] } : { y: [0, -5, 0] }}
+              transition={file ? { duration: 0.4 } : { duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
+              key={file ? file.name : "idle"}
+            >
+              <Upload className="mx-auto text-pitch-green mb-4" />
+            </motion.span>
             <span className="block font-semibold break-all">
               {file ? file.name : "Choose your match video"}
             </span>
@@ -390,14 +398,48 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </>
             )}
           </button>
-          {busy && (
-            <button
-              onClick={() => upload.current?.abort()}
-              className="pitch-button-secondary"
-            >
-              Cancel upload
-            </button>
-          )}
+          <AnimatePresence>
+            {busy && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="glass-card p-5 space-y-3 overflow-hidden"
+                aria-live="polite"
+              >
+                <div className="flex items-baseline justify-between">
+                  <span className="text-sm text-pitch-muted">
+                    {phase === "Uploading"
+                      ? "Sending your video in secure 4 MB pieces"
+                      : `${phase}…`}
+                  </span>
+                  <span className="text-2xl font-black tabular-nums">{percent}%</span>
+                </div>
+                <div className="relative h-2.5 rounded-full bg-white/10 overflow-hidden">
+                  <motion.div
+                    className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
+                    animate={{ width: `${Math.max(3, percent)}%` }}
+                    transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+                  />
+                  <motion.div
+                    className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/40 to-transparent"
+                    animate={{ left: ["-35%", "110%"] }}
+                    transition={{ duration: 1.6, repeat: Infinity, ease: "linear" }}
+                  />
+                </div>
+                <p className="text-xs text-pitch-muted">
+                  Keep this tab open until the upload finishes. After that the analysis
+                  runs on the server and you can leave.
+                </p>
+                <button
+                  onClick={() => upload.current?.abort()}
+                  className="pitch-button-secondary"
+                >
+                  Cancel upload
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
           <button
             onClick={onManual}
             disabled={busy}
