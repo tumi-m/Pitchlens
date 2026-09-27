@@ -65,6 +65,36 @@ def probe(path):
         cap.release()
 
 
+def colour_signature(frame):
+    """Normalised hue/saturation histogram: stable under pans, changes at cuts."""
+    small = cv2.resize(frame, (160, 90))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [30, 16], [0, 180, 0, 256])
+    return cv2.normalize(hist, hist).astype(np.float32)
+
+
+def vote_teams(frames):
+    """Give every observation of a track the team it was assigned most often.
+
+    Per-frame colour on a 50-pixel player is noisy; the track as a whole is not.
+    Only tracks with at least 3 confident votes and a 60% majority are relabelled.
+    """
+    votes = {}
+    for f in frames:
+        for p in f["players"]:
+            if p["team"] in (0, 1):
+                votes.setdefault(p["id"], [0, 0])[p["team"]] += 1
+    decided = {}
+    for track, (a, b) in votes.items():
+        if a + b >= 3 and max(a, b) / (a + b) >= 0.6:
+            decided[track] = 0 if a >= b else 1
+    for f in frames:
+        for p in f["players"]:
+            if p["id"] in decided and p.get("role") in (None, "person", "player"):
+                p["team"] = decided[p["id"]]
+    return frames
+
+
 def field_mask(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([25, 35, 30]), np.array([95, 255, 255]))
@@ -78,17 +108,34 @@ def field_mask(frame):
     return result
 
 
-def jersey(frame, box):
+def pitch_colour(frame, mask):
+    """Median LAB colour of the detected playing surface in this frame, if any."""
+    if mask is None or not mask.any():
+        return None
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    return np.median(lab[mask > 0][::17], axis=0).astype(float)
+
+
+def jersey(frame, box, pitch=None):
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     patch = frame[
-        max(0, int(y1 + h * 0.18)) : int(y1 + h * 0.48),
-        max(0, int(x1 + w * 0.25)) : int(x2 - w * 0.25),
+        max(0, int(y1 + h * 0.15)) : int(y1 + h * 0.55),
+        max(0, int(x1 + w * 0.2)) : int(x2 - w * 0.2),
     ]
     if patch.size == 0:
         return None
     # White and dark kits are valid colours too. A saturation gate discarded them.
+    # Grass showing around a small player drags every kit towards grey-green:
+    # drop pitch-coloured pixels before taking the median.
+    # Compare against this frame's measured pitch colour, not a fixed green
+    # band, so a green or mint kit that differs from the grass survives.
     pixels = patch.reshape(-1, 3)
+    if pitch is not None:
+        lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(float)
+        grass = np.linalg.norm(lab - pitch, axis=1) < 18
+        if (~grass).sum() >= 6:
+            pixels = pixels[~grass]
     if len(pixels) < 3:
         return None
     colour = np.median(pixels, axis=0).astype(np.uint8)
@@ -213,9 +260,10 @@ def run_video(
                 continue
             boxes, scores, classes = detect(frame)
             mask = field_mask(frame)
+            pitch = pitch_colour(frame, mask)
             for box, c in zip(boxes, classes):
                 if names[c].lower() in ("person", "player") and inside_field(mask, box):
-                    f = jersey(frame, box)
+                    f = jersey(frame, box, pitch)
                     if f is not None:
                         features.append(f)
             progress(
@@ -283,12 +331,16 @@ def run_video(
                 t = last_t + 1 / meta["fps"]
             last_t = t
             mask = field_mask(frame)
-            gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
+            pitch = pitch_colour(frame, mask)
+            gray = colour_signature(frame)
             matrix, motion_ok = camera_motion(previous_frame, frame, previous_boxes)
+            # A fast pan or zoom defeats motion estimation but keeps the colour
+            # make-up of the shot; a real cut changes it. Pixel differences alone
+            # flagged every quick pan as a cut and reset all tracks.
             cut = (
                 previous_gray is not None
                 and not motion_ok
-                and np.mean(cv2.absdiff(gray, previous_gray)) > 38
+                and cv2.compareHist(gray, previous_gray, cv2.HISTCMP_BHATTACHARYYA) > 0.5
             )
             if cut:
                 scene += 1
@@ -296,7 +348,7 @@ def run_video(
             boxes, scores, classes = detect(frame)
             observations = [
                 {
-                    "team": assign_team(jersey(frame, box), centres, use_hue=not role_aware)
+                    "team": assign_team(jersey(frame, box, pitch), centres, use_hue=not role_aware)
                     if names[c].lower() in ("person", "player")
                     else -1,
                     "role": names[c].lower(),
@@ -344,10 +396,11 @@ def run_video(
         )
     progress(stage="Measuring temporal observations", progress=96)
     analysed_duration = min(duration, max(frame_num / meta["fps"], last_t))
+    vote_teams(frames)
     metrics = derive_metrics(frames, effective_fps, analysed_duration)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-1.5",
+        "pipelineVersion": "local-vision-1.6",
         "profile": profile,
         "source": "computer-vision",
         "videoSha256": file_sha256(path),

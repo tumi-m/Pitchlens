@@ -828,3 +828,36 @@ def test_gpu_can_copy_installed_weights_but_nothing_else(service, monkeypatch, t
     assert client.get("/models/football-ball.onnx", headers={"Authorization": ""}).status_code == 401
     assert client.get("/models/status.json").status_code == 404
     assert client.get("/models/..%2F..%2Fetc%2Fpasswd").status_code == 404
+
+
+def test_track_vote_fixes_unknown_and_noisy_team_labels():
+    from app.vision.engine import vote_teams
+
+    def obs(team, role="player"):
+        return {"id": 7, "team": team, "role": role, "box": [0, 0, 10, 20], "confidence": 0.9}
+
+    frames = [{"players": [obs(t)]} for t in (0, 0, 0, -1, 1)]
+    vote_teams(frames)
+    assert [f["players"][0]["team"] for f in frames] == [0, 0, 0, 0, 0]
+    split = [{"players": [obs(t)]} for t in (0, 1, 0, 1)]
+    vote_teams(split)  # no 60% majority: left as observed
+    assert [f["players"][0]["team"] for f in split] == [0, 1, 0, 1]
+
+
+def test_pan_is_not_a_cut_but_a_new_shot_is():
+    import cv2
+    import numpy as np
+
+    from app.vision.engine import colour_signature
+
+    rng = np.random.default_rng(1)
+    pitch = np.zeros((360, 640, 3), np.uint8)
+    pitch[:] = (40, 140, 60)
+    for _ in range(12):  # players
+        x, y = rng.integers(20, 600), rng.integers(40, 300)
+        pitch[y : y + 40, x : x + 15] = (40, 40, 200)
+    panned = np.roll(pitch, 120, axis=1)
+    crowd = rng.integers(0, 255, (360, 640, 3), dtype=np.uint8)
+    compare = lambda a, b: cv2.compareHist(colour_signature(a), colour_signature(b), cv2.HISTCMP_BHATTACHARYYA)
+    assert compare(pitch, panned) < 0.2
+    assert compare(pitch, crowd) > 0.5
