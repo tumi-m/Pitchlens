@@ -58,9 +58,13 @@ image = (
 )
 
 app = modal.App("pitchlens-vision", image=image)
+# Weights copied from the Railway worker persist here between runs.
+models_volume = modal.Volume.from_name("pitchlens-models", create_if_missing=True)
 
 
-@app.function(gpu=GPU, timeout=3 * 3600, max_containers=2)
+@app.function(
+    gpu=GPU, timeout=3 * 3600, max_containers=2, volumes={"/cache": models_volume}
+)
 def analyse(video_url: str, token: str, profile: str, sample_fps: int):
     """Generator: yields progress dicts, then {"result_gz": bytes}."""
     import gzip
@@ -70,6 +74,19 @@ def analyse(video_url: str, token: str, profile: str, sample_fps: int):
     import requests
 
     from app.vision.engine import run_video
+
+    from app.vision.profiles import model_paths
+
+    missing = [p for p in model_paths(profile) if not p.is_file()]
+    if missing:
+        yield {"stage": "GPU: preparing football models", "progress": 1}
+        base = video_url.split("/jobs/")[0]
+        try:
+            for path in missing:
+                ensure_model(path, base, token)
+        except Exception as exc:
+            yield {"error": f"Model unavailable on GPU: {exc}", "user": False}
+            return
 
     workdir = Path("/tmp/job")
     workdir.mkdir(exist_ok=True)
@@ -110,3 +127,42 @@ def analyse(video_url: str, token: str, profile: str, sample_fps: int):
         yield {"error": outcome["error"], "user": outcome.get("user", False)}
         return
     yield {"result_gz": gzip.compress((workdir / "result.json").read_bytes())}
+
+
+def ensure_model(path, base, token):
+    """Copy a weight file from the volume cache, or from the worker, verifying its hash."""
+    import hashlib
+    import shutil
+
+    import requests
+
+    from app.vision.profiles import KNOWN_SHA256
+
+    def digest(p):
+        with p.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+
+    expected = KNOWN_SHA256.get(path.name)
+    cached = Path("/cache") / path.name
+    if not (cached.is_file() and (expected is None or digest(cached) == expected)):
+        temporary = cached.with_suffix(".download")
+        with requests.get(
+            f"{base}/models/{path.name}",
+            headers={"Authorization": f"Bearer {token}"},
+            stream=True,
+            timeout=300,
+        ) as response:
+            response.raise_for_status()
+            with temporary.open("wb") as f:
+                for chunk in response.iter_content(8 * 1024 * 1024):
+                    f.write(chunk)
+        if expected and digest(temporary) != expected:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(f"checksum mismatch for {path.name}")
+        temporary.replace(cached)
+        try:
+            models_volume.commit()
+        except Exception:  # cache persistence is an optimisation only
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(cached, path)
