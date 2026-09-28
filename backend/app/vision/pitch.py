@@ -242,15 +242,158 @@ def _general_position(pitch_points, min_area=1.0):
     return False
 
 
-def fit(image_points, pitch_points, size, distortion="auto"):
-    """Fit a calibration from matching image/pitch points.
+def straight_lines(t):
+    """Straight painted lines a person can click points along (pitch metres)."""
+    L, W = t["length"], t["width"]
+    lines = {
+        "far-touchline": ((0.0, 0.0), (L, 0.0)),
+        "near-touchline": ((0.0, W), (L, W)),
+        "left-goal-line": ((0.0, 0.0), (0.0, W)),
+        "right-goal-line": ((L, 0.0), (L, W)),
+        "halfway-line": ((L / 2, 0.0), (L / 2, W)),
+    }
+    if t.get("areaDepth") and t.get("areaWidth"):
+        d, b = t["areaDepth"], t["areaWidth"]
+        lines["left-box-front"] = ((d, W / 2 - b / 2), (d, W / 2 + b / 2))
+        lines["right-box-front"] = ((L - d, W / 2 - b / 2), (L - d, W / 2 + b / 2))
+    return lines
 
-    distortion: "none", "auto" (estimate k1 when 6+ points allow it and it
-    clearly helps), or "on".
-    Returns a calibration dict with residuals in metres and warnings.
+
+def _residuals(G, k1, size, image_points, pitch_points, line_clicks):
+    """Image-pixel residuals: point clicks, and distance of line clicks to their line.
+
+    G maps pitch metres to undistorted image pixels. Point residuals are
+    measured in the observed (distorted) image, which is the maximum-likelihood
+    criterion for click noise; line residuals are measured in the undistorted
+    image, where the painted line is straight.
+    """
+    out = []
+    if len(image_points):
+        projected = distort(apply(G, pitch_points), k1, size)
+        out.append((projected - image_points).ravel())
+    if line_clicks:
+        clicks = undistort(np.array([c[0] for c in line_clicks]), k1, size)
+        for (a, b), click in zip([c[1] for c in line_clicks], clicks):
+            pa, pb = apply(G, [a, b])
+            direction = pb - pa
+            norm = np.linalg.norm(direction)
+            if not np.isfinite(norm) or norm < 1e-9:
+                out.append(np.array([1e3]))
+                continue
+            normal = np.array([-direction[1], direction[0]]) / norm
+            out.append(np.array([float(np.dot(click - pa, normal))]))
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def _solve(image_points, pitch_points, line_clicks, size, k1_grid, refine_k1):
+    from scipy.optimize import least_squares
+
+    best = None
+    centre, half = _norm(size)
+    radius2 = np.max(np.sum(((image_points - centre) / half) ** 2, axis=1)) if len(image_points) else 0
+    for k1 in k1_grid:
+        # The division model must stay invertible over the clicked area.
+        if 1 + k1 * radius2 < 0.25:
+            continue
+        try:
+            G = _dlt(pitch_points, undistort(image_points, k1, size))
+        except ValueError:
+            continue
+        r = _residuals(G, k1, size, image_points, pitch_points, line_clicks)
+        if not np.isfinite(r).all():
+            continue  # this lens value folds the clicked points; not a real lens
+        cost = float(np.sum(np.minimum(r**2, 400)))  # robust: cap each at 20 px
+        if best is None or cost < best[0]:
+            best = (cost, G, k1)
+    if best is None:
+        raise ValueError("These points do not define a pitch plane. Pick points that are spread out.")
+    _, G, k1 = best
+
+    def unpack(x):
+        g = np.append(x[:8], 1).reshape(3, 3)
+        return g, (x[8] if refine_k1 else k1)
+
+    x0 = np.append((G / G[2, 2]).ravel()[:8], [k1] if refine_k1 else [])
+    if not np.isfinite(_residuals(*unpack(x0), size, image_points, pitch_points, line_clicks)).all():
+        raise ValueError("These points do not define a pitch plane. Pick points that are spread out.")
+    solution = least_squares(
+        lambda x: _residuals(*unpack(x), size, image_points, pitch_points, line_clicks),
+        x0,
+        loss="soft_l1",
+        f_scale=2.0,
+        max_nfev=3000,
+    )
+    G, k1 = unpack(solution.x)
+    if refine_k1 and (not -1.5 < k1 < 0.2 or 1 + k1 * radius2 < 0.25):
+        G, k1 = unpack(x0)
+    return G / G[2, 2], float(k1)
+
+
+def _leave_one_out(image_points, pitch_points, line_clicks, size, k1_grid, refine_k1):
+    """Residual (px) of each clicked landmark when the fit is made without it."""
+    n = len(image_points)
+    out = []
+    for i in range(n):
+        keep = [j for j in range(n) if j != i]
+        if len(keep) < 4 or not _general_position(pitch_points[keep]):
+            out.append(None)
+            continue
+        try:
+            G, k1 = _solve(image_points[keep], pitch_points[keep], line_clicks, size, k1_grid, refine_k1)
+        except ValueError:
+            out.append(None)
+            continue
+        predicted = distort(apply(G, pitch_points[i : i + 1]), k1, size)[0]
+        out.append(float(np.linalg.norm(predicted - image_points[i])))
+    return out
+
+
+def camera_geometry(G, size):
+    """Field of view (deg) and camera height (m) implied by a pitch->image homography.
+
+    Assumes square pixels and the principal point at the image centre. Returns
+    (None, None) when the homography is not consistent with a real camera.
+    """
+    w, h = size
+    shift = np.array([[1, 0, -w / 2], [0, 1, -h / 2], [0, 0, 1.0]])
+    g = shift @ np.asarray(G, float)
+    g1, g2, g3 = g[:, 0], g[:, 1], g[:, 2]
+    candidates = []
+    denom = g1[2] * g2[2]
+    if abs(denom) > 1e-12:
+        candidates.append(-(g1[0] * g2[0] + g1[1] * g2[1]) / denom)
+    denom = g2[2] ** 2 - g1[2] ** 2
+    if abs(denom) > 1e-12:
+        candidates.append((g1[0] ** 2 + g1[1] ** 2 - g2[0] ** 2 - g2[1] ** 2) / denom)
+    f2 = [c for c in candidates if c > 0]
+    if not f2:
+        return None, None
+    f = math.sqrt(float(np.median(f2)))
+    K_inv = np.diag([1 / f, 1 / f, 1.0])
+    r1, r2, t = K_inv @ g1, K_inv @ g2, K_inv @ g3
+    scale = (np.linalg.norm(r1) + np.linalg.norm(r2)) / 2
+    if scale <= 0:
+        return None, None
+    r1, r2, t = r1 / scale, r2 / scale, t / scale
+    r3 = np.cross(r1, r2)
+    R = np.column_stack([r1, r2, r3])
+    centre = -R.T @ t
+    fov = math.degrees(2 * math.atan(w / (2 * f)))
+    return round(fov, 1), round(abs(float(centre[2])), 2)
+
+
+def fit(image_points, pitch_points, size, distortion="auto", line_clicks=None):
+    """Fit a calibration from clicked landmarks and (optional) points along lines.
+
+    distortion: "none", "auto" (grid-search a one-parameter division model and
+    keep it only if held-out clicks agree better), or "on".
+    line_clicks: [((x, y), ((ax, ay), (bx, by)))] image click and its pitch line.
+    Residuals are image pixels (the natural unit of click error); each landmark
+    is also reported in metres and as a leave-one-out residual.
     """
     image_points = np.asarray(image_points, float).reshape(-1, 2)
     pitch_points = np.asarray(pitch_points, float).reshape(-1, 2)
+    line_clicks = list(line_clicks or [])
     n = len(image_points)
     if n < 4 or len(pitch_points) != n:
         raise ValueError("Click at least four pitch landmarks.")
@@ -261,59 +404,86 @@ def fit(image_points, pitch_points, size, distortion="auto"):
             "At least four of the landmarks must not share a line (for example, not all on the halfway line). "
             "Add a corner, a goal post or a point on another line."
         )
-    H = _dlt(image_points, pitch_points)
-    k1 = 0.0
-    if distortion in ("auto", "on") and n >= 6:
-        from scipy.optimize import least_squares
+    constraints = 2 * n + len(line_clicks)
+    use_distortion = distortion == "on" or (distortion == "auto" and constraints >= 12)
+    plain = _solve(image_points, pitch_points, line_clicks, size, [0.0], False)
+    G, k1 = plain
+    if use_distortion:
+        grid = list(np.arange(-1.2, 0.051, 0.05))
+        warped = _solve(image_points, pitch_points, line_clicks, size, grid, True)
+        if distortion == "on":
+            G, k1 = warped
+        elif n >= 6:
+            # Keep the lens term only if it predicts held-out clicks >= 10% better.
+            loo_plain = [r for r in _leave_one_out(image_points, pitch_points, line_clicks, size, [0.0], False) if r is not None]
+            loo_warped = [
+                r for r in _leave_one_out(image_points, pitch_points, line_clicks, size, [warped[1]], True) if r is not None
+            ]
+            if loo_plain and loo_warped and np.sqrt(np.mean(np.square(loo_warped))) < 0.9 * np.sqrt(np.mean(np.square(loo_plain))):
+                G, k1 = warped
+        elif len(line_clicks) >= 6:
+            r0 = _residuals(*plain, size, image_points, pitch_points, line_clicks)
+            r1 = _residuals(*warped, size, image_points, pitch_points, line_clicks)
+            if np.sqrt(np.mean(r1**2)) < 0.7 * np.sqrt(np.mean(r0**2)):
+                G, k1 = warped
+    H = np.linalg.inv(G)
+    H = H / H[2, 2]
+    calibration = {"H": H.tolist(), "k1": k1, "size": list(size)}
+    loo = _leave_one_out(image_points, pitch_points, line_clicks, size, [k1], False) if n >= 5 else [None] * n
+    return describe(calibration, image_points, pitch_points, line_clicks, G, loo)
 
-        def residual(params):
-            h = np.append(params[:8], 1).reshape(3, 3)
-            projected = apply(h, undistort(image_points, params[8], size))
-            return (projected - pitch_points).ravel()
 
-        start = np.append((H / H[2, 2]).ravel()[:8], 0.0)
-        solution = least_squares(residual, start, method="lm", max_nfev=4000)
-        candidate_k1 = float(solution.x[8])
-        h = np.append(solution.x[:8], 1).reshape(3, 3)
-        before = np.sqrt(np.mean(residual(start) ** 2))
-        after = np.sqrt(np.mean(solution.fun**2))
-        # Keep the distortion term only when it is physically plausible and
-        # actually explains the clicks better (not just fitting noise).
-        if -0.6 < candidate_k1 < 0.3 and (distortion == "on" or after < before * 0.8):
-            H, k1 = h, candidate_k1
-    return describe({"H": H.tolist(), "k1": k1, "size": list(size)}, image_points, pitch_points)
-
-
-def describe(calibration, image_points, pitch_points):
+def describe(calibration, image_points, pitch_points, line_clicks=(), G=None, loo=None):
     H = np.asarray(calibration["H"], float)
     k1 = calibration["k1"]
     size = calibration["size"]
-    projected = apply(H, undistort(image_points, k1, size))
-    residuals = np.linalg.norm(projected - pitch_points, axis=1)
-    rms = float(np.sqrt(np.mean(residuals**2)))
+    if G is None:
+        G = np.linalg.inv(H)
+    scale = size[1] / 360.0  # pixel thresholds are for 360p; scale with height
+    pixel = _residuals(G, k1, size, image_points, pitch_points, [])
+    pixel = np.linalg.norm(pixel.reshape(-1, 2), axis=1)
+    lines = np.abs(_residuals(G, k1, size, np.zeros((0, 2)), np.zeros((0, 2)), list(line_clicks))) if line_clicks else np.zeros(0)
+    everything = np.concatenate([pixel, lines])
+    rms_px = float(np.sqrt(np.mean(everything**2))) if len(everything) else 0.0
+    metres = np.linalg.norm(apply(H, undistort(image_points, k1, size)) - pitch_points, axis=1)
     warnings = []
-    # With exactly four points a homography passes through all of them: the
-    # residual says nothing. Say so instead of reporting a perfect fit.
-    if len(image_points) == 4:
+    n = len(image_points)
+    if n == 4 and not len(line_clicks):
         warnings.append(
-            "Four points fit exactly, so their error cannot be measured. Add a fifth or sixth landmark to check the fit."
+            "Four points fit exactly, so their error cannot be measured. Add a fifth landmark or click along a line to check the fit."
         )
-    if len(residuals) >= 6:
-        median = float(np.median(residuals))
-        for i, r in enumerate(residuals):
-            if r > max(1.5, 3 * median):
-                warnings.append(f"Point {i + 1} disagrees with the others by {r:.1f} m; it may be mis-clicked.")
+    loo = loo or [None] * n
+    known = [r for r in loo if r is not None]
+    if known:
+        median = float(np.median(known))
+        for i, r in enumerate(loo):
+            if r is not None and r > max(3 * scale, 3 * median):
+                warnings.append(f"Landmark {i + 1} disagrees with the others ({r:.1f} px when left out); it may be the wrong point.")
     folded = not horizon_ok(calibration, image_points, pitch_points)
     if folded:
         warnings.append("The pitch folds over itself with these clicks; two landmarks are probably swapped.")
-    quality = "good" if rms <= 0.5 else "check" if rms <= 1.5 else "poor"
+    fov, height = camera_geometry(G, size)
+    if fov is None or not 30 <= fov <= 175:
+        warnings.append("The fit does not look like a real camera; check the landmarks and the pitch dimensions.")
+    elif height is not None and not 1.0 <= height <= 30:
+        warnings.append(f"The fit puts the camera {height:.0f} m above the pitch; check the pitch dimensions.")
+    verifiable = n > 4 or len(line_clicks) > 0
+    quality = "good" if rms_px <= 2 * scale else "check" if rms_px <= 4 * scale else "poor"
     if folded:
         quality = "poor"
+    elif not verifiable:
+        quality = "unverified"
     return {
         **calibration,
-        "residuals": [round(float(r), 3) for r in residuals],
-        "rms": round(rms, 3),
-        "quality": quality if len(image_points) > 4 or folded else "unverified",
+        "residuals": [round(float(r), 3) for r in metres],
+        "pixelResiduals": [round(float(r), 2) for r in pixel],
+        "leaveOneOut": [None if r is None else round(float(r), 2) for r in loo],
+        "lineResiduals": [round(float(r), 2) for r in lines],
+        "rmsPixels": round(rms_px, 2),
+        "rms": round(float(np.sqrt(np.mean(metres**2))), 3),
+        "fieldOfView": fov,
+        "cameraHeight": height,
+        "quality": quality,
         "warnings": warnings,
     }
 

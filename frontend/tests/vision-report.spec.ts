@@ -1,0 +1,194 @@
+import { test, expect, Page, Route } from "@playwright/test";
+import fs from "node:fs";
+import path from "node:path";
+
+const ID = "b".repeat(32);
+const VIDEO = fs.readFileSync(path.join(__dirname, "fixtures/review.mp4"));
+
+function result() {
+  const frames = Array.from({ length: 20 }, (_, i) => ({
+    t: i * 0.2,
+    scene: 0,
+    players: [
+      { id: 1, team: 0, box: [100, 150, 112, 180], confidence: 0.9 },
+      { id: 11, team: 1, box: [400, 160, 412, 190], confidence: 0.9 },
+    ],
+    ball: { x: 110 + i * 10, y: 178, box: [108 + i * 10, 176, 112 + i * 10, 180], confidence: 0.7 },
+    camera: [1, 0, 0, 0, 1, 0],
+  }));
+  return {
+    schemaVersion: 1,
+    source: "computer-vision",
+    model: "players.pt",
+    modelSha256: "x",
+    video: { duration: 4, width: 640, height: 360, fps: 25 },
+    analysedDuration: 4,
+    analysedStart: 0,
+    sampleFps: 5,
+    teams: [
+      { id: 0, label: "Kit A", colour: "#dc2626" },
+      { id: 1, label: "Kit B", colour: "#22c55e" },
+    ],
+    metrics: {
+      sampledFrames: 20,
+      playerFrames: 20,
+      ballFrames: 20,
+      teamSeconds: [2, 0],
+      unknownSeconds: 2,
+      possessionShare: [100, 0],
+      possessionCoverage: 50,
+      trackCount: 2,
+      events: [],
+    },
+    frames,
+    limitations: ["Test fixture."],
+  };
+}
+
+const count = (value: number, confirmed = 0) => ({ value, confirmed, pending: value - confirmed });
+
+function analysis(calibrated: boolean, shotStatus: "proposed" | "confirmed" = "proposed") {
+  const template = { length: 40, width: 20, goalWidth: 3, centreRadius: 3, areaRadius: 6, areaDepth: null, areaWidth: null, penaltySpot: 6 };
+  const team = (i: number) => ({
+    controlSeconds: i ? 0.8 : 2.4,
+    possession: i ? 25 : 75,
+    passes: count(i ? 1 : 4),
+    passesComplete: count(i ? 0 : 3),
+    passAccuracy: i ? 0 : 75,
+    shots: calibrated ? count(i ? 0 : 1, shotStatus === "confirmed" && !i ? 1 : 0) : null,
+    shotsOnTarget: calibrated ? count(i ? 0 : 1, shotStatus === "confirmed" && !i ? 1 : 0) : null,
+    goals: calibrated ? { value: 0, candidates: 0 } : null,
+    interceptions: count(i ? 1 : 0),
+    tackles: count(0),
+    territory: calibrated ? (i ? 10 : 60) : null,
+  });
+  return {
+    schemaVersion: 1,
+    calibrated,
+    template: calibrated ? template : null,
+    directions: calibrated ? { segments: [{ start: 0, end: null, team0Attacks: "right" }], confidence: 0.9, source: "team-depth" } : null,
+    events: calibrated
+      ? [{ id: "ev-0", type: "shot", t: 2, team: 0, confidence: 0.6, status: shotStatus, outcome: "on-target", onTarget: true, x: 30, y: 10, needsReview: true }]
+      : [],
+    stats: {
+      teams: [team(0), team(1)],
+      coverage: { controlPercent: 80, ballStatePercent: 95, calibratedPercent: calibrated ? 100 : 0, contestedSeconds: 0, looseSeconds: 0.6, unknownSeconds: 0 },
+      momentum: [0.5],
+      heatmaps: calibrated ? { "0": [[0.2, 0.3], [0.1, 0.4]], "1": [[0.5, 0.1], [0.3, 0.1]] } : null,
+      averagePositions: calibrated ? [{ player: 1, team: 0, x: 12, y: 10, seconds: 30 }] : null,
+      shotMap: calibrated ? [{ id: "ev-0", team: 0, x: 30, y: 10, outcome: "on-target", status: shotStatus, t: 2 }] : null,
+      tracks: { fragments: 2, players: 2 },
+    },
+    review: { decisions: shotStatus === "confirmed" ? 1 : 0, confirmed: shotStatus === "confirmed" ? 1 : 0, rejected: 0, pending: calibrated && shotStatus === "proposed" ? 1 : 0 },
+    positions: calibrated ? Array.from({ length: 20 }, (_, i) => [i * 0.2, [[1, 0, 10 + i * 0.2, 10], [11, 1, 30, 10]], [11 + i * 0.3, 10, 0]]) : null,
+  };
+}
+
+async function mockReport(page: Page, opts: { calibrated: boolean }) {
+  const state = { calibrated: opts.calibrated, shot: "proposed" as "proposed" | "confirmed", reviews: [] as unknown[], previews: 0, saves: [] as unknown[] };
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false, analytics: true } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}$`), (r) =>
+    r.fulfill({ json: { id: ID, title: "Friday 5s", status: "completed", stage: "Analysis complete", progress: 100, createdAt: 0 } }),
+  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: result() }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video`), (r) =>
+    r.fulfill({ status: 200, body: VIDEO, headers: { "content-type": "video/mp4", "accept-ranges": "bytes" } }),
+  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: analysis(state.calibrated, state.shot) }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration$`), async (r: Route) => {
+    if (r.request().method() === "POST") {
+      state.saves.push(r.request().postDataJSON());
+      state.calibrated = true;
+      return r.fulfill({ json: { state: "processing", fit: { quality: "good" } } });
+    }
+    return r.fulfill({
+      json: state.calibrated
+        ? { state: "ready", template: analysis(true).template, k1: 0, size: [640, 360], coverage: 100, static: true, frames: Array(20).fill({ H: [1 / 15, 0, -20 / 15, 0, 1 / 15, -20 / 15, 0, 0, 1], d: 0 }), job: { state: "done", progress: 100 } }
+        : { state: "none" },
+    });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration/preview$`), (r) => {
+    state.previews++;
+    return r.fulfill({
+      json: {
+        template: analysis(true).template,
+        lines: [[[20, 20], [620, 20]], [[20, 320], [620, 320]]],
+        fit: {
+          H: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+          k1: 0,
+          size: [640, 360],
+          rms: 0.2,
+          rmsPixels: 1.1,
+          quality: "good",
+          warnings: [],
+          fieldOfView: 90,
+          cameraHeight: 6,
+          lineResiduals: [],
+          residuals: [
+            { name: "corner-far-left", metres: 0.1, pixels: 1, leftOut: 1.5 },
+            { name: "corner-far-right", metres: 0.1, pixels: 1, leftOut: 1.5 },
+          ],
+        },
+      },
+    });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/review$`), (r) => {
+    const body = r.request().postDataJSON();
+    state.reviews.push(body);
+    if (body.decisions?.[0]?.action === "accept") state.shot = "confirmed";
+    return r.fulfill({ json: { decisions: state.reviews.length, analysis: analysis(state.calibrated, state.shot) } });
+  });
+  return state;
+}
+
+test("an uncalibrated match shows possession and passes, and withholds shots instead of showing zero", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible();
+  await expect(page.getByText("Unlock shots, heatmaps and positions")).toBeVisible();
+  await expect(page.locator('[data-stat="Shots"]')).toContainText("—");
+  await expect(page.locator('[data-stat="Passes"]')).toContainText("4");
+  await expect(page.getByText("75%").first()).toBeVisible();
+});
+
+test("pitch setup: landmarks are clicked on the video, the fit is checked, then applied to the match", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Set up the pitch" }).first().click();
+  const overlay = page.getByTestId("calibration-overlay");
+  await expect(overlay).toBeVisible();
+  const clickAt = async (x: number, y: number) => {
+    const box = (await overlay.boundingBox())!;
+    await overlay.click({ position: { x: (x / 640) * box.width, y: (y / 360) * box.height } });
+  };
+  await expect(page.getByRole("button", { name: "Check fit" })).toBeDisabled();
+  for (const [x, y] of [[20, 20], [620, 20], [620, 320], [20, 320], [320, 170]]) await clickAt(x, y);
+  await expect(page.getByText("5 landmarks")).toBeVisible();
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await expect(page.getByText("Good fit")).toBeVisible();
+  await page.getByRole("button", { name: "Apply to the whole match" }).click();
+  await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible({ timeout: 15000 });
+  const saved = state.saves[0] as { points: { name: string; x: number; y: number }[]; template: { length: number } };
+  expect(saved.points.map((p) => p.name).slice(0, 2)).toEqual(["corner-far-left", "corner-far-right"]);
+  expect(Math.round(saved.points[0].x)).toBe(20);
+  expect(state.previews).toBe(1);
+});
+
+test("review: confirming a shot is saved on the worker and updates the stats", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: true });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible();
+  await expect(page.getByText("1 possible goal", { exact: false })).toHaveCount(0);
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await expect(page.getByRole("heading", { name: "Review moments" })).toBeVisible();
+  await page.keyboard.press("a");
+  await expect.poll(() => state.reviews.length).toBe(1);
+  expect((state.reviews[0] as { decisions: { action: string; eventId: string }[] }).decisions[0]).toEqual({ action: "accept", eventId: "ev-0" });
+  await expect(page.getByText("1 of 1 reviewed")).toBeVisible();
+  await page.getByRole("button", { name: /Goal/ }).first().click();
+  await expect.poll(() => state.reviews.length).toBe(2);
+  const added = (state.reviews[1] as { decisions: { action: string; type: string; team: number }[] }).decisions[0];
+  expect(added.action).toBe("add");
+  expect(added.type).toBe("goal");
+  expect(added.team).toBe(0);
+});

@@ -36,6 +36,18 @@ def validate_request(request, size):
         used.append(p["name"])
         image.append((x, y))
         world.append(names[p["name"]])
+    lines = pitchlib.straight_lines(template)
+    line_clicks = []
+    raw_lines = request.get("lines") or []
+    if not isinstance(raw_lines, list) or len(raw_lines) > 80:
+        raise ValueError("Click at most 80 points along lines")
+    for c in raw_lines:
+        if not isinstance(c, dict) or c.get("line") not in lines:
+            raise ValueError("Unknown line")
+        x, y = float(c.get("x")), float(c.get("y"))
+        if not (math.isfinite(x) and math.isfinite(y) and -w <= x <= 2 * w and -h <= y <= 2 * h):
+            raise ValueError("Line point is outside the video")
+        line_clicks.append(((x, y), lines[c["line"]]))
     t = float(request.get("t", 0))
     if not math.isfinite(t) or t < 0:
         raise ValueError("Invalid frame time")
@@ -44,13 +56,13 @@ def validate_request(request, size):
         raise ValueError("Unknown distortion mode")
     walls = bool(request.get("walls", False))
     template["walls"] = walls
-    return template, np.array(image), np.array(world), t, distortion, used
+    return template, np.array(image), np.array(world), t, distortion, used, line_clicks
 
 
 def preview(result, request):
     size = (result["video"]["width"], result["video"]["height"])
-    template, image, world, t, distortion, used = validate_request(request, size)
-    cal = pitchlib.fit(image, world, size, distortion)
+    template, image, world, t, distortion, used, line_clicks = validate_request(request, size)
+    cal = pitchlib.fit(image, world, size, distortion, line_clicks)
     lines = [
         [[round(float(x), 1), round(float(y), 1)] for x, y in pitchlib.pitch_to_image(cal, line)]
         for line in pitchlib.line_segments(template, step=0.5)
@@ -64,9 +76,16 @@ def _public_fit(cal, used):
         "k1": round(float(cal["k1"]), 5),
         "size": cal["size"],
         "rms": cal["rms"],
+        "rmsPixels": cal["rmsPixels"],
         "quality": cal["quality"],
         "warnings": cal["warnings"],
-        "residuals": [{"name": n, "metres": r} for n, r in zip(used, cal["residuals"])],
+        "fieldOfView": cal["fieldOfView"],
+        "cameraHeight": cal["cameraHeight"],
+        "lineResiduals": cal["lineResiduals"],
+        "residuals": [
+            {"name": n, "metres": m, "pixels": p, "leftOut": o}
+            for n, m, p, o in zip(used, cal["residuals"], cal["pixelResiduals"], cal["leaveOneOut"])
+        ],
     }
 
 
@@ -117,12 +136,12 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
     """Fit, optionally re-align through the video, and return calibration.json."""
     frames = result["frames"]
     size = (result["video"]["width"], result["video"]["height"])
-    template, image, world, t, distortion, used = validate_request(request, size)
-    cal = pitchlib.fit(image, world, size, distortion)
+    template, image, world, t, distortion, used, line_clicks = validate_request(request, size)
+    cal = pitchlib.fit(image, world, size, distortion, line_clicks)
     if cal["quality"] == "poor":
         raise ValueError(
             "These clicks do not fit a flat pitch (error "
-            f"{cal['rms']:.1f} m). Check each landmark is the right one and try again."
+            f"{cal['rmsPixels']:.1f} px). Check each landmark is the right one and the pitch size."
         )
     anchor = nearest_frame(frames, t)
     anchors = {anchor: np.asarray(cal["H"], float)}

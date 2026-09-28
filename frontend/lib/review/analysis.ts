@@ -224,10 +224,16 @@ export type CalibrationFit = {
   H: number[][];
   k1: number;
   size: [number, number];
+  /** Landmark error in metres (RMS). */
   rms: number;
+  /** Click error in image pixels (RMS), the basis of the quality grade. */
+  rmsPixels: number;
   quality: "good" | "check" | "poor" | "unverified";
   warnings: string[];
-  residuals: { name: string; metres: number }[];
+  fieldOfView: number | null;
+  cameraHeight: number | null;
+  lineResiduals: number[];
+  residuals: { name: string; metres: number; pixels: number; leftOut: number | null }[];
 };
 
 export type Calibration = {
@@ -249,6 +255,8 @@ export type Calibration = {
 export type CalibrationRequest = {
   template: PitchTemplate;
   points: { name: string; x: number; y: number }[];
+  /** Clicks anywhere along a straight painted line. */
+  lines?: { line: string; x: number; y: number }[];
   t: number;
   distortion?: "auto" | "none" | "on";
   walls?: boolean;

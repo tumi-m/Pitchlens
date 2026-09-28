@@ -37,7 +37,7 @@ def test_fit_recovers_pitch_positions_from_clicks():
     world = np.array([pitch.landmarks(TEMPLATE)[n] for n in names])
     clicks = pitch.apply(H, world) + np.random.default_rng(0).normal(0, 0.4, (len(names), 2))
     cal = pitch.fit(clicks, world, SIZE, distortion="none")
-    assert cal["quality"] == "good" and cal["rms"] < 0.5
+    assert cal["quality"] == "good" and cal["rms"] < 0.5 and cal["rmsPixels"] < 1.5
     feet = pitch.apply(H, [[10.0, 5.0], [30.0, 15.0]])
     assert np.allclose(pitch.image_to_pitch(cal, feet), [[10, 5], [30, 15]], atol=0.5)
 
@@ -59,15 +59,55 @@ def test_collinear_clicks_are_rejected():
 
 def test_wide_angle_distortion_is_estimated_when_it_helps():
     H = camera_homography()
-    k1 = -0.18
-    names = [n for n in pitch.landmarks(TEMPLATE)]
-    world = np.array([pitch.landmarks(TEMPLATE)[n] for n in names])
-    ideal = pitch.apply(H, world)
-    clicks = pitch.distort(ideal, k1, SIZE)
-    plain = pitch.fit(clicks, world, SIZE, distortion="none")
-    fitted = pitch.fit(clicks, world, SIZE, distortion="auto")
-    assert fitted["rms"] < plain["rms"] * 0.5
-    assert abs(fitted["k1"] - k1) < 0.05
+    rng = np.random.default_rng(5)
+    for k1 in (-0.18, -0.5):  # mild barrel and a strong fisheye the old fit rejected
+        names = list(pitch.landmarks(TEMPLATE))
+        world = np.array([pitch.landmarks(TEMPLATE)[n] for n in names])
+        clicks = pitch.distort(pitch.apply(H, world), k1, SIZE) + rng.normal(0, 0.5, (len(names), 2))
+        plain = pitch.fit(clicks, world, SIZE, distortion="none")
+        fitted = pitch.fit(clicks, world, SIZE, distortion="auto")
+        assert fitted["rmsPixels"] < plain["rmsPixels"] * 0.5
+        assert abs(fitted["k1"] - k1) < 0.08
+        assert fitted["quality"] == "good"
+        probe = np.array([[8.0, 4.0], [32.0, 16.0]])
+        seen = pitch.distort(pitch.apply(H, probe), k1, SIZE)
+        assert np.linalg.norm(pitch.image_to_pitch(fitted, seen) - probe, axis=1).max() < 0.3
+
+
+def test_points_along_lines_make_distortion_observable_with_few_landmarks():
+    H = camera_homography()
+    k1 = -0.35
+    marks = pitch.landmarks(TEMPLATE)
+    names = ["corner-far-left", "corner-far-right", "halfway-near", "centre-spot"]
+    world = np.array([marks[n] for n in names])
+    clicks = pitch.distort(pitch.apply(H, world), k1, SIZE)
+    lines = pitch.straight_lines(TEMPLATE)
+    line_clicks = []
+    for name in ("far-touchline", "near-touchline", "halfway-line", "left-goal-line"):
+        a, b = np.array(lines[name])
+        for s in np.linspace(0.1, 0.9, 5):
+            p = a + (b - a) * s
+            line_clicks.append((tuple(pitch.distort(pitch.apply(H, [p]), k1, SIZE)[0]), lines[name]))
+    four = pitch.fit(clicks, world, SIZE, distortion="auto")
+    assert four["quality"] == "unverified"
+    with_lines = pitch.fit(clicks, world, SIZE, distortion="auto", line_clicks=line_clicks)
+    assert with_lines["quality"] == "good" and abs(with_lines["k1"] - k1) < 0.08
+
+
+def test_camera_geometry_is_plausible_for_a_synthetic_camera():
+    fov, height = pitch.camera_geometry(camera_homography(), SIZE)
+    assert fov is not None and 30 < fov < 175 and height is not None and height > 0
+
+
+def test_a_mis_clicked_landmark_is_flagged():
+    H = camera_homography()
+    marks = pitch.landmarks(TEMPLATE)
+    names = list(marks)[:9]
+    world = np.array([marks[n] for n in names])
+    clicks = pitch.apply(H, world)
+    clicks[3] += [25, -15]
+    cal = pitch.fit(clicks, world, SIZE, distortion="none")
+    assert any("Landmark 4" in w for w in cal["warnings"])
 
 
 def test_distort_inverts_undistort():

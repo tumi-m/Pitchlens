@@ -839,8 +839,8 @@ async def save_calibration(job_id: str, request: Request):
     if fit["fit"]["quality"] == "poor":
         raise HTTPException(
             400,
-            f"These clicks do not fit a flat pitch (error {fit['fit']['rms']:.1f} m). "
-            "Check each landmark is the right one.",
+            f"These clicks do not fit a flat pitch (error {fit['fit']['rmsPixels']:.1f} px). "
+            "Check each landmark is the right one and the pitch size.",
         )
     _write_json(
         directory / "calibration-job.json",

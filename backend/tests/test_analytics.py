@@ -251,3 +251,14 @@ def test_calibration_review_and_analysis_endpoints(tmp_path, monkeypatch):
     # Unfinished jobs have no analysis.
     (directory / "result.json").unlink()
     assert client.get(f"/jobs/{job_id}/analysis").status_code == 409
+
+
+def test_reviewer_shots_count_on_target_by_outcome():
+    frames = build_match()
+    review = {"decisions": [
+        {"action": "add", "type": "shot", "t": 1.0, "team": 1, "outcome": "saved", "id": "added-a"},
+        {"action": "add", "type": "shot", "t": 2.0, "team": 1, "outcome": "off-target", "id": "added-b"},
+    ]}
+    out = analytics.analyse(result_for(frames), calibration_for(frames), review)
+    team1 = out["stats"]["teams"][1]
+    assert team1["shots"]["value"] == 2 and team1["shotsOnTarget"]["value"] == 1

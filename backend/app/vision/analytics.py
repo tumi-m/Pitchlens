@@ -565,6 +565,9 @@ def detect_events(projected, states, spells, template, directions, sample_fps, b
 # --------------------------------------------------------------------- review
 
 
+ON_TARGET = {"on-target", "saved", "goal-candidate", "goal"}
+
+
 def apply_review(events, review):
     """Apply a reviewer's append-only decisions. Later decisions win."""
     if not review:
@@ -575,19 +578,20 @@ def apply_review(events, review):
     for d in review.get("decisions", []):
         action = d.get("action")
         if action == "add":
-            added.append(
-                {
-                    "id": d.get("id") or f"added-{len(added)}",
-                    "type": d.get("type", "shot"),
-                    "t": float(d.get("t", 0)),
-                    "team": d.get("team"),
-                    "confidence": 1.0,
-                    "status": "confirmed",
-                    "source": "reviewer",
-                    **({"outcome": d["outcome"]} if d.get("outcome") else {}),
-                    **({"x": d["x"], "y": d["y"]} if d.get("x") is not None else {}),
-                }
-            )
+            item = {
+                "id": d.get("id") or f"added-{len(added)}",
+                "type": d.get("type", "shot"),
+                "t": float(d.get("t", 0)),
+                "team": d.get("team"),
+                "confidence": 1.0,
+                "status": "confirmed",
+                "source": "reviewer",
+                **({"outcome": d["outcome"]} if d.get("outcome") else {}),
+                **({"x": d["x"], "y": d["y"]} if d.get("x") is not None else {}),
+            }
+            if item["type"] == "shot":
+                item["onTarget"] = item.get("outcome", "on-target") in ON_TARGET
+            added.append(item)
             continue
         if action == "direction":
             overrides["direction"] = d.get("value")
@@ -612,6 +616,8 @@ def apply_review(events, review):
         elif action == "outcome" and d.get("value"):
             target["outcome"] = d["value"]
             target["status"] = "confirmed"
+            if target["type"] == "shot":
+                target["onTarget"] = d["value"] in ON_TARGET
     merged = [e for e in by_id.values()] + [a for a in added if a["id"] not in by_id]
     merged.sort(key=lambda e: e["t"])
     return merged, overrides
@@ -668,8 +674,12 @@ def summarise(projected, states, spells, events, template, directions, player_of
         complete = count("pass", team, outcome="complete")
         shots = count("shot", team)
         on_target = count("shot", team, onTarget=True)
-        goals_confirmed = sum(1 for e in live if e["type"] == "goal" and e.get("team") == team and e["status"] == "confirmed") + sum(
-            1 for e in live if e["type"] == "goal-candidate" and e.get("team") == team and e["status"] == "confirmed"
+        goals_confirmed = sum(
+            1
+            for e in live
+            if e.get("team") == team
+            and e["status"] == "confirmed"
+            and (e["type"] in ("goal", "goal-candidate") or (e["type"] == "shot" and e.get("outcome") in ("goal", "goal-candidate") and e.get("source") == "reviewer"))
         )
         teams.append(
             {
