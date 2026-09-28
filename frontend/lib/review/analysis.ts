@@ -256,8 +256,12 @@ export type CalibrationFit = {
   residuals: { name: string; metres: number; pixels: number; leftOut: number | null }[];
 };
 
+export type Venue = { id: string; name: string; template: PitchTemplate; size: [number, number]; static: boolean; createdAt: number };
+
 export type Calibration = {
   state: "none" | "ready";
+  /** Set when this calibration came from a saved venue. */
+  venue?: { id: string; name: string; lineScore: number | null };
   template?: PitchTemplate;
   fit?: CalibrationFit;
   k1?: number;
@@ -304,6 +308,12 @@ export const previewCalibration = (jobId: string, request: CalibrationRequest) =
 
 export const saveCalibration = (jobId: string, request: CalibrationRequest) =>
   post<{ state: string; fit: CalibrationFit }>(`jobs/${jobId}/calibration`, request);
+
+export const fetchVenues = () => visionJson<Venue[]>("venues");
+
+export const saveVenue = (jobId: string, name: string) => post<Venue>("venues", { jobId, name });
+
+export const applyVenue = (jobId: string, venue: string) => post<{ state: string }>(`jobs/${jobId}/calibration`, { venue });
 
 export const sendReview = (jobId: string, decisions: ReviewDecision[]) =>
   post<{ decisions: number; analysis: Analysis }>(`jobs/${jobId}/review`, { decisions });

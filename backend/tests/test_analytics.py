@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 
 from app.vision import analytics, pitch
@@ -463,3 +464,60 @@ def test_worker_rejects_nan_bool_teams_and_recovers_stuck_calibrations(tmp_path,
     body = {"template": "futsal", "points": clicks(), "t": 0.0}
     assert client.post(f"/jobs/{job_id}/calibration", json=body).status_code == 200
     assert client.get(f"/jobs/{job_id}/calibration").json()["state"] == "ready"
+
+
+def test_venue_calibration_is_saved_and_reused_and_refused_when_it_does_not_fit(tmp_path, monkeypatch):
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "test-token")
+    monkeypatch.setattr(server.post_pool, "submit", lambda fn, *a: fn(*a))
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers["Authorization"] = "Bearer test-token"
+    first, _ = make_job(server, build_match())
+    assert client.post("/venues", json={"name": "Court 2", "jobId": first}).status_code == 409  # no setup yet
+    assert client.post(f"/jobs/{first}/calibration", json={"template": "futsal", "points": clicks(), "t": 0.0}).status_code == 200
+    venue = client.post("/venues", json={"name": "Court 2", "jobId": first}).json()
+    assert venue["name"] == "Court 2" and [v["id"] for v in client.get("/venues").json()] == [venue["id"]]
+    second, _ = make_job(server, build_match())
+    assert client.post(f"/jobs/{second}/calibration", json={"venue": venue["id"]}).status_code == 200
+    cal = client.get(f"/jobs/{second}/calibration").json()
+    assert cal["state"] == "ready" and cal["venue"]["name"] == "Court 2" and cal["coverage"] == 100.0
+    assert client.get(f"/jobs/{second}/analysis").json()["calibrated"]
+    # A different video size cannot reuse the venue.
+    third, third_dir = make_job(server, build_match())
+    result = _json.loads((third_dir / "result.json").read_text())
+    result["video"] = {"width": 1280, "height": 720}
+    (third_dir / "result.json").write_text(_json.dumps(result))
+    client.post(f"/jobs/{third}/calibration", json={"venue": venue["id"]})
+    job = client.get(f"/jobs/{third}/calibration").json()["job"]
+    assert job["state"] == "failed" and "1280x720" in job["error"]
+    assert client.post(f"/jobs/{third}/calibration", json={"venue": "0" * 32}).status_code == 404
+
+
+def test_venue_reuse_is_verified_against_the_painted_lines(tmp_path):
+    import cv2
+
+    from app.vision import calibrate
+    from tests.test_pitch import SIZE, TEMPLATE as FUTSAL, camera_homography, render
+
+    H = camera_homography()
+    frames, video = [], tmp_path / "match.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 5.0, SIZE)
+    for i in range(30):
+        writer.write(render(H))
+        frames.append({"t": round(i / 5, 3), "scene": 0, "players": [], "ball": None, "camera": [1, 0, 0, 0, 1, 0]})
+    writer.release()
+    result = {"frames": frames, "sampleFps": 5.0, "video": {"width": SIZE[0], "height": SIZE[1]}}
+    good = {"id": "v1", "name": "Court 1", "template": FUTSAL, "size": list(SIZE), "k1": 0.0, "H": np.linalg.inv(H).tolist()}
+    out = calibrate.build_from_venue(result, good, video)
+    assert out["venue"]["lineScore"] > 0.6 and out["coverage"] == 100.0
+    # The camera was re-aimed since the venue was saved: refuse rather than map wrongly.
+    moved = np.array([[1, 0, 60.0], [0, 1, 25.0], [0, 0, 1]])
+    bad = {**good, "H": (np.linalg.inv(H) @ np.linalg.inv(moved)).tolist()}
+    with pytest.raises(ValueError, match="do not line up"):
+        calibrate.build_from_venue(result, bad, video)

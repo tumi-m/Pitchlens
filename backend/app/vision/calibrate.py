@@ -243,3 +243,99 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
         "coverage": round(covered / max(1, len(frames)) * 100, 1),
         "frames": per_frame,
     }
+
+
+# ------------------------------------------------------------------ venues
+# A fixed venue camera (PUSHIT-style) sees the same pitch every match: save its
+# calibration once and reuse it, checked against the painted lines each time.
+
+
+def venue_from_calibration(calibration, name):
+    frames = calibration.get("frames") or []
+    anchor = calibration.get("anchorFrame")
+    entry = frames[anchor] if anchor is not None and anchor < len(frames) else None
+    if not entry:
+        raise ValueError("This match has no usable pitch setup to save")
+    return {
+        "name": name,
+        "template": calibration["template"],
+        "size": calibration["size"],
+        "k1": calibration.get("k1", 0.0),
+        "H": entry["H"],
+        "static": bool(calibration.get("static")),
+        "rms": calibration.get("rms"),
+    }
+
+
+def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
+    """Apply a saved venue calibration to a new match, verified against its lines.
+
+    Refuses when the video size differs, or when the painted lines in this
+    match do not line up with the saved setup (the camera moved or it is a
+    different court).
+    """
+    frames = result["frames"]
+    size = (result["video"]["width"], result["video"]["height"])
+    if list(size) != list(venue["size"]):
+        raise ValueError(
+            f"This video is {size[0]}x{size[1]} but the saved venue was set up on {venue['size'][0]}x{venue['size'][1]}. Set up the pitch for this match."
+        )
+    template = venue["template"]
+    H = np.asarray(venue["H"], float).reshape(3, 3)
+    cal = {"H": H, "k1": venue.get("k1", 0.0), "size": list(size)}
+    static = pitchlib.static_camera(frames)
+    verified = None
+    anchors = {}
+    if video_path and Path(video_path).is_file():
+        picks = sorted(set(np.linspace(0, len(frames) - 1, min(samples, len(frames))).astype(int).tolist()))
+        masks = line_masks(video_path, frames, picks, progress=(lambda p: progress(p * 0.8)) if progress else None)
+        scores = []
+        for i, png in masks.items():
+            refined, score = _align(png, cal, H, template, search=int(min(size) * 0.05))
+            scores.append(score)
+            if refined is not None and score >= 0.45:
+                anchors[i] = refined
+        verified = round(float(np.median(scores)), 2) if scores else None
+        if not scores or len(anchors) < max(2, len(scores) // 2):
+            raise ValueError(
+                "The painted lines in this match do not line up with the saved venue (the camera may have moved). Set up the pitch for this match."
+            )
+    if static or not anchors:
+        # One fixed view: the saved homography, refined by the median correction if any.
+        anchors = {0: H} if not anchors else {0: _median_homography(list(anchors.values()), size)}
+        homographies = [anchors[0]] * len(frames)
+        distance = [0] * len(frames)
+    else:
+        homographies, distance = pitchlib.propagate(frames, anchors, static)
+    per_frame = [
+        {"H": np.asarray(h, float).round(9).reshape(-1).tolist(), "d": d} if h is not None else None
+        for h, d in zip(homographies, distance)
+    ]
+    covered = sum(1 for f in per_frame if f)
+    return {
+        "schemaVersion": 1,
+        "state": "ready",
+        "template": template,
+        "request": {"venue": venue.get("id"), "template": template},
+        "fit": {"quality": "venue", "rms": venue.get("rms"), "rmsPixels": None, "warnings": [], "residuals": []},
+        "k1": venue.get("k1", 0.0),
+        "size": list(size),
+        "rms": venue.get("rms") or 0.3,
+        "static": static,
+        "anchorFrame": 0,
+        "anchors": len(anchors),
+        "lineAligned": len(anchors),
+        "reacquired": 0,
+        "coverage": round(covered / max(1, len(frames)) * 100, 1),
+        "venue": {"id": venue.get("id"), "name": venue.get("name"), "lineScore": verified},
+        "frames": per_frame,
+    }
+
+
+def _median_homography(homographies, size):
+    """Robust average of nearby homographies: median of where they send a grid."""
+    w, h = size
+    grid = np.array([[x, y] for x in np.linspace(0, w, 5) for y in np.linspace(h * 0.3, h, 4)])
+    mapped = np.median(np.stack([pitchlib.apply(H, grid) for H in homographies]), axis=0)
+    H, _ = cv2.findHomography(grid, mapped, 0)
+    return H / H[2, 2]

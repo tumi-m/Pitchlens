@@ -200,3 +200,31 @@ test("review: confirming a shot is saved on the worker and updates the stats", a
   await expect.poll(() => state.reviews.length).toBe(3);
   expect((state.reviews[2] as { decisions: { action: string; value: number[] }[] }).decisions[0]).toEqual({ action: "score", value: [3, 1] });
 });
+
+
+test("a saved venue is applied without clicking landmarks", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: false });
+  const applied: unknown[] = [];
+  await page.route("**/api/vision/venues", (r) =>
+    r.fulfill({ json: [{ id: "e".repeat(32), name: "Tekkerz Court 2", template: analysis(true).template, size: [640, 360], static: true, createdAt: 0 }] }),
+  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration$`), async (r) => {
+    if (r.request().method() === "POST") {
+      applied.push(r.request().postDataJSON());
+      state.calibrated = true;
+      return r.fulfill({ json: { state: "processing" } });
+    }
+    return r.fulfill({
+      json: state.calibrated
+        ? { state: "ready", template: analysis(true).template, k1: 0, size: [640, 360], coverage: 100, static: true, venue: { id: "e".repeat(32), name: "Tekkerz Court 2", lineScore: 0.8 }, frames: Array(20).fill({ H: [1 / 15, 0, -20 / 15, 0, 1 / 15, -20 / 15, 0, 0, 1], d: 0 }), job: { state: "done", progress: 100 } }
+        : { state: "none" },
+    });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Use a saved venue")).toBeVisible();
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible({ timeout: 15000 });
+  expect(applied).toEqual([{ venue: "e".repeat(32) }]);
+  await expect(page.getByText(/From saved venue "Tekkerz Court 2"/)).toBeVisible();
+});
+

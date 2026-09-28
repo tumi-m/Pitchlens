@@ -860,6 +860,24 @@ def _run_calibration(directory, body):
             calibrating.discard(directory.name)
 
 
+def _run_venue_calibration(directory, venue):
+    from app.vision.calibrate import build_from_venue
+
+    status_path = directory / "calibration-job.json"
+    try:
+        result = json.loads((directory / "result.json").read_text())
+        video = directory / "video"
+        data = build_from_venue(result, venue, video if video.is_file() else None)
+        _write_json(directory / "calibration.json", data)
+        compute_analysis(directory)
+        _write_json(status_path, {"state": "done", "progress": 100, "finishedAt": time.time(), "venue": venue.get("id")})
+    except Exception as exc:  # noqa: BLE001 - reported to the user; previous calibration kept
+        _write_json(status_path, {"state": "failed", "error": str(exc)[:300], "finishedAt": time.time()})
+    finally:
+        with calibrating_lock:
+            calibrating.discard(directory.name)
+
+
 @app.post("/jobs/{job_id}/calibration")
 async def save_calibration(job_id: str, request: Request):
     directory, path = _finished_result(job_id)
@@ -879,6 +897,17 @@ async def save_calibration(job_id: str, request: Request):
 
 async def _start_calibration(job_id, directory, path, body):
     from app.vision.calibrate import preview
+
+    if "venue" in body:
+        venue_id = body.get("venue")
+        if not isinstance(venue_id, str) or not re.fullmatch(r"[a-f0-9]{32}", venue_id):
+            raise HTTPException(404, "Venue not found")
+        venue = _read_json(_venue_dir() / f"{venue_id}.json")
+        if not venue:
+            raise HTTPException(404, "Venue not found")
+        _write_json(directory / "calibration-job.json", {"state": "processing", "progress": 0, "startedAt": time.time(), "venue": venue_id})
+        post_pool.submit(_run_venue_calibration, directory, venue)
+        return {"state": "processing", "venue": {"id": venue_id, "name": venue.get("name")}}
 
     result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
     try:
@@ -993,4 +1022,51 @@ async def add_review(job_id: str, request: Request):
         raise HTTPException(409, "Too many review decisions for one match")
     data = await asyncio.to_thread(compute_analysis, directory)
     return {"decisions": total, "added": [c for c in cleaned if c["action"] == "add"], "analysis": data}
+
+
+# ------------------------------------------------------------------ venues
+
+VENUES = "venues"
+
+
+def _venue_dir():
+    directory = ROOT / VENUES
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+@app.get("/venues")
+def venues():
+    out = []
+    for path in sorted(_venue_dir().glob("*.json")):
+        data = _read_json(path) or {}
+        if data.get("id"):
+            out.append({k: data.get(k) for k in ("id", "name", "template", "size", "static", "createdAt")})
+    return out
+
+
+@app.post("/venues")
+async def create_venue(request: Request):
+    from app.vision.calibrate import venue_from_calibration
+
+    body = await _json_body(request)
+    name = body.get("name")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+        raise HTTPException(400, "Give the venue a name (up to 80 characters)")
+    job_id = body.get("jobId")
+    if not isinstance(job_id, str):
+        raise HTTPException(400, "Unknown match")
+    directory = folder(job_id)
+    calibration = _calibration_ready(directory)
+    if not calibration:
+        raise HTTPException(409, "Set up the pitch for this match first")
+    try:
+        venue = venue_from_calibration(calibration, name.strip())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if len(list(_venue_dir().glob("*.json"))) >= 500:
+        raise HTTPException(409, "Too many saved venues")
+    venue.update(id=uuid.uuid4().hex, createdAt=time.time(), sourceJob=job_id)
+    _write_json(_venue_dir() / f"{venue['id']}.json", venue)
+    return {k: venue[k] for k in ("id", "name", "template", "size", "static", "createdAt")}
 

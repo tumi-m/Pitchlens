@@ -10,6 +10,10 @@ import {
   previewCalibration,
   saveCalibration,
   fetchCalibration,
+  fetchVenues,
+  saveVenue,
+  applyVenue,
+  Venue,
 } from "@/lib/review/analysis";
 import { VisionError, clockTime } from "@/lib/review/vision";
 import { PitchSvg } from "@/components/vision/PitchGraphics";
@@ -77,6 +81,60 @@ export function PitchCalibration({
   const [progress, setProgress] = useState<number | null>(null);
   const handled = useRef(0);
   const marks = useMemo(() => landmarks(template), [template]);
+  const [venues, setVenues] = useState<Venue[]>([]);
+  const [venueId, setVenueId] = useState("");
+  const [venueName, setVenueName] = useState("");
+  const [venueNote, setVenueNote] = useState("");
+  useEffect(() => {
+    fetchVenues()
+      .then((list) => {
+        setVenues(list);
+        if (list.length) setVenueId(list[0].id);
+      })
+      .catch(() => setVenues([]));
+  }, []);
+
+  async function waitForCalibration() {
+    for (let i = 0; i < 600; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const current = await fetchCalibration(jobId);
+      const job = current.job;
+      if (job?.state === "processing") setProgress(job.progress ?? 0);
+      else if (job?.state === "failed") throw new Error(job.error || "Calibration failed");
+      else if (job?.state === "done") return;
+    }
+    throw new Error("The pitch setup is taking too long. Reload the page to check on it.");
+  }
+
+  async function useVenue() {
+    setBusy("save");
+    setError("");
+    try {
+      await applyVenue(jobId, venueId);
+      setProgress(0);
+      await waitForCalibration();
+      setProgress(null);
+      onApplied();
+    } catch (e) {
+      setProgress(null);
+      setError(e instanceof Error ? e.message : "The saved venue could not be applied");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function storeVenue() {
+    setVenueNote("");
+    setError("");
+    try {
+      const venue = await saveVenue(jobId, venueName.trim());
+      setVenues((list) => [venue, ...list.filter((v) => v.id !== venue.id)]);
+      setVenueNote(`Saved as "${venue.name}". Future matches from this camera can use it without clicks.`);
+      setVenueName("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The venue could not be saved");
+    }
+  }
 
   // Start from the saved calibration so a correction does not mean starting over.
   useEffect(() => {
@@ -168,14 +226,7 @@ export function PitchCalibration({
       await saveCalibration(jobId, request());
       setProgress(0);
       // Line re-alignment through the match runs on the worker; poll it.
-      for (let i = 0; i < 600; i++) {
-        await new Promise((r) => setTimeout(r, 1500));
-        const current = await fetchCalibration(jobId);
-        const job = current.job;
-        if (job?.state === "processing") setProgress(job.progress ?? 0);
-        else if (job?.state === "failed") throw new Error(job.error || "Calibration failed");
-        else if (job?.state === "done") break;
-      }
+      await waitForCalibration();
       setProgress(null);
       onActive(false);
       onApplied();
@@ -220,6 +271,49 @@ export function PitchCalibration({
         {ready && calibration?.static === false && (calibration?.coverage ?? 0) < 60 && (
           <p className="text-sm text-amber-200">
             The camera moves, and only part of the match could be followed from your clicks. Positions outside those parts are left out, not guessed.
+          </p>
+        )}
+        {calibration?.venue && (
+          <p className="text-xs text-pitch-muted">
+            From saved venue &quot;{calibration.venue.name}&quot;
+            {calibration.venue.lineScore !== null ? ` · lines matched ${Math.round(calibration.venue.lineScore * 100)}%` : ""}
+          </p>
+        )}
+        {!ready && venues.length > 0 && (
+          <div className="rounded-xl border border-white/10 p-3 space-y-2">
+            <p className="text-sm font-semibold">Use a saved venue</p>
+            <p className="text-xs text-pitch-muted">Same fixed camera as before? Apply its pitch setup without clicking; it is checked against the painted lines.</p>
+            <div className="flex gap-2">
+              <select aria-label="Saved venue" className="pitch-input flex-1" value={venueId} onChange={(e) => setVenueId(e.target.value)}>
+                {venues.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name} · {v.template.length}×{v.template.width} m
+                  </option>
+                ))}
+              </select>
+              <button className="pitch-button-secondary" disabled={!venueId || !!busy} onClick={useVenue}>
+                {busy === "save" ? <Loader2 size={15} className="animate-spin" /> : null}
+                {busy === "save" && progress !== null ? `${Math.round(progress)}%` : "Apply"}
+              </button>
+            </div>
+          </div>
+        )}
+        {ready && !calibration?.venue && (
+          <div className="rounded-xl border border-white/10 p-3 space-y-2">
+            <p className="text-sm font-semibold">Save as a venue</p>
+            <p className="text-xs text-pitch-muted">For a fixed camera: later matches from it reuse this setup automatically.</p>
+            <div className="flex gap-2">
+              <input aria-label="Venue name" maxLength={80} placeholder="e.g. Tekkerz Court 2" className="pitch-input flex-1" value={venueName} onChange={(e) => setVenueName(e.target.value)} />
+              <button className="pitch-button-secondary" disabled={!venueName.trim()} onClick={storeVenue}>
+                Save
+              </button>
+            </div>
+          </div>
+        )}
+        {venueNote && <p className="text-xs text-emerald-200">{venueNote}</p>}
+        {error && !active && (
+          <p role="alert" className="text-sm text-red-300">
+            {error}
           </p>
         )}
         <button className="pitch-button-secondary w-full" onClick={() => onActive(true)}>
