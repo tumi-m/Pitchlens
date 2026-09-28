@@ -4,6 +4,8 @@ import gzip
 import os
 from pathlib import Path
 
+from app.vision.access import video_grant
+
 
 class GPUUnavailable(Exception):
     """Modal could not run the job (auth, quota, image build): use the CPU instead."""
@@ -55,6 +57,7 @@ def run_on_modal(
                 max_seconds,
                 start_seconds,
                 ball_search,
+                video_grant(token, job_id),
             )
             for item in stream:
                 if cancelled():

@@ -1,10 +1,11 @@
 """Authenticated vision worker. Runs on loopback locally or as a hosted container.
 
-Video never goes to a hosted inference provider: models run inside this process.
+Models run locally or on the configured Modal GPU; uploaded footage stays private.
 The long-lived service token stays server-side (Next.js proxy -> worker).
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import math
@@ -23,6 +24,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.vision import gpu
+from app.vision.access import valid_video_grant
 from app.vision.engine import probe, run_video
 from app.vision.profiles import available_profiles
 
@@ -63,9 +65,39 @@ def auth(request: Request):
     if request.url.path == "/healthz":
         return
     if not TOKEN or not hmac.compare_digest(
-        request.headers.get("authorization", ""), f"Bearer {TOKEN}"
+        request.headers.get("authorization", "").encode(), f"Bearer {TOKEN}".encode()
     ):
         raise HTTPException(401, "Vision service authentication required")
+    job_id = request.path_params.get("job_id")
+    if job_id:
+        worker_read = (
+            request.method == "GET"
+            and request.url.path == f"/jobs/{job_id}/video"
+            and valid_video_grant(TOKEN, job_id, request.headers.get("x-pitchlens-video-grant"))
+        )
+        if not worker_read:
+            authorize_job(job_id, request)
+
+
+def require_owner(request):
+    return (
+        os.getenv("VISION_REQUIRE_OWNER", "0") == "1"
+        or bool(gpu.public_base())
+        or request.headers.get("x-pitchlens-require-owner") == "1"
+    )
+
+
+def authorize_job(job_id, request):
+    directory = folder(job_id)
+    data = json.loads((directory / "status.json").read_text())
+    expected = data.get("owner")
+    given = request.headers.get("x-pitchlens-owner", "")
+    # Legacy ownerless data remains local-only; it is never public by UUID.
+    if (expected and (not OWNER.fullmatch(given) or not hmac.compare_digest(expected, given))) or (
+        not expected and require_owner(request)
+    ):
+        raise HTTPException(404, "Job not found")
+    return directory
 
 
 def allowed_hosts():
@@ -137,9 +169,13 @@ def work(directory, status, event):
             except gpu.GPUUnavailable as exc:
                 import logging
 
+                if gpu.public_base() and not status.get("maxSeconds") and os.getenv("VISION_ALLOW_CPU_FALLBACK", "0") != "1":
+                    raise ValueError("GPU is unavailable. Your upload is saved; retry when GPU service returns.") from exc
                 logging.warning("GPU unavailable, using CPU: %s", exc)
                 update(stage="GPU unavailable; analysing on the CPU (slower)", progress=0)
         if not ran_on_gpu:
+            if gpu.public_base() and not status.get("maxSeconds") and os.getenv("VISION_ALLOW_CPU_FALLBACK", "0") != "1":
+                raise ValueError("GPU processing is not configured. Your upload is saved; contact the service owner.")
             run_video(directory / "video", directory / "result.json", **options)
         update(
             status="completed",
@@ -322,12 +358,16 @@ def health():
         "gpu": gpu.modal_enabled(),
         # Pitch calibration, event detection and reviewer decisions.
         "analytics": True,
+        "privateJobs": True,
+        "reviewIdempotency": True,
     }
 
 
 @app.get("/jobs")
 def jobs(request: Request):
-    owner = request.query_params.get("owner")
+    owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner")
+    if require_owner(request) and not owner:
+        raise HTTPException(400, "Match ownership is required")
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
     sweep_stale()
@@ -337,8 +377,8 @@ def jobs(request: Request):
             data = load_status(p.parent)
         except (OSError, ValueError, KeyError):
             continue
-        # Jobs created before ownership existed (local installs) stay visible.
-        if owner is not None and data.get("owner") not in (owner, None):
+        # Ownerless legacy jobs are visible only to a local, unscoped listing.
+        if owner is not None and data.get("owner") != owner:
             continue
         entries.append(public(data))
     return sorted(entries, key=lambda x: x["createdAt"], reverse=True)[:100]
@@ -398,7 +438,9 @@ async def create(request: Request):
         raise HTTPException(400, "Diagnostic start must be a whole number of seconds") from exc
     if not 0 <= start_seconds < 4 * 3600 or (diagnostic == "false" and start_seconds != 0):
         raise HTTPException(400, "Invalid diagnostic start")
-    owner = request.query_params.get("owner")
+    owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner")
+    if require_owner(request) and not owner:
+        raise HTTPException(400, "Match ownership is required")
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
     # A declared size means a chunked upload: this request only reserves the worker.
@@ -529,7 +571,9 @@ async def create_from_url(request: Request):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
-    owner = request.query_params.get("owner")
+    owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner")
+    if require_owner(request) and not owner:
+        raise HTTPException(400, "Match ownership is required")
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
     await asyncio.to_thread(delete_expired)
@@ -772,7 +816,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 5
+ANALYTICS_VERSION = 6
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
@@ -1034,9 +1078,16 @@ def review(job_id: str):
 async def add_review(job_id: str, request: Request):
     directory, _ = _finished_result(job_id)
     body = await _json_body(request)
+    request_id = body.get("requestId")
+    revision = body.get("expectedRevision")
+    if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r"[a-f0-9-]{32,36}", request_id)):
+        raise HTTPException(400, "Invalid review request ID")
+    if revision is not None and (isinstance(revision, bool) or not isinstance(revision, int) or revision < 0):
+        raise HTTPException(400, "Invalid review revision")
     decisions = body.get("decisions")
     if not isinstance(decisions, list) or not 1 <= len(decisions) <= 200:
         raise HTTPException(400, "Send between 1 and 200 decisions")
+    digest = hashlib.sha256(json.dumps(decisions, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     cleaned = [_clean_decision(d, i) for i, d in enumerate(decisions)]
     # Record which moment each decision was made on, so it survives re-analysis
     # (event ids are positions and change when the analysis is recomputed).
@@ -1051,21 +1102,30 @@ async def add_review(job_id: str, request: Request):
         with post_lock:
             # Append-only: the model's output and every change stay auditable.
             log = _read_json(directory / "review.json", {"decisions": []})
+            requests = log.setdefault("requests", {})
+            if request_id in requests:
+                previous = requests[request_id]
+                if previous["digest"] != digest:
+                    raise HTTPException(409, "This request ID was already used for different decisions")
+                return len(log["decisions"]), previous["added"]
+            if revision is not None and revision != len(log["decisions"]):
+                raise HTTPException(409, "This match was reviewed in another tab. Reload before saving.")
             if len(log["decisions"]) + len(cleaned) > 20000:
-                return None
+                raise HTTPException(409, "Too many review decisions for one match")
+            added = [c for c in cleaned if c["action"] == "add"]
             log["decisions"].extend(cleaned)
+            if request_id:
+                requests[request_id] = {"digest": digest, "added": added}
             _write_json(directory / "review.json", log)
-            return len(log["decisions"])
+            return len(log["decisions"]), added
 
     # The lock is taken in a worker thread: blocking the event loop would stall
     # uploads and every other request while an analysis is being computed.
-    total = await asyncio.to_thread(append)
-    if total is None:
-        raise HTTPException(409, "Too many review decisions for one match")
+    total, added = await asyncio.to_thread(append)
     data = await asyncio.to_thread(compute_analysis, directory)
     # The per-frame positions do not change with a decision; the client keeps its copy.
     data = {k: v for k, v in data.items() if k != "positions"}
-    return {"decisions": total, "added": [c for c in cleaned if c["action"] == "add"], "analysis": data}
+    return {"decisions": total, "added": added, "analysis": data}
 
 
 # ------------------------------------------------------------------ venues
@@ -1080,7 +1140,9 @@ def _venue_dir():
 
 
 def _owner(request):
-    owner = request.query_params.get("owner", "")
+    owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner", "")
+    if require_owner(request) and not OWNER.fullmatch(owner):
+        raise HTTPException(400, "Match ownership is required")
     return owner if OWNER.fullmatch(owner) else ""
 
 
@@ -1107,7 +1169,7 @@ async def create_venue(request: Request):
     job_id = body.get("jobId")
     if not isinstance(job_id, str):
         raise HTTPException(400, "Unknown match")
-    directory = folder(job_id)
+    directory = authorize_job(job_id, request)
     calibration = _calibration_ready(directory)
     if not calibration:
         raise HTTPException(409, "Set up the pitch for this match first")
@@ -1123,3 +1185,50 @@ async def create_venue(request: Request):
     _write_json(_venue_dir() / f"{venue['id']}.json", venue)
     return {k: venue[k] for k in ("id", "name", "template", "size", "static", "createdAt")}
 
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str):
+    directory = folder(job_id)
+    # Never remove files beneath a live upload, inference or calibration.
+    with calibrating_lock, lock:
+        if job_id == active or job_id in calibrating:
+            raise HTTPException(409, "Cancel processing and wait for it to stop before deleting")
+        with post_lock:
+            shutil.rmtree(directory)
+            for key in list(_prepared):
+                if key[0] == job_id:
+                    del _prepared[key]
+            # Saved venues derived from this match are personal derived data too.
+            for path in _venue_dir().glob("*.json"):
+                if (_read_json(path) or {}).get("sourceJob") == job_id:
+                    path.unlink(missing_ok=True)
+    return {"deleted": True}
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    global active
+    with lock:
+        directory = folder(job_id)
+        status = load_status(directory)
+        # A lost retry response is safe: acknowledge the existing active attempt.
+        if active == job_id and status["status"] == "processing":
+            return public(status)
+        if status["status"] not in ("failed", "interrupted", "cancelled"):
+            raise HTTPException(409, "Only stopped analyses can be retried")
+        if active is not None:
+            raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
+        if not (directory / "video").is_file() or expired(status) or not status.get("video"):
+            raise HTTPException(409, "No complete upload is available. Upload the video again.")
+        if status.get("attempts", 1) >= 3:
+            raise HTTPException(409, "Retry limit reached. Contact support before another attempt.")
+        if status.get("profile", "general") not in available_profiles():
+            raise HTTPException(503, "The selected vision models are not installed")
+        event = threading.Event()
+        status.update(status="processing", stage="Retrying saved upload", progress=0, attempts=status.get("attempts", 1) + 1)
+        write_status(directory, status)
+        active = job_id
+        cancellations[job_id] = event
+        pool.submit(work, directory, status, event)
+        return public(status)

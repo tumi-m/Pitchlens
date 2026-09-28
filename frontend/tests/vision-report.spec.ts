@@ -267,3 +267,73 @@ test("a saved venue is applied without clicking landmarks", async ({ page }) => 
   await expect(page.getByText(/From saved venue "Tekkerz Court 2"/)).toBeVisible();
 });
 
+
+test("unreviewed events are excluded from headline counts and uncertainty is not an accuracy guarantee", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Assisted review", { exact: true })).toBeVisible();
+  const shots = page.locator('[data-stat="Shots"]');
+  await expect(shots).toContainText("0 confirmed · 1 to review");
+  await expect(shots).toContainText("—");
+  await expect(page.getByText(/^95%:/)).toHaveCount(0);
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await page.keyboard.press("a");
+  await expect(shots).toContainText("confirmed in reviewed clips");
+});
+
+test("a lost review response retries the same request instead of duplicating a decision", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const requests: { requestId: string; expectedRevision: number }[] = [];
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/review$`), (route) => {
+    requests.push(route.request().postDataJSON());
+    if (requests.length === 1) return route.fulfill({ status: 503, json: { detail: "Reply lost" } });
+    return route.fulfill({ json: { decisions: 1, analysis: analysis(true, "confirmed") } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await page.keyboard.press("a");
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[0].requestId).toMatch(/^[a-f0-9-]{36}$/);
+  expect(requests[1]).toEqual(requests[0]);
+  expect(requests[0].expectedRevision).toBe(0);
+});
+
+test("a stopped analysis retries its saved upload without sending video bytes", async ({ page }) => {
+  let retried = false;
+  await page.route(`**/api/vision/jobs/${ID}`, (route) => route.fulfill({ json: {
+    id: ID, title: "Interrupted match", status: retried ? "processing" : "interrupted",
+    stage: retried ? "Retrying saved upload" : "Worker restarted", progress: 0, createdAt: 0,
+  } }));
+  await page.route(`**/api/vision/jobs/${ID}/retry`, (route) => {
+    expect(route.request().method()).toBe("POST");
+    retried = true;
+    return route.fulfill({ json: { status: "processing" } });
+  });
+  let videoWrites = 0;
+  page.on("request", (request) => { if (request.method() === "PUT") videoWrites++; });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Retry saved upload" }).click();
+  await expect(page.getByRole("button", { name: "Retry saved upload" })).toHaveCount(0);
+  expect(retried).toBe(true);
+  expect(videoWrites).toBe(0);
+});
+
+test("deleting a finished analysis confirms the scope and removes the dashboard entry", async ({ page }) => {
+  let deleted = false;
+  await page.route("**/api/vision/jobs", (route) => route.fulfill({ json: deleted ? [] : [{
+    id: ID, title: "Private match", status: "completed", stage: "Analysis complete", progress: 100, createdAt: 0,
+  }] }));
+  await page.route(`**/api/vision/jobs/${ID}`, (route) => {
+    expect(route.request().method()).toBe("DELETE");
+    deleted = true;
+    return route.fulfill({ json: { deleted: true } });
+  });
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("video, report, reviews");
+    await dialog.accept();
+  });
+  await page.goto("/dashboard");
+  await page.getByRole("button", { name: "Delete analysis and footage" }).click();
+  await expect(page.getByText("Private match", { exact: true })).toHaveCount(0);
+  expect(deleted).toBe(true);
+});

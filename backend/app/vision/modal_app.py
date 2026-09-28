@@ -71,6 +71,7 @@ def analyse(
     max_seconds=None,
     start_seconds=0,
     ball_search="exhaustive",
+    video_grant="",
 ):
     """Generator: yields progress dicts, then {"result_gz": bytes}."""
     import gzip
@@ -98,7 +99,7 @@ def analyse(
     video = workdir / "video"
     yield {"stage": "GPU: fetching the video", "progress": 1}
     with requests.get(
-        video_url, headers={"Authorization": f"Bearer {token}"}, stream=True, timeout=120
+        video_url, headers={"Authorization": f"Bearer {token}", "x-pitchlens-video-grant": video_grant}, stream=True, timeout=120
     ) as response:
         response.raise_for_status()
         with video.open("wb") as f:

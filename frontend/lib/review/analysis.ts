@@ -1,4 +1,4 @@
-import { visionJson } from "./vision";
+import { VisionError, visionJson } from "./vision";
 
 /** Pitch presets; mirrors backend/app/vision/pitch.py PRESETS (the worker validates). */
 export type PitchTemplate = {
@@ -225,7 +225,9 @@ export type Analysis = {
       possessionPercent: number;
       possessionShown: boolean;
       /** 95% interval for the first team's possession share. */
-      possessionInterval: [number, number] | null;
+      possessionMissingBounds?: [number, number] | null;
+    uncertaintyNote?: string;
+    possessionInterval: [number, number] | null;
       controlPercent: number;
       ballStatePercent: number;
       calibratedPercent: number;
@@ -328,8 +330,18 @@ export const saveVenue = (jobId: string, name: string) => post<Venue>("venues", 
 
 export const applyVenue = (jobId: string, venue: string) => post<{ state: string }>(`jobs/${jobId}/calibration`, { venue });
 
-export const sendReview = (jobId: string, decisions: ReviewDecision[]) =>
-  post<{ decisions: number; analysis: Analysis }>(`jobs/${jobId}/review`, { decisions });
+export async function sendReview(jobId: string, decisions: ReviewDecision[], expectedRevision?: number) {
+  const body = { decisions, expectedRevision, requestId: crypto.randomUUID() };
+  // Retries retain the same ID, including when the server committed but its reply was lost.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await post<{ decisions: number; analysis: Analysis }>(`jobs/${jobId}/review`, body);
+    } catch (error) {
+      if (attempt >= 2 || (error instanceof VisionError && error.status < 500)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+}
 
 export const EVENT_LABELS: Record<string, string> = {
   pass: "Pass",

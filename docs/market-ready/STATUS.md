@@ -4,13 +4,13 @@ Read this first after any break. Updated 2026-09-28.
 
 ## Where things stand
 
-Branch `claude/pitchlens-mvp-8qhpP` (not yet merged to `main`).
+Claude implementation merged to main in `1b51ffb`. Commercial-hardening changes are recorded below; check current Git HEAD before resuming.
 
 A match now produces a Sofascore-style report:
-- **Automatic, with coverage shown:** possession (time-based, with a 95%
-  interval, withheld under 60% coverage), possession by passes, passes and
-  pass accuracy (20+ attempts), interceptions, tackles, field tilt, attack
-  momentum.
+- **Automatic, with coverage shown:** observed control share (with missing-time sensitivity bounds, withheld under
+  60% estimated coverage), candidate pass share, field tilt and attack momentum.
+  Event counts are confirmed-only in the report; reviewed pass accuracy needs
+  20+ confirmed attempts. Automatic proposals remain in the review queue.
 - **After a two-minute pitch setup** (click landmarks on one frame, or reuse a
   saved venue): shots, shots on target, shot map, possible goals, heatmaps,
   average positions, a top-down live view, pitch lines drawn on the video.
@@ -72,3 +72,34 @@ cd ../frontend && npx tsc --noEmit && npm run lint && npm run build && npx playw
 3. Per-tracklet team posterior with keeper by penalty-area time; identity
    merge/split review so named player stats become possible.
 4. Keyframe-homography camera motion for panning phone footage.
+
+
+## Commercial hardening review — 28 September 2026
+
+The calibration/review/evaluation work is a substantial improvement, but does not
+pass the automatic-analytics launch gates. Tracking-data event tests are not
+end-to-end video accuracy. Model coverage and a bootstrap interval do not validate
+possession or shots. No commercial-ready claim is supported yet.
+
+Implemented after reviewing main `1b51ffb`:
+
+- Private match reads/writes require the existing browser ownership capability,
+  including video, result, calibration, review, cancellation and venue creation.
+  A match UUID/URL alone is no longer access. Proxy uses an HttpOnly SameSite
+  cookie for media/export requests; GPU fetches have expiring per-video grants.
+- Review requests have persisted idempotency IDs, retry safely after lost replies,
+  and reject stale revisions from another tab. UI prevents concurrent submissions.
+- Confirmed event counts are separated from pending candidates. Reviewed pass
+  accuracy requires 20 confirmed passes. Possession shows observed control with
+  missing-time sensitivity bounds, not a misleading accuracy interval.
+- Customers can delete footage, detections, calibration, reviews, cached analysis
+  and venue setups derived from that match. Active work must stop first.
+- Failed/interrupted jobs can retry a complete saved upload, at most three total
+  attempts. Hosted full matches require GPU by default; no silent slow CPU fallback.
+
+Still required before commercial launch: account/organization identity and recovery,
+transactional distributed jobs/quotas, billing and refund ledger, model/data rights,
+real held-out venue video evaluation, measured full-match GPU cost/latency, and a
+customer pilot. Browser capabilities improve privacy but are not team accounts.
+The filesystem worker remains single-process; do not scale replicas against the
+same volume or call the review ledger a multi-node transactional database.

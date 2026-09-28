@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, X, ArrowLeftRight, ChevronLeft, ChevronRight, Plus } from "lucide-react";
 import type { Analysis, AnalysisEvent, ReviewDecision } from "@/lib/review/analysis";
 import { describeEvent, sendReview } from "@/lib/review/analysis";
@@ -31,6 +31,7 @@ export function ReviewQueue({
   const [team, setTeam] = useState<0 | 1>(0);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const items = useMemo(() => {
     const list = analysis.events.filter((e) => {
       if (filter === "key") return e.type !== "pass" && e.type !== "out";
@@ -54,12 +55,14 @@ export function ReviewQueue({
 
   const decide = useCallback(
     async (decisions: ReviewDecision[], advance = true) => {
+      if (savingRef.current) return;
+      savingRef.current = true;
       setSaving(true);
       setError("");
       // Where to go next, decided on the list the reviewer is looking at.
       const nextId = advance ? items[index + 1]?.id ?? null : current?.id ?? null;
       try {
-        const out = await sendReview(jobId, decisions);
+        const out = await sendReview(jobId, decisions, analysis.review.decisions);
         onAnalysis(out.analysis);
         // Under "Not reviewed" the decided moment leaves the list: the next one
         // takes its place, so stay on the same position rather than skipping.
@@ -67,10 +70,11 @@ export function ReviewQueue({
       } catch (e) {
         setError(e instanceof Error ? e.message : "The decision could not be saved");
       } finally {
+        savingRef.current = false;
         setSaving(false);
       }
     },
-    [jobId, onAnalysis, items, index, current, filter],
+    [jobId, onAnalysis, items, index, current, filter, analysis.review.decisions],
   );
 
   /** The moment as the reviewer sees it, so the decision survives re-analysis. */

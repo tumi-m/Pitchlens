@@ -176,3 +176,33 @@ to each job on the `/data` volume: `calibration.json`, `review.json`
 `/data/venues/`. The website needs no new variables; redeploy both the worker
 and the site so the new `/analysis`, `/calibration`, `/review` and `/venues`
 routes exist on both sides.
+
+
+## Private reports and recovery (commercial hardening)
+
+Deploy the worker and frontend from the same release. Set `VISION_REQUIRE_OWNER=1`
+on any hosted worker; it is also enabled by the public worker URL/Railway domain.
+The proxy forwards the browser capability on every match request. Playback/export
+use a secure HttpOnly SameSite cookie established by the successful status request.
+Raw match links no longer grant access. Keep the original browser storage until
+account migration exists. Ownerless legacy hosted jobs are intentionally withheld;
+do not auto-assign them to the first caller. Local unscoped access remains available
+for an operator-led migration after ownership verification.
+
+Modal receives a four-hour, per-video signed read grant in addition to the service
+token. The proxy never forwards browser-supplied GPU grants. Keep service keys secret.
+
+Hosted full matches fail visibly when GPU execution is unavailable, preserving the
+complete upload for retry. CPU diagnostics remain possible; setting
+`VISION_ALLOW_CPU_FALLBACK=1` explicitly restores full-match CPU fallback, with the
+associated latency risk. `/jobs/{id}/retry` reuses saved complete footage for stopped
+jobs and caps attempts at three. It does not recover partial interrupted uploads.
+
+`DELETE /jobs/{id}` removes the match directory, derived venue setups and in-memory
+analysis cache; it refuses while upload/inference/calibration is active. External
+volume backups remain subject to the operator's backup-expiry policy.
+
+Review requests accept `requestId` and `expectedRevision` (number of prior decisions).
+Replaying the same ID/body returns the original added-event IDs without duplication;
+conflicting reuse or a stale revision returns 409. This is durable on the configured
+volume and serialized in one worker process, not a multi-replica transaction system.

@@ -16,7 +16,7 @@ Measure with `python backend/scripts/evaluate_match.py JOB_DIR labels.json`.
 | Pilot teams completing 3 match cycles, ≥3 paying | 5 teams | Not started (owner) |
 | Upload-to-report p95 for a 60-min match on the Modal L4 | ≤ 20 min | Unknown (estimate from a 20 s run: ~20-25 min) |
 | Accepted jobs completing | ≥ 99% | Unknown |
-| No critical security / data-loss / cross-tenant defects | None open | Shared access code only; accounts not built |
+| No critical security / data-loss / cross-tenant defects | None open | Per-match capability enforcement and privacy regressions implemented; account identity/recovery still not built |
 
 ## Gate 2 · Automatic team analytics (per metric, within the supported domain)
 
@@ -41,3 +41,13 @@ distinguishable kits.
 Player identity, distances, speeds: not offered. Requires persistent
 identity (not feasible from shirt numbers at 20-25 px) and validated
 calibration. Revisit after tracker and stitching work plus user naming.
+
+
+## Hardening verification after `1b51ffb`
+
+Added automated checks for cross-owner access on every match route, private range
+playback, expiring GPU grants, idempotent review adds, stale-tab score conflicts,
+complete deletion, retry budgets and refusing silent hosted CPU fallback. These
+checks improve assisted-pilot readiness; they do not satisfy dataset accuracy,
+accounts, payment, recovery-at-scale or customer-value gates. No paid-launch gate
+has been marked complete from code tests alone.

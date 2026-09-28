@@ -292,7 +292,10 @@ def test_pass_accuracy_appears_with_enough_attempts():
     out = analytics.analyse(result_for(frames), calibration_for(frames))
     team0 = out["stats"]["teams"][0]
     assert team0["passes"]["value"] == 24
-    assert team0["passAccuracy"] == 75.0
+    assert team0["passAccuracy"] is None  # confidence alone cannot validate an event
+    review = {"decisions": [{"action": "accept", "eventId": e["id"]} for e in out["events"] if e["type"] == "pass"]}
+    reviewed = analytics.analyse(result_for(frames), calibration_for(frames), review)
+    assert reviewed["stats"]["teams"][0]["passAccuracy"] == 75.0
     assert out["stats"]["coverage"]["possessionShown"] and team0["possession"] > 50
 
 
@@ -727,3 +730,20 @@ def test_malformed_review_decisions_are_refused_not_server_errors(tmp_path, monk
     # A fingerprint with an unhashable type is ignored, not a crash.
     ok = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "accept", "eventId": "ev-0", "event": {"type": ["shot"], "t": 1.0}}]})
     assert ok.status_code == 200
+
+
+def test_possession_bounds_include_unseen_play_not_detector_accuracy():
+    frames = build_match()
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    coverage = out["stats"]["coverage"]
+    teams = out["stats"]["teams"]
+    low, high = coverage["possessionMissingBounds"]
+    total = coverage["inPlaySeconds"]
+    assigned = sum(t["possessionSeconds"] for t in teams)
+    assert low == pytest.approx(teams[0]["possessionSeconds"] / total * 100, abs=0.1)
+    assert high - low == pytest.approx((total - assigned) / total * 100, abs=0.2)
+    assert "errors are not included" in coverage["uncertaintyNote"]
+    for frame in frames:
+        frame["ball"] = None
+    empty = analytics.analyse(result_for(frames), calibration_for(frames))
+    assert empty["stats"]["coverage"]["possessionMissingBounds"] is None

@@ -29,6 +29,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [job, setJob] = useState<VisionJob | null>(null);
   const [result, setResult] = useState<VisionResult | null>(null);
   const [error, setError] = useState("");
+  const [retrying, setRetrying] = useState(false);
   const [time, setTime] = useState(0);
   const [overlay, setOverlay] = useState(true);
   const [names, setNames] = useState(["Kit A", "Kit B"]);
@@ -274,6 +275,18 @@ export function VisionReport({ jobId }: { jobId: string }) {
                 )
               }
             />
+          )}
+          {job && ["failed", "interrupted", "cancelled"].includes(job.status) && !job.videoDeleted && (
+            <button className="pitch-button-primary" disabled={retrying} onClick={async () => {
+              setRetrying(true);
+              try {
+                await visionJson(`jobs/${jobId}/retry`, { method: "POST" });
+                window.location.reload();
+              } catch (e) {
+                setError(e instanceof Error ? e.message : "Retry failed");
+                setRetrying(false);
+              }
+            }}>{retrying ? "Starting retry…" : "Retry saved upload"}</button>
           )}
           {result && (
             <>

@@ -1281,7 +1281,7 @@ def summarise(projected, states, spells, events, template, directions, player_of
     for team in (0, 1):
         passes = count("pass", team)
         complete = count("pass", team, lambda e: e.get("outcome") == "complete")
-        reliable = [e for e in live if e["type"] == "pass" and e.get("team") == team and (e["status"] == "confirmed" or e["confidence"] >= 0.5)]
+        reliable = [e for e in live if e["type"] == "pass" and e.get("team") == team and e["status"] == "confirmed"]
         accuracy = None
         if len(reliable) >= PARAMS["minPassesForAccuracy"]:
             accuracy = round(sum(1 for e in reliable if e.get("outcome") == "complete") / len(reliable) * 100, 1)
@@ -1316,6 +1316,13 @@ def summarise(projected, states, spells, events, template, directions, player_of
         "possessionPercent": round(coverage * 100, 1),
         "possessionShown": shown,
         "possessionInterval": interval,
+        # Sensitivity to unseen play, not a statistical confidence interval:
+        # allocate every unknown second to either side while holding estimates fixed.
+        "possessionMissingBounds": [
+            round(possession_seconds[0] / in_play_seconds * 100, 1),
+            round(min(100, (possession_seconds[0] + max(0, in_play_seconds - total_possession)) / in_play_seconds * 100), 1),
+        ] if in_play_seconds > 0 and total_possession > 0 else None,
+        "uncertaintyNote": "Missing-time bounds assume observed assignments are correct; detection and control errors are not included.",
         "controlPercent": round(sum(control) / duration * 100, 1) if duration else 0,
         "ballStatePercent": round((sum(control) + contested + loose) / duration * 100, 1) if duration else 0,
         "calibratedPercent": round(sum(1 for f in projected if f["calibrated"]) / max(1, len(projected)) * 100, 1),

@@ -6,6 +6,7 @@ export const maxDuration = 300;
 
 const LOOPBACK = ["localhost", "127.0.0.1"];
 const OWNER = /^[a-f0-9]{32}$/;
+const OWNER_COOKIE = "pitchlens-vision-owner";
 // Vercel rejects function request bodies over 4.5 MB; the client sends 4 MB chunks.
 const MAX_CHUNK = 4.5 * 1024 * 1024;
 
@@ -23,7 +24,7 @@ async function proxy(
   const { path } = await context.params;
   const route = path.join("/");
   if (
-    !/^(health|jobs|venues|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start|analysis|calibration|calibration\/preview|review))?)$/.test(
+    !/^(health|jobs|venues|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start|retry|analysis|calibration|calibration\/preview|review))?)$/.test(
       route,
     )
   )
@@ -117,7 +118,10 @@ async function proxy(
   // Rebuild the query so a browser can never pick someone else's owner key.
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");
-  const owner = request.headers.get("x-pitchlens-owner");
+  const owner = request.headers.get("x-pitchlens-owner") || request.cookies.get(OWNER_COOKIE)?.value;
+  if (hosted && route !== "health" && (!owner || !OWNER.test(owner))) {
+    return Response.json({ detail: "Open this match in the browser that uploaded it.", code: "ownership" }, { status: 401 });
+  }
   if (route === "jobs" || route === "jobs/from-url" || route === "venues") {
     if (owner && OWNER.test(owner)) search.set("owner", owner);
     else if (hosted && request.method === "GET") return Response.json([]);
@@ -134,6 +138,10 @@ async function proxy(
     // Relayed byte-for-byte: a compressed hop would break Content-Length/Range.
     "accept-encoding": "identity",
   };
+  // The media element cannot set a custom header; its HttpOnly cookie is
+  // established by the authenticated status/result request before playback.
+  if (owner && OWNER.test(owner)) headers["x-pitchlens-owner"] = owner;
+  if (hosted) headers["x-pitchlens-require-owner"] = "1";
   for (const name of ["content-type", "range"]) {
     const value = request.headers.get(name);
     if (value) headers[name] = value;
@@ -152,6 +160,8 @@ async function proxy(
         { status: 413 },
       );
     init.body = await request.arrayBuffer();
+    if (init.body.byteLength > MAX_CHUNK)
+      return Response.json({ detail: "Upload chunk is too large." }, { status: 413 });
   } else if (request.method === "POST") {
     init.body = request.body;
     init.duplex = "half";
@@ -183,6 +193,9 @@ async function proxy(
     );
   }
   const out = new Headers({ "Cache-Control": "private, no-store" });
+  if (upstream.ok && owner && OWNER.test(owner)) {
+    out.append("Set-Cookie", `${OWNER_COOKIE}=${owner}; Path=/api/vision; Max-Age=31536000; HttpOnly; SameSite=Strict${hosted ? "; Secure" : ""}`);
+  }
   for (const name of [
     "content-type",
     "content-length",
@@ -201,3 +214,4 @@ async function proxy(
 export const GET = proxy;
 export const POST = proxy;
 export const PUT = proxy;
+export const DELETE = proxy;

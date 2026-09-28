@@ -454,6 +454,7 @@ def test_chunked_upload_resumes_starts_and_scopes_listing_to_owner(hosted):
     # Worker is reserved while the browser sends chunks.
     busy = client.post(f"/jobs?size=10&owner={owner}", headers={"Content-Type": "video/mp4"})
     assert busy.status_code == 409
+    client.headers["x-pitchlens-owner"] = owner
     # Starting before every byte arrives is rejected.
     assert client.post(f"/jobs/{job['id']}/start").status_code == 409
     step = 100_000
@@ -474,6 +475,7 @@ def test_chunked_upload_resumes_starts_and_scopes_listing_to_owner(hosted):
     assert len(submitted) == 1
     assert (server.ROOT / job["id"] / "video").read_bytes() == data
     assert [j["id"] for j in client.get(f"/jobs?owner={owner}").json()] == [job["id"]]
+    del client.headers["x-pitchlens-owner"]
     assert client.get(f"/jobs?owner={'d' * 32}").json() == []
     assert client.get("/jobs?owner=../../etc").status_code == 400
 
@@ -1444,7 +1446,9 @@ def test_gpu_receives_bounded_diagnostic_options(tmp_path, monkeypatch):
         start_seconds=300,
         ball_search="adaptive",
     )
-    assert calls[0][2:] == ("small-ball", 6, 20, 300, "adaptive")
+    assert calls[0][2:7] == ("small-ball", 6, 20, 300, "adaptive")
+    from app.vision.access import valid_video_grant
+    assert valid_video_grant("fixture-token", "a" * 32, calls[0][7])
     assert (tmp_path / "result.json").read_text() == '{"frames":[]}'
 
 

@@ -13,7 +13,10 @@ type Value = { value: number | null; note?: string };
 
 function count(c: CountStat | null | undefined): Value {
   if (!c) return { value: null };
-  return { value: c.value, note: c.pending ? `${c.confirmed} ✓ · ${c.pending} to review` : c.value ? "reviewed" : undefined };
+  return {
+    value: c.confirmed > 0 ? c.confirmed : null,
+    note: c.pending ? `${c.confirmed} confirmed · ${c.pending} to review` : c.confirmed ? "confirmed in reviewed clips" : "none confirmed",
+  };
 }
 
 function Row({
@@ -110,12 +113,17 @@ export function MatchReport({
   const candidates = (A.goals?.candidates ?? 0) + (B.goals?.candidates ?? 0);
   const reviewedGoals = (A.goals?.value ?? 0) + (B.goals?.value ?? 0);
   const possessionShown = cov.possessionShown;
-  const range = cov.possessionInterval;
+  const range = cov.possessionMissingBounds;
   const pct = (v: number) => `${Math.round(v)}%`;
   const events = analysis.events.filter((e) => e.status !== "rejected" && ["shot", "goal", "goal-candidate", "interception", "tackle", "pass"].includes(e.type));
   const keyEvents = events.filter((e) => e.type !== "pass");
   return (
     <div className="space-y-6">
+      <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
+        <strong>Assisted review</strong> · Automatic moments are candidates until you confirm them.
+        Counts below include confirmed events only; missed events still need to be added.
+        Observed control and pitch graphics are estimates, with full-match accuracy not yet validated.
+      </section>
       <motion.section
         initial={{ opacity: 0, y: 14 }}
         animate={{ opacity: 1, y: 0 }}
@@ -202,19 +210,19 @@ export function MatchReport({
           </div>
           <Group title="Possession">
             <Row
-              label="Ball possession (time)"
-              a={{ value: possessionShown ? A.possession : null, note: possessionShown && range ? `95%: ${Math.round(range[0])}–${Math.round(range[1])}%` : undefined }}
+              label="Observed control share"
+              a={{ value: possessionShown ? A.possession : null, note: possessionShown && range ? `unseen-play bounds: ${Math.round(range[0])}–${Math.round(range[1])}%` : undefined }}
               b={{ value: possessionShown ? B.possession : null }}
               colours={colours}
               format={pct}
               hint={
                 possessionShown
-                  ? `From winning the ball to losing it, passes in flight included, over the ${cov.possessionPercent}% of in-play time the ball could be followed.`
-                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (60% needed for a fair split).`
+                  ? `From winning the ball to losing it, passes in flight included, over the ${cov.possessionPercent}% of in-play time the ball could be followed. Bounds assign all missing play to either team; detector errors are not included.`
+                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (60% needed to display this estimate).`
               }
             />
             <Row
-              label="Possession by passes"
+              label="Candidate pass share"
               a={{ value: A.passShare ?? null }}
               b={{ value: B.passShare ?? null }}
               colours={colours}
@@ -236,9 +244,9 @@ export function MatchReport({
             <Row label="Passes" a={count(A.passes)} b={count(B.passes)} colours={colours} hint="Ball moved from one player to another (to a teammate or intercepted). Unseen transfers get lower confidence." />
             <Row label="Accurate passes" a={count(A.passesComplete)} b={count(B.passesComplete)} colours={colours} />
             <Row
-              label="Pass accuracy"
-              a={{ value: A.passAccuracy, note: A.passAccuracy === null && A.passes?.value ? "needs 20+ passes" : undefined }}
-              b={{ value: B.passAccuracy, note: B.passAccuracy === null && B.passes?.value ? "needs 20+ passes" : undefined }}
+              label="Reviewed pass accuracy"
+              a={{ value: A.passAccuracy, note: A.passAccuracy === null && A.passes?.value ? "needs 20+ reviewed passes" : undefined }}
+              b={{ value: B.passAccuracy, note: B.passAccuracy === null && B.passes?.value ? "needs 20+ reviewed passes" : undefined }}
               colours={colours}
               format={pct}
             />
@@ -270,7 +278,7 @@ export function MatchReport({
             <Row label="Tackles / balls won" a={count(A.tackles)} b={count(B.tackles)} colours={colours} />
           </Group>
           <p className="text-xs text-pitch-muted mt-4">
-            — means not measured (not zero). Counts cover the parts of the match where the ball could be followed; &quot;to review&quot; items are automatic and unconfirmed.
+            — means none confirmed or unavailable, not zero events in the match. Counts describe reviewed clips, not complete match totals. Items marked &quot;to review&quot; are excluded from confirmed counts.
           </p>
         </section>
 
