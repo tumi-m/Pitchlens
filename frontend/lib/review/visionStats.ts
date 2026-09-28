@@ -1,10 +1,14 @@
 import type { VisionFrame, VisionResult } from "./vision";
 
+/** Pixel slack for detection error; see POSSESSION_SLACK_PX in metrics.py. */
+const POSSESSION_SLACK_PX = 14;
+const AMBIGUITY_SLACK_PX = 3;
+
 /** Same rule as backend/app/vision/metrics.py possession_owner. */
 export function possessionOwner(frame: VisionFrame): number | null {
   const ball = frame.ball;
   if (!ball) return null;
-  const candidates: [number, number][] = [];
+  const candidates: [number, number, number][] = [];
   for (const p of frame.players) {
     if (p.team !== 0 && p.team !== 1) continue;
     const [x1, y1, x2, y2] = p.box;
@@ -13,11 +17,15 @@ export function possessionOwner(frame: VisionFrame): number | null {
       Math.min(
         ...[x1, (x1 + x2) / 2, x2].map((x) => Math.hypot(ball.x - x, ball.y - y2)),
       ) / scale;
-    if (distance <= 0.55) candidates.push([distance, p.team]);
+    if (distance <= 0.55 + POSSESSION_SLACK_PX / scale) candidates.push([distance, p.team, scale]);
   }
   candidates.sort((a, b) => a[0] - b[0]);
   if (!candidates.length) return null;
-  if (candidates.length > 1 && candidates[1][0] - candidates[0][0] < 0.12) return null;
+  if (
+    candidates.length > 1 &&
+    candidates[1][0] - candidates[0][0] < 0.12 + AMBIGUITY_SLACK_PX / candidates[0][2]
+  )
+    return null;
   return candidates[0][1];
 }
 

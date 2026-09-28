@@ -1043,6 +1043,18 @@ def test_speed_gates_scale_with_sparser_sampling():
     assert sorted(confirm_chains(fast, [identity] * 5, diagonal=734, sample_fps=3)) == [0, 1, 2, 3, 4]
 
 
+def test_possession_allows_pixel_slack_for_small_players_only():
+    from app.vision.metrics import possession_owner
+
+    small = {"id": 1, "team": 0, "box": [100, 100, 110, 123]}  # 23 px: whole pitch at 360p
+    large = {"id": 2, "team": 1, "box": [100, 100, 140, 300]}  # 200 px: close-up
+    # 20 px from a small player's feet is within detection error of control...
+    assert possession_owner([small], {"x": 105, "y": 143}) is small
+    # ...but 20 px is well inside 0.55 heights on a large player anyway, and
+    # 1.2 heights away on a large player is still a loose ball.
+    assert possession_owner([large], {"x": 120, "y": 540}) is None
+
+
 def test_only_weak_unattended_static_balls_are_dropped_as_markings():
     from app.vision.faint import drop_static_balls
 

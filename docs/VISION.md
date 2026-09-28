@@ -159,3 +159,13 @@ consistency over time.
    through the model in one call (`VISION_BATCH`).
 
 Run `VISION_FAINT=0` to compare against single-frame detection.
+
+### Possession on small players
+
+Control means a team player's foot point within 0.55 body heights of the ball,
+plus 14 pixels of slack for detection error (3 pixels on the ambiguity
+margin). On a 23-pixel player (a whole pitch filmed at 360p) the foot point
+and the ball centre each wobble by a few pixels, which alone exceeded the
+0.55-height radius; on large players the slack is negligible. Measured on a
+20-second 360p diagnostic of the reported night match, possession coverage
+went from 6% to 26% of the analysed time.
