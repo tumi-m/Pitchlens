@@ -1362,8 +1362,7 @@ def test_short_diagnostic_reuses_detection_and_survives_unknown_kits(tmp_path, m
     from types import SimpleNamespace
 
     import cv2
-    import torch
-    import ultralytics
+    import sys
 
     from app.vision import engine
 
@@ -1376,6 +1375,16 @@ def test_short_diagnostic_reuses_detection_and_survives_unknown_kits(tmp_path, m
     weights.write_bytes(b"test")
     calls = []
 
+    class Tensor:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
     class Model:
         names = {0: "referee"}
 
@@ -1384,14 +1393,17 @@ def test_short_diagnostic_reuses_detection_and_survives_unknown_kits(tmp_path, m
             return [
                 SimpleNamespace(
                     boxes=SimpleNamespace(
-                        xyxy=torch.tensor([[10, 10, 30, 50]]),
-                        conf=torch.tensor([0.9]),
-                        cls=torch.tensor([0]),
+                        xyxy=Tensor([[10, 10, 30, 50]]),
+                        conf=Tensor([0.9]),
+                        cls=Tensor([0]),
                     )
                 )
             ]
 
-    monkeypatch.setattr(ultralytics, "YOLO", lambda path: Model())
+    # This checks orchestration with mocked detections, not a real model. Keep
+    # it runnable in the lean Poetry/CI environment without GPU dependencies.
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(set_num_threads=lambda n: None))
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=lambda path: Model(), settings={}))
     monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
     monkeypatch.setattr(
         engine,
