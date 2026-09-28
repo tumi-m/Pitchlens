@@ -148,10 +148,11 @@ consistency over time.
    marked `inferred: true`. They count for possession continuity but never as
    observed frames (`ballFramesInferred`), and pass candidates require an
    observed ball throughout the transfer.
-5. **Static rejection.** A weakly evidenced "ball" (chain-recovered or below
-   the tracker's threshold) that does not drift for three seconds after camera
-   compensation, with no player standing over it, is a marking or a logo and
-   is removed. A confident detection of a dead ball at a set piece is kept.
+5. **Static rejection.** A "ball" that does not drift after camera
+   compensation, with no player within a body height of it, is a marking or a
+   logo and is removed: after three seconds for weak evidence (chain-recovered
+   or below the tracker's threshold), after twenty seconds for confident
+   detections, so a dead ball at a set piece is kept.
 6. **Resolution-aware tiling and batching.** The tiled football ball model
    sees 480-pixel native tiles upscaled to 640, so a 240p or 1080p frame both
    present the ball near its training scale; all tiles of a batch of frames go

@@ -1053,9 +1053,12 @@ def test_only_weak_unattended_static_balls_are_dropped_as_markings():
     marking = [{"scene": 0, "players": [], "ball": dict(weak)} for _ in range(20)]
     assert drop_static_balls(marking, [identity] * 20, 734, sample_fps=5) == 20
     assert all(f["ball"] is None for f in marking)
-    # A confident detection of a dead ball (kick-off, corner) is an observation.
+    # A confident detection of a dead ball (kick-off, corner) is an observation...
     set_piece = [{"scene": 0, "players": [], "ball": dict(strong)} for _ in range(20)]
     assert drop_static_balls(set_piece, [identity] * 20, 734, sample_fps=5) == 0
+    # ...but a confident "ball" nobody touches for half a minute is a marking or a logo.
+    logo = [{"scene": 0, "players": [], "ball": dict(strong)} for _ in range(150)]
+    assert drop_static_balls(logo, [identity] * 150, 734, sample_fps=5) == 150
     # A weak but attended ball is a player standing over it, not a logo.
     attended = [{"scene": 0, "players": [{"team": 0, "box": [40, 10, 60, 52]}], "ball": dict(weak)}
                 for _ in range(20)]

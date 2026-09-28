@@ -247,33 +247,38 @@ def _attended(frame, ball):
     return False
 
 
-def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0):
-    """A weakly evidenced 'ball' that has not moved for several seconds (after
-    cancelling camera motion) is a pitch marking, a logo or a stray object.
+def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confident_seconds=20.0):
+    """A 'ball' that has not moved for a long time (after cancelling camera
+    motion) with nobody standing over it is a pitch marking, a logo or a stray
+    object, not the match ball.
 
-    Only chain-recovered or sub-threshold positions are eligible: a confident
-    detector observation of a ball at rest (kick-off, corner, penalty) is kept,
-    and so is any still ball with a player standing over it. Drift is measured
-    from where the run started, so a slowly rolling ball is not "static".
+    Weak evidence (chain-recovered or below the tracker's threshold) needs only
+    `seconds` of stillness; a confident detector observation needs
+    `confident_seconds`, long enough that a dead ball at a kick-off, corner or
+    penalty is kept. A still ball with a team player within one body height is
+    always kept. Drift is measured from where the run started, so a slowly
+    rolling ball is not "static".
     """
-    limit = max(2, int(round(seconds * sample_fps)))
     tolerance = diagonal * 0.004
-    run = []  # indices of consecutive frames with a near-stationary weak ball
+    run = []  # indices of consecutive frames with a near-stationary ball
     dropped = 0
 
     def flush():
         nonlocal dropped
-        if len(run) >= limit and sum(_attended(frames[i], frames[i]["ball"]) for i in run) * 2 < len(run):
-            for i in run:
-                frames[i]["ball"] = None
-                dropped += 1
+        if run:
+            weak = all(frames[i]["ball"].get("recovered") or frames[i]["ball"]["confidence"] < 0.15 for i in run)
+            limit = max(2, int(round((seconds if weak else confident_seconds) * sample_fps)))
+            attended = sum(_attended(frames[i], frames[i]["ball"]) for i in run)
+            if len(run) >= limit and attended * 2 < len(run):
+                for i in run:
+                    frames[i]["ball"] = None
+                    dropped += 1
         run.clear()
 
     anchor = None  # start of the run, carried through each frame's camera transform
     for i, f in enumerate(frames):
         b = f["ball"]
-        weak = b is not None and not b.get("inferred") and (b.get("recovered") or b["confidence"] < 0.15)
-        if not weak:
+        if b is None or b.get("inferred"):
             flush()
             anchor = None
             continue
