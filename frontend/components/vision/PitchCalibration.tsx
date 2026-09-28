@@ -45,6 +45,7 @@ export function PitchCalibration({
   onOverlay,
   calibration,
   onApplied,
+  onStep,
 }: {
   jobId: string;
   videoSize: [number, number];
@@ -56,6 +57,8 @@ export function PitchCalibration({
   onOverlay: (overlay: CalibrationOverlay | null) => void;
   calibration: Calibration | null;
   onApplied: () => void;
+  /** Move the paused video by this many seconds (the click layer covers the player's controls). */
+  onStep: (seconds: number) => void;
 }) {
   const saved = calibration?.request;
   const [presetKey, setPresetKey] = useState<string>("five-a-side");
@@ -238,6 +241,27 @@ export function PitchCalibration({
         <li>Pick a landmark below, then click exactly on it in the video. Aim for 6 or more, spread out.</li>
         <li>Low cameras rarely see the near corners: add points along any straight line you can see.</li>
       </ol>
+      <div className="flex items-center gap-1 text-sm" role="group" aria-label="Choose the frame">
+        <span className="text-pitch-muted mr-1">Frame {clockTime(time)}</span>
+        {(
+          [
+            [-5, "−5 s"],
+            [-0.2, "◀"],
+            [0.2, "▶"],
+            [5, "+5 s"],
+          ] as const
+        ).map(([delta, label]) => (
+          <button
+            key={label}
+            className="px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 disabled:opacity-40"
+            disabled={frameTime !== null}
+            title={frameTime !== null ? "Clear the clicks to choose another frame" : `Move ${delta} s`}
+            onClick={() => onStep(delta)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
       <div className="grid grid-cols-2 gap-2 text-sm">
         <label className="col-span-2">
           Pitch type

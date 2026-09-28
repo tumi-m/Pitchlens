@@ -605,10 +605,10 @@ def run_video(
             "Ball confidence scores are not calibrated probabilities.",
             "Faint ball candidates require temporal and neural support; "
             "short gaps on the same track are camera-compensated and marked inferred.",
-            "Possession is visible ball-to-player proximity, not official match possession.",
+            "Possession is estimated from observed ball control and the passes between; it is not official match possession.",
             "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
             "Track IDs change after occlusion and cuts; they are not player identities.",
-            "Positions are image coordinates. Speed, distance, xG and score are not measured.",
+            "Positions are image coordinates until the pitch is set up; speed, distance and xG are not measured, and goals count only when a person confirms them.",
             "Green-surface filtering can include sideline players or miss players near boundaries.",
         ]
         + (

@@ -166,7 +166,9 @@ export function ReviewQueue({
           ))}
           {analysis.directions && (
             <span className="text-xs text-pitch-muted">
-              {analysis.directions.source === "reviewer" ? "set by you" : `detected, ${Math.round(analysis.directions.confidence * 100)}% sure`}
+              {analysis.directions.source === "reviewer"
+                ? "set by you"
+                : `detected from team positions (${Math.round(analysis.directions.confidence * 100)}% of minutes agree) · please check`}
             </span>
           )}
         </div>

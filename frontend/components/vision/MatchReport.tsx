@@ -286,7 +286,9 @@ export function MatchReport({
             <svg viewBox={`0 0 ${analysis.stats.momentum.length * 10} 80`} className="w-full h-28" preserveAspectRatio="none">
               <line x1="0" y1="40" x2={analysis.stats.momentum.length * 10} y2="40" stroke="rgba(255,255,255,0.15)" strokeWidth="0.6" />
               {analysis.stats.momentum.map((v, i) => {
-                const h = v === null ? 0 : Math.max(1.5, Math.abs(v) * 36);
+                // Scale to the largest swing so a quiet match still reads.
+                const peak = Math.max(0.05, ...analysis.stats.momentum.map((m) => Math.abs(m ?? 0)));
+                const h = v === null ? 0 : Math.max(1.5, (Math.abs(v) / peak) * 36);
                 const up = (v ?? 0) >= 0;
                 return (
                   <g key={i} onClick={() => onSeek(start + i * 60)} className="cursor-pointer">

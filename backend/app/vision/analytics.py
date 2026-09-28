@@ -75,6 +75,7 @@ PARAMS = {
     "kickoffCentreRadius": 1.5,
     "kickoffOwnHalfShare": 0.8,
     "kickoffWindow": (10.0, 90.0),
+    "minTiltSeconds": 20.0,  # attacking-third control, both teams, before field tilt is shown
     # Momentum.
     "momentumGoalScale": 8.0,  # m, exp(-distance to attacked goal / scale)
     "momentumHalfLifeMinutes": 1.5,
@@ -1005,7 +1006,8 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"]} if template else None,
                 "interceptions": count("interception", team),
                 "tackles": count("tackle", team),
-                "fieldTilt": round(tilt[team] / sum(tilt) * 100, 1) if template and sum(tilt) > 0 else None,
+                # Withheld on a sliver of evidence (seconds of final-third control).
+                "fieldTilt": round(tilt[team] / sum(tilt) * 100, 1) if template and sum(tilt) >= PARAMS["minTiltSeconds"] else None,
             }
         )
     coverage_block = {

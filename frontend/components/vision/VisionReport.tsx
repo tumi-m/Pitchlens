@@ -468,6 +468,14 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         onOverlay={setCalOverlay}
                         calibration={calibration}
                         onApplied={loadAnalytics}
+                        onStep={(delta) => {
+                          const v = player.current;
+                          if (!v) return;
+                          v.pause();
+                          const next = Math.min(Math.max(0, v.currentTime + delta), Math.max(0, (v.duration || result.video.duration) - 0.05));
+                          v.currentTime = next;
+                          setTime(next);
+                        }}
                       />
                     </div>
                   )}
