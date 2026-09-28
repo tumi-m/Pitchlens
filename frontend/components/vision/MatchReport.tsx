@@ -244,6 +244,11 @@ export function MatchReport({
             />
           </Group>
           <Group title="Attacking">
+            {analysis.calibrated && cov.calibratedPercent < 60 && (
+              <p className="text-[11px] text-amber-200/90 pt-1">
+                The pitch is mapped for {cov.calibratedPercent}% of the match, so shots cover that part only.
+              </p>
+            )}
             <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up." />
             <Row
               label="Shots on target"
