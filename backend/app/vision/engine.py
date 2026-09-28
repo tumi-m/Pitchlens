@@ -15,7 +15,12 @@ from threadpoolctl import threadpool_limits
 
 from app.vision.ball import TiledBallDetector, create_ball_detector
 from app.vision.ball_tracking import BallTracker
-from app.vision.faint import ball_size_prior, difference_candidates, recover_ball
+from app.vision.faint import (
+    ball_size_prior,
+    difference_candidates,
+    recover_ball,
+    strong_candidates,
+)
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
 from app.vision.tracking import MotionTracker, camera_motion
@@ -426,7 +431,7 @@ def run_video(
                 )
             candidates.sort(key=lambda c: -c["confidence"])
             candidates = candidates[:12]
-            strong = [c for c in candidates if c["confidence"] >= 0.15]
+            strong = strong_candidates(candidates)
             previous_frame = frame
             previous_boxes = [p["box"] for p in players]
             # Airborne balls can be outside the green surface; temporal association

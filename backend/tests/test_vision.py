@@ -1018,6 +1018,17 @@ def test_a_weaker_parallel_chain_cannot_overwrite_a_stronger_one():
     assert all(promoted[i].get("source") != "motion" for i in range(8))
 
 
+def test_motion_blobs_never_drive_the_online_tracker():
+    from app.vision.faint import strong_candidates
+
+    candidates = [
+        {"x": 1, "y": 1, "confidence": 0.4, "source": "motion"},
+        {"x": 2, "y": 2, "confidence": 0.2},
+        {"x": 3, "y": 3, "confidence": 0.1},
+    ]
+    assert strong_candidates(candidates) == [{"x": 2, "y": 2, "confidence": 0.2}]
+
+
 def test_long_stationary_ball_is_dropped_as_a_marking():
     from app.vision.faint import drop_static_balls
 

@@ -127,7 +127,9 @@ consistency over time.
 2. **Difference imaging.** After cancelling camera motion with the per-frame
    affine, consecutive frames are subtracted; small, round, fast-moving blobs
    of ball size (about 1/8 of a player's height) inside the dilated pitch mask
-   become extra low-confidence candidates (`source: "motion"`).
+   become extra low-confidence candidates (`source: "motion"`, at most 0.15).
+   They only ever feed the confirmation step; the frame-by-frame ball tracker
+   sees detector responses alone.
 3. **Track-before-detect.** `faint.confirm_chains` links candidates across up
    to six sampled frames when they follow a near-constant velocity (tolerance
    3% of the frame diagonal per frame, top speed 15% per frame). Earlier

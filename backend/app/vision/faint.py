@@ -79,13 +79,27 @@ def difference_candidates(previous, current, matrix, players, diameter, limit=8,
                 "y": round(float(cy), 1),
                 "box": [round(float(cx - bw / 2), 1), round(float(cy - bh / 2), 1),
                         round(float(cx + bw / 2), 1), round(float(cy + bh / 2), 1)],
-                # Deliberately weak: only a consistent trajectory can promote it.
-                "confidence": round(min(0.3, 0.05 + energy / 255), 3),
+                # Deliberately weak: only a consistent trajectory can promote it,
+                # and it never outranks a real (if faint) detector response.
+                "confidence": round(min(0.15, 0.05 + energy / 510), 3),
                 "source": "motion",
             }
         )
     found.sort(key=lambda c: -c["confidence"])
     return found[:limit]
+
+
+def strong_candidates(candidates, threshold=0.15):
+    """Candidates allowed to drive the online ball tracker frame by frame.
+
+    Motion blobs are kept only for the batch confirmation step: fed straight to
+    the tracker they made every sock and shadow an 'observed' ball.
+    """
+    return [
+        c
+        for c in candidates
+        if c["confidence"] >= threshold and c.get("source", "detector") != "motion"
+    ]
 
 
 def _warp_point(xy, matrix):
