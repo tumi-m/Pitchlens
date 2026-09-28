@@ -39,7 +39,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [analysisError, setAnalysisError] = useState("");
   const [calibrating, setCalibrating] = useState(false);
   const [calOverlay, setCalOverlay] = useState<CalibrationOverlay | null>(null);
-  const [calClick, setCalClick] = useState<{ x: number; y: number; n: number } | null>(null);
+  const [calClick, setCalClick] = useState<{ x: number; y: number; n: number; moved?: boolean } | null>(null);
   const [showLines, setShowLines] = useState(true);
   const [reviewOpen, setReviewOpen] = useState(false);
   const clipEnd = useRef<number | null>(null);
@@ -184,7 +184,13 @@ export function VisionReport({ jobId }: { jobId: string }) {
     const x = ((e.clientX - box.left) / box.width) * result.video.width;
     const y = ((e.clientY - box.top) / box.height) * result.video.height;
     player.current?.pause();
-    setCalClick((c) => ({ x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, n: (c?.n ?? 0) + 1 }));
+    // Pitch setup is anchored to an analysed frame (a moving camera is elsewhere
+    // a moment later): off one, move to the nearest and ask for the click again.
+    const now = player.current?.currentTime ?? time;
+    const nearest = result.frames.length ? result.frames[nearestFrame(result.frames, now)].t : now;
+    const moved = Math.abs(nearest - now) > 0.5 / (result.video.fps || 30) + 0.005;
+    if (moved) snapTo(nearest);
+    setCalClick((c) => ({ x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, n: (c?.n ?? 0) + 1, moved }));
   }
   function snapTo(t: number) {
     const v = player.current;

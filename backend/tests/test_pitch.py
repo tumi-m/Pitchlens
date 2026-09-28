@@ -281,3 +281,145 @@ def test_points_behind_the_camera_are_not_drawn():
     front = pitch.pitch_to_image(cal, [[5.0, 10.0]])  # towards the left goal: visible
     behind = pitch.pitch_to_image(cal, [[38.0, 10.0]])  # the right goal: behind the camera
     assert np.isfinite(front).all() and np.isnan(behind).all()
+
+
+def _crowd(ids, dx=0.0):
+    spots = [(100, 200), (200, 220), (300, 180), (400, 240), (500, 210)]
+    return [{"id": k, "box": [x - 5 + dx, y - 30, x + 5 + dx, y]} for k, (x, y) in zip(ids, spots)]
+
+
+def test_a_slowly_re_aimed_fixed_camera_is_not_static():
+    rng = np.random.default_rng(2)
+    frames = [{"t": i / 5, "scene": 0, "camera": [1, 0, float(rng.normal(0, 0.2)), 0, 1, float(rng.normal(0, 0.2))]} for i in range(3000)]
+    assert pitch.static_camera(frames)
+    for f in frames[1500:1596]:  # 2.5 px per frame for 19 s: noise in any one frame, 240 px in all
+        f["camera"][2] += 2.5
+    assert not pitch.static_camera(frames)
+
+
+def test_a_fixed_camera_is_only_carried_across_a_motion_gap_the_tracks_survive():
+    H = np.linalg.inv(camera_homography())
+
+    def frames_with(gap_players):
+        frames = []
+        for i in range(100):
+            players = _crowd(range(1, 6)) if i < 50 else gap_players
+            frames.append({"t": i / 5, "scene": 0, "players": players, "camera": None if i in (0, 50, 51) else [1, 0, 0, 0, 1, 0]})
+        return frames
+
+    held = frames_with(_crowd(range(1, 6), dx=3))  # the same players, where they were
+    assert pitch.static_camera(held) and pitch.static_breaks(held) == [0]
+    homographies, _ = pitch.propagate(held, {10: H}, static=True)
+    assert all(h is not None for h in homographies)
+    for moved in (frames_with(_crowd(range(11, 16))), frames_with(_crowd(range(1, 6), dx=240))):
+        # New tracks (or everyone shifted together): the camera may have been re-aimed.
+        assert pitch.static_breaks(moved) == [0, 50]
+        homographies, _ = pitch.propagate(moved, {10: H}, static=True)
+        assert all(h is not None for h in homographies[:50]) and all(h is None for h in homographies[50:])
+
+
+def test_a_re_aimed_fixed_camera_is_found_again_from_the_lines(tmp_path):
+    from app.vision import calibrate
+
+    fps = 5.0
+    H0 = camera_homography()
+    shifted = np.array([[1, 0, -60], [0, 1, 12], [0, 0, 1]]) @ H0  # re-aimed while motion was lost
+    writer = cv2.VideoWriter(str(tmp_path / "fixed.avi"), cv2.VideoWriter_fourcc(*"MJPG"), fps, SIZE)
+    frames = []
+    for i in range(40):
+        writer.write(render(H0 if i < 20 else shifted))
+        players = _crowd(range(1, 6)) if i < 20 else _crowd(range(11, 16))
+        frames.append({"t": round(i / fps, 3), "frame": i, "scene": 0, "players": players, "ball": None,
+                       "camera": None if i in (0, 20, 21) else [1, 0, 0, 0, 1, 0]})
+    writer.release()
+    marks = pitch.landmarks(TEMPLATE)
+    names = ["corner-far-left", "corner-far-right", "halfway-near", "centre-spot", "left-goal-near-post", "halfway-far"]
+    points = [{"name": n, "x": float(pitch.apply(H0, [marks[n]])[0][0]), "y": float(pitch.apply(H0, [marks[n]])[0][1])} for n in names]
+    result = {"frames": frames, "sampleFps": fps, "video": {"width": SIZE[0], "height": SIZE[1], "fps": fps}}
+    request = {"template": "futsal", "points": points, "t": 1.0, "distortion": "none"}
+    # Without the footage nothing can vouch for the second view: it stays unmapped.
+    out = calibrate.build(result, request)
+    assert out["static"] and out["coverage"] == 50.0
+    out = calibrate.build(result, request, tmp_path / "fixed.avi")
+    assert out["coverage"] == 100.0 and out["reacquired"] >= 1
+    probe = np.array([[10.0, 5.0], [20.0, 10.0], [30.0, 15.0]])
+    H = np.asarray(out["frames"][30]["H"]).reshape(3, 3)
+    assert np.linalg.norm(pitch.apply(H, pitch.apply(shifted, probe)) - probe, axis=1).max() < 0.5
+
+
+def test_line_masks_read_the_analysed_frame_by_its_number(tmp_path, monkeypatch):
+    from app.vision import calibrate
+
+    path = tmp_path / "counter.avi"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30, (64, 48))
+    for n in range(90):
+        writer.write(np.full((48, 64, 3), n * 2, np.uint8))
+    writer.release()
+    monkeypatch.setattr(calibrate.pitchlib, "line_mask", lambda image, **kw: image[:, :, 0])
+    numbers = [12, 15, 30, 61, 88]
+    # Stored times that disagree with the decoder clock, as on variable-frame-rate video.
+    frames = [{"t": round(n / 30 + 0.4, 3), "frame": n} for n in numbers]
+    masks = calibrate.line_masks(path, frames, range(len(frames)))
+    seen = {i: int(np.median(cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_GRAYSCALE))) for i, png in masks.items()}
+    assert sorted(seen) == list(range(len(numbers)))
+    assert all(abs(seen[i] - 2 * n) <= 3 for i, n in enumerate(numbers)), seen
+
+
+def test_clicks_between_analysed_frames_of_a_moving_camera_are_refused():
+    from app.vision import calibrate
+
+    H = camera_homography()
+    marks = pitch.landmarks(TEMPLATE)
+    names = ["corner-far-left", "corner-far-right", "halfway-near", "centre-spot", "left-goal-near-post", "halfway-far"]
+    points = [{"name": n, "x": float(pitch.apply(H, [marks[n]])[0][0]), "y": float(pitch.apply(H, [marks[n]])[0][1])} for n in names]
+    frames = [{"t": round(i / 3, 3), "scene": 0, "players": [], "ball": None, "camera": [1, 0, -20, 0, 1, 0] if i else None} for i in range(30)]
+    result = {"frames": frames, "sampleFps": 3, "video": {"width": SIZE[0], "height": SIZE[1], "fps": 30}}
+    with pytest.raises(ValueError, match="between analysed frames"):
+        calibrate.build(result, {"template": "futsal", "points": points, "t": 3.16, "distortion": "none"})
+    assert calibrate.build(result, {"template": "futsal", "points": points, "t": 3.333, "distortion": "none"})["anchorFrame"] == 10
+
+
+def _look_at(position, target, fov, size):
+    w, h = size
+    f = w / 2 / math.tan(math.radians(fov) / 2)
+    K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]])
+    forward = np.asarray(target, float) - position
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, [0, 0, 1.0])
+    right /= np.linalg.norm(right)
+    down = np.cross(forward, right)
+    R = np.vstack([right, down, forward])
+    P = K @ np.hstack([R, (-R @ np.asarray(position, float)).reshape(3, 1)])
+    return P[:, [0, 1, 3]]
+
+
+def test_camera_geometry_is_stable_for_a_camera_facing_straight_across():
+    size = (1280, 720)
+    G = _look_at(np.array([20.0, 40.0, 8.0]), [20.0, 10.0, 0.0], 70.0, size)  # side-on, level with halfway
+    world = np.array([p for p in pitch.landmarks(TEMPLATE).values()], float)
+    image = pitch.apply(G, world)
+    inside = (image[:, 0] > 0) & (image[:, 0] < size[0]) & (image[:, 1] > 0) & (image[:, 1] < size[1])
+    world, image = world[inside], image[inside]
+    assert len(world) >= 8
+    wrong = 0
+    for seed in range(100):
+        noisy = image + np.random.default_rng(seed).normal(0, 1.0, image.shape)
+        Gn, _ = cv2.findHomography(world, noisy, 0)
+        fov, height = pitch.camera_geometry(Gn, size)
+        wrong += fov is None or abs(fov - 70.0) > 10 or abs(height - 8.0) > 2
+    assert wrong <= 3, wrong
+
+
+def test_malformed_calibration_values_are_input_errors():
+    from app.vision import calibrate
+
+    good = [{"name": n, "x": 100.0 + 50 * k, "y": 100.0 + 20 * k} for k, n in enumerate(["corner-far-left", "corner-far-right", "halfway-near", "centre-spot"])]
+    for request in (
+        {"template": "futsal", "points": [{"name": ["a"], "x": 1, "y": 1}] + good},
+        {"template": "futsal", "points": good, "lines": [{"line": {"x": 1}, "x": 1, "y": 1}]},
+        {"template": "futsal", "points": [{**good[0], "x": 10**400}] + good[1:]},
+        {"template": "futsal", "points": good, "t": 10**400},
+        {"template": {"length": 10**400, "width": 20}, "points": good},
+    ):
+        with pytest.raises(ValueError):
+            calibrate.validate_request(request, SIZE)

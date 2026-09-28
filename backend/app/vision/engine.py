@@ -394,7 +394,7 @@ def run_video(
             tick = time.monotonic()
             ball_batches = ball_detector.detect_batch([b[1] for b in batch], threshold=0.05)
             timings["ballInferenceSeconds"] += time.monotonic() - tick
-        for (t, frame, _), (boxes, scores, classes), raw_candidates in zip(
+        for (t, frame, number), (boxes, scores, classes), raw_candidates in zip(
             batch, detections, ball_batches
         ):
             mask = field_mask(frame)
@@ -467,6 +467,9 @@ def run_video(
             frames.append(
                 {
                     "t": round(t, 3),
+                    # Source frame number: pitch setup reads this exact frame
+                    # again (timestamps drift on variable-frame-rate video).
+                    "frame": number,
                     "scene": scene,
                     "players": players,
                     "ball": ball,

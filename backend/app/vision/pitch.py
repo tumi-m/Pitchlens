@@ -80,13 +80,13 @@ def normalise_template(spec):
     base.update({k: v for k, v in spec.items() if k in base})
     try:
         length, width = float(base["length"]), float(base["width"])
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Pitch length and width must be numbers") from exc
     if not (10 <= length <= 130 and 5 <= width <= 100 and length >= width * 0.8):
         raise ValueError("Pitch dimensions must be 10-130 m long and 5-100 m wide")
     try:
         goal = float(base["goalWidth"] or 3.0)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Goal width must be a number") from exc
     if not 1 <= goal <= min(8, width):
         raise ValueError("Goal width must be between 1 m and 8 m")
@@ -99,7 +99,7 @@ def normalise_template(spec):
             continue
         try:
             value = float(value)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"{key} must be a number") from exc
         if not (0 < value <= limit):
             raise ValueError(f"{key} must be between 0 and {limit:.1f} m for this pitch")
@@ -378,18 +378,24 @@ def camera_geometry(G, size):
     w, h = size
     shift = np.array([[1, 0, -w / 2], [0, 1, -h / 2], [0, 0, 1.0]])
     g = shift @ np.asarray(G, float)
-    g1, g2, g3 = g[:, 0], g[:, 1], g[:, 2]
-    candidates = []
-    denom = g1[2] * g2[2]
-    if abs(denom) > 1e-12:
-        candidates.append(-(g1[0] * g2[0] + g1[1] * g2[1]) / denom)
-    denom = g2[2] ** 2 - g1[2] ** 2
-    if abs(denom) > 1e-12:
-        candidates.append((g1[0] ** 2 + g1[1] ** 2 - g2[0] ** 2 - g2[1] ** 2) / denom)
-    f2 = [c for c in candidates if c > 0]
-    if not f2:
+    norm = np.linalg.norm(g[:, :2])
+    if not np.isfinite(norm) or norm <= 0:
         return None, None
-    f = math.sqrt(float(np.median(f2)))
+    g = g / norm
+    g1, g2, g3 = g[:, 0], g[:, 1], g[:, 2]
+    # Both rotation constraints (r1.r2 = 0, |r1| = |r2|) are linear in f^2:
+    # A f^2 + B = 0. Solving them together by least squares weights each by how
+    # well it is conditioned; either alone breaks down for some views (the first
+    # for a camera facing straight across the pitch).
+    A = np.array([g1[2] * g2[2], g1[2] ** 2 - g2[2] ** 2])
+    B = np.array([g1[0] * g2[0] + g1[1] * g2[1], g1[0] ** 2 + g1[1] ** 2 - g2[0] ** 2 - g2[1] ** 2])
+    den = float(A @ A)
+    if den <= 1e-18:
+        return None, None
+    f2 = -float(A @ B) / den
+    if not math.isfinite(f2) or f2 <= 0:
+        return None, None
+    f = math.sqrt(f2)
     K_inv = np.diag([1 / f, 1 / f, 1.0])
     r1, r2, t = K_inv @ g1, K_inv @ g2, K_inv @ g3
     scale = (np.linalg.norm(r1) + np.linalg.norm(r2)) / 2
@@ -587,22 +593,74 @@ def _affine(frame):
     return np.vstack([a, [0, 0, 1]])
 
 
-def static_camera(frames):
-    """True when the recorded camera motion is negligible (a fixed venue camera)."""
-    moves = [
-        np.hypot(*np.asarray(f["camera"], float).reshape(2, 3)[:, 2])
-        for f in frames
-        if f.get("camera") is not None
-    ]
-    if len(moves) < max(5, len(frames) * 0.5):
+def static_camera(frames, window_seconds=5.0, max_drift=8.0):
+    """True when the recorded camera motion is negligible (a fixed venue camera).
+
+    Judged on the motion chain, not frame by frame: a slow re-aim of 2-3 px per
+    frame looks like noise in any one frame but adds up within seconds. Frames
+    whose motion is unknown are handled by static_breaks().
+    """
+    moved = [(f.get("t"), np.asarray(f["camera"], float).reshape(2, 3)[:, 2]) for f in frames if f.get("camera") is not None]
+    if len(moved) < max(5, len(frames) * 0.5):
         return False
+    moves = [float(np.hypot(*shift)) for _, shift in moved]
     # A fixed camera that was bumped or re-aimed moves for a moment: not static.
-    return float(np.percentile(moves, 95)) < 0.6 and float(np.max(moves)) < 3.0
+    if float(np.percentile(moves, 95)) >= 0.6 or float(np.max(moves)) >= 3.0:
+        return False
+    times = [t if t is not None else k for k, (t, _) in enumerate(moved)]
+    total = np.vstack([[0.0, 0.0], np.cumsum([shift for _, shift in moved], axis=0)])
+    first = 0
+    for last in range(len(moved)):
+        while times[last] - times[first] > window_seconds:
+            first += 1
+        if float(np.hypot(*(total[last + 1] - total[first]))) >= max_drift:
+            return False
+    return True
+
+
+def _held_still(frames, i):
+    """Motion was not measured at frame i: did the camera stay put anyway?
+
+    Players tracked across the gap keep their image positions when it did; a
+    moved camera shifts them all together, or breaks their tracks.
+    """
+    if i <= 0:
+        return False
+    before = {p["id"]: p["box"] for p in frames[i - 1].get("players") or [] if p.get("box")}
+    after = {p["id"]: p["box"] for p in frames[i].get("players") or [] if p.get("box")}
+    common = [k for k in before if k in after]
+    if len(common) < 3:
+        return False
+    dx = float(np.median([(after[k][0] + after[k][2] - before[k][0] - before[k][2]) / 2 for k in common]))
+    dy = float(np.median([after[k][3] - before[k][3] for k in common]))
+    height = float(np.median([before[k][3] - before[k][1] for k in common]))
+    return math.hypot(dx, dy) <= 0.5 * max(height, 1.0)
+
+
+def static_breaks(frames):
+    """Where a fixed camera's view must be established again: the first frame,
+    each new shot, and motion gaps the player tracks cannot vouch for."""
+    return [
+        i
+        for i in range(len(frames))
+        if i == 0
+        or frames[i]["scene"] != frames[i - 1]["scene"]
+        or (frames[i].get("camera") is None and not _held_still(frames, i))
+    ]
 
 
 def _elapsed(frames, earlier, later):
     a, b = frames[earlier].get("t"), frames[later].get("t")
     return 0.0 if a is None or b is None else b - a
+
+
+def _step(frames, i, static):
+    """Camera motion from frame i-1 to frame i, or None where it is unknown."""
+    if not static:
+        return _affine(frames[i])
+    # A fixed camera does not move, but where motion could not be measured it
+    # may have been re-aimed: carry on only if the player tracks say it held still.
+    return IDENTITY if frames[i].get("camera") is not None or _held_still(frames, i) else None
 
 
 def propagate(frames, anchors, static=None, max_seconds=12.0):
@@ -633,7 +691,7 @@ def propagate(frames, anchors, static=None, max_seconds=12.0):
             # painted lines, stop trusting it after max_seconds.
             if not static and _elapsed(frames, index, i) > max_seconds:
                 break
-            a = IDENTITY if static else _affine(frames[i])
+            a = _step(frames, i, static)
             if a is None:
                 break
             to_anchor = to_anchor @ np.linalg.inv(a)
@@ -646,7 +704,7 @@ def propagate(frames, anchors, static=None, max_seconds=12.0):
                 break
             if not static and _elapsed(frames, i, index) > max_seconds:
                 break
-            a = IDENTITY if static else _affine(frames[i + 1])
+            a = _step(frames, i + 1, static)
             if a is None:
                 break
             to_anchor = to_anchor @ a

@@ -56,7 +56,7 @@ export function PitchCalibration({
   videoSize: [number, number];
   time: number;
   /** Latest click on the video in video pixels; n increments per click. */
-  click: { x: number; y: number; n: number } | null;
+  click: { x: number; y: number; n: number; moved?: boolean } | null;
   active: boolean;
   onActive: (active: boolean) => void;
   onOverlay: (overlay: CalibrationOverlay | null) => void;
@@ -176,6 +176,10 @@ export function PitchCalibration({
   useEffect(() => {
     if (!active || !click || click.n === handled.current) return;
     handled.current = click.n;
+    if (click.moved) {
+      setError("Moved to the nearest analysed frame: the pitch setup has to use one. Click the landmark again.");
+      return;
+    }
     if (frameTime !== null && Math.abs(time - frameTime) > 0.08) {
       setError(`Clicks must all be on one frame (${clockTime(frameTime)}). Go back to it, or clear and start again.`);
       return;

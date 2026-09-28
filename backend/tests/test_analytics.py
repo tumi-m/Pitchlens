@@ -711,3 +711,19 @@ def test_an_off_pitch_bystander_does_not_split_a_player_across_a_missed_frame():
     for start in (None, 10, 12):
         mapping = run(start)
         assert mapping[1] == mapping[2], start
+
+
+def test_malformed_review_decisions_are_refused_not_server_errors(tmp_path, monkeypatch):
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, _ = make_job(server, build_match())
+    for decision in (
+        {"action": ["accept"]},
+        {"action": "add", "type": ["shot"], "t": 1.0},
+        {"action": "add", "type": "shot", "t": "soon"},
+        {"action": "add", "type": "shot", "t": 10**400},
+        {"action": "add", "type": "shot", "t": True},
+    ):
+        assert client.post(f"/jobs/{job_id}/review", json={"decisions": [decision]}).status_code == 400, decision
+    # A fingerprint with an unhashable type is ignored, not a crash.
+    ok = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "accept", "eventId": "ev-0", "event": {"type": ["shot"], "t": 1.0}}]})
+    assert ok.status_code == 200

@@ -177,6 +177,36 @@ test("pitch setup: landmarks are clicked on the video, the fit is checked, then 
   expect(state.previews).toBe(1);
 });
 
+test("pitch setup: a click between analysed frames moves to the nearest one and asks again", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Set up the pitch" }).first().click();
+  const overlay = page.getByTestId("calibration-overlay");
+  await expect(overlay).toBeVisible();
+  // Land between the analysed frames at 1.0 s and 1.2 s (as a timeline click would).
+  await page.evaluate(() => {
+    const v = document.querySelector("video")!;
+    v.pause();
+    v.currentTime = 1.1;
+  });
+  await expect.poll(() => page.evaluate(() => document.querySelector("video")!.currentTime)).toBeCloseTo(1.1, 2);
+  const clickAt = async (x: number, y: number) => {
+    const box = (await overlay.boundingBox())!;
+    await overlay.click({ position: { x: (x / 640) * box.width, y: (y / 360) * box.height } });
+  };
+  await clickAt(20, 20);
+  await expect(page.getByText("Moved to the nearest analysed frame", { exact: false })).toBeVisible();
+  const snapped = await page.evaluate(() => document.querySelector("video")!.currentTime);
+  expect([1.0, 1.2].some((t) => Math.abs(snapped - t) < 0.01)).toBe(true);
+  for (const [x, y] of [[20, 20], [620, 20], [620, 320], [20, 320], [320, 170]]) await clickAt(x, y);
+  await expect(page.getByText("5 landmarks")).toBeVisible();
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await expect(page.getByText("Good fit")).toBeVisible();
+  await page.getByRole("button", { name: "Apply to the whole match" }).click();
+  await expect.poll(() => state.saves.length).toBe(1);
+  expect(Math.abs((state.saves[0] as { t: number }).t - snapped)).toBeLessThan(0.01);
+});
+
 test("review: confirming a shot is saved on the worker and updates the stats", async ({ page }) => {
   const state = await mockReport(page, { calibrated: true });
   await page.goto(`/vision/${ID}`);

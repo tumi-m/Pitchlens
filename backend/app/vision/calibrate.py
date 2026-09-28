@@ -26,13 +26,13 @@ def validate_request(request, size):
     image, world, used = [], [], []
     w, h = size
     for p in points:
-        if not isinstance(p, dict) or p.get("name") not in names:
+        if not isinstance(p, dict) or not isinstance(p.get("name"), str) or p["name"] not in names:
             raise ValueError("Unknown landmark")
         if p["name"] in used:
             raise ValueError("Each landmark can be used once")
         try:
             x, y = float(p.get("x")), float(p.get("y"))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("Landmark positions must be numbers") from exc
         if not (math.isfinite(x) and math.isfinite(y) and -w <= x <= 2 * w and -h <= y <= 2 * h):
             raise ValueError("Landmark position is outside the video")
@@ -45,18 +45,18 @@ def validate_request(request, size):
     if not isinstance(raw_lines, list) or len(raw_lines) > 80:
         raise ValueError("Click at most 80 points along lines")
     for c in raw_lines:
-        if not isinstance(c, dict) or c.get("line") not in lines:
+        if not isinstance(c, dict) or not isinstance(c.get("line"), str) or c["line"] not in lines:
             raise ValueError("Unknown line")
         try:
             x, y = float(c.get("x")), float(c.get("y"))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("Line points must be numbers") from exc
         if not (math.isfinite(x) and math.isfinite(y) and -w <= x <= 2 * w and -h <= y <= 2 * h):
             raise ValueError("Line point is outside the video")
         line_clicks.append(((x, y), lines[c["line"]]))
     try:
         t = float(request.get("t", 0))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Invalid frame time") from exc
     if not math.isfinite(t) or t < 0:
         raise ValueError("Invalid frame time")
@@ -115,34 +115,65 @@ def nearest_frame(frames, t):
 def line_masks(video_path, frames, indices, progress=None):
     """PNG-compressed line masks for the chosen sampled frames (memory-light).
 
-    Frames are matched by the decoder's timestamp (the same clock the engine
-    used for t), so variable-frame-rate phone video lines up correctly.
+    The engine records each sample's source frame number; the video is read the
+    same way (seek to the analysis start, count decoded frames), so masks come
+    from exactly the analysed frames even on variable-frame-rate phone video.
+    Older results without frame numbers are matched by time: the frame-count
+    clock when t is exactly one, otherwise the decoder's timestamp.
     """
-    wanted = sorted(set(indices), key=lambda i: frames[i]["t"])
+    wanted = sorted(set(indices))
     if not wanted:
         return {}
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     half = 0.5 / fps
+    by_number, by_time = {}, []
+    for i in wanted:
+        number = frames[i].get("frame")
+        if not (isinstance(number, int) and not isinstance(number, bool) and number >= 0):
+            t = frames[i]["t"]
+            n = int(round(t * fps))
+            # The engine stored frame/fps when it distrusted the decoder clock.
+            number = n if abs(round(n / fps, 3) - t) < 0.0015 else None
+        if number is None:
+            by_time.append(i)
+        else:
+            by_number.setdefault(number, i)
+    by_time.sort(key=lambda i: frames[i]["t"])
     out = {}
-    k = 0
+
+    def keep(i):
+        ok, image = cap.retrieve()
+        if ok:
+            ok, png = cv2.imencode(".png", pitchlib.line_mask(image, restrict_to_grass=False))
+            if ok:
+                out[i] = png.tobytes()
+        if progress and len(out) % 50 == 0:
+            progress(len(out) / len(wanted))
+
     try:
-        while k < len(wanted):
+        n = 0
+        start = frames[0].get("frame")
+        if not by_time and isinstance(start, int) and not isinstance(start, bool) and 0 < start <= min(by_number):
+            # Same seek as the engine, so frame counting starts at the same place.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            n = start
+        last = max(by_number) if by_number else -1
+        k = 0
+        while n <= last or k < len(by_time):
             if not cap.grab():
                 break
-            position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            # Skip targets we have passed without a close enough frame.
-            while k < len(wanted) and frames[wanted[k]]["t"] < position - half:
-                k += 1
-            if k < len(wanted) and abs(frames[wanted[k]]["t"] - position) <= half:
-                ok, image = cap.retrieve()
-                if ok:
-                    ok, png = cv2.imencode(".png", pitchlib.line_mask(image, restrict_to_grass=False))
-                    if ok:
-                        out[wanted[k]] = png.tobytes()
-                k += 1
-                if progress and len(out) % 50 == 0:
-                    progress(len(out) / len(wanted))
+            if n in by_number:
+                keep(by_number[n])
+            if k < len(by_time):
+                position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                # Skip targets we have passed without a close enough frame.
+                while k < len(by_time) and frames[by_time[k]]["t"] < position - half:
+                    k += 1
+                if k < len(by_time) and abs(frames[by_time[k]]["t"] - position) <= half:
+                    keep(by_time[k])
+                    k += 1
+            n += 1
     finally:
         cap.release()
     return out
@@ -171,13 +202,30 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
     anchor = nearest_frame(frames, t)
     static = pitchlib.static_camera(frames)
     fps = result.get("sampleFps") or 5
-    if not static and abs(frames[anchor]["t"] - t) > 0.75 / fps:
+    # The clicks must be on an analysed frame itself (to within one video frame):
+    # a moving camera is somewhere else a fraction of a second later.
+    native = float((result.get("video") or {}).get("fps") or 0)
+    tolerance = min(0.25 / fps, 0.5 / native + 0.005) if native > 0 else 0.25 / fps
+    if not static and abs(frames[anchor]["t"] - t) > tolerance:
         raise ValueError(
             "The camera moves, and the clicked moment is between analysed frames. Use the frame buttons in the pitch setup to pick an analysed frame."
         )
     anchors = {anchor: np.asarray(cal["H"], float)}
     aligned = 0
     reacquired = 0
+    if static and video_path and Path(video_path).is_file():
+        # A fixed camera keeps one view, except where it may have been re-aimed
+        # (motion lost with the tracks broken) or the recording cut: find the
+        # painted lines again there, or leave that stretch unmapped.
+        breaks = pitchlib.static_breaks(frames)
+        own = max(i for i in breaks if i <= anchor)  # the clicked frame covers its own stretch
+        breaks = [i for i in breaks if i != own]
+        masks = line_masks(video_path, frames, breaks, progress=(lambda p: progress(p * 0.8)) if progress else None)
+        for i in sorted(masks):
+            refined, score = _align(masks[i], cal, anchors[anchor], template, int(min(size) * 0.3))
+            if refined is not None and score >= 0.6:
+                anchors[i] = refined
+                reacquired += 1
     if not static and video_path and Path(video_path).is_file():
         fps = result.get("sampleFps") or 5
         stride = max(1, int(round(stride_seconds * fps)))
@@ -286,19 +334,24 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
     H = np.asarray(venue["H"], float).reshape(3, 3)
     cal = {"H": H, "k1": venue.get("k1", 0.0), "size": list(size)}
     static = pitchlib.static_camera(frames)
+    # A fixed camera may still have been re-aimed where motion was lost, or the
+    # recording cut: each stretch between such breaks is checked on its own.
+    breaks = pitchlib.static_breaks(frames) if static else []
     verified = None
     anchors = {}
-    if video_path and Path(video_path).is_file():
+    has_video = bool(video_path and Path(video_path).is_file())
+    if has_video:
         picks = sorted(set(np.linspace(0, len(frames) - 1, min(samples, len(frames))).astype(int).tolist()))
-        masks = line_masks(video_path, frames, picks, progress=(lambda p: progress(p * 0.8)) if progress else None)
+        masks = line_masks(video_path, frames, sorted(set(picks) | set(breaks)), progress=(lambda p: progress(p * 0.8)) if progress else None)
         scores = []
         for i, png in masks.items():
             refined, score = _align(png, cal, H, template, search=int(min(size) * 0.05))
-            scores.append(score)
+            if i in picks:
+                scores.append(score)
             if refined is not None and score >= 0.45:
                 anchors[i] = refined
         verified = round(float(np.median(scores)), 2) if scores else None
-        if not scores or len(anchors) < max(2, len(scores) // 2):
+        if not scores or sum(1 for i in anchors if i in picks) < max(2, len(scores) // 2):
             raise ValueError(
                 "The painted lines in this match do not line up with the saved venue (the camera may have moved). Set up the pitch for this match."
             )
@@ -307,11 +360,23 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
             "This match's footage is no longer on the server, so the saved venue cannot be checked against the "
             "painted lines, and the camera moves. Set up the pitch for this match instead."
         )
-    if static or not anchors:
-        # One fixed view: the saved homography, refined by the median correction if any.
-        anchors = {0: H} if not anchors else {0: _median_homography(list(anchors.values()), size)}
-        homographies = [anchors[0]] * len(frames)
-        distance = [0] * len(frames)
+    if static:
+        # One fixed view per stretch: the median of its verified corrections, or
+        # the saved homography for the first stretch when there is no footage to
+        # check. A stretch nothing verifies stays unmapped.
+        homographies, distance = [None] * len(frames), [None] * len(frames)
+        fixed = {}
+        edges = breaks + [len(frames)]
+        for first, end in zip(edges, edges[1:]):
+            inside = [anchors[i] for i in anchors if first <= i < end]
+            if inside:
+                fixed[first] = _median_homography(inside, size) if len(inside) > 1 else inside[0]
+            elif not has_video and first == 0:
+                fixed[first] = H
+            if first in fixed:
+                for i in range(first, end):
+                    homographies[i], distance[i] = fixed[first], i - first
+        anchors = fixed
     else:
         homographies, distance = pitchlib.propagate(frames, anchors, static)
     per_frame = [

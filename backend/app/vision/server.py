@@ -961,22 +961,24 @@ EVENT_TYPES = {"pass", "shot", "goal", "goal-candidate", "interception", "tackle
 
 
 def _clean_decision(d, index):
-    if not isinstance(d, dict) or d.get("action") not in REVIEW_ACTIONS:
+    if not isinstance(d, dict) or not isinstance(d.get("action"), str) or d["action"] not in REVIEW_ACTIONS:
         raise HTTPException(400, "Unknown review action")
     out = {"action": d["action"], "at": round(time.time(), 3)}
     if d["action"] == "add":
-        if d.get("type") not in EVENT_TYPES:
+        if not isinstance(d.get("type"), str) or d["type"] not in EVENT_TYPES:
             raise HTTPException(400, "Unknown event type")
-        t = float(d.get("t", -1))
-        if not (0 <= t <= 6 * 3600):
+        t = d.get("t", -1)
+        # Range first: math.isfinite overflows on a huge JSON integer.
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not (0 <= t <= 6 * 3600) or not math.isfinite(t):
             raise HTTPException(400, "Invalid event time")
+        t = float(t)
         out.update(type=d["type"], t=round(t, 2), id=f"added-{uuid.uuid4().hex[:10]}")
         if isinstance(d.get("team"), int) and not isinstance(d.get("team"), bool) and d["team"] in (0, 1):
             out["team"] = d["team"]
         if isinstance(d.get("outcome"), str):
             out["outcome"] = d["outcome"][:40]
         x, y = d.get("x"), d.get("y")
-        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and abs(v) < 200 for v in (x, y)):
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 200 and math.isfinite(v) for v in (x, y)):
             out["x"], out["y"] = float(x), float(y)
         return out
     if d["action"] == "direction":
@@ -1002,7 +1004,7 @@ def _clean_decision(d, index):
     seen = d.get("event")
     if isinstance(seen, dict):
         t = seen.get("t")
-        if seen.get("type") in EVENT_TYPES and isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= t <= 6 * 3600:
+        if isinstance(seen.get("type"), str) and seen["type"] in EVENT_TYPES and isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= t <= 6 * 3600 and math.isfinite(t):
             fingerprint = {"type": seen["type"], "t": round(float(t), 2)}
             if isinstance(seen.get("team"), int) and not isinstance(seen.get("team"), bool) and seen["team"] in (0, 1):
                 fingerprint["team"] = seen["team"]
