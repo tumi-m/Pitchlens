@@ -1,10 +1,17 @@
+import { estimateMotion } from "@/lib/review/footageCheck";
+
 /** Browser-only inspection: the file is not uploaded or sent to an inference API. */
 export type VideoPreflight = {
   width: number;
   height: number;
   duration: number;
   samples: { t: number; image: string }[];
+  /** Share of sampled frame pairs that changed abruptly (cuts/replays), when measurable. */
+  motion?: number;
 };
+
+/** The file itself is unusable (limits the server enforces too); not a browser codec gap. */
+export class PreflightRejected extends Error {}
 
 export async function inspectVideo(file: File, signal: AbortSignal): Promise<VideoPreflight> {
   const url = URL.createObjectURL(file);
@@ -34,9 +41,9 @@ export async function inspectVideo(file: File, signal: AbortSignal): Promise<Vid
     await waitFor("loadeddata", () => { video.src = url; });
     const { videoWidth: width, videoHeight: height, duration } = video;
     if (!Number.isFinite(duration) || duration <= 0 || !width || !height)
-      throw new Error("The video has invalid dimensions or duration.");
+      throw new PreflightRejected("The video has invalid dimensions or duration.");
     if (duration > 4 * 3600 || width > 4096 || height > 4096)
-      throw new Error("Choose a video under four hours and 4096 pixels per side.");
+      throw new PreflightRejected("Choose a video under four hours and 4096 pixels per side.");
     const canvas = document.createElement("canvas");
     canvas.width = Math.min(480, width);
     canvas.height = Math.max(1, Math.round(height * canvas.width / width));
@@ -49,7 +56,8 @@ export async function inspectVideo(file: File, signal: AbortSignal): Promise<Vid
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       samples.push({ t, image: canvas.toDataURL("image/jpeg", .8) });
     }
-    return { width, height, duration, samples };
+    const motion = await estimateMotion(video, duration, signal);
+    return { width, height, duration, samples, motion };
   } finally {
     video.removeAttribute("src");
     video.load();

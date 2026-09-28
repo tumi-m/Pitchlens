@@ -1,5 +1,6 @@
 """Football-specific ONNX inference with standard letterbox/NMS decoding."""
 
+import math
 import os
 from pathlib import Path
 
@@ -29,6 +30,9 @@ class BallDetector:
         self.height, self.width = self.input.shape[2:]
         if not isinstance(self.height, int) or not isinstance(self.width, int):
             raise ValueError("Ball model must declare fixed input dimensions")
+
+    def detect_batch(self, frames, threshold=0.2):
+        return [self.detect(frame, threshold) for frame in frames]
 
     def detect(self, frame, threshold=0.2):
         height, width = frame.shape[:2]
@@ -83,7 +87,21 @@ class BallDetector:
 
 
 class TiledBallDetector:
-    """Local YOLO weights trained for tiles, including Roboflow's football example."""
+    """Local YOLO weights trained for tiles, including Roboflow's football example.
+
+    Tiles are sized so a ball is always presented near the model's training
+    scale: a 360p frame is split into two tiles that get upscaled, a 1080p
+    frame into twelve. Frames sharper than 1080p are first reduced to 1080p
+    (their ball is still twice the 480p size), so 4K costs the same as 1080p.
+    Tiles of a batch of frames go through the model in calls of at most
+    MAX_CROPS crops, which is where a GPU earns its keep without running out
+    of memory.
+    """
+
+    TILE = 480  # native pixels per tile side before resizing to imgsz 640
+    OVERLAP = 48
+    MAX_SHORT_SIDE = 1080
+    MAX_CROPS = 32  # 640x640 crops per forward pass
 
     def __init__(self, path, device="cpu"):
         from ultralytics import YOLO
@@ -94,60 +112,114 @@ class TiledBallDetector:
             raise ValueError("Ball model must contain a named ball class")
         self.device = device
 
-    def detect(self, frame, threshold=0.2, focus=None):
+    def scale_for(self, frame):
+        """Downscale factor applied before tiling (1 for 1080p and below)."""
+        short = min(frame.shape[:2])
+        return 1.0 if short <= self.MAX_SHORT_SIDE else self.MAX_SHORT_SIDE / short
+
+    def tiles(self, frame):
+        """(x0, y0, scale, crop): crop coordinates map back as (x / scale, y / scale)."""
+        scale = self.scale_for(frame)
+        if scale < 1:
+            frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         h, w = frame.shape[:2]
-        tiles = [
-            (x, y, min(w, x + w // 2 + 50), min(h, y + h // 2 + 50))
-            for y in sorted({0, max(0, h // 2 - 50)})
-            for x in sorted({0, max(0, w // 2 - 50)})
-        ]
-        found = []
+        cols = max(1, math.ceil(w / self.TILE))
+        rows = max(1, math.ceil(h / self.TILE))
+        tw, th = math.ceil(w / cols), math.ceil(h / rows)
+        out = []
+        for r in range(rows):
+            for c in range(cols):
+                x0 = max(0, c * tw - self.OVERLAP)
+                y0 = max(0, r * th - self.OVERLAP)
+                x1 = min(w, (c + 1) * tw + self.OVERLAP)
+                y1 = min(h, (r + 1) * th + self.OVERLAP)
+                out.append((x0, y0, scale, frame[y0:y1, x0:x1]))
+        return out
 
-        def infer(tile):
-            x, y, right, bottom = tile
-            result = self.model.predict(
-                frame[y:bottom, x:right],
-                imgsz=640,
-                conf=threshold,
-                classes=self.classes,
-                device=self.device,
-                quantize=16 if str(self.device).startswith("cuda") else None,
-                verbose=False,
-            )[0]
+    def _predict(self, crops, threshold):
+        results = []
+        for start in range(0, len(crops), self.MAX_CROPS):
             self.inference_calls = getattr(self, "inference_calls", 0) + 1
-            detections = []
-            for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
-                box = [box[0] + x, box[1] + y, box[2] + x, box[3] + y]
-                detections.append(
-                    {
-                        "x": (box[0] + box[2]) / 2,
-                        "y": (box[1] + box[3]) / 2,
-                        "box": box,
-                        "confidence": confidence,
-                    }
+            results.extend(
+                self.model.predict(
+                    crops[start : start + self.MAX_CROPS],
+                    imgsz=640,
+                    conf=threshold,
+                    classes=self.classes,
+                    device=self.device,
+                    quantize=16 if str(self.device).startswith("cuda") else None,
+                    verbose=False,
                 )
-            return detections
+            )
+        return results
 
-        if focus is not None:
-            # Keep the training crop scale: select an existing tile instead of zooming
-            # arbitrarily. A miss/ambiguous observation searches the remaining tiles.
-            def margin(tile):
-                x, y, right, bottom = tile
-                return min(focus[0] - x, right - focus[0], focus[1] - y, bottom - focus[1])
+    @staticmethod
+    def _collect(result, x0, y0, scale=1.0):
+        out = []
+        for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+            box = [(box[0] + x0) / scale, (box[1] + y0) / scale, (box[2] + x0) / scale, (box[3] + y0) / scale]
+            out.append(
+                {
+                    "x": round((box[0] + box[2]) / 2, 1),
+                    "y": round((box[1] + box[3]) / 2, 1),
+                    "box": [round(v, 1) for v in box],
+                    "confidence": round(confidence, 3),
+                }
+            )
+        return out
 
-            selected = max(tiles, key=margin)
-            if margin(selected) >= min(h, w) * 0.08:
-                found = infer(selected)
-                tiles.remove(selected)
-                if (
-                    len(found) == 1
-                    and found[0]["confidence"] >= 0.35
-                    and np.hypot(found[0]["x"] - focus[0], found[0]["y"] - focus[1])
-                    < min(h, w) * 0.15
-                ):
-                    return found
-        for tile in tiles:
-            found.extend(infer(tile))
+    def detect_batch(self, frames, threshold=0.2):
+        """Detect in several frames with one model call. Returns a list per frame."""
+        crops, owners = [], []
+        for index, frame in enumerate(frames):
+            for x0, y0, scale, tile in self.tiles(frame):
+                crops.append(tile)
+                owners.append((index, x0, y0, scale))
+        if not crops:
+            return [[] for _ in frames]
+        results = self._predict(crops, threshold)
+        per_frame = [[] for _ in frames]
+        for result, (index, x0, y0, scale) in zip(results, owners):
+            per_frame[index].extend(self._collect(result, x0, y0, scale))
+        return [self._suppress(found, threshold) for found in per_frame]
+
+    def detect(self, frame, threshold=0.2, focus=None):
+        """Single frame. With `focus` (last known ball position) the tile around
+        it is searched first; a clear hit there saves the remaining tiles."""
+        if focus is None:
+            return self.detect_batch([frame], threshold)[0]
+        h, w = frame.shape[:2]
+        tiles = self.tiles(frame)
+        scale = self.scale_for(frame)
+        fx, fy = focus[0] * scale, focus[1] * scale
+
+        def margin(tile):
+            x0, y0, _, crop = tile
+            th, tw = crop.shape[:2]
+            return min(fx - x0, x0 + tw - fx, fy - y0, y0 + th - fy)
+
+        selected = max(tiles, key=margin)
+        found = []
+        if margin(selected) >= min(h, w) * scale * 0.08:
+            x0, y0, _, crop = selected
+            found = self._collect(self._predict([crop], threshold)[0], x0, y0, scale)
+            tiles.remove(selected)
+            # One clear hit next to the last position settles it; weak candidates
+            # (kept for track-before-detect) do not make the tile "ambiguous".
+            strong = [f for f in found if f["confidence"] >= 0.35]
+            if (
+                len(strong) == 1
+                and np.hypot(strong[0]["x"] - focus[0], strong[0]["y"] - focus[1]) < min(h, w) * 0.15
+            ):
+                return self._suppress(found, threshold)
+        if tiles:
+            results = self._predict([t[3] for t in tiles], threshold)
+            for result, (x0, y0, s, _) in zip(results, tiles):
+                found.extend(self._collect(result, x0, y0, s))
+        return self._suppress(found, threshold)
+
+    @staticmethod
+    def _suppress(found, threshold):
         if not found:
             return []
         boxes = [

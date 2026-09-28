@@ -367,10 +367,17 @@ def test_tiled_ball_inference_merges_overlap_and_preserves_source_coordinates():
     from app.vision.ball import TiledBallDetector
 
     class Model:
-        def predict(self, image, **kwargs):
-            ys, xs = np.where(image[:, :, 0] > 0)
-            boxes = np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
-            return [SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.array([0.8])))]
+        def predict(self, images, **kwargs):
+            out = []
+            for image in images:
+                ys, xs = np.where(image[:, :, 0] > 0)
+                if len(xs):
+                    boxes = np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
+                    conf = np.array([0.8])
+                else:
+                    boxes, conf = np.zeros((0, 4)), np.zeros(0)
+                out.append(SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=conf)))
+            return out
 
     detector = TiledBallDetector.__new__(TiledBallDetector)
     detector.model, detector.classes, detector.device = Model(), [0], "cpu"
@@ -834,6 +841,328 @@ def test_gpu_can_copy_installed_weights_but_nothing_else(service, monkeypatch, t
     assert client.get("/models/..%2F..%2Fetc%2Fpasswd").status_code == 404
 
 
+def test_track_vote_fixes_unknown_and_noisy_team_labels():
+    from app.vision.engine import vote_teams
+
+    def obs(team, role="player"):
+        return {"id": 7, "team": team, "role": role, "box": [0, 0, 10, 20], "confidence": 0.9}
+
+    frames = [{"players": [obs(t)]} for t in (0, 0, 0, -1, 1)]
+    vote_teams(frames)
+    assert [f["players"][0]["team"] for f in frames] == [0, 0, 0, 0, 0]
+    split = [{"players": [obs(t)]} for t in (0, 1, 0, 1)]
+    vote_teams(split)  # no 60% majority: left as observed
+    assert [f["players"][0]["team"] for f in split] == [0, 1, 0, 1]
+
+
+def test_pan_is_not_a_cut_but_a_new_shot_is():
+    import cv2
+    import numpy as np
+
+    from app.vision.engine import colour_signature
+
+    rng = np.random.default_rng(1)
+    pitch = np.zeros((360, 640, 3), np.uint8)
+    pitch[:] = (40, 140, 60)
+    for _ in range(12):  # players
+        x, y = rng.integers(20, 600), rng.integers(40, 300)
+        pitch[y : y + 40, x : x + 15] = (40, 40, 200)
+    panned = np.roll(pitch, 120, axis=1)
+    crowd = rng.integers(0, 255, (360, 640, 3), dtype=np.uint8)
+    compare = lambda a, b: cv2.compareHist(colour_signature(a), colour_signature(b), cv2.HISTCMP_BHATTACHARYYA)
+    assert compare(pitch, panned) < 0.2
+    assert compare(pitch, crowd) > 0.5
+
+
+# ── Faint-object ball recovery (track-before-detect) ─────────────────────
+def test_weak_candidates_on_a_smooth_path_are_confirmed_but_blips_are_not():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for i in range(8):
+        cands = [{"x": 100 + 12 * i, "y": 200 - 3 * i, "box": None, "confidence": 0.12}]
+        if i == 4:
+            cands.append({"x": 500, "y": 50, "box": None, "confidence": 0.14})  # isolated blip
+        frames.append({"scene": 0, "ball": None, "ballCandidates": cands})
+    promoted = confirm_chains(frames, [identity] * 8, diagonal=734)
+    assert sorted(promoted) == list(range(8))
+    assert all(promoted[i]["x"] == 100 + 12 * i for i in range(8))
+    assert promoted[4]["y"] != 50
+
+
+def test_chain_never_crosses_a_scene_cut():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = [
+        {"scene": 0 if i < 4 else 1, "ball": None,
+         "ballCandidates": [{"x": 100 + 10 * i, "y": 100, "box": None, "confidence": 0.1}]}
+        for i in range(6)
+    ]
+    promoted = confirm_chains(frames, [identity] * 6, diagonal=734, min_length=3, min_evidence=0.25)
+    assert set(promoted) == {0, 1, 2, 3}
+
+
+def test_recovery_bridges_short_gaps_as_inferred_not_observed():
+    from app.vision.faint import recover_ball
+    from app.vision.metrics import derive_metrics
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for i in range(6):
+        ball = {"x": 100 + 20 * i, "y": 100, "box": [0, 0, 4, 4], "confidence": 0.7, "trackId": 1}
+        frames.append(
+            {"t": i * 0.2, "scene": 0, "players": [], "ball": None if i in (2, 3) else ball,
+             "ballCandidates": []}
+        )
+    counts = recover_ball(frames, [identity] * 6, diagonal=734, sample_fps=5, max_bridge=0.5)
+    assert counts["inferred"] == 2
+    assert frames[2]["ball"]["inferred"] and frames[2]["ball"]["x"] == 140
+    metrics = derive_metrics(frames, 5, 1.2)
+    assert metrics["ballFrames"] == 4 and metrics["ballFramesInferred"] == 2
+
+
+def test_difference_candidates_find_a_small_moving_blob_and_ignore_players():
+    from app.vision.faint import difference_candidates
+
+    prev = np.full((360, 640, 3), 60, np.uint8)
+    cur = prev.copy()
+    cur[180:186, 300:306] = 255  # ball-sized moving blob
+    cur[50:110, 100:130] = 255  # a player-sized change, inside a player box
+    players = [{"box": [100, 50, 130, 110]}]
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    found = difference_candidates(prev, cur, identity, players, diameter=6)
+    assert len(found) == 1
+    assert abs(found[0]["x"] - 302.5) < 1.5 and found[0]["source"] == "motion"
+    assert found[0]["confidence"] <= 0.3
+
+
+def test_motion_only_chains_need_to_be_long_and_stay_low_confidence():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    def run(n, source):
+        frames = [
+            {"scene": 0, "ball": None,
+             "ballCandidates": [{"x": 100 + 10 * i, "y": 100, "box": None, "confidence": 0.2, "source": source}]}
+            for i in range(n)
+        ]
+        return confirm_chains(frames, [identity] * n, diagonal=734)
+    assert run(4, "motion") == {}  # four socks in a row are not a ball
+    promoted = run(7, "motion")
+    assert len(promoted) == 7 and max(p["confidence"] for p in promoted.values()) <= 0.4
+
+
+def test_implausibly_fast_jumps_do_not_join_a_chain():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = [
+        {"scene": 0, "ball": None,
+         "ballCandidates": [{"x": 100 + (300 if i % 2 else 0), "y": 100, "box": None, "confidence": 0.2}]}
+        for i in range(6)
+    ]
+    assert confirm_chains(frames, [identity] * 6, diagonal=734) == {}
+
+
+def test_stationary_ball_survives_an_accelerating_pan():
+    """Camera compensation must cancel motion, not double it: an accelerating pan
+    used to break every chain that a constant pan happened to keep."""
+    from app.vision.faint import confirm_chains
+
+    pans = [0, 0, 0, 150, 200, 200, 200, 200, 200]
+    x, frames, matrices = 1400.0, [], []
+    for pan in pans:
+        x -= pan  # the pitch (and the ball on it) shifts left as the camera pans right
+        frames.append({"scene": 0, "ball": None,
+                       "ballCandidates": [{"x": x, "y": 500.0, "box": None, "confidence": 0.2}]})
+        matrices.append(np.array([[1.0, 0, -pan], [0, 1.0, 0]]))
+    promoted = confirm_chains(frames, matrices, diagonal=2203)
+    assert sorted(promoted) == list(range(len(pans)))
+
+
+def test_gates_stay_in_current_pixels_after_a_long_zoom():
+    """A minute of zooming must not change what 'plausible speed' means after the next cut."""
+    from app.vision.faint import confirm_chains
+
+    zoom = np.array([[1.2, 0, 0], [0, 1.2, 0]])
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames, matrices = [], []
+    for i in range(10):  # scene 0: static noise candidate while the camera zooms in
+        frames.append({"scene": 0, "ball": None,
+                       "ballCandidates": [{"x": 5.0 * 1.2**i, "y": 5.0 * 1.2**i, "box": None, "confidence": 0.05}]})
+        matrices.append(zoom if i else identity)
+    for i in range(8):  # scene 1: a clean 30 px/frame ball path
+        frames.append({"scene": 1, "ball": None,
+                       "ballCandidates": [{"x": 100.0 + 30 * i, "y": 200.0, "box": None, "confidence": 0.2}]})
+        matrices.append(None if i == 0 else identity)
+    promoted = confirm_chains(frames, matrices, diagonal=734)
+    assert sorted(promoted) == list(range(10, 18))
+
+
+def test_a_weaker_parallel_chain_cannot_overwrite_a_stronger_one():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = [
+        {"scene": 0, "ball": None, "ballCandidates": [
+            {"x": 100.0 + 12 * i, "y": 100.0, "box": None, "confidence": 0.5},
+            {"x": 400.0 + 12 * i, "y": 300.0, "box": None, "confidence": 0.12, "source": "motion"},
+        ]}
+        for i in range(8)
+    ]
+    promoted = confirm_chains(frames, [identity] * 8, diagonal=734)
+    assert len(promoted) == 8
+    assert all(promoted[i]["x"] == 100.0 + 12 * i for i in range(8))
+    assert all(promoted[i].get("source") != "motion" for i in range(8))
+
+
+def test_motion_blobs_never_drive_the_online_tracker():
+    from app.vision.faint import strong_candidates
+
+    candidates = [
+        {"x": 1, "y": 1, "confidence": 0.4, "source": "motion"},
+        {"x": 2, "y": 2, "confidence": 0.2},
+        {"x": 3, "y": 3, "confidence": 0.1},
+    ]
+    assert strong_candidates(candidates) == [{"x": 2, "y": 2, "confidence": 0.2}]
+
+
+def test_speed_gates_scale_with_sparser_sampling():
+    """A 30 px/frame path at 6 fps is a 60 px/frame path at 3 fps; both are the same ball."""
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    fast = [
+        {"scene": 0, "ball": None,
+         "ballCandidates": [{"x": 50.0 + 130 * i, "y": 100.0, "box": None, "confidence": 0.2}]}
+        for i in range(5)
+    ]
+    assert confirm_chains(fast, [identity] * 5, diagonal=734, sample_fps=6) == {}
+    assert sorted(confirm_chains(fast, [identity] * 5, diagonal=734, sample_fps=3)) == [0, 1, 2, 3, 4]
+
+
+def test_only_weak_unattended_static_balls_are_dropped_as_markings():
+    from app.vision.faint import drop_static_balls
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    weak = {"x": 50.0, "y": 50.0, "box": [48, 48, 52, 52], "confidence": 0.3, "trackId": -1,
+            "recovered": True}
+    strong = {**weak, "confidence": 0.5, "trackId": 3, "recovered": False}
+    marking = [{"scene": 0, "players": [], "ball": dict(weak)} for _ in range(20)]
+    assert drop_static_balls(marking, [identity] * 20, 734, sample_fps=5) == 20
+    assert all(f["ball"] is None for f in marking)
+    # A confident detection of a dead ball (kick-off, corner) is an observation...
+    set_piece = [{"scene": 0, "players": [], "ball": dict(strong)} for _ in range(20)]
+    assert drop_static_balls(set_piece, [identity] * 20, 734, sample_fps=5) == 0
+    # ...but a confident "ball" nobody touches for half a minute is a marking or a logo.
+    logo = [{"scene": 0, "players": [], "ball": dict(strong)} for _ in range(150)]
+    assert drop_static_balls(logo, [identity] * 150, 734, sample_fps=5) == 150
+    # A weak but attended ball is a player standing over it, not a logo.
+    attended = [{"scene": 0, "players": [{"team": 0, "box": [40, 10, 60, 52]}], "ball": dict(weak)}
+                for _ in range(20)]
+    assert drop_static_balls(attended, [identity] * 20, 734, sample_fps=5) == 0
+    # Slow drift (2 px/frame) is a rolling ball: measured from the run's origin, not the last frame.
+    rolling = [{"scene": 0, "players": [], "ball": {**weak, "x": 50.0 + 2 * i}} for i in range(20)]
+    assert drop_static_balls(rolling, [identity] * 20, 734, sample_fps=5) == 0
+
+
+def test_bridging_uses_the_online_trackers_gate():
+    """Two balls the tracker refused to link (too far for the gap) are never joined."""
+    from app.vision.faint import recover_ball
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for i in range(6):
+        ball = {"x": 100.0 if i < 2 else 1500.0, "y": 100, "box": [0, 0, 4, 4], "confidence": 0.7,
+                "trackId": 1 if i < 2 else 9}
+        frames.append({"t": i * 0.1, "scene": 0, "players": [], "ball": None if i in (2, 3) else ball,
+                       "ballCandidates": []})
+    counts = recover_ball(frames, [identity] * 6, diagonal=2203, sample_fps=10, max_bridge=0.5)
+    assert counts["inferred"] == 0 and frames[2]["ball"] is None
+
+
+def test_pass_candidates_need_an_observed_ball_throughout_the_transfer():
+    from app.vision.metrics import derive_metrics
+
+    a = {"id": 1, "team": 0, "box": [0, 0, 20, 100], "confidence": 0.9}
+    b = {"id": 2, "team": 0, "box": [200, 0, 220, 100], "confidence": 0.9}
+    def frame(i, ball):
+        return {"t": i * 0.2, "scene": 0, "players": [a, b], "ball": ball}
+    at = lambda x, **extra: {"x": x, "y": 100.0, "box": [x - 2, 98, x + 2, 102], "confidence": 0.7,
+                             "trackId": 1, **extra}
+    observed = [frame(0, at(10)), frame(1, at(10)), frame(2, at(105)), frame(3, at(210)), frame(4, at(210))]
+    bridged = [frame(0, at(10)), frame(1, at(10)), frame(2, at(105, inferred=True, observed=False)),
+               frame(3, at(210)), frame(4, at(210))]
+    with_observed = derive_metrics(observed, 5, 1.0)["events"]
+    with_bridged = derive_metrics(bridged, 5, 1.0)["events"]
+    assert with_bridged == []
+    assert len(with_observed) >= len(with_bridged)
+
+
+def test_motion_blobs_never_displace_detector_candidates():
+    from app.vision.engine import merge_candidates
+
+    detector = [{"x": i, "confidence": 0.31 - 0.03 * i} for i in range(8)]
+    motion = [{"x": 100 + i, "confidence": 0.15, "source": "motion"} for i in range(8)]
+    merged = merge_candidates(detector, motion)
+    assert len(merged) == 12
+    assert all(d in merged for d in detector)
+    assert sum(1 for c in merged if c.get("source") == "motion") == 4
+    # A frame with few detector hits leaves room for motion evidence.
+    assert len(merge_candidates(detector[:2], motion)) == 10
+
+
+def test_tiles_scale_with_resolution_but_stay_bounded():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+    calls = []
+
+    class Model:
+        def predict(self, images, **kwargs):
+            calls.append(len(images))
+            return [SimpleNamespace(boxes=SimpleNamespace(xyxy=np.empty((0, 4)), conf=np.empty(0)))
+                    for _ in images]
+
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    assert len(detector.tiles(np.zeros((360, 640, 3), np.uint8))) == 2
+    assert len(detector.tiles(np.zeros((1080, 1920, 3), np.uint8))) == 12
+    # 4K is reduced to 1080p before tiling: same cost, ball still twice the 480p size.
+    tiles = detector.tiles(np.zeros((2160, 3840, 3), np.uint8))
+    assert len(tiles) == 12 and tiles[0][2] == 0.5
+    detector.detect_batch([np.zeros((2160, 3840, 3), np.uint8)] * 8)
+    assert sum(calls) == 96 and max(calls) <= TiledBallDetector.MAX_CROPS
+
+
+def test_4k_detections_map_back_to_source_pixels():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+
+    class Model:
+        def predict(self, images, **kwargs):
+            results = []
+            for image in images:
+                ys, xs = np.where(image[:, :, 0] > 0)
+                boxes = (np.array([[xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]]) if len(xs)
+                         else np.empty((0, 4)))
+                results.append(SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.full(len(boxes), 0.9))))
+            return results
+
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    frame = np.zeros((2160, 3840, 3), np.uint8)
+    frame[1000:1040, 3000:3040] = 255
+    found = detector.detect(frame)
+    assert len(found) == 1
+    assert abs(found[0]["x"] - 3020) <= 3 and abs(found[0]["y"] - 1020) <= 3
+
+
 def test_diagnostic_metrics_use_source_timestamp_offset():
     frames = [frame(120), frame(120.2), frame(120.4), frame(120.6)]
     out = derive_metrics(frames, 5, 0.8, start_seconds=120)
@@ -862,17 +1191,20 @@ def test_focused_ball_search_falls_back_after_miss_and_restores_coordinates():
     class Model:
         calls = 0
 
-        def predict(self, image, **kwargs):
+        def predict(self, images, **kwargs):
             self.calls += 1
-            ys, xs = np.where(image[:, :, 0] > 0)
-            boxes = (
-                np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
-                if len(xs)
-                else np.empty((0, 4))
-            )
-            return [
-                SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.full(len(boxes), 0.8)))
-            ]
+            results = []
+            for image in images:
+                ys, xs = np.where(image[:, :, 0] > 0)
+                boxes = (
+                    np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
+                    if len(xs)
+                    else np.empty((0, 4))
+                )
+                results.append(
+                    SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.full(len(boxes), 0.8)))
+                )
+            return results
 
     detector = TiledBallDetector.__new__(TiledBallDetector)
     detector.model, detector.classes, detector.device = Model(), [0], "cpu"
@@ -885,7 +1217,8 @@ def test_focused_ball_search_falls_back_after_miss_and_restores_coordinates():
     image[276:285, 536:545] = 255
     found = detector.detect(image, focus=[100, 80])
     assert len(found) == 1 and (found[0]["x"], found[0]["y"]) == (540, 280)
-    assert detector.model.calls == 5  # miss triggers all four tiles, no tile repeated
+    # A miss sweeps the remaining tiles in one batched call; no tile is repeated.
+    assert detector.model.calls == 3
 
 
 def test_player_reacquisition_velocity_uses_elapsed_gap():
@@ -937,7 +1270,11 @@ def test_short_diagnostic_reuses_detection_and_survives_unknown_kits(tmp_path, m
     monkeypatch.setattr(ultralytics, "YOLO", lambda path: Model())
     monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
     monkeypatch.setattr(
-        engine, "create_ball_detector", lambda *args: SimpleNamespace(detect=lambda *a, **k: [])
+        engine,
+        "create_ball_detector",
+        lambda *args: SimpleNamespace(
+            detect=lambda *a, **k: [], detect_batch=lambda frames, **k: [[] for _ in frames]
+        ),
     )
     result = engine.run_video(
         video, tmp_path / "result.json", start_seconds=1, max_seconds=1, sample_fps=6

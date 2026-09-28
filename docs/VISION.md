@@ -113,3 +113,49 @@ swatch need not look like the complete shirt pattern.
 
 The report now synchronizes overlays with decoded video-frame callbacks in
 supported browsers. Older browsers retain native time-update handling.
+
+## Engine 2.0: faint-object ball pipeline
+
+A ball at 360p is a handful of pixels that rarely passes a detector's confidence
+threshold in any single frame, yet it traces a smooth path across frames. The
+engine now borrows the approach astronomers use for faint moving objects
+(track-before-detect, "shift-and-stack"): keep weak evidence, confirm it by
+consistency over time.
+
+1. **Weak candidates kept.** The ball detector runs at 5% confidence; up to
+   12 candidates per frame are kept in memory for the confirmation pass
+   (motion blobs never displace detector responses). They are written to the
+   result only with `VISION_KEEP_CANDIDATES=1`, for tuning.
+2. **Difference imaging.** After cancelling camera motion with the per-frame
+   affine, consecutive frames are subtracted (signed: where the picture got
+   brighter, so a light ball does not leave a ghost behind); small, round, fast-moving blobs
+   of ball size (about 1/8 of a player's height) inside the dilated pitch mask
+   become extra low-confidence candidates (`source: "motion"`, at most 0.15).
+   They only ever feed the confirmation step; the frame-by-frame ball tracker
+   sees detector responses alone.
+3. **Track-before-detect.** `faint.confirm_chains` links candidates across up
+   to six sampled frames when they follow a near-constant velocity (tolerance
+   3% of the frame diagonal per frame, top speed 15% per frame). Earlier
+   candidates are carried into the current frame's pixels through the
+   intervening camera transforms, so the gates mean the same thing after a
+   zoom or a pan. Chains of at least three members with enough summed evidence
+   are promoted to observed ball positions (`recovered: true`); a stronger
+   chain always keeps its frames against a weaker parallel one. Motion-only
+   chains must be twice as long and are capped at 0.4 confidence; chains with
+   neural corroboration at 0.6.
+4. **Gap bridging.** Up to 0.5 s of missing positions between two observations
+   that the online tracker's own distance gate would link are interpolated and
+   marked `inferred: true`. They count for possession continuity but never as
+   observed frames (`ballFramesInferred`), and pass candidates require an
+   observed ball throughout the transfer.
+5. **Static rejection.** A "ball" that does not drift after camera
+   compensation, with no player within a body height of it, is a marking or a
+   logo and is removed: after three seconds for weak evidence (chain-recovered
+   or detector confidence below 0.3), after twenty seconds for confident
+   detections, so a dead ball at a set piece is kept.
+6. **Resolution-aware tiling and batching.** The tiled football ball model
+   sees 480-pixel native tiles upscaled to 640, so a 240p or 1080p frame both
+   present the ball near its training scale; all tiles of a batch of frames go
+   through the model in one call (`VISION_BATCH`).
+
+Run `VISION_FAINT=0` to compare against single-frame detection.

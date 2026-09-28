@@ -272,6 +272,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
                               fill="none"
                               stroke="#f8ef3d"
                               strokeWidth="2"
+                              strokeDasharray={frame.ball.inferred ? "3 3" : undefined}
+                              opacity={frame.ball.inferred ? 0.7 : 1}
                             />
                             <text
                               x={frame.ball.x + 9}
@@ -281,7 +283,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                               strokeWidth=".3"
                               fontSize="10"
                             >
-                              ball
+                              {frame.ball.inferred ? "ball (inferred)" : "ball"}
                             </text>
                           </>
                         )}
@@ -300,7 +302,11 @@ export function VisionReport({ jobId }: { jobId: string }) {
                     <p className="text-pitch-muted">
                       {clockTime(time)} · {frame?.players.length ?? 0} visible
                       tracks ·{" "}
-                      {frame?.ball ? "ball detected" : "ball not observed"}
+                      {frame?.ball
+                        ? frame.ball.inferred
+                          ? "ball inferred between observations"
+                          : "ball detected"
+                        : "ball not observed"}
                     </p>
                   </div>
                   <p className="text-xs text-pitch-muted">
@@ -428,7 +434,7 @@ function DetectionTimeline({
         return {
           start,
           rate: frames.length
-            ? frames.filter((f) => f.ball).length / frames.length
+            ? frames.filter((f) => f.ball && !f.ball.inferred).length / frames.length
             : 0,
         };
       }),

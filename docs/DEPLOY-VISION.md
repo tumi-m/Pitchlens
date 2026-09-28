@@ -155,3 +155,9 @@ Modal → Settings → Usage & billing.
 - The upload page defaults to 6 analysed frames/second when a GPU is
   available; 10 fps follows the ball best and costs proportionally more.
 - Modal → Settings → Usage & billing shows the cost per run ("Ephemeral Apps").
+
+### Engine tuning variables
+
+- `VISION_BATCH`: frames per model call (default 8 on GPU, 2 on CPU).
+- `VISION_FAINT=0`: turn off track-before-detect ball recovery (default on).
+- `VISION_THREADS`: CPU threads for inference.

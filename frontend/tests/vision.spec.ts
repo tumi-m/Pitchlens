@@ -208,12 +208,19 @@ test("a YouTube link is sent to the worker only after the rights confirmation", 
 });
 
 
-test("corrupt footage is rejected before an upload is reserved", async ({ page }) => {
-  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true } }));
+test("undecodable footage warns, skips the short test and still allows the upload", async ({ page }) => {
+  // A browser without the codec (HEVC in Firefox/Linux Chromium) looks exactly
+  // like a corrupt file from here; the analysis server is the one that decides.
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, diagnostics: true } }));
   const calls = await mockChunkedWorker(page);
   await page.goto("/upload");
   await page.getByLabel("Video for computer vision").setInputFiles({name: "broken.mp4", mimeType: "video/mp4", buffer: Buffer.from("not a video")});
   await expect(page.getByRole("alert").filter({ hasText: "could not decode" })).toBeVisible();
-  await expect(page.getByRole("button", {name: "Analyse video automatically", exact: true})).toBeDisabled();
+  await expect(page.getByRole("heading", { name: "Video checked on your device" })).toHaveCount(0);
   expect(calls.created).toBe(0);
+  await expect(page.getByRole("button", {name: "Analyse video automatically", exact: true})).toBeEnabled();
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Detecting players", exact: true })).toBeVisible();
+  expect(calls.created).toBe(1);
+  expect(calls.diagnostic).not.toBe("true");
 });

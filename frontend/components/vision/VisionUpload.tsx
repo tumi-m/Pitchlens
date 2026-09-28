@@ -2,10 +2,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
-import { inspectVideo, VideoPreflight } from "@/lib/review/preflight";
+import { inspectVideo, PreflightRejected, VideoPreflight } from "@/lib/review/preflight";
 import { clockTime } from "@/lib/review/vision";
 import { Navbar } from "@/components/ui/Navbar";
 import { AnimatePresence, motion } from "framer-motion";
+import { gradeFootage } from "@/lib/review/footageCheck";
 import {
   VisionHealth,
   VisionError,
@@ -36,10 +37,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [adaptive, setAdaptive] = useState(false);
   const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
   const [checking, setChecking] = useState(false);
+  /** The browser could not decode the file (codec gap or corrupt); the server decides. */
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const [rejected, setRejected] = useState(false);
   const [diagnostic, setDiagnostic] = useState(false);
   const [start, setStart] = useState(0);
   useEffect(() => {
     setPreflight(null);
+    setPreviewFailed(false);
+    setRejected(false);
     setStart(0);
     if (!file) { setChecking(false); return; }
     const controller = new AbortController();
@@ -47,11 +53,24 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     inspectVideo(file, controller.signal).then((result) => {
       if (!controller.signal.aborted) setPreflight(result);
     }).catch((e) => {
-      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Video check failed");
+      if (controller.signal.aborted) return;
+      if (e instanceof PreflightRejected) {
+        setRejected(true);
+        setError(e.message);
+      } else {
+        // HEVC .mov from a phone in Firefox or Linux Chromium ends here although the
+        // analysis server decodes it fine: warn, drop the short test, allow the upload.
+        setPreviewFailed(true);
+        setDiagnostic(false);
+      }
     }).finally(() => { if (!controller.signal.aborted) setChecking(false); });
     return () => controller.abort();
   }, [file]);
-  const ready = source === "file" ? !!file && !!preflight && !checking : linkOk && rights;
+  const check = preflight
+    ? gradeFootage(preflight.width, preflight.height, preflight.duration, preflight.motion)
+    : null;
+  const ready =
+    source === "file" ? !!file && !checking && !rejected : linkOk && rights;
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
   const upload = useRef<AbortController | null>(null);
@@ -339,34 +358,156 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </label>
             </div>
           )}
-          {source === "file" && checking && <p role="status">Checking video on this device before upload…</p>}
-          {source === "file" && preflight && (
-            <section className="glass-card p-5 space-y-4" aria-label="Video readiness">
-              <h2 className="font-semibold">Video checked on your device</h2>
-              <p className="text-sm">{preflight.width} × {preflight.height} · {clockTime(preflight.duration)} · No video uploaded yet.</p>
-              <div className="grid grid-cols-3 gap-2">
-                {preflight.samples.map((sample) => (
-                  <button key={sample.t} type="button" disabled={busy} className="text-xs text-left"
-                    onClick={() => { setStart(Math.max(0, Math.floor(sample.t))); setDiagnostic(health?.diagnostics === true); }}>
-                    {/* Native image: these are local canvas previews, not remote assets. */}
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={sample.image} alt={`Video sample at ${clockTime(sample.t)}`} className="rounded w-full" />
-                    Test from {clockTime(sample.t)}
-                  </button>
-                ))}
-              </div>
-              {preflight.height <= 360 && <p className="text-sm text-amber-200">Low-resolution footage is supported. A ball only a few pixels wide may be indistinguishable from markings or compression noise; test a short section with visible play first.</p>}
-              <label className="flex gap-2 text-sm"><input type="checkbox" checked={diagnostic} disabled={busy || !health?.diagnostics}
-                onChange={(e) => setDiagnostic(e.target.checked)} />Test 20 seconds before analysing the full match</label>
-              {!health?.diagnostics && <p className="text-sm text-amber-200">This worker needs an update to support short tests. Submitting now analyses the full video.</p>}
-              {diagnostic && <label className="block text-sm">Test start (seconds)
-                <input aria-label="Test start (seconds)" type="number" min="0" max={Math.max(0, Math.ceil(preflight.duration) - 1)} step="1"
-                  value={start} disabled={busy} className="pitch-input ml-3 w-28"
-                  onChange={(e) => setStart(Math.max(0, Math.min(Math.ceil(preflight.duration) - 1, Math.floor(Number(e.target.value) || 0))))} />
-              </label>}
-              <p className="text-xs text-pitch-muted">{Math.ceil((diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) * Number(fps)).toLocaleString()} frames requested. The short test still transfers the file to the analysis server; only the selected section is analysed. Detection coverage is not an accuracy score.</p>
-            </section>
+          {source === "file" && checking && (
+            <p role="status" className="text-sm text-pitch-muted">
+              Checking the video on this device before upload…
+            </p>
           )}
+          {source === "file" && previewFailed && !checking && (
+            <p
+              role="alert"
+              className="border border-amber-500/40 bg-amber-500/10 rounded-xl p-4 text-sm"
+            >
+              This browser could not decode the video, so the footage grade and the 20-second
+              test are unavailable here. The analysis server decodes files itself (H.264 and
+              HEVC); you can still analyse the full match. If the server rejects it too, export
+              it as an H.264 MP4.
+            </p>
+          )}
+          <AnimatePresence>
+            {source === "file" && preflight && check && (
+              <motion.section
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+                className="glass-card p-5 space-y-4"
+                aria-label="Video readiness"
+                aria-live="polite"
+              >
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <h2 className="font-semibold">Video checked on your device</h2>
+                    <p className="text-sm text-pitch-muted">
+                      {preflight.width} × {preflight.height} · {clockTime(preflight.duration)} · ball ≈{" "}
+                      {check.ballPixels}px wide · No video uploaded yet.
+                    </p>
+                  </div>
+                  <span
+                    className="px-3 py-1 rounded-full text-sm font-bold shrink-0"
+                    style={{
+                      background:
+                        check.grade === "great"
+                          ? "#22c55e"
+                          : check.grade === "good"
+                            ? "#84cc16"
+                            : check.grade === "limited"
+                              ? "#f59e0b"
+                              : "#ef4444",
+                      color: "#0b0f1a",
+                    }}
+                  >
+                    {check.score}/100 · {check.grade}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                  <motion.div
+                    className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
+                    initial={{ width: 0 }}
+                    animate={{ width: `${check.score}%` }}
+                    transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+                  />
+                </div>
+                <ul className="text-sm text-pitch-muted space-y-1">
+                  {check.notes.map((n) => (
+                    <li key={n}>· {n}</li>
+                  ))}
+                  {check.height <= 360 && (
+                    <li>
+                      · Low-resolution footage is supported: faint balls are confirmed across
+                      frames rather than one frame at a time. Test a short section with visible
+                      play first.
+                    </li>
+                  )}
+                  {check.grade === "great" && check.notes.length <= 1 && (
+                    <li>· One fixed, high camera showing the whole pitch gives the best results.</li>
+                  )}
+                </ul>
+                <div className="grid grid-cols-3 gap-2">
+                  {preflight.samples.map((sample) => (
+                    <button
+                      key={sample.t}
+                      type="button"
+                      disabled={busy}
+                      className="text-xs text-left"
+                      onClick={() => {
+                        setStart(Math.max(0, Math.floor(sample.t)));
+                        setDiagnostic(health?.diagnostics === true);
+                      }}
+                    >
+                      {/* Native image: these are local canvas previews, not remote assets. */}
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={sample.image}
+                        alt={`Video sample at ${clockTime(sample.t)}`}
+                        className="rounded w-full"
+                      />
+                      Test from {clockTime(sample.t)}
+                    </button>
+                  ))}
+                </div>
+                <label className="flex gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={diagnostic}
+                    disabled={busy || !health?.diagnostics}
+                    onChange={(e) => setDiagnostic(e.target.checked)}
+                  />
+                  Test 20 seconds before analysing the full match
+                </label>
+                {!health?.diagnostics && (
+                  <p className="text-sm text-amber-200">
+                    This worker needs an update to support short tests. Submitting now analyses
+                    the full video.
+                  </p>
+                )}
+                {diagnostic && (
+                  <label className="block text-sm">
+                    Test start (seconds)
+                    <input
+                      aria-label="Test start (seconds)"
+                      type="number"
+                      min="0"
+                      max={Math.max(0, Math.ceil(preflight.duration) - 1)}
+                      step="1"
+                      value={start}
+                      disabled={busy}
+                      className="pitch-input ml-3 w-28"
+                      onChange={(e) =>
+                        setStart(
+                          Math.max(
+                            0,
+                            Math.min(
+                              Math.ceil(preflight.duration) - 1,
+                              Math.floor(Number(e.target.value) || 0),
+                            ),
+                          ),
+                        )
+                      }
+                    />
+                  </label>
+                )}
+                <p className="text-xs text-pitch-muted">
+                  {Math.ceil(
+                    (diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) *
+                      Number(fps),
+                  ).toLocaleString()}{" "}
+                  frames requested. The short test still transfers the file to the analysis
+                  server; only the selected section is analysed. Detection coverage is not an
+                  accuracy score.
+                </p>
+              </motion.section>
+            )}
+          </AnimatePresence>
           <label className="block text-sm">
             Match title
             <input

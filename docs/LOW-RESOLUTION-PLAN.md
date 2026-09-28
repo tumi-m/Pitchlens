@@ -124,3 +124,13 @@ Different precision, calibration and tracking state prevent interpreting this as
 an accuracy gain. These timings compare two complete configurations, not just the
 search algorithm; they do not predict deployed GPU latency. No verified passes
 were recovered. Use the saved overlays to inspect errors before a full-match run.
+
+## Engine 2.0 (merged)
+
+The bounded diagnostics above are the measurement side. The detection side is
+the faint-object pipeline described in `docs/VISION.md` ("Engine 2.0"): weak
+detector candidates plus camera-compensated difference imaging, confirmed by
+trajectory consistency across frames, gap bridging marked `inferred`, static
+rejection, batched tiled inference and a browser-side footage grade before
+upload. Adaptive ball search, agnostic NMS, calibration reuse, the kit
+fallback and the `performance` timings from this plan are all kept.

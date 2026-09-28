@@ -15,6 +15,12 @@ from threadpoolctl import threadpool_limits
 
 from app.vision.ball import TiledBallDetector, create_ball_detector
 from app.vision.ball_tracking import BallTracker
+from app.vision.faint import (
+    ball_size_prior,
+    difference_candidates,
+    recover_ball,
+    strong_candidates,
+)
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
 from app.vision.tracking import MotionTracker, camera_motion
@@ -65,6 +71,36 @@ def probe(path):
         cap.release()
 
 
+def colour_signature(frame):
+    """Normalised hue/saturation histogram: stable under pans, changes at cuts."""
+    small = cv2.resize(frame, (160, 90))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [30, 16], [0, 180, 0, 256])
+    return cv2.normalize(hist, hist).astype(np.float32)
+
+
+def vote_teams(frames):
+    """Give every observation of a track the team it was assigned most often.
+
+    Per-frame colour on a 50-pixel player is noisy; the track as a whole is not.
+    Only tracks with at least 3 confident votes and a 60% majority are relabelled.
+    """
+    votes = {}
+    for f in frames:
+        for p in f["players"]:
+            if p["team"] in (0, 1):
+                votes.setdefault(p["id"], [0, 0])[p["team"]] += 1
+    decided = {}
+    for track, (a, b) in votes.items():
+        if a + b >= 3 and max(a, b) / (a + b) >= 0.6:
+            decided[track] = 0 if a >= b else 1
+    for f in frames:
+        for p in f["players"]:
+            if p["id"] in decided and p.get("role") in (None, "person", "player"):
+                p["team"] = decided[p["id"]]
+    return frames
+
+
 def field_mask(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([25, 35, 30]), np.array([95, 255, 255]))
@@ -78,17 +114,34 @@ def field_mask(frame):
     return result
 
 
-def jersey(frame, box):
+def pitch_colour(frame, mask):
+    """Median LAB colour of the detected playing surface in this frame, if any."""
+    if mask is None or not mask.any():
+        return None
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    return np.median(lab[mask > 0][::17], axis=0).astype(float)
+
+
+def jersey(frame, box, pitch=None):
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     patch = frame[
-        max(0, int(y1 + h * 0.18)) : int(y1 + h * 0.48),
-        max(0, int(x1 + w * 0.25)) : int(x2 - w * 0.25),
+        max(0, int(y1 + h * 0.15)) : int(y1 + h * 0.55),
+        max(0, int(x1 + w * 0.2)) : int(x2 - w * 0.2),
     ]
     if patch.size == 0:
         return None
     # White and dark kits are valid colours too. A saturation gate discarded them.
+    # Grass showing around a small player drags every kit towards grey-green:
+    # drop pitch-coloured pixels before taking the median.
+    # Compare against this frame's measured pitch colour, not a fixed green
+    # band, so a green or mint kit that differs from the grass survives.
     pixels = patch.reshape(-1, 3)
+    if pitch is not None:
+        lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(float)
+        grass = np.linalg.norm(lab - pitch, axis=1) < 18
+        if (~grass).sum() >= 6:
+            pixels = pixels[~grass]
     if len(pixels) < 3:
         return None
     colour = np.median(pixels, axis=0).astype(np.uint8)
@@ -141,6 +194,14 @@ def assign_team(feature, centres, use_hue=True):
     return (
         idx if distances[idx] < 50 and abs(distances[0] - distances[1]) > 12 and hue_matches else -1
     )
+
+
+def merge_candidates(detector, motion, limit=12):
+    """Keep at most `limit` candidates per frame without letting motion blobs
+    (which all saturate at the same low confidence) push out the faint detector
+    responses the confirmation pass exists to keep."""
+    n_motion = min(len(motion), max(4, limit - len(detector)))
+    return detector[: limit - n_motion] + motion[:n_motion]
 
 
 def run_video(
@@ -198,11 +259,12 @@ def run_video(
     if not people:
         raise ValueError("Player model must contain a named person/player class.")
 
-    def detect(frame):
+    def detect_batch(batch):
+        """Player detection for a list of frames in one model call."""
         tick = time.monotonic()
-        r = model.predict(
-            frame,
-            conf=0.18,
+        results = model.predict(
+            batch,
+            conf=0.15,
             imgsz=1280 if "player" in names.values() else 960,
             classes=people,
             # One person can receive conflicting player/referee/keeper labels.
@@ -212,13 +274,26 @@ def run_video(
             # FP16 on a GPU roughly doubles throughput at no practical accuracy cost.
             quantize=16 if device.startswith("cuda") else None,
             verbose=False,
-        )[0]
-        boxes = r.boxes.xyxy.cpu().numpy()
-        scores = r.boxes.conf.cpu().numpy()
-        classes = r.boxes.cls.cpu().numpy().astype(int)
+        )
         timings["playerInferenceSeconds"] += time.monotonic() - tick
         timings["playerInferenceCalls"] += 1
-        return boxes, scores, classes
+        return [
+            (
+                r.boxes.xyxy.cpu().numpy(),
+                r.boxes.conf.cpu().numpy(),
+                r.boxes.cls.cpu().numpy().astype(int),
+            )
+            for r in results
+        ]
+
+    def detect(frame):
+        return detect_batch([frame])[0]
+
+    # Batches amortise model overhead; a GPU processes 8 frames almost as fast as one.
+    batch_size = max(1, int(os.getenv("VISION_BATCH", "8" if device.startswith("cuda") else "2")))
+    # Adaptive search keys each frame's ball search on the previous frame's ball,
+    # so ball inference runs frame by frame in that mode.
+    adaptive = isinstance(ball_detector, TiledBallDetector) and ball_search == "adaptive"
 
     progress(stage="Learning kit colours from the footage", progress=1)
     cap = cv2.VideoCapture(str(path))
@@ -250,9 +325,10 @@ def run_video(
             boxes, scores, classes = detect(frame)
             calibration[frame_index] = (boxes, scores, classes)
             mask = field_mask(frame)
+            pitch = pitch_colour(frame, mask)
             for box, c in zip(boxes, classes):
                 if names[c].lower() in ("person", "player") and inside_field(mask, box):
-                    f = jersey(frame, box)
+                    f = jersey(frame, box, pitch)
                     if f is not None:
                         features.append(f)
             progress(
@@ -291,6 +367,112 @@ def run_video(
         progress=5,
         processedSeconds=0,
     )
+    matrices = []  # per sampled frame: affine mapping the previous frame into this one
+    pending = []  # decoded frames awaiting a batched detection
+
+    def process(batch):
+        nonlocal previous_gray, previous_frame, previous_boxes, previous_ball, last_sweep
+        nonlocal scene, reported
+        # Calibration already detected some of these frames; only run the rest.
+        detections = [calibration.pop(index, None) for _, _, index in batch]
+        missing = [i for i, d in enumerate(detections) if d is None]
+        if missing:
+            for i, d in zip(missing, detect_batch([batch[i][1] for i in missing])):
+                detections[i] = d
+        if adaptive:
+            ball_batches = [None] * len(batch)
+        else:
+            tick = time.monotonic()
+            ball_batches = ball_detector.detect_batch([b[1] for b in batch], threshold=0.05)
+            timings["ballInferenceSeconds"] += time.monotonic() - tick
+        for (t, frame, _), (boxes, scores, classes), raw_candidates in zip(
+            batch, detections, ball_batches
+        ):
+            mask = field_mask(frame)
+            pitch = pitch_colour(frame, mask)
+            gray = colour_signature(frame)
+            tick = time.monotonic()
+            matrix, motion_ok = camera_motion(previous_frame, frame, previous_boxes)
+            timings["cameraMotionSeconds"] += time.monotonic() - tick
+            # A fast pan or zoom defeats motion estimation but keeps the colour
+            # make-up of the shot; a real cut changes it. Pixel differences alone
+            # flagged every quick pan as a cut and reset all tracks.
+            cut = (
+                previous_gray is not None
+                and not motion_ok
+                and cv2.compareHist(gray, previous_gray, cv2.HISTCMP_BHATTACHARYYA) > 0.5
+            )
+            if cut:
+                scene += 1
+            previous_gray = gray
+            observations = [
+                {
+                    "team": assign_team(jersey(frame, box, pitch), centres, use_hue=not role_aware)
+                    if centres is not None and names[c].lower() in ("person", "player")
+                    else -1,
+                    "role": names[c].lower(),
+                    "box": [round(float(x), 1) for x in box],
+                    "confidence": round(float(score), 3),
+                }
+                for box, score, c in zip(boxes, scores, classes)
+                if c in people and inside_field(mask, box)
+            ]
+            players = tracker.update(observations, t, matrix, cut=cut)
+            if raw_candidates is None:
+                # Adaptive: look where the ball just was first, sweep the whole
+                # frame when that tile is empty or ambiguous, and at least twice a second.
+                focus = None
+                if previous_ball is not None and not cut and motion_ok and t - last_sweep < 0.5:
+                    focus = matrix @ np.array([previous_ball["x"], previous_ball["y"], 1.0])
+                if focus is None:
+                    last_sweep = t
+                tick = time.monotonic()
+                raw_candidates = ball_detector.detect(frame, threshold=0.05, focus=focus)
+                timings["ballInferenceSeconds"] += time.monotonic() - tick
+            # Weak neural candidates plus difference-imaging candidates; the
+            # track-before-detect pass after the loop decides which are real.
+            diameter = ball_size_prior(players, frame.shape[0])
+            detector = sorted(raw_candidates, key=lambda c: -c["confidence"])
+            motion = []
+            if motion_ok and not cut:
+                motion = difference_candidates(
+                    previous_frame, frame, matrix, players, diameter, mask=mask
+                )
+            candidates = merge_candidates(detector, motion)
+            strong = strong_candidates(candidates)
+            previous_frame = frame
+            previous_boxes = [p["box"] for p in players]
+            # Airborne balls can be outside the green surface; temporal association
+            # resolves candidates instead of rejecting them by background colour.
+            ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
+            previous_ball = ball
+            matrices.append(None if cut or not motion_ok else matrix)
+            frames.append(
+                {
+                    "t": round(t, 3),
+                    "scene": scene,
+                    "players": players,
+                    "ball": ball,
+                    "ballCandidates": candidates,
+                }
+            )
+            # Report on wall time, not frame count: a slow CPU host can take
+            # minutes per 50 frames, which looks frozen.
+            now = time.monotonic()
+            if now - reported >= 3:
+                reported = now
+                elapsed = now - started
+                done = t - start_seconds
+                progress(
+                    stage="Detecting players, tracking kits and following the ball",
+                    progress=round(5 + done / duration * 88, 1),
+                    processedSeconds=round(done, 1),
+                    elapsedSeconds=round(elapsed),
+                    etaSeconds=round(
+                        elapsed / max(done + 1 / effective_fps, 0.1) * max(0, duration - done)
+                    ),
+                )
+
     try:
         while frame_num / meta["fps"] < start_seconds + duration:
             if cancelled():
@@ -302,7 +484,7 @@ def run_video(
                 # Container frame counts are estimates: trimmed clips (edit lists)
                 # routinely declare several seconds more than they hold. The real
                 # end of the stream is the end of the analysis, reported below.
-                if frames:
+                if frames or pending:
                     break
                 raise ValueError("Video decoding stopped before the requested duration.")
             if (frame_num - first_frame) % stride:
@@ -312,7 +494,7 @@ def run_video(
             ok, frame = cap.retrieve()
             timings["decodeSeconds"] += time.monotonic() - tick
             if not ok:
-                if frames:
+                if frames or pending:
                     break
                 raise ValueError("Video decoding stopped before the end.")
             # Phone footage is often variable frame rate: prefer the decoder's
@@ -329,98 +511,53 @@ def run_video(
                 and abs(position - index_time) <= 0.5
                 else index_time
             )
-            if frames and t <= last_t:
+            if (frames or pending) and t <= last_t:
                 t = last_t + 1 / meta["fps"]
             last_t = t
-            mask = field_mask(frame)
-            gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
-            tick = time.monotonic()
-            matrix, motion_ok = camera_motion(previous_frame, frame, previous_boxes)
-            timings["cameraMotionSeconds"] += time.monotonic() - tick
-            cut = (
-                previous_gray is not None
-                and not motion_ok
-                and np.mean(cv2.absdiff(gray, previous_gray)) > 38
-            )
-            if cut:
-                scene += 1
-            previous_gray = gray
-            cached = calibration.pop(frame_num, None)
-            boxes, scores, classes = cached if cached is not None else detect(frame)
-            observations = [
-                {
-                    "team": assign_team(jersey(frame, box), centres, use_hue=not role_aware)
-                    if centres is not None and names[c].lower() in ("person", "player")
-                    else -1,
-                    "role": names[c].lower(),
-                    "box": [round(float(x), 1) for x in box],
-                    "confidence": round(float(score), 3),
-                }
-                for box, score, c in zip(boxes, scores, classes)
-                if c in people and inside_field(mask, box)
-            ]
-            players = tracker.update(observations, t, matrix, cut=cut)
-            previous_frame = frame
-            previous_boxes = [p["box"] for p in players]
-            tick = time.monotonic()
-            if isinstance(ball_detector, TiledBallDetector) and ball_search == "adaptive":
-                focus = None
-                if previous_ball is not None and not cut and motion_ok and t - last_sweep < 0.5:
-                    focus = matrix @ np.array([previous_ball["x"], previous_ball["y"], 1.0])
-                if focus is None:
-                    last_sweep = t
-                candidates = ball_detector.detect(frame, threshold=0.15, focus=focus)
-            else:
-                candidates = ball_detector.detect(frame, threshold=0.15)
-            timings["ballInferenceSeconds"] += time.monotonic() - tick
-            # Airborne balls can be outside the green surface; temporal association
-            # resolves candidates instead of rejecting them by background colour.
-            ball = ball_tracker.update(candidates, t, matrix, frame.shape, cut=cut)
-            previous_ball = ball
-            frames.append(
-                {
-                    "t": round(t, 3),
-                    "scene": scene,
-                    "players": players,
-                    "ball": ball,
-                    "ballCandidates": candidates,
-                }
-            )
-            # Report on wall time, not frame count: a slow CPU host can take
-            # minutes per 50 frames, which looks frozen.
-            now = time.monotonic()
-            if now - reported >= 3:
-                reported = now
-                elapsed = now - started
-                progress(
-                    stage="Detecting players, tracking kits and following the ball",
-                    progress=round(5 + (t - start_seconds) / duration * 90, 1),
-                    processedSeconds=round(t - start_seconds, 1),
-                    elapsedSeconds=round(elapsed),
-                    etaSeconds=round(
-                        elapsed
-                        / max(t - start_seconds + 1 / effective_fps, 0.1)
-                        * max(0, duration - (t - start_seconds))
-                    ),
-                )
+            pending.append((t, frame, frame_num))
+            if len(pending) >= batch_size:
+                process(pending)
+                pending = []
             frame_num += 1
+        if pending:
+            process(pending)
+            pending = []
     finally:
         cap.release()
     if not frames or not any(f["players"] for f in frames):
         raise ValueError(
             "No on-pitch players detected. This video cannot be analysed by the installed model."
         )
+    progress(stage="Confirming faint ball tracks across frames", progress=94)
+    tick = time.monotonic()
+    diagonal = math.hypot(meta["width"], meta["height"])
+    # VISION_FAINT=0 disables track-before-detect recovery (for comparisons).
+    faint = (
+        recover_ball(frames, matrices, diagonal, effective_fps)
+        if os.getenv("VISION_FAINT", "1") != "0"
+        else {"recovered": 0, "inferred": 0, "disabled": True}
+    )
+    timings["ballRecoverySeconds"] = time.monotonic() - tick
+    # Working data for the confirmation pass: ~12 dicts per frame, tens of MB
+    # on a full match. Kept only when asked (tuning, benchmarks).
+    if os.getenv("VISION_KEEP_CANDIDATES", "0") != "1":
+        for f in frames:
+            f.pop("ballCandidates", None)
     progress(stage="Measuring temporal observations", progress=96)
-    analysed_duration = min(duration, (frame_num - first_frame) / meta["fps"])
+    analysed_duration = min(
+        duration, max((frame_num - first_frame) / meta["fps"], last_t - start_seconds)
+    )
+    vote_teams(frames)
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-1.6",
+        "pipelineVersion": "local-vision-2.0",
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},
             "totalSeconds": round(time.monotonic() - total_started, 3),
             "device": device,
+            "batchSize": batch_size,
             "analysedFrames": len(frames),
         },
         "source": "computer-vision",
@@ -430,11 +567,10 @@ def run_video(
         "ballModel": ball_path.name,
         "ballModelSha256": file_sha256(ball_path),
         "ballInference": "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles",
-        "ballSearch": ball_search
-        if isinstance(ball_detector, TiledBallDetector)
-        else "whole-frame",
+        "ballSearch": ball_search if isinstance(ball_detector, TiledBallDetector) else "whole-frame",
         "ballTileCalls": getattr(ball_detector, "inference_calls", None),
-        "ballTracking": "camera-compensated-observations",
+        "ballTracking": "camera-compensated-observations+track-before-detect",
+        "ballRecovery": faint,
         "video": meta,
         "analysedDuration": analysed_duration,
         "analysedStart": start_seconds,
@@ -445,6 +581,7 @@ def run_video(
         "limitations": ([kit_warning] if kit_warning else [])
         + [
             "Ball confidence scores are not calibrated probabilities.",
+            "Faint ball positions are confirmed by consistency across frames (track-before-detect); short gaps on a confirmed path are bridged and marked inferred.",
             "Possession is visible ball-to-player proximity, not official match possession.",
             "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
             "Track IDs change after occlusion and cuts; they are not player identities.",
