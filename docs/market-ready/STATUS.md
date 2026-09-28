@@ -22,7 +22,8 @@ A match now produces a Sofascore-style report:
 
 - Event logic on human-labelled open tracking data (Metrica), held-out match,
   degraded like one 360p camera: pass F1 0.62, possession share error
-  1.2 points, possession agreement 91.5% on 77% of play; shots F1 0.20.
+  0.1 points, possession agreement 89.6% on 85% of play; shot recall 67%
+  (precision 34%, all shots go to review).
   This validates the rules, not the vision; vision accuracy is unmeasured.
 - Calibration: synthetic panning video with motion gaps stays within 0.5 m.
 - Tracking: track IDs on a 3-minute clip 329 → 199 (97.5% of observations

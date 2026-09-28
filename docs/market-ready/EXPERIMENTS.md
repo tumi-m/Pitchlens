@@ -3,6 +3,15 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E10 · Possession through longer unseen gaps (2026-09-28)
+- Possession gap (ball unseen or loose between two controls) 5 s → 8 s, tuned
+  on game 1 (12 s raised coverage further but cost more agreement).
+- Held-out game 2: moderate degradation coverage 77% → 85%, agreement
+  91.5% → 89.6%, share error 1.2 → 0.1 points; heavy degradation coverage
+  48% → 68% (share now shown), agreement 86.5% → 87.6%, share error
+  3.4 → 1.6 points.
+- Decision: adopt 8 s.
+
 ## E9 · Shots inferred from the ball's flight (2026-09-28)
 - Hypothesis: most missed shots have the release hidden at the feet; a fast
   ball heading for goal from range, not collected by the attacking side, is a

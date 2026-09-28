@@ -72,7 +72,7 @@ PARAMS = {
     "saveWindow": 1.5,  # s for a keeper-area gain after a shot
     "onTargetMargin": 0.3,  # m outside the posts (ball radius + noise)
     # Possession sequences and dead ball.
-    "maxPossessionGap": 5.0,  # s of unseen/loose ball a possession survives
+    "maxPossessionGap": 8.0,  # s of unseen/loose ball a possession survives (E10)
     "deadBallSpeed": 1.5,  # m/s mean player speed...
     "deadBallSeconds": 3.0,  # ...for at least this long
     "possessionMinCoverage": 0.6,  # share of in-play time before possession % is shown
