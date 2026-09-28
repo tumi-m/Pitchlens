@@ -26,7 +26,8 @@ export function ReviewQueue({
   onAnalysis: (analysis: Analysis) => void;
 }) {
   const [filter, setFilter] = useState<"key" | "all" | "pending">("key");
-  const [index, setIndex] = useState(0);
+  // The selection follows the event, not a position: decisions change the list.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [team, setTeam] = useState<0 | 1>(0);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -38,25 +39,42 @@ export function ReviewQueue({
     });
     return list.sort((a, b) => (filter === "key" ? (PRIORITY[a.type] ?? 9) - (PRIORITY[b.type] ?? 9) || a.t - b.t : a.t - b.t));
   }, [analysis, filter]);
-  const current: AnalysisEvent | undefined = items[Math.min(index, items.length - 1)];
+  const found = selectedId === null ? -1 : items.findIndex((e) => e.id === selectedId);
+  const index = found >= 0 ? found : 0;
+  const current: AnalysisEvent | undefined = items[index];
   const reviewed = analysis.events.filter((e) => e.status !== "proposed").length;
+  const move = useCallback(
+    (step: number) => {
+      if (!items.length) return;
+      const next = Math.min(items.length - 1, Math.max(0, index + step));
+      setSelectedId(items[next].id);
+    },
+    [items, index],
+  );
 
   const decide = useCallback(
     async (decisions: ReviewDecision[], advance = true) => {
       setSaving(true);
       setError("");
+      // Where to go next, decided on the list the reviewer is looking at.
+      const nextId = advance ? items[index + 1]?.id ?? null : current?.id ?? null;
       try {
         const out = await sendReview(jobId, decisions);
         onAnalysis(out.analysis);
-        if (advance) setIndex((i) => i + 1);
+        // Under "Not reviewed" the decided moment leaves the list: the next one
+        // takes its place, so stay on the same position rather than skipping.
+        if (advance) setSelectedId(filter === "pending" ? nextId : nextId ?? current?.id ?? null);
       } catch (e) {
         setError(e instanceof Error ? e.message : "The decision could not be saved");
       } finally {
         setSaving(false);
       }
     },
-    [jobId, onAnalysis],
+    [jobId, onAnalysis, items, index, current, filter],
   );
+
+  /** The moment as the reviewer sees it, so the decision survives re-analysis. */
+  const seen = (e: AnalysisEvent) => ({ type: e.type, t: e.t, team: e.team, ...(e.outcome ? { outcome: e.outcome } : {}) });
 
   const watch = useCallback(
     (e: AnalysisEvent | undefined) => {
@@ -78,15 +96,19 @@ export function ReviewQueue({
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // Never hijack browser shortcuts (Ctrl/Cmd+R reload, Cmd+G find, ...).
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
       const target = e.target as HTMLElement;
-      if (target && ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
+      if (target && (["INPUT", "SELECT", "TEXTAREA", "VIDEO"].includes(target.tagName) || target.isContentEditable)) return;
+      if (target?.tagName === "BUTTON" && (e.key === " " || e.key === "Enter")) return;
       if (saving) return;
       const key = e.key.toLowerCase();
-      if (key === "a" && current) decide([{ action: "accept", eventId: current.id }]);
-      else if (key === "r" && current) decide([{ action: "reject", eventId: current.id }]);
-      else if (key === "t" && current && current.team !== null) decide([{ action: "team", eventId: current.id, value: current.team === 0 ? 1 : 0 }], false);
-      else if (key === "j" || key === "arrowright") setIndex((i) => Math.min(items.length - 1, i + 1));
-      else if (key === "k" || key === "arrowleft") setIndex((i) => Math.max(0, i - 1));
+      if (key === "a" && current) decide([{ action: "accept", eventId: current.id, event: seen(current) }]);
+      else if (key === "r" && current) decide([{ action: "reject", eventId: current.id, event: seen(current) }]);
+      else if (key === "t" && current && current.team !== null)
+        decide([{ action: "team", eventId: current.id, event: seen(current), value: current.team === 0 ? 1 : 0 }], false);
+      else if (key === "j" || key === "arrowright") move(1);
+      else if (key === "k" || key === "arrowleft") move(-1);
       else if (key === "1") setTeam(0);
       else if (key === "2") setTeam(1);
       else if (key === "g") add("goal");
@@ -99,7 +121,7 @@ export function ReviewQueue({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [current, items.length, decide, add, watch, saving]);
+  }, [current, move, decide, add, watch, saving]);
 
   const direction = analysis.directions?.segments?.[0]?.team0Attacks;
   const [score, setScore] = useState<[string, string]>([
@@ -107,9 +129,8 @@ export function ReviewQueue({
     analysis.enteredScore ? String(analysis.enteredScore[1]) : "",
   ]);
   const scoreValid = score.every((v) => /^\d{1,2}$/.test(v));
-  const confirmedGoals = [0, 1].map(
-    (team) => analysis.events.filter((e) => e.team === team && e.status === "confirmed" && (e.type === "goal" || e.type === "goal-candidate")).length,
-  );
+  // The worker's count: it merges a confirmed shot-with-goal and a goal moment.
+  const confirmedGoals = [0, 1].map((team) => analysis.stats.teams[team]?.goals?.value ?? 0);
   return (
     <section className="glass-card p-5 space-y-4" aria-label="Review moments">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -181,7 +202,7 @@ export function ReviewQueue({
             ["all", "Everything"],
           ] as const
         ).map(([key, label]) => (
-          <button key={key} role="tab" aria-selected={filter === key} onClick={() => { setFilter(key); setIndex(0); }} className={`flex-1 py-1.5 rounded-md ${filter === key ? "bg-pitch-indigo-soft/50" : "text-pitch-muted"}`}>
+          <button key={key} role="tab" aria-selected={filter === key} onClick={() => { setFilter(key); setSelectedId(null); }} className={`flex-1 py-1.5 rounded-md ${filter === key ? "bg-pitch-indigo-soft/50" : "text-pitch-muted"}`}>
             {label}
           </button>
         ))}
@@ -189,7 +210,7 @@ export function ReviewQueue({
       {current ? (
         <div className="rounded-xl border border-white/10 p-4 space-y-3">
           <div className="flex items-center justify-between gap-3">
-            <button aria-label="Previous moment" className="p-2 rounded-lg hover:bg-white/10" onClick={() => setIndex((i) => Math.max(0, i - 1))}>
+            <button aria-label="Previous moment" className="p-2 rounded-lg hover:bg-white/10" onClick={() => move(-1)}>
               <ChevronLeft size={18} />
             </button>
             <button className="flex-1 text-left" onClick={() => watch(current)}>
@@ -206,18 +227,18 @@ export function ReviewQueue({
                 {current.source === "reviewer" ? " · added by you" : ""}
               </span>
             </button>
-            <button aria-label="Next moment" className="p-2 rounded-lg hover:bg-white/10" onClick={() => setIndex((i) => Math.min(items.length - 1, i + 1))}>
+            <button aria-label="Next moment" className="p-2 rounded-lg hover:bg-white/10" onClick={() => move(1)}>
               <ChevronRight size={18} />
             </button>
           </div>
           <div className="grid grid-cols-3 gap-2">
-            <button className="pitch-button-secondary" disabled={saving} onClick={() => decide([{ action: "accept", eventId: current.id }])}>
+            <button className="pitch-button-secondary" disabled={saving} onClick={() => decide([{ action: "accept", eventId: current.id, event: seen(current) }])}>
               <Check size={15} /> Confirm <kbd className="text-[10px] opacity-60">A</kbd>
             </button>
-            <button className="pitch-button-secondary" disabled={saving} onClick={() => decide([{ action: "reject", eventId: current.id }])}>
+            <button className="pitch-button-secondary" disabled={saving} onClick={() => decide([{ action: "reject", eventId: current.id, event: seen(current) }])}>
               <X size={15} /> Reject <kbd className="text-[10px] opacity-60">R</kbd>
             </button>
-            <button className="pitch-button-secondary" disabled={saving || current.team === null} onClick={() => current.team !== null && decide([{ action: "team", eventId: current.id, value: current.team === 0 ? 1 : 0 }], false)}>
+            <button className="pitch-button-secondary" disabled={saving || current.team === null} onClick={() => current.team !== null && decide([{ action: "team", eventId: current.id, event: seen(current), value: current.team === 0 ? 1 : 0 }], false)}>
               <ArrowLeftRight size={15} /> Other team <kbd className="text-[10px] opacity-60">T</kbd>
             </button>
           </div>
@@ -228,8 +249,11 @@ export function ReviewQueue({
                 aria-label="Shot outcome"
                 className="pitch-input w-full mt-1"
                 value={current.outcome || ""}
-                onChange={(e) => decide([{ action: "outcome", eventId: current.id, value: e.target.value }], false)}
+                onChange={(e) => decide([{ action: "outcome", eventId: current.id, event: seen(current), value: e.target.value }], false)}
               >
+                <option value="unresolved" disabled>
+                  Outcome unknown · choose one
+                </option>
                 <option value="on-target">On target</option>
                 <option value="saved">Saved</option>
                 <option value="blocked">Blocked</option>
@@ -242,7 +266,7 @@ export function ReviewQueue({
             <p className="text-xs text-pitch-muted">Confirming a possible goal counts it in the score.</p>
           )}
           <p className="text-xs text-pitch-muted text-center">
-            {Math.min(index, items.length - 1) + 1} / {items.length} · J/K or ←/→ to move · space to replay
+            {index + 1} / {items.length} · J/K or ←/→ to move · space to replay
           </p>
         </div>
       ) : (

@@ -80,8 +80,10 @@ def preview(result, request):
     size = (result["video"]["width"], result["video"]["height"])
     template, image, world, t, distortion, used, line_clicks, _ = validate_request(request, size)
     cal = pitchlib.fit(image, world, size, distortion, line_clicks)
+    # Points behind the camera come back NaN: send null (JSON has no NaN) so the
+    # browser splits the line there.
     lines = [
-        [[round(float(x), 1), round(float(y), 1)] for x, y in pitchlib.pitch_to_image(cal, line)]
+        [[round(float(x), 1), round(float(y), 1)] if math.isfinite(x) and math.isfinite(y) else None for x, y in pitchlib.pitch_to_image(cal, line)]
         for line in pitchlib.line_segments(template, step=0.5)
     ]
     return {"fit": _public_fit(cal, used), "template": template, "lines": lines}
@@ -300,6 +302,11 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
             raise ValueError(
                 "The painted lines in this match do not line up with the saved venue (the camera may have moved). Set up the pitch for this match."
             )
+    if not anchors and not static:
+        raise ValueError(
+            "This match's footage is no longer on the server, so the saved venue cannot be checked against the "
+            "painted lines, and the camera moves. Set up the pitch for this match instead."
+        )
     if static or not anchors:
         # One fixed view: the saved homography, refined by the median correction if any.
         anchors = {0: H} if not anchors else {0: _median_homography(list(anchors.values()), size)}
@@ -327,7 +334,7 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
         "lineAligned": len(anchors),
         "reacquired": 0,
         "coverage": round(covered / max(1, len(frames)) * 100, 1),
-        "venue": {"id": venue.get("id"), "name": venue.get("name"), "lineScore": verified},
+        "venue": {"id": venue.get("id"), "name": venue.get("name"), "lineScore": verified, "verified": verified is not None},
         "frames": per_frame,
     }
 

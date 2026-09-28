@@ -1137,6 +1137,7 @@ def apply_review(events, review):
                 if target["type"] == "shot":
                     target["onTarget"] = target.get("outcome") in ON_TARGET
                 kept[d.get("eventId")] = target
+                kept[target["id"]] = target  # later decisions address it by its public id
             else:
                 continue
         if action == "accept":
@@ -1156,7 +1157,8 @@ def apply_review(events, review):
             target["status"] = "confirmed"
             if target["type"] == "shot":
                 target["onTarget"] = d["value"] in ON_TARGET
-    merged = current + list(added.values()) + list(kept.values())
+    unique_kept = list({id(v): v for v in kept.values()}.values())
+    merged = current + list(added.values()) + unique_kept
     merged.sort(key=lambda e: e["t"])
     return merged, overrides
 
@@ -1249,10 +1251,13 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 "passAccuracy": accuracy,
                 # Share of all detected passes (the definition many stats sites use for
                 # possession), as a cross-check on the time-based share.
-                "passShare": round(passes["value"] / len(all_passes) * 100, 1) if len(all_passes) >= PARAMS["minPassesForAccuracy"] else None,
+                "passShare": round(passes["value"] / len(all_passes) * 100, 1)
+                if shown and len(all_passes) >= PARAMS["minPassesForAccuracy"]
+                else None,
                 "shots": count("shot", team) if template else None,
                 "shotsOnTarget": count("shot", team, lambda e: e.get("onTarget") is True) if template else None,
-                "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"]} if template else None,
+                # Confirmed goals count with or without a pitch setup; candidates need one.
+                "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"] if template else None},
                 "interceptions": count("interception", team),
                 "tackles": count("tackle", team),
                 # Withheld on a sliver of evidence (seconds of final-third control).
@@ -1338,8 +1343,21 @@ def summarise(projected, states, spells, events, template, directions, player_of
 # --------------------------------------------------------------------- entry
 
 
-def analyse(result, calibration=None, review=None):
-    """Full analytics for one analysed match. Pure function of its inputs."""
+def direction_override(review):
+    """The attacking direction a reviewer set last, if any."""
+    value = None
+    for d in (review or {}).get("decisions", []):
+        if d.get("action") == "direction" and d.get("value") in ("left", "right"):
+            value = d["value"]
+    return value
+
+
+def prepare(result, calibration=None, direction=None):
+    """Everything that does not depend on the reviewer's event decisions.
+
+    Expensive on a full match (projection, stitching, control, events); the
+    worker caches it so a review keypress only re-runs finish().
+    """
     frames = result["frames"]
     sample_fps = result.get("sampleFps") or 5
     start = result.get("analysedStart", 0) or 0
@@ -1347,15 +1365,11 @@ def analyse(result, calibration=None, review=None):
     projected, template = project(frames, calibration)
     player_of = stitch_tracks(projected, sample_fps)
     directions = attacking_directions(projected, template, player_of)
-    overrides = {}
-    if review:
-        _, overrides = apply_review([], review)
-    if overrides.get("direction") in ("left", "right") and template:
+    if direction in ("left", "right") and template:
         # Reviewer says which way team 0 attacks first; keep the detected switch time, if any.
         switch = directions["segments"][1]["start"] if directions and len(directions.get("segments", [])) == 2 else None
-        first = overrides["direction"]
-        other = "left" if first == "right" else "right"
-        segments = [{"start": 0.0, "end": switch if switch is not None else math.inf, "team0Attacks": first}]
+        other = "left" if direction == "right" else "right"
+        segments = [{"start": 0.0, "end": switch if switch is not None else math.inf, "team0Attacks": direction}]
         if switch is not None:
             segments.append({"start": switch, "end": math.inf, "team0Attacks": other})
         directions = {"segments": segments, "confidence": 1.0, "source": "reviewer"}
@@ -1366,8 +1380,36 @@ def analyse(result, calibration=None, review=None):
     in_play, dead_intervals = dead_ball(projected, velocities, ball_velocity, sample_fps)
     owner, sequences, possession_seconds, in_play_seconds = possession_sequences(projected, spells, in_play, sample_fps)
     events, kickoffs = detect_events(projected, states, spells, template, directions, sample_fps, in_play, dead_intervals)
-    events, _ = apply_review(events, review)
-    stats = summarise(projected, states, spells, events, template, directions, player_of, sample_fps, duration, start, in_play, owner, sequences, possession_seconds, in_play_seconds)
+    return {
+        "projected": projected,
+        "template": template,
+        "player_of": player_of,
+        "directions": directions,
+        "states": states,
+        "spells": spells,
+        "in_play": in_play,
+        "owner": owner,
+        "sequences": sequences,
+        "possession_seconds": possession_seconds,
+        "in_play_seconds": in_play_seconds,
+        "events": events,
+        "kickoffs": kickoffs,
+        "sample_fps": sample_fps,
+        "duration": duration,
+        "start": start,
+        "positions": compact_positions(projected, player_of) if template else None,
+    }
+
+
+def finish(base, review=None, include_positions=True):
+    """Apply the reviewer's decisions to a prepared analysis and summarise it."""
+    events, overrides = apply_review(base["events"], review)
+    stats = summarise(
+        base["projected"], base["states"], base["spells"], events, base["template"], base["directions"], base["player_of"],
+        base["sample_fps"], base["duration"], base["start"], base["in_play"], base["owner"], base["sequences"],
+        base["possession_seconds"], base["in_play_seconds"],
+    )
+    directions = base["directions"]
     serial_directions = None
     if directions:
         serial_directions = {
@@ -1375,6 +1417,7 @@ def analyse(result, calibration=None, review=None):
             "confidence": float(directions.get("confidence", 0)),
             "segments": [{**s, "end": None if s["end"] == math.inf else s["end"]} for s in directions["segments"]],
         }
+    template = base["template"]
     return {
         "schemaVersion": 1,
         "calibrated": template is not None,
@@ -1382,7 +1425,7 @@ def analyse(result, calibration=None, review=None):
         "directions": serial_directions,
         "params": {k: list(v) if isinstance(v, tuple) else v for k, v in PARAMS.items()},
         "events": events,
-        "kickoffs": kickoffs,
+        "kickoffs": base["kickoffs"],
         # The final score as typed by the reviewer (the authority for the scoreline).
         "enteredScore": overrides.get("score") if isinstance(overrides.get("score"), list) else None,
         "stats": stats,
@@ -1394,8 +1437,13 @@ def analyse(result, calibration=None, review=None):
             "rejected": sum(1 for e in events if e["status"] == "rejected"),
             "pending": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True)),
         },
-        "positions": compact_positions(projected, player_of) if template else None,
+        "positions": base["positions"] if include_positions else None,
     }
+
+
+def analyse(result, calibration=None, review=None):
+    """Full analytics for one analysed match. Pure function of its inputs."""
+    return finish(prepare(result, calibration, direction_override(review)), review)
 
 
 def _review_accuracy(events, review):

@@ -138,12 +138,21 @@ export function distort(x: number, y: number, k1: number, size: [number, number]
   return [ux * f * s + cx, uy * f * s + cy];
 }
 
-/** Pitch metres -> image pixels for a frame, given its image->pitch homography. */
+/** Pitch metres -> image pixels for a frame, given its image->pitch homography.
+ *  Points behind the camera come back null (a homography would mirror them into view). */
 export function pitchToImage(H: Mat3, k1: number, size: [number, number], points: [number, number][]) {
   const inv = invert3(H);
   if (!inv) return [];
+  // Reference: a point certainly in view (bottom centre of the image).
+  const seen = applyH(H, size[0] / 2, size[1] * 0.95);
+  const wOf = (x: number, y: number) => inv[6] * x + inv[7] * y + inv[8];
+  const front = seen ? Math.sign(wOf(seen[0], seen[1])) : 1;
   const out: ([number, number] | null)[] = [];
   for (const [x, y] of points) {
+    if (Math.sign(wOf(x, y)) !== front) {
+      out.push(null);
+      continue;
+    }
     const p = applyH(inv, x, y);
     out.push(p ? distort(p[0], p[1], k1, size) : null);
   }
@@ -261,7 +270,7 @@ export type Venue = { id: string; name: string; template: PitchTemplate; size: [
 export type Calibration = {
   state: "none" | "ready";
   /** Set when this calibration came from a saved venue. */
-  venue?: { id: string; name: string; lineScore: number | null };
+  venue?: { id: string; name: string; lineScore: number | null; verified?: boolean };
   template?: PitchTemplate;
   fit?: CalibrationFit;
   k1?: number;
@@ -286,10 +295,13 @@ export type CalibrationRequest = {
   walls?: boolean;
 };
 
+/** The moment a decision was made on, as the reviewer saw it (survives re-analysis). */
+export type SeenEvent = { type: string; t: number; team: number | null; outcome?: string };
+
 export type ReviewDecision =
-  | { action: "accept" | "reject" | "reset"; eventId: string }
-  | { action: "team"; eventId: string; value: 0 | 1 }
-  | { action: "type" | "outcome"; eventId: string; value: string }
+  | { action: "accept" | "reject" | "reset"; eventId: string; event?: SeenEvent }
+  | { action: "team"; eventId: string; value: 0 | 1; event?: SeenEvent }
+  | { action: "type" | "outcome"; eventId: string; value: string; event?: SeenEvent }
   | { action: "add"; type: string; t: number; team?: 0 | 1; outcome?: string; x?: number; y?: number }
   | { action: "direction"; value: "left" | "right" }
   | { action: "score"; value: [number, number] };
@@ -297,14 +309,14 @@ export type ReviewDecision =
 export const fetchAnalysis = (jobId: string, signal?: AbortSignal) =>
   visionJson<Analysis>(`jobs/${jobId}/analysis`, { signal });
 
-export const fetchCalibration = (jobId: string, signal?: AbortSignal) =>
-  visionJson<Calibration>(`jobs/${jobId}/calibration`, { signal });
+export const fetchCalibration = (jobId: string, signal?: AbortSignal, frames = true) =>
+  visionJson<Calibration>(`jobs/${jobId}/calibration${frames ? "" : "?frames=0"}`, { signal });
 
 const post = <T,>(path: string, body: unknown) =>
   visionJson<T>(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export const previewCalibration = (jobId: string, request: CalibrationRequest) =>
-  post<{ fit: CalibrationFit; template: PitchTemplate; lines: [number, number][][] }>(`jobs/${jobId}/calibration/preview`, request);
+  post<{ fit: CalibrationFit; template: PitchTemplate; lines: ([number, number] | null)[][] }>(`jobs/${jobId}/calibration/preview`, request);
 
 export const saveCalibration = (jobId: string, request: CalibrationRequest) =>
   post<{ state: string; fit: CalibrationFit }>(`jobs/${jobId}/calibration`, request);

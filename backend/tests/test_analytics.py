@@ -133,7 +133,9 @@ def test_uncalibrated_results_report_unavailable_not_zero():
     out = analytics.analyse(result_for(frames), None)
     assert not out["calibrated"]
     team0 = out["stats"]["teams"][0]
-    assert team0["shots"] is None and team0["goals"] is None
+    assert team0["shots"] is None
+    # Goals a reviewer confirms still count without a pitch setup; candidates need one.
+    assert team0["goals"] == {"value": 0, "candidates": None}
     assert out["stats"]["heatmaps"] is None
     assert team0["possessionSeconds"] > 0 and team0["passes"]["value"] >= 1
 
@@ -533,3 +535,90 @@ def test_a_shot_is_inferred_when_the_shooters_touch_was_not_seen():
     shots = [e for e in out["events"] if e["type"] == "shot"]
     assert len(shots) == 1 and shots[0]["team"] == 0 and shots[0].get("inferred")
     assert shots[0]["needsReview"] and shots[0]["confidence"] <= 0.35
+
+
+def _client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "test-token")
+    monkeypatch.setattr(server, "_prepared", server.OrderedDict())
+    monkeypatch.setattr(server.post_pool, "submit", lambda fn, *a: fn(*a))
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers["Authorization"] = "Bearer test-token"
+    return server, client
+
+
+def test_decisions_use_the_moment_the_reviewer_saw_and_kept_moments_can_be_undone(tmp_path, monkeypatch):
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, directory = make_job(server, build_match())
+    stale = client.get(f"/jobs/{job_id}/analysis").json()["events"]  # uncalibrated list
+    assert client.post(f"/jobs/{job_id}/calibration", json={"template": "futsal", "points": clicks(), "t": 0.0}).status_code == 200
+    now = client.get(f"/jobs/{job_id}/analysis").json()["events"]
+    seen = stale[0]
+    assert now[0]["type"] != seen["type"] or abs(now[0]["t"] - seen["t"]) > 0.05 or len(now) != len(stale)
+    # The reviewer confirms what they saw on their (stale) list.
+    out = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "accept", "eventId": seen["id"], "event": {k: seen.get(k) for k in ("type", "t", "team")}}]}).json()
+    confirmed = [e for e in out["analysis"]["events"] if e["status"] == "confirmed"]
+    assert len(confirmed) == 1 and confirmed[0]["type"] == seen["type"] and abs(confirmed[0]["t"] - seen["t"]) <= 1.0
+    assert "positions" not in out["analysis"] or out["analysis"]["positions"] is None
+    # A confirmed moment whose detection has gone is kept, and can still be undone.
+    kept_decision = {"action": "accept", "eventId": "ev-99", "event": {"type": "shot", "t": 1.5, "team": 1}}
+    kept = [e for e in client.post(f"/jobs/{job_id}/review", json={"decisions": [kept_decision]}).json()["analysis"]["events"] if e["id"].startswith("kept-")]
+    assert len(kept) == 1
+    undone = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "reject", "eventId": kept[0]["id"]}]})
+    assert undone.status_code == 200
+    assert [e["status"] for e in undone.json()["analysis"]["events"] if e["id"] == kept[0]["id"]] == ["rejected"]
+
+
+def test_review_keypresses_do_not_recompute_the_whole_analysis(tmp_path, monkeypatch):
+    from app.vision import analytics as A
+
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, _ = make_job(server, build_match())
+    calls = []
+    real = A.prepare
+    monkeypatch.setattr(A, "prepare", lambda *a, **k: calls.append(1) or real(*a, **k))
+    first = client.get(f"/jobs/{job_id}/analysis").json()
+    for e in first["events"][:3]:
+        assert client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "accept", "eventId": e["id"]}]}).status_code == 200
+    assert len(calls) == 1
+    # Changing the attacking direction does need a re-analysis.
+    client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "direction", "value": "left"}]})
+    assert len(calls) == 2
+
+
+def test_calibration_can_be_polled_without_its_frames(tmp_path, monkeypatch):
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, _ = make_job(server, build_match())
+    client.post(f"/jobs/{job_id}/calibration", json={"template": "futsal", "points": clicks(), "t": 0.0})
+    assert "frames" in client.get(f"/jobs/{job_id}/calibration").json()
+    light = client.get(f"/jobs/{job_id}/calibration?frames=0").json()
+    assert light["state"] == "ready" and "frames" not in light
+
+
+def test_venues_are_private_to_the_browser_that_saved_them(tmp_path, monkeypatch):
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, _ = make_job(server, build_match())
+    client.post(f"/jobs/{job_id}/calibration", json={"template": "futsal", "points": clicks(), "t": 0.0})
+    mine, theirs = "a" * 32, "b" * 32
+    venue = client.post(f"/venues?owner={mine}", json={"name": "Court 1", "jobId": job_id}).json()
+    assert [v["id"] for v in client.get(f"/venues?owner={mine}").json()] == [venue["id"]]
+    assert client.get(f"/venues?owner={theirs}").json() == []
+    other, _ = make_job(server, build_match())
+    assert client.post(f"/jobs/{other}/calibration?owner={theirs}", json={"venue": venue["id"]}).status_code == 404
+    assert client.post(f"/jobs/{other}/calibration?owner={mine}", json={"venue": venue["id"]}).status_code == 200
+
+
+def test_an_unverifiable_venue_is_refused_for_a_moving_camera():
+    from app.vision import calibrate
+
+    frames = build_match()
+    for f in frames:
+        f["camera"] = [1, 0, 8.0, 0, 1, 0]  # panning
+    result = result_for(frames)
+    venue = {"id": "v", "name": "Court", "template": TEMPLATE, "size": [640, 360], "k1": 0.0, "H": np.linalg.inv(TO_IMAGE).tolist()}
+    with pytest.raises(ValueError, match="no longer on the server"):
+        calibrate.build_from_venue(result, venue, None)

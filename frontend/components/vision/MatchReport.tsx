@@ -105,7 +105,8 @@ export function MatchReport({
   const [heatTeam, setHeatTeam] = useState<0 | 1>(0);
   const [A, B] = analysis.stats.teams as [TeamStats, TeamStats];
   const cov = analysis.stats.coverage;
-  const goalsKnown = analysis.calibrated && A.goals && B.goals;
+  // Reviewer-confirmed goals count with or without a pitch setup.
+  const goalsKnown = A.goals !== null && B.goals !== null;
   const candidates = (A.goals?.candidates ?? 0) + (B.goals?.candidates ?? 0);
   const reviewedGoals = (A.goals?.value ?? 0) + (B.goals?.value ?? 0);
   const possessionShown = cov.possessionShown;
@@ -148,10 +149,10 @@ export function MatchReport({
             <span className="text-xs text-pitch-muted max-w-[16rem]">
               {analysis.enteredScore
                 ? `Score entered by you · ${reviewedGoals} of ${analysis.enteredScore[0] + analysis.enteredScore[1]} goals located in the video`
-                : !analysis.calibrated
-                ? "Set up the pitch to find shots and possible goals"
                 : reviewedGoals > 0
-                  ? "Goals confirmed by review"
+                ? "Goals confirmed by review"
+                : !analysis.calibrated
+                  ? "Enter the score, or set up the pitch to find shots and possible goals"
                   : candidates
                     ? `${candidates} possible goal${candidates === 1 ? "" : "s"} to confirm`
                     : "No goal confirmed yet. Add goals you saw in the review."}
@@ -289,7 +290,7 @@ export function MatchReport({
           <section className={card}>
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Attack momentum</h2>
-              <span className="text-[11px] text-pitch-muted">Per minute · control in the opponent&apos;s half counts double</span>
+              <span className="text-[11px] text-pitch-muted">Per minute · control near the opponent&apos;s goal counts most</span>
             </div>
             <svg viewBox={`0 0 ${analysis.stats.momentum.length * 10} 80`} className="w-full h-28" preserveAspectRatio="none">
               <line x1="0" y1="40" x2={analysis.stats.momentum.length * 10} y2="40" stroke="rgba(255,255,255,0.15)" strokeWidth="0.6" />

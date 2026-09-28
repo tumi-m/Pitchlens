@@ -196,7 +196,9 @@ export function VisionReport({ jobId }: { jobId: string }) {
   }
   const startCalibration = () => {
     setCalibrating(true);
-    if (result && result.frames.length) snapTo(result.frames[nearestFrame(result.frames, time)].t);
+    // Adjusting a saved setup returns to the frame it was clicked on.
+    const savedAt = calibration?.request?.t;
+    if (result && result.frames.length) snapTo(result.frames[nearestFrame(result.frames, savedAt ?? time)].t);
     calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
   const openReview = () => {
@@ -342,13 +344,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         onClick={videoClick}
                         data-testid="calibration-overlay"
                       >
-                        {(calibrating ? calOverlay?.lines?.map((l) => l.map((p) => p as [number, number] | null)) : projectedLines)?.map((line, i) => (
+                        {splitAtGaps(calibrating ? calOverlay?.lines?.map((l) => l.map((p) => p as [number, number] | null)) : projectedLines).map((line, i) => (
                           <polyline
                             key={i}
-                            points={line
-                              .filter((p): p is [number, number] => !!p && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Math.abs(p[0]) < 1e4 && Math.abs(p[1]) < 1e4)
-                              .map(([x, y]) => `${x},${y}`)
-                              .join(" ")}
+                            points={line.map(([x, y]) => `${x},${y}`).join(" ")}
                             fill="none"
                             stroke={calibrating ? "#f43f5e" : "rgba(56,189,248,0.8)"}
                             strokeWidth={calibrating ? 1.5 : 1.2}
@@ -476,6 +475,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         onOverlay={setCalOverlay}
                         calibration={calibration}
                         onApplied={loadAnalytics}
+                        videoAvailable={!job?.videoDeleted}
                         onStep={(delta) => {
                           // Step between analysed frames: calibration is anchored to one of them.
                           const step = Math.sign(delta) * Math.max(1, Math.round(Math.abs(delta) * result.sampleFps));
@@ -526,7 +526,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       colours={[colour(0), colour(1)]}
                       time={time}
                       onWatch={watchClip}
-                      onAnalysis={setAnalysis}
+                      onAnalysis={(next) =>
+                        // Review responses leave out the per-frame positions (unchanged).
+                        setAnalysis((prev) => ({ ...next, positions: next.positions ?? prev?.positions ?? null }))
+                      }
                     />
                   ) : (
                     <section className="glass-card p-5 flex flex-wrap items-center justify-between gap-3">
@@ -622,6 +625,24 @@ export function VisionReport({ jobId }: { jobId: string }) {
     </>
   );
 }
+/** Split polylines where points are missing (behind the camera) instead of joining across. */
+function splitAtGaps(lines: (([number, number] | null)[] | undefined)[] | null | undefined): [number, number][][] {
+  const out: [number, number][][] = [];
+  for (const line of lines || []) {
+    let run: [number, number][] = [];
+    for (const p of line || []) {
+      const ok = !!p && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Math.abs(p[0]) < 1e4 && Math.abs(p[1]) < 1e4;
+      if (ok) run.push(p as [number, number]);
+      else {
+        if (run.length > 1) out.push(run);
+        run = [];
+      }
+    }
+    if (run.length > 1) out.push(run);
+  }
+  return out;
+}
+
 function nearestFrame(frames: { t: number }[], t: number) {
   let l = 0;
   let r = frames.length - 1;

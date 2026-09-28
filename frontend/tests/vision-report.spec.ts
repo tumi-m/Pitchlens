@@ -98,7 +98,7 @@ async function mockReport(page: Page, opts: { calibrated: boolean }) {
     r.fulfill({ status: 200, body: VIDEO, headers: { "content-type": "video/mp4", "accept-ranges": "bytes" } }),
   );
   await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: analysis(state.calibrated, state.shot) }));
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration$`), async (r: Route) => {
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration(\\?.*)?$`), async (r: Route) => {
     if (r.request().method() === "POST") {
       state.saves.push(r.request().postDataJSON());
       state.calibrated = true;
@@ -184,9 +184,18 @@ test("review: confirming a shot is saved on the worker and updates the stats", a
   await expect(page.getByText("1 possible goal", { exact: false })).toHaveCount(0);
   await page.getByRole("button", { name: "Start reviewing" }).click();
   await expect(page.getByRole("heading", { name: "Review moments" })).toBeVisible();
+  // Browser shortcuts are never taken over (Ctrl/Cmd+A select all, +G find, +R reload...).
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Meta+g");
+  await page.waitForTimeout(300);
+  expect(state.reviews.length).toBe(0);
   await page.keyboard.press("a");
   await expect.poll(() => state.reviews.length).toBe(1);
-  expect((state.reviews[0] as { decisions: { action: string; eventId: string }[] }).decisions[0]).toEqual({ action: "accept", eventId: "ev-0" });
+  expect((state.reviews[0] as { decisions: { action: string; eventId: string }[] }).decisions[0]).toEqual({
+    action: "accept",
+    eventId: "ev-0",
+    event: { type: "shot", t: 2, team: 0, outcome: "on-target" },
+  });
   await expect(page.getByText("1 of 1 reviewed")).toBeVisible();
   await page.getByRole("button", { name: /Goal/ }).first().click();
   await expect.poll(() => state.reviews.length).toBe(2);
@@ -208,7 +217,7 @@ test("a saved venue is applied without clicking landmarks", async ({ page }) => 
   await page.route("**/api/vision/venues", (r) =>
     r.fulfill({ json: [{ id: "e".repeat(32), name: "Tekkerz Court 2", template: analysis(true).template, size: [640, 360], static: true, createdAt: 0 }] }),
   );
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration$`), async (r) => {
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration(\\?.*)?$`), async (r) => {
     if (r.request().method() === "POST") {
       applied.push(r.request().postDataJSON());
       state.calibrated = true;

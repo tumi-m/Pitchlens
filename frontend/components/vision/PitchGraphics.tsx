@@ -106,6 +106,7 @@ const OUTCOME_STYLE: Record<string, { fill: string; label: string }> = {
   saved: { fill: "#38bdf8", label: "Saved" },
   blocked: { fill: "#a78bfa", label: "Blocked" },
   "off-target": { fill: "#ef4444", label: "Off target" },
+  unresolved: { fill: "#94a3b8", label: "Outcome unknown" },
 };
 
 /** Shots for both teams: the first team shoots right, the second left (as on Sofascore). */
@@ -130,7 +131,7 @@ export function ShotMap({
         {shots.map((s, i) => {
           const x = s.team === 0 ? s.x : template.length - s.x;
           const y = s.team === 0 ? s.y : template.width - s.y;
-          const style = OUTCOME_STYLE[s.outcome || ""] || OUTCOME_STYLE["off-target"];
+          const style = OUTCOME_STYLE[s.outcome || ""] || OUTCOME_STYLE.unresolved;
           return (
             <motion.g
               key={s.id}
@@ -148,7 +149,7 @@ export function ShotMap({
         })}
       </PitchSvg>
       <div className="flex flex-wrap gap-3 justify-center text-[11px] text-pitch-muted mt-2">
-        {["on-target", "saved", "blocked", "off-target", "goal-candidate"].map((k) => (
+        {["on-target", "saved", "blocked", "off-target", "goal-candidate", "unresolved"].map((k) => (
           <span key={k} className="flex items-center gap-1.5">
             <span className="w-2.5 h-2.5 rounded-full" style={{ background: OUTCOME_STYLE[k].fill }} />
             {OUTCOME_STYLE[k].label}

@@ -264,3 +264,20 @@ def test_forcing_distortion_with_four_clicks_does_not_invent_a_lens():
     world = np.array([pitch.landmarks(TEMPLATE)[n] for n in names])
     cal = pitch.fit(pitch.apply(H, world) + [[1.5, -1], [0, 1], [-1, 0], [1, 1]], world, SIZE, distortion="on")
     assert cal["k1"] == 0.0
+
+
+def test_points_behind_the_camera_are_not_drawn():
+    # Camera 3 m up at the near touchline, looking along the pitch to the left goal.
+    K = np.array([[300.0, 0, 320], [0, 300.0, 180], [0, 0, 1]])
+    yaw, pitch_down = np.radians(170), np.radians(8)
+    Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+    base = np.array([[0, 1, 0], [0, 0, -1], [1, 0, 0]])  # x_cam = world y, y_cam = -z, z_cam = world x
+    Rx = np.array([[1, 0, 0], [0, np.cos(pitch_down), -np.sin(pitch_down)], [0, np.sin(pitch_down), np.cos(pitch_down)]])
+    R = Rx @ base @ Rz.T
+    C = np.array([20.0, 21.0, 3.0])
+    t = -R @ C
+    P2I = K @ np.column_stack([R[:, 0], R[:, 1], t])  # ground plane z = 0
+    cal = {"H": np.linalg.inv(P2I), "k1": 0.0, "size": list(SIZE)}
+    front = pitch.pitch_to_image(cal, [[5.0, 10.0]])  # towards the left goal: visible
+    behind = pitch.pitch_to_image(cal, [[38.0, 10.0]])  # the right goal: behind the camera
+    assert np.isfinite(front).all() and np.isnan(behind).all()

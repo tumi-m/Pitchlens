@@ -545,8 +545,22 @@ def image_to_pitch(calibration, points, H=None):
 
 
 def pitch_to_image(calibration, points, H=None):
+    """Pitch metres -> image pixels; NaN for points behind the camera.
+
+    A homography maps points behind the camera to finite, mirrored pixels; the
+    sign of the projective coordinate tells them apart (compared with a point
+    known to be visible: the bottom centre of the image).
+    """
     H = np.asarray(H if H is not None else calibration["H"], float)
-    return distort(apply(np.linalg.inv(H), points), calibration["k1"], calibration["size"])
+    inverse = np.linalg.inv(H)
+    w, h = calibration["size"]
+    visible = apply(H, undistort([[w / 2, h * 0.95]], calibration["k1"], calibration["size"]))[0]
+    reference = np.sign((inverse @ np.array([visible[0], visible[1], 1.0]))[2])
+    pts = np.asarray(points, float).reshape(-1, 2)
+    homog = np.hstack([pts, np.ones((len(pts), 1))]) @ inverse.T
+    out = distort(apply(inverse, pts), calibration["k1"], calibration["size"])
+    out[np.sign(homog[:, 2]) != reference] = np.nan
+    return out
 
 
 # ---------------------------------------------------------------- camera motion

@@ -14,6 +14,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -771,19 +772,28 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 3
+ANALYTICS_VERSION = 4
+_prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
+PREPARED_CACHE = 3
 
 
-def compute_analysis(directory):
-    """analysis.json from result + calibration + review; cached until an input changes."""
-    from app.vision.analytics import analyse
+def _stamp(path):
+    return [path.stat().st_mtime_ns, path.stat().st_size] if path.is_file() else 0
+
+
+def compute_analysis(directory, include_positions=True):
+    """analysis.json from result + calibration + review; cached until an input changes.
+
+    The expensive stage (projection, tracks, possession, events) is kept in
+    memory per match, so a review decision only re-applies decisions and
+    re-summarises: a keypress, not a full re-analysis.
+    """
+    from app.vision.analytics import direction_override, finish, prepare
 
     inputs = [directory / "result.json", directory / "calibration.json", directory / "review.json"]
 
     def stamp():
-        return [ANALYTICS_VERSION] + [
-            [p.stat().st_mtime_ns, p.stat().st_size] if p.is_file() else 0 for p in inputs
-        ]
+        return [ANALYTICS_VERSION] + [_stamp(p) for p in inputs]
 
     cached = _read_json(directory / "analysis.json")
     if cached and cached.get("inputs") == stamp():
@@ -794,8 +804,18 @@ def compute_analysis(directory):
         if cached and cached.get("inputs") == stamp():
             return cached
         key = stamp()
-        result = json.loads(inputs[0].read_text())
-        analysis = analyse(result, _calibration_ready(directory), _read_json(inputs[2]))
+        review = _read_json(inputs[2])
+        base_key = (directory.name, ANALYTICS_VERSION, json.dumps(key[1:3]), direction_override(review))
+        base = _prepared.get(base_key)
+        if base is None:
+            result = json.loads(inputs[0].read_text())
+            base = prepare(result, _calibration_ready(directory), direction_override(review))
+            _prepared[base_key] = base
+            while len(_prepared) > PREPARED_CACHE:
+                _prepared.popitem(last=False)
+        else:
+            _prepared.move_to_end(base_key)
+        analysis = finish(base, review)
         analysis["inputs"] = key
         _write_json(directory / "analysis.json", analysis)
     return analysis
@@ -811,10 +831,15 @@ def analysis(job_id: str):
 
 
 @app.get("/jobs/{job_id}/calibration")
-def calibration(job_id: str):
-    """The saved calibration (per-frame homographies) plus any run in progress."""
+def calibration(job_id: str, request: Request):
+    """The saved calibration (per-frame homographies) plus any run in progress.
+
+    ?frames=0 leaves out the per-frame homographies (for polling a running job).
+    """
     directory = folder(job_id)
     data = _calibration_ready(directory) or {"state": "none"}
+    if request.query_params.get("frames") == "0":
+        data = {k: v for k, v in data.items() if k != "frames"}
     job = _read_json(directory / "calibration-job.json")
     if job:
         data = {**data, "job": job}
@@ -882,6 +907,9 @@ def _run_venue_calibration(directory, venue):
 async def save_calibration(job_id: str, request: Request):
     directory, path = _finished_result(job_id)
     body = await _json_body(request)
+    body.pop("_owner", None)
+    if "venue" in body:
+        body["_owner"] = _owner(request)
     # In-memory, so a calibration interrupted by a restart never blocks a retry.
     with calibrating_lock:
         if job_id in calibrating:
@@ -903,7 +931,7 @@ async def _start_calibration(job_id, directory, path, body):
         if not isinstance(venue_id, str) or not re.fullmatch(r"[a-f0-9]{32}", venue_id):
             raise HTTPException(404, "Venue not found")
         venue = _read_json(_venue_dir() / f"{venue_id}.json")
-        if not venue:
+        if not venue or venue.get("owner", "") != body.get("_owner", ""):
             raise HTTPException(404, "Venue not found")
         _write_json(directory / "calibration-job.json", {"state": "processing", "progress": 0, "startedAt": time.time(), "venue": venue_id})
         post_pool.submit(_run_venue_calibration, directory, venue)
@@ -967,9 +995,20 @@ def _clean_decision(d, index):
         out["value"] = value
         return out
     event = d.get("eventId")
-    if not isinstance(event, str) or not re.fullmatch(r"(ev|added)-[a-z0-9-]{1,40}", event):
+    if not isinstance(event, str) or not re.fullmatch(r"(ev|added|kept-ev|kept-added)-[a-z0-9-]{1,60}", event):
         raise HTTPException(400, "Unknown event")
     out["eventId"] = event
+    # The moment the reviewer was looking at (their list may be older than ours).
+    seen = d.get("event")
+    if isinstance(seen, dict):
+        t = seen.get("t")
+        if seen.get("type") in EVENT_TYPES and isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= t <= 6 * 3600:
+            fingerprint = {"type": seen["type"], "t": round(float(t), 2)}
+            if isinstance(seen.get("team"), int) and not isinstance(seen.get("team"), bool) and seen["team"] in (0, 1):
+                fingerprint["team"] = seen["team"]
+            if isinstance(seen.get("outcome"), str):
+                fingerprint["outcome"] = seen["outcome"][:40]
+            out["event"] = fingerprint
     if d["action"] == "team":
         if isinstance(d.get("value"), bool) or d.get("value") not in (0, 1):
             raise HTTPException(400, "Team must be 0 or 1")
@@ -1003,7 +1042,8 @@ async def add_review(job_id: str, request: Request):
     by_id = {e["id"]: e for e in current.get("events", [])}
     for d in cleaned:
         event = by_id.get(d.get("eventId"))
-        if event is not None:
+        # Prefer what the reviewer saw; fall back to our current list (older clients).
+        if event is not None and "event" not in d:
             d["event"] = {k: event.get(k) for k in ("type", "t", "team", "outcome")}
     def append():
         with post_lock:
@@ -1021,6 +1061,8 @@ async def add_review(job_id: str, request: Request):
     if total is None:
         raise HTTPException(409, "Too many review decisions for one match")
     data = await asyncio.to_thread(compute_analysis, directory)
+    # The per-frame positions do not change with a decision; the client keeps its copy.
+    data = {k: v for k, v in data.items() if k != "positions"}
     return {"decisions": total, "added": [c for c in cleaned if c["action"] == "add"], "analysis": data}
 
 
@@ -1035,12 +1077,19 @@ def _venue_dir():
     return directory
 
 
+def _owner(request):
+    owner = request.query_params.get("owner", "")
+    return owner if OWNER.fullmatch(owner) else ""
+
+
 @app.get("/venues")
-def venues():
+def venues(request: Request):
+    """Venues saved from this browser (owner key); a local worker without keys sees all."""
+    owner = _owner(request)
     out = []
     for path in sorted(_venue_dir().glob("*.json")):
         data = _read_json(path) or {}
-        if data.get("id"):
+        if data.get("id") and (data.get("owner", "") == owner):
             out.append({k: data.get(k) for k in ("id", "name", "template", "size", "static", "createdAt")})
     return out
 
@@ -1064,9 +1113,11 @@ async def create_venue(request: Request):
         venue = venue_from_calibration(calibration, name.strip())
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    if len(list(_venue_dir().glob("*.json"))) >= 500:
+    owner = _owner(request)
+    mine = [p for p in _venue_dir().glob("*.json") if (_read_json(p) or {}).get("owner", "") == owner]
+    if len(mine) >= 50:
         raise HTTPException(409, "Too many saved venues")
-    venue.update(id=uuid.uuid4().hex, createdAt=time.time(), sourceJob=job_id)
+    venue.update(id=uuid.uuid4().hex, createdAt=time.time(), sourceJob=job_id, owner=owner)
     _write_json(_venue_dir() / f"{venue['id']}.json", venue)
     return {k: venue[k] for k in ("id", "name", "template", "size", "static", "createdAt")}
 

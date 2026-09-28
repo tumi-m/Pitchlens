@@ -21,7 +21,7 @@ import { PitchSvg } from "@/components/vision/PitchGraphics";
 export type CalibrationOverlay = {
   points: { name: string; x: number; y: number; label: string }[];
   linePoints: { line: string; x: number; y: number }[];
-  lines: [number, number][][] | null;
+  lines: ([number, number] | null)[][] | null;
 };
 
 const LINES: { name: string; label: string }[] = [
@@ -50,6 +50,7 @@ export function PitchCalibration({
   calibration,
   onApplied,
   onStep,
+  videoAvailable = true,
 }: {
   jobId: string;
   videoSize: [number, number];
@@ -63,6 +64,8 @@ export function PitchCalibration({
   onApplied: () => void;
   /** Move the paused video by this many seconds (the click layer covers the player's controls). */
   onStep: (seconds: number) => void;
+  /** False once retention deleted the footage: a saved venue could not be checked. */
+  videoAvailable?: boolean;
 }) {
   const saved = calibration?.request;
   const [presetKey, setPresetKey] = useState<string>("five-a-side");
@@ -75,12 +78,19 @@ export function PitchCalibration({
   const [points, setPoints] = useState<{ name: string; x: number; y: number }[]>([]);
   const [linePoints, setLinePoints] = useState<{ line: string; x: number; y: number }[]>([]);
   const [frameTime, setFrameTime] = useState<number | null>(null);
-  const [preview, setPreview] = useState<{ fit: CalibrationFit; lines: [number, number][][] } | null>(null);
+  const [preview, setPreview] = useState<{ fit: CalibrationFit; lines: ([number, number] | null)[][] } | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"" | "preview" | "save">("");
   const [progress, setProgress] = useState<number | null>(null);
   const handled = useRef(0);
   const marks = useMemo(() => landmarks(template), [template]);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [venues, setVenues] = useState<Venue[]>([]);
   const [venueId, setVenueId] = useState("");
   const [venueName, setVenueName] = useState("");
@@ -97,7 +107,9 @@ export function PitchCalibration({
   async function waitForCalibration() {
     for (let i = 0; i < 600; i++) {
       await new Promise((r) => setTimeout(r, 1500));
-      const current = await fetchCalibration(jobId);
+      // Leaving the page stops the polling (and skips the callbacks).
+      if (!mounted.current) throw new DOMException("Left the page", "AbortError");
+      const current = await fetchCalibration(jobId, undefined, false);
       const job = current.job;
       if (job?.state === "processing") setProgress(job.progress ?? 0);
       else if (job?.state === "failed") throw new Error(job.error || "Calibration failed");
@@ -116,6 +128,7 @@ export function PitchCalibration({
       setProgress(null);
       onApplied();
     } catch (e) {
+      if (!mounted.current) return;
       setProgress(null);
       setError(e instanceof Error ? e.message : "The saved venue could not be applied");
     } finally {
@@ -142,6 +155,7 @@ export function PitchCalibration({
     setTemplate({ ...PITCH_PRESETS["five-a-side"].template, ...saved.template });
     setPresetKey("custom");
     setWalls(!!saved.walls);
+    if (saved.distortion) setDistortion(saved.distortion);
     setPoints(saved.points || []);
     setLinePoints(saved.lines || []);
     setFrameTime(saved.t ?? null);
@@ -231,6 +245,7 @@ export function PitchCalibration({
       onActive(false);
       onApplied();
     } catch (e) {
+      if (!mounted.current) return;
       setProgress(null);
       setError(e instanceof VisionError && e.code === "access" ? "Enter the access code on the upload page first." : e instanceof Error ? e.message : "Calibration failed");
     } finally {
@@ -279,7 +294,7 @@ export function PitchCalibration({
             {calibration.venue.lineScore !== null ? ` · lines matched ${Math.round(calibration.venue.lineScore * 100)}%` : ""}
           </p>
         )}
-        {!ready && venues.length > 0 && (
+        {!ready && venues.length > 0 && videoAvailable && (
           <div className="rounded-xl border border-white/10 p-3 space-y-2">
             <p className="text-sm font-semibold">Use a saved venue</p>
             <p className="text-xs text-pitch-muted">Same fixed camera as before? Apply its pitch setup without clicking; it is checked against the painted lines.</p>
