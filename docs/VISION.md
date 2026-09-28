@@ -122,10 +122,13 @@ engine now borrows the approach astronomers use for faint moving objects
 (track-before-detect, "shift-and-stack"): keep weak evidence, confirm it by
 consistency over time.
 
-1. **Weak candidates kept.** The ball detector runs at 5% confidence; the
-   strongest 12 candidates per frame are stored (`ballCandidates`).
+1. **Weak candidates kept.** The ball detector runs at 5% confidence; up to
+   12 candidates per frame are kept in memory for the confirmation pass
+   (motion blobs never displace detector responses). They are written to the
+   result only with `VISION_KEEP_CANDIDATES=1`, for tuning.
 2. **Difference imaging.** After cancelling camera motion with the per-frame
-   affine, consecutive frames are subtracted; small, round, fast-moving blobs
+   affine, consecutive frames are subtracted (signed: where the picture got
+   brighter, so a light ball does not leave a ghost behind); small, round, fast-moving blobs
    of ball size (about 1/8 of a player's height) inside the dilated pitch mask
    become extra low-confidence candidates (`source: "motion"`, at most 0.15).
    They only ever feed the confirmation step; the frame-by-frame ball tracker
@@ -140,11 +143,15 @@ consistency over time.
    chain always keeps its frames against a weaker parallel one. Motion-only
    chains must be twice as long and are capped at 0.4 confidence; chains with
    neural corroboration at 0.6.
-4. **Gap bridging.** Up to 0.5 s of missing positions inside a confirmed path
-   are interpolated and marked `inferred: true`. They count for possession
-   continuity but never as observed frames (`ballFramesInferred`).
-5. **Static rejection.** A "ball" that does not move for three seconds after
-   camera compensation is a marking or a logo and is removed.
+4. **Gap bridging.** Up to 0.5 s of missing positions between two observations
+   that the online tracker's own distance gate would link are interpolated and
+   marked `inferred: true`. They count for possession continuity but never as
+   observed frames (`ballFramesInferred`), and pass candidates require an
+   observed ball throughout the transfer.
+5. **Static rejection.** A weakly evidenced "ball" (chain-recovered or below
+   the tracker's threshold) that does not drift for three seconds after camera
+   compensation, with no player standing over it, is a marking or a logo and
+   is removed. A confident detection of a dead ball at a set piece is kept.
 6. **Resolution-aware tiling and batching.** The tiled football ball model
    sees 480-pixel native tiles upscaled to 640, so a 240p or 1080p frame both
    present the ball near its training scale; all tiles of a batch of frames go

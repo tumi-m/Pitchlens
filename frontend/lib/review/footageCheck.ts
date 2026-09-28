@@ -6,7 +6,7 @@ export type FootageCheck = {
   width: number;
   height: number;
   duration: number;
-  /** Expected ball diameter in pixels for a full-pitch view (~1/70 of frame height). */
+  /** Expected ball diameter in pixels for a full-pitch view (~1/70 of the short side). */
   ballPixels: number;
   /** 0–100 */
   score: number;
@@ -19,18 +19,21 @@ export type FootageCheck = {
 export function gradeFootage(width: number, height: number, duration: number, motion?: number): FootageCheck {
   const notes: string[] = [];
   let score = 100;
-  const ballPixels = Math.round((height / 70) * 10) / 10;
-  if (height >= 1080) notes.push("1080p or better: the ball is large enough to track well.");
-  else if (height >= 720) {
+  // Grade by the short side: a portrait 720x1280 file shows the pitch across
+  // 720 pixels, so its ball is the 720p ball, not the 1080p one.
+  const side = Math.min(width, height);
+  const ballPixels = Math.round((side / 70) * 10) / 10;
+  if (side >= 1080) notes.push("1080p or better: the ball is large enough to track well.");
+  else if (side >= 720) {
     score -= 15;
     notes.push("720p: workable. 1080p would make the ball twice as easy to follow.");
-  } else if (height >= 480) {
+  } else if (side >= 480) {
     score -= 35;
     notes.push("Below 720p the ball is only a few pixels wide; expect gaps in ball tracking.");
   } else {
     score -= 55;
     notes.push(
-      `At ${height}p the ball is about ${ballPixels} pixels across. Player stats will work; ball stats will be partial.`,
+      `At ${side}p the ball is about ${ballPixels} pixels across. Player stats will work; ball stats will be partial.`,
     );
   }
   if (duration < 60) {
@@ -81,8 +84,9 @@ function bhattacharyya(a: number[], b: number[]) {
   return Math.sqrt(Math.max(0, 1 - s));
 }
 
-const seek = (video: HTMLVideoElement, t: number) =>
+const seek = (video: HTMLVideoElement, t: number, signal?: AbortSignal) =>
   new Promise<boolean>((resolve) => {
+    if (signal?.aborted) return resolve(false);
     const done = () => {
       cleanup();
       resolve(true);
@@ -96,9 +100,12 @@ const seek = (video: HTMLVideoElement, t: number) =>
       clearTimeout(timer);
       video.removeEventListener("seeked", done);
       video.removeEventListener("error", fail);
+      signal?.removeEventListener("abort", fail);
     };
     video.addEventListener("seeked", done, { once: true });
     video.addEventListener("error", fail, { once: true });
+    // A new file selection must release this decoder at once, not after two seeks.
+    signal?.addEventListener("abort", fail, { once: true });
     video.currentTime = t;
   });
 
@@ -123,15 +130,15 @@ export async function estimateMotion(
     for (const fraction of [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]) {
       if (signal?.aborted) break;
       const t = duration * fraction;
-      if (!(await seek(video, t))) break;
+      if (!(await seek(video, t, signal))) break;
       const a = frameSignature(video, canvas);
-      if (!(await seek(video, Math.min(duration - 0.1, t + 0.5)))) break;
+      if (!(await seek(video, Math.min(duration - 0.1, t + 0.5), signal))) break;
       const b = frameSignature(video, canvas);
       if (!a || !b) break;
       pairs++;
       if (bhattacharyya(a, b) > 0.35) cuts++;
     }
-    return pairs >= 3 ? cuts / pairs : undefined;
+    return pairs >= 3 && !signal?.aborted ? cuts / pairs : undefined;
   } catch {
     return undefined;
   }

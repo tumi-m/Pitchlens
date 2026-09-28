@@ -1043,16 +1043,121 @@ def test_speed_gates_scale_with_sparser_sampling():
     assert sorted(confirm_chains(fast, [identity] * 5, diagonal=734, sample_fps=3)) == [0, 1, 2, 3, 4]
 
 
-def test_long_stationary_ball_is_dropped_as_a_marking():
+def test_only_weak_unattended_static_balls_are_dropped_as_markings():
     from app.vision.faint import drop_static_balls
 
     identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
-    ball = {"x": 50.0, "y": 50.0, "box": [48, 48, 52, 52], "confidence": 0.5, "trackId": 3}
-    frames = [{"scene": 0, "ball": dict(ball)} for _ in range(20)]
-    moving = [{"scene": 0, "ball": {**ball, "x": 50.0 + 15 * i}} for i in range(20)]
-    assert drop_static_balls(frames, [identity] * 20, 734, sample_fps=5) == 20
-    assert all(f["ball"] is None for f in frames)
-    assert drop_static_balls(moving, [identity] * 20, 734, sample_fps=5) == 0
+    weak = {"x": 50.0, "y": 50.0, "box": [48, 48, 52, 52], "confidence": 0.3, "trackId": -1,
+            "recovered": True}
+    strong = {**weak, "confidence": 0.5, "trackId": 3, "recovered": False}
+    marking = [{"scene": 0, "players": [], "ball": dict(weak)} for _ in range(20)]
+    assert drop_static_balls(marking, [identity] * 20, 734, sample_fps=5) == 20
+    assert all(f["ball"] is None for f in marking)
+    # A confident detection of a dead ball (kick-off, corner) is an observation.
+    set_piece = [{"scene": 0, "players": [], "ball": dict(strong)} for _ in range(20)]
+    assert drop_static_balls(set_piece, [identity] * 20, 734, sample_fps=5) == 0
+    # A weak but attended ball is a player standing over it, not a logo.
+    attended = [{"scene": 0, "players": [{"team": 0, "box": [40, 10, 60, 52]}], "ball": dict(weak)}
+                for _ in range(20)]
+    assert drop_static_balls(attended, [identity] * 20, 734, sample_fps=5) == 0
+    # Slow drift (2 px/frame) is a rolling ball: measured from the run's origin, not the last frame.
+    rolling = [{"scene": 0, "players": [], "ball": {**weak, "x": 50.0 + 2 * i}} for i in range(20)]
+    assert drop_static_balls(rolling, [identity] * 20, 734, sample_fps=5) == 0
+
+
+def test_bridging_uses_the_online_trackers_gate():
+    """Two balls the tracker refused to link (too far for the gap) are never joined."""
+    from app.vision.faint import recover_ball
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for i in range(6):
+        ball = {"x": 100.0 if i < 2 else 1500.0, "y": 100, "box": [0, 0, 4, 4], "confidence": 0.7,
+                "trackId": 1 if i < 2 else 9}
+        frames.append({"t": i * 0.1, "scene": 0, "players": [], "ball": None if i in (2, 3) else ball,
+                       "ballCandidates": []})
+    counts = recover_ball(frames, [identity] * 6, diagonal=2203, sample_fps=10, max_bridge=0.5)
+    assert counts["inferred"] == 0 and frames[2]["ball"] is None
+
+
+def test_pass_candidates_need_an_observed_ball_throughout_the_transfer():
+    from app.vision.metrics import derive_metrics
+
+    a = {"id": 1, "team": 0, "box": [0, 0, 20, 100], "confidence": 0.9}
+    b = {"id": 2, "team": 0, "box": [200, 0, 220, 100], "confidence": 0.9}
+    def frame(i, ball):
+        return {"t": i * 0.2, "scene": 0, "players": [a, b], "ball": ball}
+    at = lambda x, **extra: {"x": x, "y": 100.0, "box": [x - 2, 98, x + 2, 102], "confidence": 0.7,
+                             "trackId": 1, **extra}
+    observed = [frame(0, at(10)), frame(1, at(10)), frame(2, at(105)), frame(3, at(210)), frame(4, at(210))]
+    bridged = [frame(0, at(10)), frame(1, at(10)), frame(2, at(105, inferred=True, observed=False)),
+               frame(3, at(210)), frame(4, at(210))]
+    with_observed = derive_metrics(observed, 5, 1.0)["events"]
+    with_bridged = derive_metrics(bridged, 5, 1.0)["events"]
+    assert with_bridged == []
+    assert len(with_observed) >= len(with_bridged)
+
+
+def test_motion_blobs_never_displace_detector_candidates():
+    from app.vision.engine import merge_candidates
+
+    detector = [{"x": i, "confidence": 0.31 - 0.03 * i} for i in range(8)]
+    motion = [{"x": 100 + i, "confidence": 0.15, "source": "motion"} for i in range(8)]
+    merged = merge_candidates(detector, motion)
+    assert len(merged) == 12
+    assert all(d in merged for d in detector)
+    assert sum(1 for c in merged if c.get("source") == "motion") == 4
+    # A frame with few detector hits leaves room for motion evidence.
+    assert len(merge_candidates(detector[:2], motion)) == 10
+
+
+def test_tiles_scale_with_resolution_but_stay_bounded():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+    calls = []
+
+    class Model:
+        def predict(self, images, **kwargs):
+            calls.append(len(images))
+            return [SimpleNamespace(boxes=SimpleNamespace(xyxy=np.empty((0, 4)), conf=np.empty(0)))
+                    for _ in images]
+
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    assert len(detector.tiles(np.zeros((360, 640, 3), np.uint8))) == 2
+    assert len(detector.tiles(np.zeros((1080, 1920, 3), np.uint8))) == 12
+    # 4K is reduced to 1080p before tiling: same cost, ball still twice the 480p size.
+    tiles = detector.tiles(np.zeros((2160, 3840, 3), np.uint8))
+    assert len(tiles) == 12 and tiles[0][2] == 0.5
+    detector.detect_batch([np.zeros((2160, 3840, 3), np.uint8)] * 8)
+    assert sum(calls) == 96 and max(calls) <= TiledBallDetector.MAX_CROPS
+
+
+def test_4k_detections_map_back_to_source_pixels():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+
+    class Model:
+        def predict(self, images, **kwargs):
+            results = []
+            for image in images:
+                ys, xs = np.where(image[:, :, 0] > 0)
+                boxes = (np.array([[xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]]) if len(xs)
+                         else np.empty((0, 4)))
+                results.append(SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.full(len(boxes), 0.9))))
+            return results
+
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    frame = np.zeros((2160, 3840, 3), np.uint8)
+    frame[1000:1040, 3000:3040] = 255
+    found = detector.detect(frame)
+    assert len(found) == 1
+    assert abs(found[0]["x"] - 3020) <= 3 and abs(found[0]["y"] - 1020) <= 3
 
 
 def test_diagnostic_metrics_use_source_timestamp_offset():

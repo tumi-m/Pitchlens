@@ -196,6 +196,14 @@ def assign_team(feature, centres, use_hue=True):
     )
 
 
+def merge_candidates(detector, motion, limit=12):
+    """Keep at most `limit` candidates per frame without letting motion blobs
+    (which all saturate at the same low confidence) push out the faint detector
+    responses the confirmation pass exists to keep."""
+    n_motion = min(len(motion), max(4, limit - len(detector)))
+    return detector[: limit - n_motion] + motion[:n_motion]
+
+
 def run_video(
     path,
     output,
@@ -424,13 +432,13 @@ def run_video(
             # Weak neural candidates plus difference-imaging candidates; the
             # track-before-detect pass after the loop decides which are real.
             diameter = ball_size_prior(players, frame.shape[0])
-            candidates = list(raw_candidates)
+            detector = sorted(raw_candidates, key=lambda c: -c["confidence"])
+            motion = []
             if motion_ok and not cut:
-                candidates += difference_candidates(
+                motion = difference_candidates(
                     previous_frame, frame, matrix, players, diameter, mask=mask
                 )
-            candidates.sort(key=lambda c: -c["confidence"])
-            candidates = candidates[:12]
+            candidates = merge_candidates(detector, motion)
             strong = strong_candidates(candidates)
             previous_frame = frame
             previous_boxes = [p["box"] for p in players]
@@ -530,6 +538,11 @@ def run_video(
         else {"recovered": 0, "inferred": 0, "disabled": True}
     )
     timings["ballRecoverySeconds"] = time.monotonic() - tick
+    # Working data for the confirmation pass: ~12 dicts per frame, tens of MB
+    # on a full match. Kept only when asked (tuning, benchmarks).
+    if os.getenv("VISION_KEEP_CANDIDATES", "0") != "1":
+        for f in frames:
+            f.pop("ballCandidates", None)
     progress(stage="Measuring temporal observations", progress=96)
     analysed_duration = min(
         duration, max((frame_num - first_frame) / meta["fps"], last_t - start_seconds)

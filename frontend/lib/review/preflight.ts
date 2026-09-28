@@ -10,6 +10,9 @@ export type VideoPreflight = {
   motion?: number;
 };
 
+/** The file itself is unusable (limits the server enforces too); not a browser codec gap. */
+export class PreflightRejected extends Error {}
+
 export async function inspectVideo(file: File, signal: AbortSignal): Promise<VideoPreflight> {
   const url = URL.createObjectURL(file);
   const video = document.createElement("video");
@@ -38,9 +41,9 @@ export async function inspectVideo(file: File, signal: AbortSignal): Promise<Vid
     await waitFor("loadeddata", () => { video.src = url; });
     const { videoWidth: width, videoHeight: height, duration } = video;
     if (!Number.isFinite(duration) || duration <= 0 || !width || !height)
-      throw new Error("The video has invalid dimensions or duration.");
+      throw new PreflightRejected("The video has invalid dimensions or duration.");
     if (duration > 4 * 3600 || width > 4096 || height > 4096)
-      throw new Error("Choose a video under four hours and 4096 pixels per side.");
+      throw new PreflightRejected("Choose a video under four hours and 4096 pixels per side.");
     const canvas = document.createElement("canvas");
     canvas.width = Math.min(480, width);
     canvas.height = Math.max(1, Math.round(height * canvas.width / width));

@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
-import { inspectVideo, VideoPreflight } from "@/lib/review/preflight";
+import { inspectVideo, PreflightRejected, VideoPreflight } from "@/lib/review/preflight";
 import { clockTime } from "@/lib/review/vision";
 import { Navbar } from "@/components/ui/Navbar";
 import { AnimatePresence, motion } from "framer-motion";
@@ -37,10 +37,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [adaptive, setAdaptive] = useState(false);
   const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
   const [checking, setChecking] = useState(false);
+  /** The browser could not decode the file (codec gap or corrupt); the server decides. */
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const [rejected, setRejected] = useState(false);
   const [diagnostic, setDiagnostic] = useState(false);
   const [start, setStart] = useState(0);
   useEffect(() => {
     setPreflight(null);
+    setPreviewFailed(false);
+    setRejected(false);
     setStart(0);
     if (!file) { setChecking(false); return; }
     const controller = new AbortController();
@@ -48,14 +53,24 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     inspectVideo(file, controller.signal).then((result) => {
       if (!controller.signal.aborted) setPreflight(result);
     }).catch((e) => {
-      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Video check failed");
+      if (controller.signal.aborted) return;
+      if (e instanceof PreflightRejected) {
+        setRejected(true);
+        setError(e.message);
+      } else {
+        // HEVC .mov from a phone in Firefox or Linux Chromium ends here although the
+        // analysis server decodes it fine: warn, drop the short test, allow the upload.
+        setPreviewFailed(true);
+        setDiagnostic(false);
+      }
     }).finally(() => { if (!controller.signal.aborted) setChecking(false); });
     return () => controller.abort();
   }, [file]);
   const check = preflight
     ? gradeFootage(preflight.width, preflight.height, preflight.duration, preflight.motion)
     : null;
-  const ready = source === "file" ? !!file && !!preflight && !checking : linkOk && rights;
+  const ready =
+    source === "file" ? !!file && !checking && !rejected : linkOk && rights;
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
   const upload = useRef<AbortController | null>(null);
@@ -346,6 +361,17 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           {source === "file" && checking && (
             <p role="status" className="text-sm text-pitch-muted">
               Checking the video on this device before upload…
+            </p>
+          )}
+          {source === "file" && previewFailed && !checking && (
+            <p
+              role="alert"
+              className="border border-amber-500/40 bg-amber-500/10 rounded-xl p-4 text-sm"
+            >
+              This browser could not decode the video, so the footage grade and the 20-second
+              test are unavailable here. The analysis server decodes files itself (H.264 and
+              HEVC); you can still analyse the full match. If the server rejects it too, export
+              it as an H.264 MP4.
             </p>
           )}
           <AnimatePresence>

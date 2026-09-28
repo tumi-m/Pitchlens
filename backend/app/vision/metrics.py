@@ -27,7 +27,8 @@ def possession_owner(players, ball):
 
 def derive_metrics(frames, sample_fps, duration, start_seconds=0):
     dt = 1 / sample_fps
-    # Require consecutive observations, never bridge unseen-ball intervals.
+    # Possession runs may include positions bridged for up to 0.5 s inside a
+    # confirmed ball path (`inferred`); pass windows below require observed frames.
     runs = []
     for f in frames:
         owner = possession_owner(f["players"], f["ball"])
@@ -57,7 +58,7 @@ def derive_metrics(frames, sample_fps, duration, start_seconds=0):
             bisect_left(timestamps, previous["end"]) : bisect_right(timestamps, r["start"])
         ]
         # A pass candidate needs a visible ball throughout the transfer.
-        if not observed or any(f["ball"] is None for f in observed):
+        if not observed or any(f["ball"] is None or f["ball"].get("inferred") for f in observed):
             continue
         if len({f["ball"]["trackId"] for f in observed if "trackId" in f["ball"]}) > 1:
             continue

@@ -41,7 +41,10 @@ def difference_candidates(previous, current, matrix, players, diameter, limit=8,
     warped = cv2.warpAffine(previous, matrix, (w, h), flags=cv2.INTER_LINEAR)
     grey_now = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
     grey_prev = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    diff = cv2.absdiff(grey_now, grey_prev)
+    # Signed difference: where the picture got brighter. A light ball arriving
+    # lights up its new position; with an absolute difference the spot it left
+    # behind lit up too and the ghost trailed every promoted position by a frame.
+    diff = cv2.subtract(grey_now, grey_prev)
     # Border pixels the warp could not fill look like motion.
     diff[:3, :] = 0
     diff[-3:, :] = 0
@@ -80,7 +83,7 @@ def difference_candidates(previous, current, matrix, players, diameter, limit=8,
                 "box": [round(float(cx - bw / 2), 1), round(float(cy - bh / 2), 1),
                         round(float(cx + bw / 2), 1), round(float(cy + bh / 2), 1)],
                 # Deliberately weak: only a consistent trajectory can promote it,
-                # and it never outranks a real (if faint) detector response.
+                # and it never outranks a detector response the tracker accepts.
                 "confidence": round(min(0.15, 0.05 + energy / 510), 3),
                 "source": "motion",
             }
@@ -126,9 +129,11 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
     for i in range(n):
         m = matrices[i] if i > 0 and matrices[i] is not None else None
         local.append(np.vstack([m, [0, 0, 1]]) if m is not None else identity)
-
-    def carry(point, transform):
-        return (transform @ np.array([point[0], point[1], 1.0]))[:2]
+    points, conf = [], []
+    for f in frames:
+        c = f.get("ballCandidates", [])
+        points.append(np.array([[k["x"], k["y"], 1.0] for k in c]) if c else np.zeros((0, 3)))
+        conf.append(np.array([k["confidence"] for k in c]) if c else np.zeros(0))
 
     # Physical plausibility in image space. A hard pass crosses a small pitch in
     # about a second, i.e. up to ~0.15 of the frame diagonal per sampled frame
@@ -140,9 +145,14 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
     # (frame, candidate) -> (score, length, previous key, velocity in own frame's pixels)
     best = {}
     order = []
+    # Per-frame arrays for the dynamic programme (a 40-minute match has ~300k
+    # candidates; a Python inner loop took minutes, this takes seconds).
+    scores = [None] * n
+    lengths = [None] * n
+    velocities = [None] * n
     for i in range(n):
-        candidates = frames[i].get("ballCandidates", [])
-        if not candidates:
+        m = len(points[i])
+        if not m:
             continue
         # transform[back] maps frame i-back coordinates into frame i coordinates.
         transform = [identity]
@@ -151,36 +161,38 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
             if k < 0 or frames[k]["scene"] != frames[i]["scene"]:
                 break
             transform.append(transform[-1] @ local[k + 1])
-        for j, c in enumerate(candidates):
-            key = (i, j)
-            score, length, prev, velocity = c["confidence"], 1, None, None
-            here = np.array([c["x"], c["y"]])
-            # Link to the best chain ending within the window that predicts this point.
-            for back in range(1, len(transform)):
-                k = i - back
-                for l, ck in enumerate(frames[k].get("ballCandidates", [])):
-                    pk = (k, l)
-                    if pk not in best:
-                        continue
-                    s0, len0, _, v0 = best[pk]
-                    there = carry((ck["x"], ck["y"]), transform[back])
-                    step = here - there
-                    if np.linalg.norm(step) > max_step * back:
-                        continue
-                    if v0 is not None:
-                        # Velocity is a direction: rotate/scale it, never translate it.
-                        predicted = there + transform[back][:2, :2] @ v0 * back
-                        tolerance = gate * back
-                    else:
-                        predicted = there
-                        tolerance = gate * back + max_step * 0.6
-                    if np.linalg.norm(here - predicted) > tolerance:
-                        continue
-                    candidate_score = s0 + c["confidence"] - 0.02 * back
-                    if candidate_score > score:
-                        score, length, prev, velocity = candidate_score, len0 + 1, pk, step / back
-            best[key] = (score, length, prev, velocity)
-            order.append(key)
+        here = points[i][:, :2]
+        score = conf[i].copy()
+        length = np.ones(m, int)
+        prev = [None] * m
+        velocity = np.full((m, 2), np.nan)
+        for back in range(1, len(transform)):
+            k = i - back
+            if scores[k] is None:
+                continue
+            T = transform[back]
+            there = (points[k] @ T.T)[:, :2]
+            v0 = velocities[k]
+            has_v = ~np.isnan(v0[:, 0])
+            # Velocity is a direction: rotate/scale it, never translate it.
+            carried = np.where(has_v[:, None], v0 @ T[:2, :2].T, 0.0)
+            predicted = there + carried * back
+            tolerance = np.where(has_v, gate * back, gate * back + max_step * 0.6)
+            step = here[:, None, :] - there[None, :, :]
+            ok = np.linalg.norm(step, axis=2) <= max_step * back
+            ok &= np.linalg.norm(here[:, None, :] - predicted[None], axis=2) <= tolerance[None, :]
+            candidate = np.where(ok, scores[k][None, :] + conf[i][:, None] - 0.02 * back, -np.inf)
+            for j in range(m):
+                l = int(np.argmax(candidate[j]))
+                if candidate[j, l] > score[j]:
+                    score[j] = candidate[j, l]
+                    length[j] = lengths[k][l] + 1
+                    prev[j] = (k, l)
+                    velocity[j] = step[j, l] / back
+        scores[i], lengths[i], velocities[i] = score, length, velocity
+        for j in range(m):
+            best[(i, j)] = (float(score[j]), int(length[j]), prev[j])
+            order.append((i, j))
     # Walk chains from their strongest end, longest first, without reuse.
     promoted = {}
     used = set()
@@ -223,40 +235,58 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
     return promoted
 
 
+def _attended(frame, ball):
+    """A team player stands over the ball (a set piece), so it is no marking."""
+    for p in frame.get("players", []):
+        if p.get("team") not in (0, 1):
+            continue
+        x1, y1, x2, y2 = p["box"]
+        scale = max(y2 - y1, 1)
+        if min(math.hypot(ball["x"] - x, ball["y"] - y2) for x in (x1, (x1 + x2) / 2, x2)) <= scale:
+            return True
+    return False
+
+
 def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0):
-    """A 'ball' that has not moved for several seconds (after cancelling camera
-    motion) is a pitch marking, a logo or a stray object, not the match ball."""
+    """A weakly evidenced 'ball' that has not moved for several seconds (after
+    cancelling camera motion) is a pitch marking, a logo or a stray object.
+
+    Only chain-recovered or sub-threshold positions are eligible: a confident
+    detector observation of a ball at rest (kick-off, corner, penalty) is kept,
+    and so is any still ball with a player standing over it. Drift is measured
+    from where the run started, so a slowly rolling ball is not "static".
+    """
     limit = max(2, int(round(seconds * sample_fps)))
     tolerance = diagonal * 0.004
-    run = []  # indices of consecutive frames with a near-stationary ball
+    run = []  # indices of consecutive frames with a near-stationary weak ball
     dropped = 0
 
     def flush():
         nonlocal dropped
-        if len(run) >= limit:
+        if len(run) >= limit and sum(_attended(frames[i], frames[i]["ball"]) for i in run) * 2 < len(run):
             for i in run:
                 frames[i]["ball"] = None
                 dropped += 1
         run.clear()
 
-    previous = None
+    anchor = None  # start of the run, carried through each frame's camera transform
     for i, f in enumerate(frames):
         b = f["ball"]
-        if b is None or b.get("inferred"):
+        weak = b is not None and not b.get("inferred") and (b.get("recovered") or b["confidence"] < 0.15)
+        if not weak:
             flush()
-            previous = None
+            anchor = None
             continue
-        if previous is not None and matrices[i] is not None and frames[i - 1]["scene"] == f["scene"]:
-            expected = _warp_point(previous, matrices[i])
-            if np.linalg.norm(np.array([b["x"], b["y"]]) - expected) <= tolerance:
+        here = np.array([b["x"], b["y"]])
+        if anchor is not None and matrices[i] is not None and frames[i - 1]["scene"] == f["scene"]:
+            anchor = _warp_point(anchor, matrices[i])
+            if np.linalg.norm(here - anchor) <= tolerance:
                 if not run:
                     run.append(i - 1)
                 run.append(i)
-            else:
-                flush()
-        else:
-            flush()
-        previous = (b["x"], b["y"])
+                continue
+        flush()
+        anchor = here
     flush()
     return dropped
 
@@ -281,7 +311,8 @@ def recover_ball(frames, matrices, diagonal, sample_fps, max_bridge=0.5):
         if f["ball"] is not None and not f["ball"].get("inferred"):
             if last is not None and 1 < i - last <= max_gap and frames[last]["scene"] == f["scene"]:
                 a, b = frames[last]["ball"], f["ball"]
-                reach = diagonal * 0.12 * (i - last) * max(1.0, 6.0 / max(sample_fps, 0.5))
+                # The online tracker's own gate: never join what it refused to join.
+                reach = diagonal * (0.025 + 0.3 * (i - last) / sample_fps)
                 if math.hypot(a["x"] - b["x"], a["y"] - b["y"]) <= reach:
                     for k in range(last + 1, i):
                         s = (k - last) / (i - last)
