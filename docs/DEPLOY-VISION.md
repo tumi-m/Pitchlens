@@ -161,3 +161,18 @@ Modal → Settings → Usage & billing.
 - `VISION_BATCH`: frames per model call (default 8 on GPU, 2 on CPU).
 - `VISION_FAINT=0`: turn off track-before-detect ball recovery (default on).
 - `VISION_THREADS`: CPU threads for inference.
+- `VISION_TRACKER=legacy`: previous player tracker (default is the
+  ByteTrack-style tracker from pipeline 2.2).
+- `VISION_KEEP_CANDIDATES=1`: keep every ball candidate in result.json (large;
+  for tuning only).
+
+### Match analytics, pitch setup and venues (no new configuration)
+
+Pitch calibration, event detection and reviewer decisions run on the Railway
+worker itself (CPU, a few seconds per match; applying a pitch setup to a
+moving camera re-reads the video once, about a minute). They are stored next
+to each job on the `/data` volume: `calibration.json`, `review.json`
+(append-only), `analysis.json` (a cache). Saved venues live in
+`/data/venues/`. The website needs no new variables; redeploy both the worker
+and the site so the new `/analysis`, `/calibration`, `/review` and `/venues`
+routes exist on both sides.
