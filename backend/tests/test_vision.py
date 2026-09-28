@@ -1029,6 +1029,20 @@ def test_motion_blobs_never_drive_the_online_tracker():
     assert strong_candidates(candidates) == [{"x": 2, "y": 2, "confidence": 0.2}]
 
 
+def test_speed_gates_scale_with_sparser_sampling():
+    """A 30 px/frame path at 6 fps is a 60 px/frame path at 3 fps; both are the same ball."""
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    fast = [
+        {"scene": 0, "ball": None,
+         "ballCandidates": [{"x": 50.0 + 130 * i, "y": 100.0, "box": None, "confidence": 0.2}]}
+        for i in range(5)
+    ]
+    assert confirm_chains(fast, [identity] * 5, diagonal=734, sample_fps=6) == {}
+    assert sorted(confirm_chains(fast, [identity] * 5, diagonal=734, sample_fps=3)) == [0, 1, 2, 3, 4]
+
+
 def test_long_stationary_ball_is_dropped_as_a_marking():
     from app.vision.faint import drop_static_balls
 

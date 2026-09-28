@@ -106,7 +106,7 @@ def _warp_point(xy, matrix):
     return matrix @ np.array([xy[0], xy[1], 1.0])
 
 
-def confirm_chains(frames, matrices, diagonal, window=6, min_length=3, min_evidence=0.55):
+def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_length=3, min_evidence=0.55):
     """Track-before-detect over all sampled frames.
 
     `matrices[i]` maps frame i-1 coordinates into frame i coordinates. A chain is
@@ -133,8 +133,10 @@ def confirm_chains(frames, matrices, diagonal, window=6, min_length=3, min_evide
     # Physical plausibility in image space. A hard pass crosses a small pitch in
     # about a second, i.e. up to ~0.15 of the frame diagonal per sampled frame
     # at 6 fps; anything faster is a jump between unrelated blobs.
-    max_step = diagonal * 0.15
-    gate = diagonal * 0.03  # prediction tolerance per frame of separation
+    # Sparser sampling means more movement between samples: scale the gates.
+    per_sample = max(1.0, 6.0 / max(sample_fps, 0.5))
+    max_step = diagonal * 0.15 * per_sample
+    gate = diagonal * 0.03 * per_sample  # prediction tolerance per frame of separation
     # (frame, candidate) -> (score, length, previous key, velocity in own frame's pixels)
     best = {}
     order = []
@@ -264,7 +266,7 @@ def recover_ball(frames, matrices, diagonal, sample_fps, max_bridge=0.5):
 
     Returns counts: {"recovered": n, "inferred": n, "droppedStatic": n}.
     """
-    promoted = confirm_chains(frames, matrices, diagonal)
+    promoted = confirm_chains(frames, matrices, diagonal, sample_fps)
     recovered = 0
     for i, candidate in promoted.items():
         if frames[i]["ball"] is None:
@@ -279,7 +281,8 @@ def recover_ball(frames, matrices, diagonal, sample_fps, max_bridge=0.5):
         if f["ball"] is not None and not f["ball"].get("inferred"):
             if last is not None and 1 < i - last <= max_gap and frames[last]["scene"] == f["scene"]:
                 a, b = frames[last]["ball"], f["ball"]
-                if math.hypot(a["x"] - b["x"], a["y"] - b["y"]) <= diagonal * 0.12 * (i - last):
+                reach = diagonal * 0.12 * (i - last) * max(1.0, 6.0 / max(sample_fps, 0.5))
+                if math.hypot(a["x"] - b["x"], a["y"] - b["y"]) <= reach:
                     for k in range(last + 1, i):
                         s = (k - last) / (i - last)
                         frames[k]["ball"] = {
