@@ -540,12 +540,13 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           )}
           <p className="text-sm text-pitch-muted">
             {health?.gpu
-              ? "Analysis runs on a GPU: expect several minutes for a full match (the first run of the day can take a few extra minutes to start). "
+              ? "Analysis runs on a GPU (the first run of the day can take a few extra minutes to start). "
               : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
             The report shows a live time estimate, and you can leave and come
-            back. It shows detection coverage and unknown time. Kit groups need your team
-            names; automatic pass candidates are estimates. Score, xG and
-            physical speed are not yet measured.
+            back. You get possession and passes automatically; a two-minute pitch
+            setup (or a saved venue) adds shots, heatmaps and positions. Goals and
+            shots are proposed for you to confirm, and the score comes from you.
+            Speed, distance and xG are not measured.
           </p>
           <div className="grid sm:grid-cols-2 gap-4">
             <label className="text-sm">Footage type

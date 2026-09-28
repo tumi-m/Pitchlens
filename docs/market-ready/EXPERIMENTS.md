@@ -1,0 +1,125 @@
+# Experiments
+
+Hypothesis, data, configuration, outcome, decision. Newest first.
+Development data only unless marked; none of these is a held-out result.
+
+## E12 · Camera field of view for a side-on halfway camera (2026-09-28)
+- Synthetic 1280×720 camera 30 m from a futsal court, level with halfway,
+  facing straight across; 13 visible landmarks with 0.7-2 px click noise,
+  100 seeds each.
+- Old estimate (median of two focal candidates): 14-17 of 100 fits more than
+  10° off. Least-squares solve of both constraints: 0 of 100.
+- Decision: adopt (display only; the homography was never affected).
+
+## E11 · Adversarial review of the new code (2026-09-28)
+- Two review rounds by independent agents, each finding reproduced and then
+  challenged by a skeptic before it counted. Final round: 49 claims,
+  13 confirmed (most already fixed by the first round's fixes).
+- All confirmed defects fixed, each with a regression test that fails on the
+  old code: stale review decisions confirming goals, defender blocks counted
+  as saves, a warm-up kick-off flagged as a goal, zeros shown for unmeasured
+  counts, stitching mixing metres with pixels, a re-aimed fixed camera kept
+  on its old calibration, masks from the wrong frame on variable-frame-rate
+  video, clicks between analysed frames accepted, 500s on malformed input.
+- Backend tests 150 → 163; browser tests 10 → 11 on the vision pages.
+- Held-out Metrica game 2 (moderate degradation) re-run after the fixes:
+  passes, shots and possession unchanged (pass F1 0.62, shot F1 0.45,
+  agreement 89.6%); goal-candidate precision 2/3 → 2/2 (the opening
+  kick-off no longer raises a false candidate).
+
+## E10 · Possession through longer unseen gaps (2026-09-28)
+- Possession gap (ball unseen or loose between two controls) 5 s → 8 s, tuned
+  on game 1 (12 s raised coverage further but cost more agreement).
+- Held-out game 2: moderate degradation coverage 77% → 85%, agreement
+  91.5% → 89.6%, share error 1.2 → 0.1 points; heavy degradation coverage
+  48% → 68% (share now shown), agreement 86.5% → 87.6%, share error
+  3.4 → 1.6 points.
+- Decision: adopt 8 s.
+
+## E9 · Shots inferred from the ball's flight (2026-09-28)
+- Hypothesis: most missed shots have the release hidden at the feet; a fast
+  ball heading for goal from range, not collected by the attacking side, is a
+  shot by the team attacking that goal.
+- Tuned on game 1 (speed bar 8 m/s kept: 10-12 m/s cost more recall than they
+  saved in false shots). Held-out game 2, shot recall / F1:
+  none 33% → 92% / 0.40 → 0.54; moderate 13% → 67% / 0.20 → 0.45;
+  heavy 4% → 46% / 0.08 → 0.37. Precision ~0.31-0.39: about two proposals per
+  real shot, which the reviewer confirms or rejects. Goal candidates on clean
+  tracking: 5 of 5 real goals flagged, no false ones.
+- Decision: adopt, marked `inferred`, confidence 0.3, always reviewed.
+
+## E8 · Event engine against human-labelled events (Metrica open data, 2026-09-28)
+- Data: Metrica Sports sample games 1 and 2 (25 fps optical tracking with
+  hand-labelled events; acknowledged, not redistributed). Game 1 = development
+  (all tuning), game 2 = held out (run once per setting after tuning stopped).
+- Harness: `backend/scripts/evaluate_on_tracking_data.py` converts tracking to
+  Pitchlens frames and degrades it: 5 fps, position noise, ball missing at
+  random and extra at players' feet, IDs fragmented; then runs the unchanged
+  analytics and scores passes, shots, interceptions (one-to-one, ±1 s / ±2 s)
+  and possession (per 0.2 s, event-derived labels).
+- Changes found necessary on game 1: gain validation on either side of a
+  frame (reception/release), duel zone = possession zone, single-frame
+  touches (direction change) and hidden single sightings, noise-scaled
+  relative-speed test, wider shot band with "teammate collects = not a shot",
+  stitching solved per connected group (a dense matrix used 13 GB) and
+  repeated until stable (a player split into 40 fragments stayed split).
+- Held-out game 2:
+
+| Degradation | Pass P / R / F1 | Shot F1 | Interception F1 | Possession agreement / coverage | Share error |
+|---|---|---|---|---|---|
+| none | 0.83 / 0.82 / 0.83 | 0.40 | 0.45 | 93.8% / 90% | 0.8 pts |
+| moderate (0.3 m players, 0.5 m ball, 30% + 30% at feet dropped, new ID every ~5 s) | 0.75 / 0.52 / 0.62 | 0.20 | 0.21 | 91.5% / 77% | 1.2 pts |
+| heavy (0.5 m / 0.8 m, 40% + 40%, ~3 s) | 0.65 / 0.29 / 0.40 | 0.08 | 0.10 | 86.5% / 48% (share withheld) | 3.4 pts |
+
+- Reading: possession share meets the ≤5-point target at every level; pass
+  detection is in the published range for independent data (F1 ~0.71);
+  shots are weak under degradation (as the literature reports) and stay
+  review-gated. Limits: 11-a-side professional data, positions are better than
+  a 360p camera before degradation, only two matches.
+
+## E7 · ByteTrack-style tracker and optimal stitching (2026-09-28)
+- Replay of the 3-min indoor clip's recorded detections through both trackers.
+- Legacy: 329 IDs, median track 2.7 s, 63 IDs with ≤2 sightings, 99.6% of
+  observations kept. New (Kalman, two passes, 3.5 s lost buffer, 2-hit
+  confirmation, soft kit cost, start threshold 0.4, pre-confirmation sightings
+  restored): 192 IDs (-42%), median 4.8 s, 6 short IDs, 96.8% kept.
+- After offline stitching: 151 player tracks (previously 209). Possession
+  followed (41%) and event counts unchanged: no regression.
+- Decision: new tracker is the default (`VISION_TRACKER=legacy` reverts).
+- Side effect: with longer tracks the per-track kit vote covers 89% of player
+  observations (legacy tracker: 80%). Accuracy of those labels is unmeasured.
+
+## E6 · Research-grounded analytics on real results (2026-09-28)
+- Data: owner's 20 s GPU diagnostic of the night 5-a-side (360p, uncalibrated);
+  owner's earlier full-match export (pipeline 1.5); 3-min indoor clip with a
+  guessed-dimension calibration.
+- Outcome: possession followed for 54% of play on the 20 s diagnostic (control-only
+  rule: 6%, with 14 px slack: 26%). Old full-match export: 4.6% (ball visible 15%
+  in that engine version, the real bottleneck). Analytics run in 0.07 s (3 min)
+  and 1.2 s (37 min).
+- Decision: adopt team-possession sequences; withhold the share below 60%.
+
+## E5 · Calibration through a pan (synthetic ground truth, 2026-09-28)
+- Rendered 60-frame panning video with motion-estimate noise (σ 0.8 px) and two
+  frames of failed motion estimation.
+- Outcome: 100% of frames calibrated, max error < 0.5 m after line re-alignment.
+  First version locked onto a wrong solution after the gap (27 m error); fixed
+  by staged alignment (shift search → similarity → regularised homography) plus
+  plausibility checks.
+
+## E4 · Calibration on real indoor footage (2026-09-28)
+- 3-min panning broadcast-style clip; venue dimensions unknown (guessed).
+- Outcome: 30 frames re-aligned to lines; coverage 17% because the guessed
+  template cannot match the painted lines elsewhere. Lesson: dimensions must be
+  right; the UI makes them editable and the fit flags mismatches.
+
+## E3 · Engine 2.0 faint-ball recovery (2026-09-28)
+- 3-min indoor clip at 360p and 240p, CPU, stand-in ball model.
+- Outcome (360p): frames with a ball 36% → 70% (153 marked inferred); possession
+  coverage 4.9% → 17.1%; recovered positions move 7-13 px per frame (median).
+- GPU diagnostic on the owner's night clip: ball in 91% of 100 frames; 23 s total.
+
+## Next
+- E7 tracker upgrade (Kalman, 3-4 s lost buffer, confirmation, soft team cost):
+  measure IDs per minute and median track length on the 3-min clip.
+- E8 WASB soccer heatmap candidates on Modal against labelled night frames.

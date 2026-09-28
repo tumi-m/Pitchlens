@@ -1103,6 +1103,18 @@ def test_speed_gates_scale_with_sparser_sampling():
     ]
 
 
+def test_possession_allows_pixel_slack_for_small_players_only():
+    from app.vision.metrics import possession_owner
+
+    small = {"id": 1, "team": 0, "box": [100, 100, 110, 123]}  # 23 px: whole pitch at 360p
+    large = {"id": 2, "team": 1, "box": [100, 100, 140, 300]}  # 200 px: close-up
+    # 20 px from a small player's feet is within detection error of control...
+    assert possession_owner([small], {"x": 105, "y": 143}) is small
+    # ...but 20 px is well inside 0.55 heights on a large player anyway, and
+    # 1.2 heights away on a large player is still a loose ball.
+    assert possession_owner([large], {"x": 120, "y": 540}) is None
+
+
 def test_only_weak_unattended_static_balls_are_dropped_as_markings():
     from app.vision.faint import drop_static_balls
 
@@ -1531,3 +1543,76 @@ def test_motion_recovery_requires_local_bracketing_neural_evidence():
     assert 1 in promoted  # one observed blob between two detector hits
     assert all(i <= 2 for i in promoted)  # no authentication of the entire later motion chain
     assert promoted[1]["confidence"] == 0.1  # trajectory length never invents detector confidence
+
+
+def test_byte_tracker_keeps_identity_through_a_short_occlusion_and_confirms_before_counting():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for k in range(20):
+        x = 100 + 6 * k
+        obs = [] if 8 <= k <= 14 else [{"team": 0, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}]
+        frames.append(tracker.update(obs, k * 0.2, identity))
+    ids = {p["id"] for f in frames for p in f}
+    assert len(ids) == 1  # 1.4 s unseen is within the lost-track buffer
+    assert len(frames[0]) == 1  # the first sighting is restored once the track is confirmed
+
+
+def test_byte_tracker_does_not_invent_tracks_from_one_off_false_positives():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    out = tracker.update([{"team": -1, "role": "player", "box": [300, 100, 312, 130], "confidence": 0.95}], 0.0, identity)
+    for k in range(1, 6):
+        out += tracker.update([], k * 0.2, identity)
+    assert out == []
+
+
+def test_byte_tracker_tolerates_one_wrong_kit_colour():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    ids = set()
+    for k in range(10):
+        team = 1 if k == 5 else 0  # a single frame of mis-read colour
+        x = 100 + 5 * k
+        for p in tracker.update([{"team": team, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}], k * 0.2, identity):
+            ids.add(p["id"])
+    assert len(ids) == 1
+
+
+def test_byte_tracker_confirms_tracks_at_one_sample_per_second():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    lists = []
+    for k in range(6):
+        x = 100 + 20 * k
+        lists.append(tracker.update([{"team": 0, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}], float(k), identity))
+    out = [p for frame in lists for p in frame]  # read after late additions landed
+    assert len(out) == 6 and len({p["id"] for p in out}) == 1
+
+
+def test_established_kit_never_takes_the_other_teams_player():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    for k in range(5):  # player A (kit 0) well established
+        tracker.update([{"team": 0, "role": "player", "box": [100, 100, 112, 130], "confidence": 0.9}], k * 0.2, identity)
+    # A is now only weakly detected while B (kit 1) appears right next to him.
+    out = tracker.update(
+        [
+            {"team": 0, "role": "player", "box": [101, 100, 113, 130], "confidence": 0.2},
+            {"team": 1, "role": "player", "box": [106, 100, 118, 130], "confidence": 0.9},
+        ],
+        1.0,
+        identity,
+    )
+    a = [p for p in out if p["team"] == 0]
+    assert a and all(p["team"] == 0 for p in out if p["id"] == a[0]["id"])

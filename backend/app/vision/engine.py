@@ -28,7 +28,7 @@ from app.vision.faint import (
 )
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
-from app.vision.tracking import MotionTracker, camera_motion
+from app.vision.tracking import ByteTracker, MotionTracker, camera_motion
 
 
 def file_sha256(path):
@@ -356,7 +356,8 @@ def run_video(
         kit_warning = str(exc) + " Team assignments and possession are unavailable."
     timings["setupSeconds"] = time.monotonic() - total_started
     cap = cv2.VideoCapture(str(path))
-    tracker = MotionTracker()
+    # VISION_TRACKER=legacy restores the pre-2.2 tracker (for comparisons).
+    tracker = MotionTracker() if os.getenv("VISION_TRACKER", "byte") == "legacy" else ByteTracker()
     ball_tracker = BallTracker()
     frames = []
     scene = 0
@@ -393,7 +394,7 @@ def run_video(
             tick = time.monotonic()
             ball_batches = ball_detector.detect_batch([b[1] for b in batch], threshold=0.05)
             timings["ballInferenceSeconds"] += time.monotonic() - tick
-        for (t, frame, _), (boxes, scores, classes), raw_candidates in zip(
+        for (t, frame, number), (boxes, scores, classes), raw_candidates in zip(
             batch, detections, ball_batches
         ):
             mask = field_mask(frame)
@@ -426,6 +427,10 @@ def run_video(
                 if c in people and inside_field(mask, box)
             ]
             players = tracker.update(observations, t, matrix, cut=cut)
+            # Masking uses every on-pitch detection: the tracker only lists a new
+            # player once confirmed (on the next frame), and an unmasked limb would
+            # look like a moving ball or a camera-motion feature.
+            detected = [{"box": o["box"]} for o in observations]
             if raw_candidates is None:
                 # Adaptive: look where the ball just was first, sweep the whole
                 # frame when that tile is empty or ambiguous, and at least twice a second.
@@ -439,7 +444,7 @@ def run_video(
                 timings["ballInferenceSeconds"] += time.monotonic() - tick
             # Weak neural candidates plus difference-imaging candidates; the
             # track-before-detect pass after the loop decides which are real.
-            diameter = ball_size_prior(players, frame.shape[0])
+            diameter = ball_size_prior(detected or players, frame.shape[0])
             raw_candidates = fuse_ball_candidates(
                 raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
             )
@@ -447,24 +452,34 @@ def run_video(
             motion = []
             if motion_ok and not cut:
                 motion = difference_candidates(
-                    previous_frame, frame, matrix, players, diameter, mask=mask
+                    previous_frame, frame, matrix, detected, diameter, mask=mask
                 )
             candidates = merge_candidates(detector, motion)
             strong = strong_candidates(candidates)
             previous_frame = frame
-            previous_boxes = [p["box"] for p in players]
+            previous_boxes = [p["box"] for p in detected]
             # Airborne balls can be outside the green surface; temporal association
             # resolves candidates instead of rejecting them by background colour.
             ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
             previous_ball = ball
-            matrices.append(None if cut or not motion_ok else matrix)
+            camera = None if cut or not motion_ok else matrix
+            matrices.append(camera)
             frames.append(
                 {
                     "t": round(t, 3),
+                    # Source frame number: pitch setup reads this exact frame
+                    # again (timestamps drift on variable-frame-rate video).
+                    "frame": number,
                     "scene": scene,
                     "players": players,
                     "ball": ball,
                     "ballCandidates": candidates,
+                    # Affine mapping the previous sampled frame into this one (null at
+                    # cuts or when motion could not be estimated). Pitch calibration
+                    # follows a panning camera through these.
+                    "camera": None
+                    if camera is None
+                    else [round(float(v), 5) for v in np.asarray(camera).reshape(-1)],
                 }
             )
             # Report on wall time, not frame count: a slow CPU host can take
@@ -562,7 +577,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.1",
+        "pipelineVersion": "local-vision-2.3",
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},
@@ -597,10 +612,10 @@ def run_video(
             "Ball confidence scores are not calibrated probabilities.",
             "Faint ball candidates require temporal and neural support; "
             "short gaps on the same track are camera-compensated and marked inferred.",
-            "Possession is visible ball-to-player proximity, not official match possession.",
+            "Possession is estimated from observed ball control and the passes between; it is not official match possession.",
             "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
             "Track IDs change after occlusion and cuts; they are not player identities.",
-            "Positions are image coordinates. Speed, distance, xG and score are not measured.",
+            "Positions are image coordinates until the pitch is set up; speed, distance and xG are not measured, and goals count only when a person confirms them.",
             "Green-surface filtering can include sideline players or miss players near boundaries.",
         ]
         + (

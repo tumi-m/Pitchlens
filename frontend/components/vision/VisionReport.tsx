@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Navbar } from "@/components/ui/Navbar";
 import {
@@ -12,6 +12,18 @@ import {
 import { MatchCentre } from "@/components/vision/MatchCentre";
 import { AnalysisWait } from "@/components/vision/AnalysisWait";
 import { matchStats } from "@/lib/review/visionStats";
+import { MatchReport } from "@/components/vision/MatchReport";
+import { ReviewQueue } from "@/components/vision/ReviewQueue";
+import { PitchCalibration, CalibrationOverlay } from "@/components/vision/PitchCalibration";
+import { MiniPitch } from "@/components/vision/PitchGraphics";
+import {
+  Analysis,
+  Calibration,
+  fetchAnalysis,
+  fetchCalibration,
+  pitchLines,
+  pitchToImage,
+} from "@/lib/review/analysis";
 
 export function VisionReport({ jobId }: { jobId: string }) {
   const [job, setJob] = useState<VisionJob | null>(null);
@@ -22,6 +34,17 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [names, setNames] = useState(["Kit A", "Kit B"]);
   const [filter, setFilter] = useState("all");
   const player = useRef<HTMLVideoElement>(null);
+  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [calibration, setCalibration] = useState<Calibration | null>(null);
+  const [analysisError, setAnalysisError] = useState("");
+  const [calibrating, setCalibrating] = useState(false);
+  const [calOverlay, setCalOverlay] = useState<CalibrationOverlay | null>(null);
+  const [calClick, setCalClick] = useState<{ x: number; y: number; n: number; moved?: boolean } | null>(null);
+  const [showLines, setShowLines] = useState(true);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const clipEnd = useRef<number | null>(null);
+  const reviewRef = useRef<HTMLDivElement>(null);
+  const calibrationRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let stopped = false;
     let loaded = false;
@@ -77,6 +100,22 @@ export function VisionReport({ jobId }: { jobId: string }) {
       clearTimeout(timer);
     };
   }, [jobId]);
+  const loadAnalytics = useCallback(async () => {
+    try {
+      const [a, c] = await Promise.all([fetchAnalysis(jobId), fetchCalibration(jobId)]);
+      setAnalysis(a);
+      setCalibration(c);
+      setAnalysisError("");
+    } catch (e) {
+      // Older workers have no analytics endpoints: keep the classic report.
+      setAnalysis(null);
+      if (!(e instanceof VisionError && e.status === 404))
+        setAnalysisError(e instanceof Error ? e.message : "Match analytics are unavailable");
+    }
+  }, [jobId]);
+  useEffect(() => {
+    if (result) loadAnalytics();
+  }, [result, loadAnalytics]);
   useEffect(() => {
     const video = player.current;
     if (!video || !result) return;
@@ -96,8 +135,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
     };
   }, [result]);
   // Binary lookup keeps playback cheap even for a full-length match.
-  const frame = useMemo(() => {
-    if (!result || !result.frames.length) return null;
+  const frameIndex = useMemo(() => {
+    if (!result || !result.frames.length) return -1;
     let l = 0,
       r = result.frames.length - 1;
     while (l < r) {
@@ -105,9 +144,16 @@ export function VisionReport({ jobId }: { jobId: string }) {
       if (result.frames[m].t <= time) l = m;
       else r = m - 1;
     }
-    const f = result.frames[l];
-    return Math.abs(f.t - time) <= (1 / result.sampleFps) * 1.5 ? f : null;
+    return Math.abs(result.frames[l].t - time) <= (1 / result.sampleFps) * 1.5 ? l : -1;
   }, [result, time]);
+  const frame = frameIndex >= 0 && result ? result.frames[frameIndex] : null;
+  // Painted pitch lines projected through this frame's calibration (a live check of its accuracy).
+  const projectedLines = useMemo(() => {
+    if (!showLines || calibrating || !calibration || calibration.state !== "ready" || !calibration.template || frameIndex < 0) return null;
+    const entry = calibration.frames?.[frameIndex];
+    if (!entry || !calibration.size) return null;
+    return pitchLines(calibration.template, 0.5).map((line) => pitchToImage(entry.H, calibration.k1 ?? 0, calibration.size!, line));
+  }, [showLines, calibrating, calibration, frameIndex]);
   const events = useMemo(
     () =>
       result?.metrics.events.filter(
@@ -117,12 +163,54 @@ export function VisionReport({ jobId }: { jobId: string }) {
   );
   function seek(t: number) {
     if (player.current) {
+      clipEnd.current = null;
       player.current.currentTime = t;
       player.current.pause();
       player.current.scrollIntoView({ behavior: "smooth", block: "center" });
       setTime(t);
     }
   }
+  const watchClip = useCallback((t: number, until: number) => {
+    const video = player.current;
+    if (!video) return;
+    clipEnd.current = until;
+    video.currentTime = t;
+    setTime(t);
+    video.play().catch(() => {});
+  }, []);
+  function videoClick(e: React.MouseEvent<SVGSVGElement>) {
+    if (!calibrating || !result) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const x = ((e.clientX - box.left) / box.width) * result.video.width;
+    const y = ((e.clientY - box.top) / box.height) * result.video.height;
+    player.current?.pause();
+    // Pitch setup is anchored to an analysed frame (a moving camera is elsewhere
+    // a moment later): off one, move to the nearest and ask for the click again.
+    const now = player.current?.currentTime ?? time;
+    const nearest = result.frames.length ? result.frames[nearestFrame(result.frames, now)].t : now;
+    const moved = Math.abs(nearest - now) > 0.5 / (result.video.fps || 30) + 0.005;
+    if (moved) snapTo(nearest);
+    setCalClick((c) => ({ x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, n: (c?.n ?? 0) + 1, moved }));
+  }
+  function snapTo(t: number) {
+    const v = player.current;
+    if (!v) return;
+    v.pause();
+    clipEnd.current = null;
+    v.currentTime = t;
+    setTime(t);
+  }
+  const startCalibration = () => {
+    setCalibrating(true);
+    // Adjusting a saved setup returns to the frame it was clicked on.
+    const savedAt = calibration?.request?.t;
+    if (result && result.frames.length) snapTo(result.frames[nearestFrame(result.frames, savedAt ?? time)].t);
+    calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const openReview = () => {
+    setReviewOpen(true);
+    setTimeout(() => reviewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+  };
   function rename(index: number, value: string) {
     const next = [...names];
     next[index] = value;
@@ -189,13 +277,31 @@ export function VisionReport({ jobId }: { jobId: string }) {
           )}
           {result && (
             <>
-              <MatchCentre
-                result={result}
-                stats={stats!}
-                names={names}
-                colours={[colour(0), colour(1)]}
-                onSeek={seek}
-              />
+              {analysis ? (
+                <MatchReport
+                  analysis={analysis}
+                  names={names}
+                  colours={[colour(0), colour(1)]}
+                  duration={result.analysedDuration}
+                  start={result.analysedStart ?? 0}
+                  onSeek={seek}
+                  onCalibrate={startCalibration}
+                  onReview={openReview}
+                />
+              ) : (
+                <MatchCentre
+                  result={result}
+                  stats={stats!}
+                  names={names}
+                  colours={[colour(0), colour(1)]}
+                  onSeek={seek}
+                />
+              )}
+              {analysisError && (
+                <p className="text-sm text-amber-200 glass-card p-4" role="status">
+                  Match analytics could not be loaded ({analysisError}). The classic report is shown.
+                </p>
+              )}
               <div className="grid lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)] gap-6">
                 <div className="space-y-4">
                   {job?.videoDeleted && (
@@ -220,7 +326,14 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       preload="metadata"
                       className="w-full h-full"
                       src={job?.videoDeleted ? undefined : `/api/vision/jobs/${jobId}/video`}
-                      onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+                      onTimeUpdate={(e) => {
+                        const v = e.currentTarget;
+                        setTime(v.currentTime);
+                        if (clipEnd.current !== null && v.currentTime >= clipEnd.current) {
+                          clipEnd.current = null;
+                          v.pause();
+                        }
+                      }}
                       onSeeked={(e) => setTime(e.currentTarget.currentTime)}
                       onError={() =>
                         !job?.videoDeleted &&
@@ -229,7 +342,40 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         )
                       }
                     />
-                    {overlay && frame && (
+                    {(calibrating || projectedLines) && (
+                      <svg
+                        aria-label={calibrating ? "Click pitch landmarks on the video" : "Projected pitch lines"}
+                        className={`absolute inset-0 w-full h-full ${calibrating ? "cursor-crosshair" : "pointer-events-none"}`}
+                        viewBox={`0 0 ${result.video.width} ${result.video.height}`}
+                        onClick={videoClick}
+                        data-testid="calibration-overlay"
+                      >
+                        {splitAtGaps(calibrating ? calOverlay?.lines?.map((l) => l.map((p) => p as [number, number] | null)) : projectedLines).map((line, i) => (
+                          <polyline
+                            key={i}
+                            points={line.map(([x, y]) => `${x},${y}`).join(" ")}
+                            fill="none"
+                            stroke={calibrating ? "#f43f5e" : "rgba(56,189,248,0.8)"}
+                            strokeWidth={calibrating ? 1.5 : 1.2}
+                          />
+                        ))}
+                        {calibrating &&
+                          calOverlay?.points.map((p) => (
+                            <g key={p.name}>
+                              <circle cx={p.x} cy={p.y} r={5} fill="none" stroke="#f8ef3d" strokeWidth={1.5} />
+                              <circle cx={p.x} cy={p.y} r={1} fill="#f8ef3d" />
+                              <text x={p.x + 6} y={p.y - 6} fontSize={11} fill="#f8ef3d" stroke="#111" strokeWidth={0.3}>
+                                {p.label}
+                              </text>
+                            </g>
+                          ))}
+                        {calibrating &&
+                          calOverlay?.linePoints.map((p, i) => (
+                            <rect key={i} x={p.x - 2.5} y={p.y - 2.5} width={5} height={5} fill="#38bdf8" stroke="#111" strokeWidth={0.5} />
+                          ))}
+                      </svg>
+                    )}
+                    {overlay && frame && !calibrating && (
                       <svg
                         aria-label="Computer vision detection overlay"
                         className="absolute inset-0 w-full h-full pointer-events-none"
@@ -299,6 +445,12 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       />
                       Detection overlay
                     </label>
+                    {calibration?.state === "ready" && (
+                      <label className="flex gap-2">
+                        <input type="checkbox" checked={showLines} onChange={(e) => setShowLines(e.target.checked)} />
+                        Pitch lines
+                      </label>
+                    )}
                     <p className="text-pitch-muted">
                       {clockTime(time)} · {frame?.players.length ?? 0} visible
                       tracks ·{" "}
@@ -317,6 +469,35 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   <DetectionTimeline result={result} onSeek={seek} />
                 </div>
                 <aside className="space-y-4">
+                  {analysis !== null && (
+                    <div ref={calibrationRef}>
+                      <PitchCalibration
+                        jobId={jobId}
+                        videoSize={[result.video.width, result.video.height]}
+                        time={time}
+                        click={calClick}
+                        active={calibrating}
+                        onActive={(on) => (on ? startCalibration() : setCalibrating(false))}
+                        onOverlay={setCalOverlay}
+                        calibration={calibration}
+                        onApplied={loadAnalytics}
+                        videoAvailable={!job?.videoDeleted}
+                        onStep={(delta) => {
+                          // Step between analysed frames: calibration is anchored to one of them.
+                          const step = Math.sign(delta) * Math.max(1, Math.round(Math.abs(delta) * result.sampleFps));
+                          const from = nearestFrame(result.frames, time);
+                          const target = result.frames[Math.min(result.frames.length - 1, Math.max(0, from + step))];
+                          if (target) snapTo(target.t);
+                        }}
+                      />
+                    </div>
+                  )}
+                  {analysis?.calibrated && (
+                    <section className="glass-card p-4 space-y-2">
+                      <h2 className="text-sm font-semibold">Pitch view</h2>
+                      <MiniPitch analysis={analysis} time={time} colours={[colour(0), colour(1)]} />
+                    </section>
+                  )}
                   <section className="glass-card p-5 space-y-4">
                     <h2 className="font-semibold">Detected kit groups</h2>
                     <p className="text-sm text-pitch-muted">
@@ -341,6 +522,37 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   </section>
                 </aside>
               </div>
+              {analysis && (
+                <div ref={reviewRef}>
+                  {reviewOpen ? (
+                    <ReviewQueue
+                      jobId={jobId}
+                      analysis={analysis}
+                      names={names}
+                      colours={[colour(0), colour(1)]}
+                      time={time}
+                      onWatch={watchClip}
+                      onAnalysis={(next) =>
+                        // Review responses leave out the per-frame positions (unchanged).
+                        setAnalysis((prev) => ({ ...next, positions: next.positions ?? prev?.positions ?? null }))
+                      }
+                    />
+                  ) : (
+                    <section className="glass-card p-5 flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h2 className="text-xl font-semibold">Review moments</h2>
+                        <p className="text-sm text-pitch-muted">
+                          {analysis.review.pending} automatic moments wait for a quick check. Confirmed goals set the score.
+                        </p>
+                      </div>
+                      <button className="pitch-button-primary" onClick={openReview}>
+                        Start reviewing
+                      </button>
+                    </section>
+                  )}
+                </div>
+              )}
+              {!analysis && (
               <section className="glass-card p-5 space-y-4">
                 <div className="flex flex-wrap gap-3 justify-between">
                   <h2 className="text-xl font-semibold">
@@ -397,6 +609,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   </p>
                 )}
               </section>
+              )}
               <section className="glass-card p-5 space-y-3">
                 <h2 className="text-xl font-semibold">
                   Measurement boundaries
@@ -418,6 +631,36 @@ export function VisionReport({ jobId }: { jobId: string }) {
     </>
   );
 }
+/** Split polylines where points are missing (behind the camera) instead of joining across. */
+function splitAtGaps(lines: (([number, number] | null)[] | undefined)[] | null | undefined): [number, number][][] {
+  const out: [number, number][][] = [];
+  for (const line of lines || []) {
+    let run: [number, number][] = [];
+    for (const p of line || []) {
+      const ok = !!p && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Math.abs(p[0]) < 1e4 && Math.abs(p[1]) < 1e4;
+      if (ok) run.push(p as [number, number]);
+      else {
+        if (run.length > 1) out.push(run);
+        run = [];
+      }
+    }
+    if (run.length > 1) out.push(run);
+  }
+  return out;
+}
+
+function nearestFrame(frames: { t: number }[], t: number) {
+  let l = 0;
+  let r = frames.length - 1;
+  while (l < r) {
+    const m = Math.floor((l + r) / 2);
+    if (frames[m].t < t) l = m + 1;
+    else r = m;
+  }
+  if (l > 0 && Math.abs(frames[l - 1].t - t) <= Math.abs(frames[l].t - t)) return l - 1;
+  return l;
+}
+
 function DetectionTimeline({
   result,
   onSeek,

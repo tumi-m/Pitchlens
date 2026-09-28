@@ -4,6 +4,14 @@ import math
 from bisect import bisect_left, bisect_right
 
 
+# Detection error in pixels: a player's foot point and a 3-pixel ball centre
+# each wobble by a few pixels. On a 23-pixel player (a whole pitch at 360p)
+# that error alone exceeds the 0.55-height control radius, so real control was
+# rarely attributed. The slack is in pixels: negligible on large players.
+POSSESSION_SLACK_PX = 14
+AMBIGUITY_SLACK_PX = 3
+
+
 def possession_owner(players, ball):
     if not ball:
         return None
@@ -17,11 +25,15 @@ def possession_owner(players, ball):
         distance = (
             min(math.hypot(ball["x"] - x, ball["y"] - y2) for x in (x1, (x1 + x2) / 2, x2)) / scale
         )
-        if distance <= 0.55:
-            candidates.append((distance, p))
+        if distance <= 0.55 + POSSESSION_SLACK_PX / scale:
+            candidates.append((distance, p, scale))
     candidates.sort(key=lambda item: item[0])
-    if not candidates or (len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.12):
+    if not candidates:
         return None
+    if len(candidates) > 1:
+        margin = 0.12 + AMBIGUITY_SLACK_PX / candidates[0][2]
+        if candidates[1][0] - candidates[0][0] < margin:
+            return None
     return candidates[0][1]
 
 

@@ -23,7 +23,7 @@ async function proxy(
   const { path } = await context.params;
   const route = path.join("/");
   if (
-    !/^(health|jobs|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start))?)$/.test(
+    !/^(health|jobs|venues|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start|analysis|calibration|calibration\/preview|review))?)$/.test(
       route,
     )
   )
@@ -118,7 +118,7 @@ async function proxy(
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");
   const owner = request.headers.get("x-pitchlens-owner");
-  if (route === "jobs" || route === "jobs/from-url") {
+  if (route === "jobs" || route === "jobs/from-url" || route === "venues") {
     if (owner && OWNER.test(owner)) search.set("owner", owner);
     else if (hosted && request.method === "GET") return Response.json([]);
     else if (hosted)
@@ -127,6 +127,8 @@ async function proxy(
         { status: 400 },
       );
   }
+  // Saved venues belong to the browser that saved them.
+  if (route.endsWith("/calibration") && owner && OWNER.test(owner)) search.set("owner", owner);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     // Relayed byte-for-byte: a compressed hop would break Content-Length/Range.

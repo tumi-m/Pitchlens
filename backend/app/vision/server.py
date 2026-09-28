@@ -7,12 +7,14 @@ The long-lived service token stays server-side (Next.js proxy -> worker).
 import asyncio
 import hmac
 import json
+import math
 import os
 import re
 import shutil
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -47,6 +49,13 @@ cancellations = {}
 upload_activity = {}
 upload_started = {}
 pool = ThreadPoolExecutor(max_workers=1)
+# Calibration and analytics are CPU post-processing of a finished result: they
+# must never queue behind (or block) an upload or a GPU analysis.
+post_pool = ThreadPoolExecutor(max_workers=1)
+post_lock = threading.Lock()
+calibrating = set()  # job ids with a calibration queued or running in this process
+calibrating_lock = threading.Lock()
+MAX_JSON_BODY = 256 * 1024
 
 
 def auth(request: Request):
@@ -168,6 +177,14 @@ def stop_jobs():
         event.set()
 
 
+def recover_calibrations():
+    """A calibration running when the worker stopped will never finish: say so."""
+    for status in ROOT.glob("*/calibration-job.json"):
+        data = _read_json(status) or {}
+        if data.get("state") == "processing":
+            _write_json(status, {"state": "failed", "error": "The analysis server restarted. Apply the pitch setup again.", "finishedAt": time.time()})
+
+
 def recover_after_restart():
     """Persist what load_status infers: work in flight when the process died is interrupted."""
     for path in ROOT.glob("*/status.json"):
@@ -275,6 +292,7 @@ def start_retention_sweeper():
 
 
 app.add_event_handler("startup", recover_after_restart)
+app.add_event_handler("startup", recover_calibrations)
 app.add_event_handler("startup", start_retention_sweeper)
 
 
@@ -302,6 +320,8 @@ def health():
         "maxChunk": MAX_CHUNK,
         "retentionHours": RETENTION_HOURS or None,
         "gpu": gpu.modal_enabled(),
+        # Pitch calibration, event detection and reviewer decisions.
+        "analytics": True,
     }
 
 
@@ -698,3 +718,408 @@ def video(job_id: str, request: Request):
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
     # Browser decodes the actual container; MP4 is the supported reference-video format.
     return StreamingResponse(stream(), status_code=code, headers=headers, media_type="video/mp4")
+
+
+# ------------------------------------------------------------------ analytics
+
+
+def _read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _write_json(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, separators=(",", ":")))
+    temporary.replace(path)
+
+
+async def _json_body(request: Request):
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_JSON_BODY:
+        raise HTTPException(413, "Request is too large")
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_JSON_BODY:
+            raise HTTPException(413, "Request is too large")
+    def reject_constant(value):
+        raise ValueError(f"{value} is not allowed")
+
+    try:
+        # NaN/Infinity are not JSON; refusing them keeps stored files valid.
+        data = json.loads(body or b"{}", parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(400, "Invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    return data
+
+
+def _finished_result(job_id):
+    directory = folder(job_id)
+    path = directory / "result.json"
+    if not path.is_file():
+        raise HTTPException(409, "Analysis is not complete")
+    return directory, path
+
+
+def _calibration_ready(directory):
+    data = _read_json(directory / "calibration.json")
+    return data if data and data.get("state") == "ready" else None
+
+
+# Bump when analytics logic changes so cached analyses are recomputed on deploy.
+ANALYTICS_VERSION = 5
+_prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
+PREPARED_CACHE = 3
+
+
+def _stamp(path):
+    return [path.stat().st_mtime_ns, path.stat().st_size] if path.is_file() else 0
+
+
+def compute_analysis(directory, include_positions=True):
+    """analysis.json from result + calibration + review; cached until an input changes.
+
+    The expensive stage (projection, tracks, possession, events) is kept in
+    memory per match, so a review decision only re-applies decisions and
+    re-summarises: a keypress, not a full re-analysis.
+    """
+    from app.vision.analytics import direction_override, finish, prepare
+
+    inputs = [directory / "result.json", directory / "calibration.json", directory / "review.json"]
+
+    def stamp():
+        return [ANALYTICS_VERSION] + [_stamp(p) for p in inputs]
+
+    cached = _read_json(directory / "analysis.json")
+    if cached and cached.get("inputs") == stamp():
+        return cached
+    with post_lock:
+        # Another request may have computed it while we waited.
+        cached = _read_json(directory / "analysis.json")
+        if cached and cached.get("inputs") == stamp():
+            return cached
+        key = stamp()
+        review = _read_json(inputs[2])
+        base_key = (directory.name, ANALYTICS_VERSION, json.dumps(key[1:3]), direction_override(review))
+        base = _prepared.get(base_key)
+        if base is None:
+            result = json.loads(inputs[0].read_text())
+            base = prepare(result, _calibration_ready(directory), direction_override(review))
+            _prepared[base_key] = base
+            while len(_prepared) > PREPARED_CACHE:
+                _prepared.popitem(last=False)
+        else:
+            _prepared.move_to_end(base_key)
+        analysis = finish(base, review)
+        analysis["inputs"] = key
+        _write_json(directory / "analysis.json", analysis)
+    return analysis
+
+
+@app.get("/jobs/{job_id}/analysis")
+def analysis(job_id: str):
+    directory, _ = _finished_result(job_id)
+    try:
+        return compute_analysis(directory)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(422, f"Analytics could not be computed: {exc}") from exc
+
+
+@app.get("/jobs/{job_id}/calibration")
+def calibration(job_id: str, request: Request):
+    """The saved calibration (per-frame homographies) plus any run in progress.
+
+    ?frames=0 leaves out the per-frame homographies (for polling a running job).
+    """
+    directory = folder(job_id)
+    data = _calibration_ready(directory) or {"state": "none"}
+    if request.query_params.get("frames") == "0":
+        data = {k: v for k, v in data.items() if k != "frames"}
+    job = _read_json(directory / "calibration-job.json")
+    if job:
+        data = {**data, "job": job}
+    return data
+
+
+@app.post("/jobs/{job_id}/calibration/preview")
+async def calibration_preview(job_id: str, request: Request):
+    from app.vision.calibrate import preview
+
+    _, path = _finished_result(job_id)
+    body = await _json_body(request)
+    result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    try:
+        return await asyncio.to_thread(preview, result, body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _run_calibration(directory, body):
+    from app.vision.calibrate import build
+
+    status_path = directory / "calibration-job.json"
+
+    def progress(fraction):
+        current = _read_json(status_path) or {}
+        if current.get("state") == "processing":
+            current["progress"] = round(min(0.99, fraction) * 100, 1)
+            _write_json(status_path, current)
+
+    try:
+        result = json.loads((directory / "result.json").read_text())
+        video = directory / "video"
+        data = build(result, body, video if video.is_file() else None, progress)
+        # The previous calibration stays in force until this one is complete.
+        _write_json(directory / "calibration.json", data)
+        compute_analysis(directory)
+        _write_json(status_path, {"state": "done", "progress": 100, "finishedAt": time.time()})
+    except Exception as exc:  # noqa: BLE001 - reported to the user; previous calibration kept
+        _write_json(status_path, {"state": "failed", "error": str(exc)[:300], "finishedAt": time.time()})
+    finally:
+        with calibrating_lock:
+            calibrating.discard(directory.name)
+
+
+def _run_venue_calibration(directory, venue):
+    from app.vision.calibrate import build_from_venue
+
+    status_path = directory / "calibration-job.json"
+    try:
+        result = json.loads((directory / "result.json").read_text())
+        video = directory / "video"
+        data = build_from_venue(result, venue, video if video.is_file() else None)
+        _write_json(directory / "calibration.json", data)
+        compute_analysis(directory)
+        _write_json(status_path, {"state": "done", "progress": 100, "finishedAt": time.time(), "venue": venue.get("id")})
+    except Exception as exc:  # noqa: BLE001 - reported to the user; previous calibration kept
+        _write_json(status_path, {"state": "failed", "error": str(exc)[:300], "finishedAt": time.time()})
+    finally:
+        with calibrating_lock:
+            calibrating.discard(directory.name)
+
+
+@app.post("/jobs/{job_id}/calibration")
+async def save_calibration(job_id: str, request: Request):
+    directory, path = _finished_result(job_id)
+    body = await _json_body(request)
+    body.pop("_owner", None)
+    if "venue" in body:
+        body["_owner"] = _owner(request)
+    # In-memory, so a calibration interrupted by a restart never blocks a retry.
+    with calibrating_lock:
+        if job_id in calibrating:
+            raise HTTPException(409, "A calibration for this match is already being applied")
+        calibrating.add(job_id)
+    try:
+        return await _start_calibration(job_id, directory, path, body)
+    except BaseException:
+        with calibrating_lock:
+            calibrating.discard(job_id)
+        raise
+
+
+async def _start_calibration(job_id, directory, path, body):
+    from app.vision.calibrate import preview
+
+    if "venue" in body:
+        venue_id = body.get("venue")
+        if not isinstance(venue_id, str) or not re.fullmatch(r"[a-f0-9]{32}", venue_id):
+            raise HTTPException(404, "Venue not found")
+        venue = _read_json(_venue_dir() / f"{venue_id}.json")
+        if not venue or venue.get("owner", "") != body.get("_owner", ""):
+            raise HTTPException(404, "Venue not found")
+        _write_json(directory / "calibration-job.json", {"state": "processing", "progress": 0, "startedAt": time.time(), "venue": venue_id})
+        post_pool.submit(_run_venue_calibration, directory, venue)
+        return {"state": "processing", "venue": {"id": venue_id, "name": venue.get("name")}}
+
+    result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    try:
+        fit = await asyncio.to_thread(preview, result, body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if fit["fit"]["quality"] == "poor":
+        raise HTTPException(
+            400,
+            f"These clicks do not fit a flat pitch (error {fit['fit']['rmsPixels']:.1f} px). "
+            "Check each landmark is the right one and the pitch size.",
+        )
+    _write_json(
+        directory / "calibration-job.json",
+        {"state": "processing", "progress": 0, "startedAt": time.time(), "fit": fit["fit"]},
+    )
+    post_pool.submit(_run_calibration, directory, body)
+    return {"state": "processing", **fit}
+
+
+REVIEW_ACTIONS = {"accept", "reject", "reset", "team", "type", "outcome", "add", "direction", "score"}
+EVENT_TYPES = {"pass", "shot", "goal", "goal-candidate", "interception", "tackle", "out", "save", "foul", "note"}
+
+
+def _clean_decision(d, index):
+    if not isinstance(d, dict) or not isinstance(d.get("action"), str) or d["action"] not in REVIEW_ACTIONS:
+        raise HTTPException(400, "Unknown review action")
+    out = {"action": d["action"], "at": round(time.time(), 3)}
+    if d["action"] == "add":
+        if not isinstance(d.get("type"), str) or d["type"] not in EVENT_TYPES:
+            raise HTTPException(400, "Unknown event type")
+        t = d.get("t", -1)
+        # Range first: math.isfinite overflows on a huge JSON integer.
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not (0 <= t <= 6 * 3600) or not math.isfinite(t):
+            raise HTTPException(400, "Invalid event time")
+        t = float(t)
+        out.update(type=d["type"], t=round(t, 2), id=f"added-{uuid.uuid4().hex[:10]}")
+        if isinstance(d.get("team"), int) and not isinstance(d.get("team"), bool) and d["team"] in (0, 1):
+            out["team"] = d["team"]
+        if isinstance(d.get("outcome"), str):
+            out["outcome"] = d["outcome"][:40]
+        x, y = d.get("x"), d.get("y")
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 200 and math.isfinite(v) for v in (x, y)):
+            out["x"], out["y"] = float(x), float(y)
+        return out
+    if d["action"] == "direction":
+        if d.get("value") not in ("left", "right"):
+            raise HTTPException(400, "Direction must be left or right")
+        out["value"] = d["value"]
+        return out
+    if d["action"] == "score":
+        value = d.get("value")
+        if (
+            not isinstance(value, list)
+            or len(value) != 2
+            or not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 99 for v in value)
+        ):
+            raise HTTPException(400, "Score must be two whole numbers from 0 to 99")
+        out["value"] = value
+        return out
+    event = d.get("eventId")
+    if not isinstance(event, str) or not re.fullmatch(r"(ev|added|kept-ev|kept-added)-[a-z0-9-]{1,60}", event):
+        raise HTTPException(400, "Unknown event")
+    out["eventId"] = event
+    # The moment the reviewer was looking at (their list may be older than ours).
+    seen = d.get("event")
+    if isinstance(seen, dict):
+        t = seen.get("t")
+        if isinstance(seen.get("type"), str) and seen["type"] in EVENT_TYPES and isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= t <= 6 * 3600 and math.isfinite(t):
+            fingerprint = {"type": seen["type"], "t": round(float(t), 2)}
+            if isinstance(seen.get("team"), int) and not isinstance(seen.get("team"), bool) and seen["team"] in (0, 1):
+                fingerprint["team"] = seen["team"]
+            if isinstance(seen.get("outcome"), str):
+                fingerprint["outcome"] = seen["outcome"][:40]
+            out["event"] = fingerprint
+    if d["action"] == "team":
+        if isinstance(d.get("value"), bool) or d.get("value") not in (0, 1):
+            raise HTTPException(400, "Team must be 0 or 1")
+        out["value"] = d["value"]
+    elif d["action"] in ("type", "outcome"):
+        allowed = EVENT_TYPES if d["action"] == "type" else None
+        value = d.get("value")
+        if not isinstance(value, str) or (allowed and value not in allowed):
+            raise HTTPException(400, "Invalid value")
+        out["value"] = value[:40]
+    return out
+
+
+@app.get("/jobs/{job_id}/review")
+def review(job_id: str):
+    directory = folder(job_id)
+    return _read_json(directory / "review.json", {"decisions": []})
+
+
+@app.post("/jobs/{job_id}/review")
+async def add_review(job_id: str, request: Request):
+    directory, _ = _finished_result(job_id)
+    body = await _json_body(request)
+    decisions = body.get("decisions")
+    if not isinstance(decisions, list) or not 1 <= len(decisions) <= 200:
+        raise HTTPException(400, "Send between 1 and 200 decisions")
+    cleaned = [_clean_decision(d, i) for i, d in enumerate(decisions)]
+    # Record which moment each decision was made on, so it survives re-analysis
+    # (event ids are positions and change when the analysis is recomputed).
+    current = await asyncio.to_thread(compute_analysis, directory)
+    by_id = {e["id"]: e for e in current.get("events", [])}
+    for d in cleaned:
+        event = by_id.get(d.get("eventId"))
+        # Prefer what the reviewer saw; fall back to our current list (older clients).
+        if event is not None and "event" not in d:
+            d["event"] = {k: event.get(k) for k in ("type", "t", "team", "outcome")}
+    def append():
+        with post_lock:
+            # Append-only: the model's output and every change stay auditable.
+            log = _read_json(directory / "review.json", {"decisions": []})
+            if len(log["decisions"]) + len(cleaned) > 20000:
+                return None
+            log["decisions"].extend(cleaned)
+            _write_json(directory / "review.json", log)
+            return len(log["decisions"])
+
+    # The lock is taken in a worker thread: blocking the event loop would stall
+    # uploads and every other request while an analysis is being computed.
+    total = await asyncio.to_thread(append)
+    if total is None:
+        raise HTTPException(409, "Too many review decisions for one match")
+    data = await asyncio.to_thread(compute_analysis, directory)
+    # The per-frame positions do not change with a decision; the client keeps its copy.
+    data = {k: v for k, v in data.items() if k != "positions"}
+    return {"decisions": total, "added": [c for c in cleaned if c["action"] == "add"], "analysis": data}
+
+
+# ------------------------------------------------------------------ venues
+
+VENUES = "venues"
+
+
+def _venue_dir():
+    directory = ROOT / VENUES
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+def _owner(request):
+    owner = request.query_params.get("owner", "")
+    return owner if OWNER.fullmatch(owner) else ""
+
+
+@app.get("/venues")
+def venues(request: Request):
+    """Venues saved from this browser (owner key); a local worker without keys sees all."""
+    owner = _owner(request)
+    out = []
+    for path in sorted(_venue_dir().glob("*.json")):
+        data = _read_json(path) or {}
+        if data.get("id") and (data.get("owner", "") == owner):
+            out.append({k: data.get(k) for k in ("id", "name", "template", "size", "static", "createdAt")})
+    return out
+
+
+@app.post("/venues")
+async def create_venue(request: Request):
+    from app.vision.calibrate import venue_from_calibration
+
+    body = await _json_body(request)
+    name = body.get("name")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+        raise HTTPException(400, "Give the venue a name (up to 80 characters)")
+    job_id = body.get("jobId")
+    if not isinstance(job_id, str):
+        raise HTTPException(400, "Unknown match")
+    directory = folder(job_id)
+    calibration = _calibration_ready(directory)
+    if not calibration:
+        raise HTTPException(409, "Set up the pitch for this match first")
+    try:
+        venue = venue_from_calibration(calibration, name.strip())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    owner = _owner(request)
+    mine = [p for p in _venue_dir().glob("*.json") if (_read_json(p) or {}).get("owner", "") == owner]
+    if len(mine) >= 50:
+        raise HTTPException(409, "Too many saved venues")
+    venue.update(id=uuid.uuid4().hex, createdAt=time.time(), sourceJob=job_id, owner=owner)
+    _write_json(_venue_dir() / f"{venue['id']}.json", venue)
+    return {k: venue[k] for k in ("id", "name", "template", "size", "static", "createdAt")}
+
