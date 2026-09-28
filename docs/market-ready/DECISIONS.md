@@ -85,15 +85,33 @@ The brief (prepared by another assistant) was treated as input, not a script.
   or flags an unseen goal. Research: shots are the weakest automatic event
   even on better data (Mills et al. 2026; Bischofberger et al. 2024).
 
+## 2026-09-28 · Rules settled by the adversarial code review
+
+- A reviewer's decision records the moment they judged (type, time, team,
+  outcome). After re-analysis it re-attaches to the matching event, and where
+  the new analysis reads that moment differently the reviewer's reading
+  stands. A stale "accept" can therefore never confirm a goal nobody saw.
+- Unmeasured is null, never zero: passes, tackles, interceptions and
+  possessions need kit labels; shots need an attacking direction (automatic
+  or set by the reviewer). Reviewer-logged events still count.
+- A fixed camera is judged on its whole motion chain (no 5-second window may
+  drift 8 px or more), and a moment where motion was not measured is only
+  bridged when the player tracks show the camera held still. Otherwise the
+  view is found again from the painted lines, or that stretch stays
+  unmapped. Thresholds come from synthetic checks; confirm them on the first
+  real fixed-camera footage (the `static` flag in calibration.json).
+- Pitch setup uses an analysed frame exactly (to within one video frame);
+  the engine stores each sample's source frame number so the same frame is
+  read again on variable-frame-rate video.
+- With a role-aware detector, an outfield defender winning the ball after a
+  shot is a block wherever it happens; the keeper-area rule is the fallback.
+
 ## 2026-09-28 · Not adopted yet (with reasons)
 
 - Multi-frame heatmap ball detector (WASB, TrackNetV3): strongest published
   approach for tiny balls (MIT code; WASB ships soccer weights trained on
   ISSIA-CNR, whose data terms are unclear). Needs GPU work on Modal and
   labelled Pitchlens clips to validate; next ball experiment.
-- ByteTrack/BoT-SORT-style tracker and global tracklet stitching: expected to
-  halve track fragmentation (44% of track ends are followed within 2 s by a
-  nearby new track). Scheduled after this release (see STATUS.md).
 - xG: no validated small-sided model exists; 11v11 coefficients do not
   transfer to 3.66 × 1.22 m goals.
 - Jersey-number recognition: impossible at 20-25 px players (a number is

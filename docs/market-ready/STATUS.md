@@ -33,15 +33,18 @@ A match now produces a Sofascore-style report:
 
 ## Current task
 
-Adversarial review of the new code: calibration, analytics, worker and
-tracker findings fixed; frontend findings pending.
+Adversarial review complete: every confirmed finding fixed with a regression
+test (E11). Next: merge to `main`, redeploy the worker and site, and run the
+first real match from the target venue through pitch setup and review.
 
 ## Blockers (owner)
 
 1. Real footage with labels: 6-10 short clips and 2-3 full matches from the
    target venues (PUSHIT at Tekkerz), with final scores. Needed for any
    vision-level accuracy claim (RELEASE-GATES.md).
-2. Venue facts: court dimensions, goal size, markings, camera height/lens.
+2. Venue facts: court dimensions, goal size, markings, camera height/lens,
+   and whether the camera is fixed (the fixed-camera thresholds are only
+   checked on synthetic video so far; DECISIONS.md).
 3. Licensing decision on Ultralytics AGPL-3.0 before charging (DECISIONS.md).
 4. Business details and payment account before billing is built.
 

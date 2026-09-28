@@ -577,7 +577,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.2",
+        "pipelineVersion": "local-vision-2.3",
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},

@@ -3,6 +3,26 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E12 · Camera field of view for a side-on halfway camera (2026-09-28)
+- Synthetic 1280×720 camera 30 m from a futsal court, level with halfway,
+  facing straight across; 13 visible landmarks with 0.7-2 px click noise,
+  100 seeds each.
+- Old estimate (median of two focal candidates): 14-17 of 100 fits more than
+  10° off. Least-squares solve of both constraints: 0 of 100.
+- Decision: adopt (display only; the homography was never affected).
+
+## E11 · Adversarial review of the new code (2026-09-28)
+- Two review rounds by independent agents, each finding reproduced and then
+  challenged by a skeptic before it counted. Final round: 49 claims,
+  13 confirmed (most already fixed by the first round's fixes).
+- All confirmed defects fixed, each with a regression test that fails on the
+  old code: stale review decisions confirming goals, defender blocks counted
+  as saves, a warm-up kick-off flagged as a goal, zeros shown for unmeasured
+  counts, stitching mixing metres with pixels, a re-aimed fixed camera kept
+  on its old calibration, masks from the wrong frame on variable-frame-rate
+  video, clicks between analysed frames accepted, 500s on malformed input.
+- Backend tests 150 → 163; browser tests 10 → 11 on the vision pages.
+
 ## E10 · Possession through longer unseen gaps (2026-09-28)
 - Possession gap (ball unseen or loose between two controls) 5 s → 8 s, tuned
   on game 1 (12 s raised coverage further but cost more agreement).
