@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
-from app.vision import gpu
+from app.vision import billing, gpu
 from app.vision.access import valid_video_grant
 from app.vision.engine import probe, run_video
 from app.vision.profiles import available_profiles
@@ -110,6 +110,7 @@ app = FastAPI(
     title="Pitchlens vision worker", docs_url=None, redoc_url=None, dependencies=[Depends(auth)]
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
+app.include_router(billing.router(lambda: ROOT))
 
 
 def folder(job_id):

@@ -33,9 +33,12 @@ A match now produces a Sofascore-style report:
 
 ## Current task
 
-Adversarial review complete: every confirmed finding fixed with a regression
-test (E11). Next: merge to `main`, redeploy the worker and site, and run the
-first real match from the target venue through pitch setup and review.
+Commercial hardening through `e117017` is on main. CI passes; production health
+reports private-job enforcement and idempotent review, and anonymous access to a
+private report returns 401. Paystack/ZAR sandbox preparation is implemented
+(see PAYSTACK-SETUP.md); merchant integration still needs a real test transaction.
+Next product validation: run the first labelled target-venue match through pitch
+setup and review, measure accuracy, turnaround time and reviewer effort.
 
 ## Blockers (owner)
 
@@ -46,7 +49,9 @@ first real match from the target venue through pitch setup and review.
    and whether the camera is fixed (the fixed-camera thresholds are only
    checked on synthetic video so far; DECISIONS.md).
 3. Licensing decision on Ultralytics AGPL-3.0 before charging (DECISIONS.md).
-4. Business details and payment account before billing is built.
+4. Market confirmed: South Africa. No merchant account yet. Paystack test checkout
+   and a sandbox ledger are prepared; merchant signup, test key and provider smoke
+   test remain with the owner. Live billing remains disabled.
 
 ## Next commands
 
@@ -98,8 +103,16 @@ Implemented after reviewing main `1b51ffb`:
   attempts. Hosted full matches require GPU by default; no silent slow CPU fallback.
 
 Still required before commercial launch: account/organization identity and recovery,
-transactional distributed jobs/quotas, billing and refund ledger, model/data rights,
+transactional distributed jobs/quotas, account-bound live billing/refunds, model/data rights,
 real held-out venue video evaluation, measured full-match GPU cost/latency, and a
 customer pilot. Browser capabilities improve privacy but are not team accounts.
 The filesystem worker remains single-process; do not scale replicas against the
 same volume or call the review ledger a multi-node transactional database.
+
+## South Africa payment preparation
+
+Paystack/ZAR sandbox checkout, server verification and signed webhook settlement
+are implemented with a persistent transactional SQLite test ledger. Duplicate
+deliveries and browser returns cannot double-credit. No account/key has been
+supplied and no provider transaction is verified yet. Live keys are refused;
+sandbox credits do not purchase or unlock analysis. See [setup and launch gaps](PAYSTACK-SETUP.md).

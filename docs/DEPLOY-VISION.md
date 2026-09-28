@@ -206,3 +206,12 @@ Review requests accept `requestId` and `expectedRevision` (number of prior decis
 Replaying the same ID/body returns the original added-event IDs without duplication;
 conflicting reuse or a stale revision returns 409. This is durable on the configured
 volume and serialized in one worker process, not a multi-replica transaction system.
+
+## South Africa payment sandbox
+
+The `/billing` page prepares Paystack checkout in ZAR. It stays disabled until a
+test merchant key, callback and test amount are configured on the worker. Live
+keys are refused. The SQLite sandbox ledger lives under `VISION_DATA_DIR` on the
+persistent volume; it is separate from match deletion. Follow
+[Paystack setup](market-ready/PAYSTACK-SETUP.md) for environment variables,
+webhook configuration, recovery and the remaining live-launch requirements.

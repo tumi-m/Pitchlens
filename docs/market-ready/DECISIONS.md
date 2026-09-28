@@ -2,6 +2,18 @@
 
 Each entry: the decision, what else was considered, and why. Newest first.
 
+## 2026-09-28 · South Africa: prepare Paystack in ZAR, sandbox only
+
+The owner confirmed South Africa and approved Paystack preparation without an
+existing merchant account. Implement hosted test checkout and durable, idempotent
+sandbox settlement now; decline live keys until account identity, entitlements,
+refunds and launch operations are implemented. No selling price is chosen from a
+test amount. See PAYSTACK-SETUP.md for the flow and explicit limits.
+
+The later commercial review also supersedes the bootstrap-interval presentation
+below: report bounds now show sensitivity to unobserved time, not an accuracy
+confidence interval. Earlier research decisions remain here as historical context.
+
 ## 2026-09-28 · How we used the "market-ready" implementation brief
 
 The brief (prepared by another assistant) was treated as input, not a script.

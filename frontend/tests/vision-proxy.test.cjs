@@ -74,3 +74,13 @@ test('delete and retry require same-origin access authorization', async () => {
   assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, access: 'fixture-access' }), s.route())).status, 200);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('retry'))).status, 200);
 });
+
+test('billing requires owner and write authorization; browser proxy never accepts webhooks', async () => {
+  const s = setup();
+  const billing = (name) => ({ params: Promise.resolve({ path: ['billing', name] }) });
+  assert.equal((await s.api.GET(s.request(), billing('summary'))).status, 401);
+  assert.equal((await s.api.GET(s.request({ owner: OWNER }), billing('summary'))).status, 200);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), billing('checkout'))).status, 401);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), billing('verify'))).status, 200);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), billing('webhook'))).status, 404);
+});

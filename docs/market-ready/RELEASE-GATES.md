@@ -51,3 +51,10 @@ complete deletion, retry budgets and refusing silent hosted CPU fallback. These
 checks improve assisted-pilot readiness; they do not satisfy dataset accuracy,
 accounts, payment, recovery-at-scale or customer-value gates. No paid-launch gate
 has been marked complete from code tests alone.
+
+## Payment preparation
+
+Paystack/ZAR test-only checkout and duplicate-safe sandbox settlement are implemented.
+This is not a completed paid-launch gate: no merchant test key/provider transaction,
+account recovery, paid analysis entitlement consumption, refunds/disputes, live
+invoicing or production reconciliation has been validated. See PAYSTACK-SETUP.md.
