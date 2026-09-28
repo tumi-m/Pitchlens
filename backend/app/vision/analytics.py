@@ -1084,6 +1084,8 @@ def analyse(result, calibration=None, review=None):
         "kickoffs": kickoffs,
         "stats": stats,
         "review": {
+            # How often the automatic events were right, from this match's decisions.
+            "byType": _review_accuracy(events, review),
             "decisions": len(review.get("decisions", [])) if review else 0,
             "confirmed": sum(1 for e in events if e["status"] == "confirmed"),
             "rejected": sum(1 for e in events if e["status"] == "rejected"),
@@ -1091,6 +1093,14 @@ def analyse(result, calibration=None, review=None):
         },
         "positions": compact_positions(projected, player_of) if template else None,
     }
+
+
+def _review_accuracy(events, review):
+    from app.evaluation.metrics import review_metrics
+
+    if not review:
+        return {}
+    return review_metrics({"events": events}, review)
 
 
 def compact_positions(projected, player_of):
