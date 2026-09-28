@@ -102,6 +102,14 @@ export function ReviewQueue({
   }, [current, items.length, decide, add, watch, saving]);
 
   const direction = analysis.directions?.segments?.[0]?.team0Attacks;
+  const [score, setScore] = useState<[string, string]>([
+    analysis.enteredScore ? String(analysis.enteredScore[0]) : "",
+    analysis.enteredScore ? String(analysis.enteredScore[1]) : "",
+  ]);
+  const scoreValid = score.every((v) => /^\d{1,2}$/.test(v));
+  const confirmedGoals = [0, 1].map(
+    (team) => analysis.events.filter((e) => e.team === team && e.status === "confirmed" && (e.type === "goal" || e.type === "goal-candidate")).length,
+  );
   return (
     <section className="glass-card p-5 space-y-4" aria-label="Review moments">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -114,6 +122,35 @@ export function ReviewQueue({
         Confirm what the camera saw, reject mistakes, and add anything it missed. Confirmed goals set the score; every
         decision is kept, so you can undo it later.
       </p>
+      <div className="rounded-xl border border-white/10 p-4 space-y-2">
+        <p className="text-sm font-semibold">Final score</p>
+        <p className="text-xs text-pitch-muted">
+          Type the score you know. It sets the scoreline; possible goals are listed first so you can find each one.
+        </p>
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-2 text-sm">
+            <span style={{ color: colours[0] }}>{names[0]}</span>
+            <input aria-label={`Goals for ${names[0]}`} inputMode="numeric" className="pitch-input w-14 text-center" value={score[0]} onChange={(e) => setScore([e.target.value.trim(), score[1]])} />
+          </label>
+          <span className="text-pitch-muted">–</span>
+          <label className="flex items-center gap-2 text-sm">
+            <input aria-label={`Goals for ${names[1]}`} inputMode="numeric" className="pitch-input w-14 text-center" value={score[1]} onChange={(e) => setScore([score[0], e.target.value.trim()])} />
+            <span style={{ color: colours[1] }}>{names[1]}</span>
+          </label>
+          <button
+            className="pitch-button-secondary ml-auto"
+            disabled={!scoreValid || saving}
+            onClick={() => decide([{ action: "score", value: [Number(score[0]), Number(score[1])] }], false)}
+          >
+            Save score
+          </button>
+        </div>
+        {analysis.enteredScore && (
+          <p className="text-xs text-pitch-muted">
+            Goals located in the video: {confirmedGoals[0]} of {analysis.enteredScore[0]} · {confirmedGoals[1]} of {analysis.enteredScore[1]}
+          </p>
+        )}
+      </div>
       {analysis.calibrated && (
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="text-pitch-muted">In the first half {names[0]} attacked</span>

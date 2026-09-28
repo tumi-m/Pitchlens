@@ -321,3 +321,20 @@ def test_play_stopped_is_excluded_and_a_centre_restart_suggests_a_goal():
     goals = [e for e in out["events"] if e["type"] == "goal-candidate"]
     assert goals and goals[0]["team"] == 0 and "centre-restart" in goals[0]["evidence"]
     assert out["stats"]["teams"][0]["goals"]["value"] == 0  # still needs a reviewer
+
+
+
+def test_entered_score_is_reported_and_validated(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "test-token")
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers["Authorization"] = "Bearer test-token"
+    job_id, _ = make_job(server, build_match())
+    assert client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "score", "value": [3, -1]}]}).status_code == 400
+    assert client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "score", "value": [3, True]}]}).status_code == 400
+    ok = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "score", "value": [3, 2]}]})
+    assert ok.status_code == 200 and ok.json()["analysis"]["enteredScore"] == [3, 2]

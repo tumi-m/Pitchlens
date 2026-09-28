@@ -850,7 +850,7 @@ async def save_calibration(job_id: str, request: Request):
     return {"state": "processing", **fit}
 
 
-REVIEW_ACTIONS = {"accept", "reject", "reset", "team", "type", "outcome", "add", "direction"}
+REVIEW_ACTIONS = {"accept", "reject", "reset", "team", "type", "outcome", "add", "direction", "score"}
 EVENT_TYPES = {"pass", "shot", "goal", "goal-candidate", "interception", "tackle", "out", "save", "foul", "note"}
 
 
@@ -877,6 +877,16 @@ def _clean_decision(d, index):
         if d.get("value") not in ("left", "right"):
             raise HTTPException(400, "Direction must be left or right")
         out["value"] = d["value"]
+        return out
+    if d["action"] == "score":
+        value = d.get("value")
+        if (
+            not isinstance(value, list)
+            or len(value) != 2
+            or not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 99 for v in value)
+        ):
+            raise HTTPException(400, "Score must be two whole numbers from 0 to 99")
+        out["value"] = value
         return out
     event = d.get("eventId")
     if not isinstance(event, str) or not re.fullmatch(r"(ev|added)-[a-z0-9-]{1,40}", event):

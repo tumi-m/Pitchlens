@@ -231,6 +231,8 @@ export type Analysis = {
     possessionSequences?: { team: number; start: number; end: number; seconds: number }[];
   };
   kickoffs?: { t: number; team: number }[];
+  /** Final score typed by the reviewer: the authority for the scoreline. */
+  enteredScore?: [number, number] | null;
   review: { decisions: number; confirmed: number; rejected: number; pending: number };
   /** [t, [[player, team, x, y]...] | null, [bx, by, inferred] | null] per sampled frame. */
   positions: [number, [number, number, number, number][] | null, [number, number, number] | null][] | null;
@@ -283,7 +285,8 @@ export type ReviewDecision =
   | { action: "team"; eventId: string; value: 0 | 1 }
   | { action: "type" | "outcome"; eventId: string; value: string }
   | { action: "add"; type: string; t: number; team?: 0 | 1; outcome?: string; x?: number; y?: number }
-  | { action: "direction"; value: "left" | "right" };
+  | { action: "direction"; value: "left" | "right" }
+  | { action: "score"; value: [number, number] };
 
 export const fetchAnalysis = (jobId: string, signal?: AbortSignal) =>
   visionJson<Analysis>(`jobs/${jobId}/analysis`, { signal });

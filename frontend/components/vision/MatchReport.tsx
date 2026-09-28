@@ -129,7 +129,13 @@ export function MatchReport({
           <div className="flex flex-col items-center gap-2 text-center">
             <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">Score</span>
             <div className="text-5xl font-black tabular-nums">
-              {goalsKnown && reviewedGoals > 0 ? (
+              {analysis.enteredScore ? (
+                <>
+                  <span style={{ color: colours[0] }}>{analysis.enteredScore[0]}</span>
+                  <span className="text-pitch-muted text-3xl mx-2">–</span>
+                  <span style={{ color: colours[1] }}>{analysis.enteredScore[1]}</span>
+                </>
+              ) : goalsKnown && reviewedGoals > 0 ? (
                 <>
                   <span style={{ color: colours[0] }}>{A.goals?.value}</span>
                   <span className="text-pitch-muted text-3xl mx-2">–</span>
@@ -140,7 +146,9 @@ export function MatchReport({
               )}
             </div>
             <span className="text-xs text-pitch-muted max-w-[16rem]">
-              {!analysis.calibrated
+              {analysis.enteredScore
+                ? `Score entered by you · ${reviewedGoals} of ${analysis.enteredScore[0] + analysis.enteredScore[1]} goals located in the video`
+                : !analysis.calibrated
                 ? "Set up the pitch to find shots and possible goals"
                 : reviewedGoals > 0
                   ? "Goals confirmed by review"
@@ -148,11 +156,9 @@ export function MatchReport({
                     ? `${candidates} possible goal${candidates === 1 ? "" : "s"} to confirm`
                     : "No goal confirmed yet. Add goals you saw in the review."}
             </span>
-            {analysis.calibrated && (
-              <button className="text-xs underline text-pitch-green" onClick={onReview}>
-                Review moments ({analysis.review.pending} waiting)
-              </button>
-            )}
+            <button className="text-xs underline text-pitch-green" onClick={onReview}>
+              {analysis.enteredScore ? "Review moments" : "Enter the score and review moments"} ({analysis.review.pending} waiting)
+            </button>
           </div>
           <div className="flex flex-col items-center gap-2">
             <span className="w-12 h-12 rounded-full border-4 border-white/20" style={{ background: colours[1] }} />

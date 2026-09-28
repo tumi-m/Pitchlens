@@ -194,4 +194,9 @@ test("review: confirming a shot is saved on the worker and updates the stats", a
   expect(added.action).toBe("add");
   expect(added.type).toBe("goal");
   expect(added.team).toBe(0);
+  await page.getByLabel("Goals for Kit A").fill("3");
+  await page.getByLabel("Goals for Kit B").fill("1");
+  await page.getByRole("button", { name: "Save score" }).click();
+  await expect.poll(() => state.reviews.length).toBe(3);
+  expect((state.reviews[2] as { decisions: { action: string; value: number[] }[] }).decisions[0]).toEqual({ action: "score", value: [3, 1] });
 });

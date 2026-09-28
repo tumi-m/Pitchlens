@@ -897,6 +897,9 @@ def apply_review(events, review):
         if action == "direction":
             overrides["direction"] = d.get("value")
             continue
+        if action == "score":
+            overrides["score"] = d.get("value")
+            continue
         target = by_id.get(d.get("eventId"))
         if target is None:
             target = next((a for a in added if a["id"] == d.get("eventId")), None)
@@ -1128,6 +1131,8 @@ def analyse(result, calibration=None, review=None):
         "params": {k: list(v) if isinstance(v, tuple) else v for k, v in PARAMS.items()},
         "events": events,
         "kickoffs": kickoffs,
+        # The final score as typed by the reviewer (the authority for the scoreline).
+        "enteredScore": overrides.get("score") if isinstance(overrides.get("score"), list) else None,
         "stats": stats,
         "review": {
             # How often the automatic events were right, from this match's decisions.
