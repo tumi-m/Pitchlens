@@ -151,7 +151,7 @@ consistency over time.
 5. **Static rejection.** A "ball" that does not drift after camera
    compensation, with no player within a body height of it, is a marking or a
    logo and is removed: after three seconds for weak evidence (chain-recovered
-   or below the tracker's threshold), after twenty seconds for confident
+   or detector confidence below 0.3), after twenty seconds for confident
    detections, so a dead ball at a set piece is kept.
 6. **Resolution-aware tiling and batching.** The tiled football ball model
    sees 480-pixel native tiles upscaled to 640, so a 240p or 1080p frame both

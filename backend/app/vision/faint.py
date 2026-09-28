@@ -252,7 +252,7 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
     motion) with nobody standing over it is a pitch marking, a logo or a stray
     object, not the match ball.
 
-    Weak evidence (chain-recovered or below the tracker's threshold) needs only
+    Weak evidence (chain-recovered or detector confidence below 0.3) needs only
     `seconds` of stillness; a confident detector observation needs
     `confident_seconds`, long enough that a dead ball at a kick-off, corner or
     penalty is kept. A still ball with a team player within one body height is
@@ -266,7 +266,9 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
     def flush():
         nonlocal dropped
         if run:
-            weak = all(frames[i]["ball"].get("recovered") or frames[i]["ball"]["confidence"] < 0.15 for i in run)
+            # "Confident" means the detector was fairly sure, not merely above
+            # the tracker's 0.15 entry bar: a 0.17 blob still for 14 s is a marking.
+            weak = all(frames[i]["ball"].get("recovered") or frames[i]["ball"]["confidence"] < 0.3 for i in run)
             limit = max(2, int(round((seconds if weak else confident_seconds) * sample_fps)))
             attended = sum(_attended(frames[i], frames[i]["ball"]) for i in run)
             if len(run) >= limit and attended * 2 < len(run):
