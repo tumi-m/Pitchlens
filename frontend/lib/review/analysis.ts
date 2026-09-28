@@ -164,6 +164,8 @@ export type TeamStats = {
   passes: CountStat;
   passesComplete: CountStat;
   passAccuracy: number | null;
+  /** Share of all detected passes: the pass-based possession definition, as a cross-check. */
+  passShare?: number | null;
   shots: CountStat | null;
   shotsOnTarget: CountStat | null;
   goals: { value: number; candidates: number } | null;

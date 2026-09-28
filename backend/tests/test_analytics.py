@@ -357,3 +357,109 @@ def test_stitching_scales_to_heavily_fragmented_matches():
     tracemalloc.stop()
     assert len(mapping) == 6000 and len(set(mapping.values())) <= 60
     assert peak < 200 * 1024 * 1024 and time.monotonic() - started < 60
+
+
+def test_review_decisions_survive_re_analysis_and_never_retarget_another_event():
+    from app.vision.analytics import apply_review
+
+    before = [
+        {"id": "ev-0", "type": "pass", "t": 10.0, "team": 0, "status": "proposed"},
+        {"id": "ev-1", "type": "shot", "t": 20.0, "team": 0, "status": "proposed", "outcome": "unresolved"},
+    ]
+    review = {"decisions": [
+        {"action": "accept", "eventId": "ev-1", "event": {"type": "shot", "t": 20.0, "team": 0}},
+        {"action": "reject", "eventId": "ev-0", "event": {"type": "pass", "t": 10.0, "team": 0}},
+    ]}
+    # Re-analysis inserted a new event first: every id shifted by one.
+    after = [
+        {"id": "ev-0", "type": "tackle", "t": 5.0, "team": 1, "status": "proposed"},
+        {"id": "ev-1", "type": "pass", "t": 10.2, "team": 0, "status": "proposed"},
+        {"id": "ev-2", "type": "shot", "t": 20.3, "team": 0, "status": "proposed"},
+    ]
+    merged, _ = apply_review(after, review)
+    status = {e["type"]: e["status"] for e in merged}
+    assert status == {"tackle": "proposed", "pass": "rejected", "shot": "confirmed"}
+    # The confirmed shot vanished entirely after re-analysis: it is kept, not moved.
+    merged, _ = apply_review([{"id": "ev-0", "type": "pass", "t": 20.0, "team": 0, "status": "proposed"}], review)
+    kept = [e for e in merged if e["type"] == "shot"]
+    assert len(kept) == 1 and kept[0]["status"] == "confirmed" and kept[0]["source"] == "reviewer"
+    assert [e for e in merged if e["type"] == "pass"][0]["status"] == "proposed"
+
+
+def test_a_shot_confirmed_as_goal_counts_once():
+    from app.vision.analytics import confirmed_goals
+
+    events = [
+        {"type": "shot", "t": 30.0, "team": 0, "status": "confirmed", "outcome": "goal-candidate"},
+        {"type": "goal-candidate", "t": 30.0, "team": 0, "status": "confirmed"},
+        {"type": "goal", "t": 95.0, "team": 0, "status": "confirmed"},
+        {"type": "shot", "t": 120.0, "team": 0, "status": "proposed", "outcome": "goal-candidate"},
+    ]
+    assert confirmed_goals(events, 0) == 2
+
+
+def test_add_decision_with_only_x_is_stored_without_coordinates(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "test-token")
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers["Authorization"] = "Bearer test-token"
+    job_id, _ = make_job(server, build_match())
+    ok = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "add", "type": "shot", "t": 1.0, "team": 0, "x": 5}]})
+    assert ok.status_code == 200
+    assert client.get(f"/jobs/{job_id}/analysis").status_code == 200
+
+
+def test_airborne_ball_projected_far_behind_the_goal_is_not_a_goal_candidate():
+    frames = build_match()
+    # Replace the shot's flight with a lofted ball that projects 8 m behind the line.
+    for f in frames:
+        if f["t"] >= 5.0 and f["ball"] is not None:
+            f["ball"] = ball((48.0, 11.0))
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    assert not any(e["type"] == "goal-candidate" for e in out["events"])
+
+
+def test_goalkeeper_collecting_a_shot_is_a_save():
+    frames = build_match()
+    keeper = {"id": 99, "team": -1, "role": "goalkeeper", "box": None}
+    for f in frames:
+        x, y = img((39.2, 11.2))
+        f["players"].append({**keeper, "box": [x - 5, y - 30, x + 5, y], "confidence": 0.9})
+    # The keeper stops the ball on the line instead of it going in.
+    for f in frames:
+        if f["ball"] is not None and f["ball"]["x"] > img((39.0, 0))[0]:
+            f["ball"] = ball((39.4, 11.2))
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    shot = next(e for e in out["events"] if e["type"] == "shot")
+    assert shot["outcome"] == "saved" and shot["onTarget"] is True
+
+
+def test_worker_rejects_nan_bool_teams_and_recovers_stuck_calibrations(tmp_path, monkeypatch):
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "test-token")
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers["Authorization"] = "Bearer test-token"
+    job_id, directory = make_job(server, build_match())
+    raw = b'{"decisions": [{"action": "add", "type": "shot", "t": NaN}]}'
+    assert client.post(f"/jobs/{job_id}/review", content=raw, headers={"content-type": "application/json"}).status_code == 400
+    assert client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "add", "type": "shot", "t": 1, "team": True}]}).json()["added"][0].get("team") is None
+    huge = {"decisions": [{"action": "add", "type": "note", "t": 1}] * 200, "pad": "x" * 300000}
+    assert client.post(f"/jobs/{job_id}/review", json=huge).status_code == 413
+    # A calibration left 'processing' by a restart is reported as failed and can be retried.
+    (directory / "calibration-job.json").write_text(_json.dumps({"state": "processing", "startedAt": 0}))
+    server.recover_calibrations()
+    assert client.get(f"/jobs/{job_id}/calibration").json()["job"]["state"] == "failed"
+    monkeypatch.setattr(server.post_pool, "submit", lambda fn, *a: fn(*a))
+    body = {"template": "futsal", "points": clicks(), "t": 0.0}
+    assert client.post(f"/jobs/{job_id}/calibration", json=body).status_code == 200
+    assert client.get(f"/jobs/{job_id}/calibration").json()["state"] == "ready"

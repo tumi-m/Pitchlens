@@ -30,7 +30,10 @@ def validate_request(request, size):
             raise ValueError("Unknown landmark")
         if p["name"] in used:
             raise ValueError("Each landmark can be used once")
-        x, y = float(p.get("x")), float(p.get("y"))
+        try:
+            x, y = float(p.get("x")), float(p.get("y"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Landmark positions must be numbers") from exc
         if not (math.isfinite(x) and math.isfinite(y) and -w <= x <= 2 * w and -h <= y <= 2 * h):
             raise ValueError("Landmark position is outside the video")
         used.append(p["name"])
@@ -44,11 +47,17 @@ def validate_request(request, size):
     for c in raw_lines:
         if not isinstance(c, dict) or c.get("line") not in lines:
             raise ValueError("Unknown line")
-        x, y = float(c.get("x")), float(c.get("y"))
+        try:
+            x, y = float(c.get("x")), float(c.get("y"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Line points must be numbers") from exc
         if not (math.isfinite(x) and math.isfinite(y) and -w <= x <= 2 * w and -h <= y <= 2 * h):
             raise ValueError("Line point is outside the video")
         line_clicks.append(((x, y), lines[c["line"]]))
-    t = float(request.get("t", 0))
+    try:
+        t = float(request.get("t", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid frame time") from exc
     if not math.isfinite(t) or t < 0:
         raise ValueError("Invalid frame time")
     distortion = request.get("distortion", "auto")
@@ -56,12 +65,20 @@ def validate_request(request, size):
         raise ValueError("Unknown distortion mode")
     walls = bool(request.get("walls", False))
     template["walls"] = walls
-    return template, np.array(image), np.array(world), t, distortion, used, line_clicks
+    clean = {
+        "template": template,
+        "points": [{"name": n, "x": float(x), "y": float(y)} for n, (x, y) in zip(used, image)],
+        "lines": [{"line": c.get("line"), "x": float(c.get("x")), "y": float(c.get("y"))} for c in raw_lines],
+        "t": t,
+        "distortion": distortion,
+        "walls": walls,
+    }
+    return template, np.array(image), np.array(world), t, distortion, used, line_clicks, clean
 
 
 def preview(result, request):
     size = (result["video"]["width"], result["video"]["height"])
-    template, image, world, t, distortion, used, line_clicks = validate_request(request, size)
+    template, image, world, t, distortion, used, line_clicks, _ = validate_request(request, size)
     cal = pitchlib.fit(image, world, size, distortion, line_clicks)
     lines = [
         [[round(float(x), 1), round(float(y), 1)] for x, y in pitchlib.pitch_to_image(cal, line)]
@@ -94,30 +111,36 @@ def nearest_frame(frames, t):
 
 
 def line_masks(video_path, frames, indices, progress=None):
-    """PNG-compressed line masks for the chosen sampled frames (memory-light)."""
-    wanted = sorted(set(indices))
+    """PNG-compressed line masks for the chosen sampled frames (memory-light).
+
+    Frames are matched by the decoder's timestamp (the same clock the engine
+    used for t), so variable-frame-rate phone video lines up correctly.
+    """
+    wanted = sorted(set(indices), key=lambda i: frames[i]["t"])
     if not wanted:
         return {}
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    targets = {int(round(frames[i]["t"] * fps)): i for i in wanted}
-    last = max(targets)
+    half = 0.5 / fps
     out = {}
-    number = 0
+    k = 0
     try:
-        while number <= last:
+        while k < len(wanted):
             if not cap.grab():
                 break
-            if number in targets:
+            position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            # Skip targets we have passed without a close enough frame.
+            while k < len(wanted) and frames[wanted[k]]["t"] < position - half:
+                k += 1
+            if k < len(wanted) and abs(frames[wanted[k]]["t"] - position) <= half:
                 ok, image = cap.retrieve()
                 if ok:
-                    mask = pitchlib.line_mask(image)
-                    ok, png = cv2.imencode(".png", mask)
+                    ok, png = cv2.imencode(".png", pitchlib.line_mask(image, restrict_to_grass=False))
                     if ok:
-                        out[targets[number]] = png.tobytes()
+                        out[wanted[k]] = png.tobytes()
+                k += 1
                 if progress and len(out) % 50 == 0:
-                    progress(len(out) / len(targets))
-            number += 1
+                    progress(len(out) / len(wanted))
     finally:
         cap.release()
     return out
@@ -136,7 +159,7 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
     """Fit, optionally re-align through the video, and return calibration.json."""
     frames = result["frames"]
     size = (result["video"]["width"], result["video"]["height"])
-    template, image, world, t, distortion, used, line_clicks = validate_request(request, size)
+    template, image, world, t, distortion, used, line_clicks, clean = validate_request(request, size)
     cal = pitchlib.fit(image, world, size, distortion, line_clicks)
     if cal["quality"] == "poor":
         raise ValueError(
@@ -144,8 +167,13 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
             f"{cal['rmsPixels']:.1f} px). Check each landmark is the right one and the pitch size."
         )
     anchor = nearest_frame(frames, t)
-    anchors = {anchor: np.asarray(cal["H"], float)}
     static = pitchlib.static_camera(frames)
+    fps = result.get("sampleFps") or 5
+    if not static and abs(frames[anchor]["t"] - t) > 0.75 / fps:
+        raise ValueError(
+            "The camera moves, and the clicked moment is between analysed frames. Use the frame buttons in the pitch setup to pick an analysed frame."
+        )
+    anchors = {anchor: np.asarray(cal["H"], float)}
     aligned = 0
     reacquired = 0
     if not static and video_path and Path(video_path).is_file():
@@ -202,7 +230,7 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
         "schemaVersion": 1,
         "state": "ready",
         "template": template,
-        "request": {**request, "points": request.get("points")},
+        "request": clean,
         "fit": _public_fit(cal, used),
         "k1": cal["k1"],
         "size": list(size),

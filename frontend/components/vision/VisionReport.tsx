@@ -186,9 +186,17 @@ export function VisionReport({ jobId }: { jobId: string }) {
     player.current?.pause();
     setCalClick((c) => ({ x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, n: (c?.n ?? 0) + 1 }));
   }
+  function snapTo(t: number) {
+    const v = player.current;
+    if (!v) return;
+    v.pause();
+    clipEnd.current = null;
+    v.currentTime = t;
+    setTime(t);
+  }
   const startCalibration = () => {
     setCalibrating(true);
-    player.current?.pause();
+    if (result && result.frames.length) snapTo(result.frames[nearestFrame(result.frames, time)].t);
     calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
   const openReview = () => {
@@ -464,17 +472,16 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         time={time}
                         click={calClick}
                         active={calibrating}
-                        onActive={setCalibrating}
+                        onActive={(on) => (on ? startCalibration() : setCalibrating(false))}
                         onOverlay={setCalOverlay}
                         calibration={calibration}
                         onApplied={loadAnalytics}
                         onStep={(delta) => {
-                          const v = player.current;
-                          if (!v) return;
-                          v.pause();
-                          const next = Math.min(Math.max(0, v.currentTime + delta), Math.max(0, (v.duration || result.video.duration) - 0.05));
-                          v.currentTime = next;
-                          setTime(next);
+                          // Step between analysed frames: calibration is anchored to one of them.
+                          const step = Math.sign(delta) * Math.max(1, Math.round(Math.abs(delta) * result.sampleFps));
+                          const from = nearestFrame(result.frames, time);
+                          const target = result.frames[Math.min(result.frames.length - 1, Math.max(0, from + step))];
+                          if (target) snapTo(target.t);
                         }}
                       />
                     </div>
@@ -615,6 +622,18 @@ export function VisionReport({ jobId }: { jobId: string }) {
     </>
   );
 }
+function nearestFrame(frames: { t: number }[], t: number) {
+  let l = 0;
+  let r = frames.length - 1;
+  while (l < r) {
+    const m = Math.floor((l + r) / 2);
+    if (frames[m].t < t) l = m + 1;
+    else r = m;
+  }
+  if (l > 0 && Math.abs(frames[l - 1].t - t) <= Math.abs(frames[l].t - t)) return l - 1;
+  return l;
+}
+
 function DetectionTimeline({
   result,
   onSeek,

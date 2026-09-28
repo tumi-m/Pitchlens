@@ -7,6 +7,7 @@ The long-lived service token stays server-side (Next.js proxy -> worker).
 import asyncio
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -51,6 +52,8 @@ pool = ThreadPoolExecutor(max_workers=1)
 # must never queue behind (or block) an upload or a GPU analysis.
 post_pool = ThreadPoolExecutor(max_workers=1)
 post_lock = threading.Lock()
+calibrating = set()  # job ids with a calibration queued or running in this process
+calibrating_lock = threading.Lock()
 MAX_JSON_BODY = 256 * 1024
 
 
@@ -173,6 +176,14 @@ def stop_jobs():
         event.set()
 
 
+def recover_calibrations():
+    """A calibration running when the worker stopped will never finish: say so."""
+    for status in ROOT.glob("*/calibration-job.json"):
+        data = _read_json(status) or {}
+        if data.get("state") == "processing":
+            _write_json(status, {"state": "failed", "error": "The analysis server restarted. Apply the pitch setup again.", "finishedAt": time.time()})
+
+
 def recover_after_restart():
     """Persist what load_status infers: work in flight when the process died is interrupted."""
     for path in ROOT.glob("*/status.json"):
@@ -280,6 +291,7 @@ def start_retention_sweeper():
 
 
 app.add_event_handler("startup", recover_after_restart)
+app.add_event_handler("startup", recover_calibrations)
 app.add_event_handler("startup", start_retention_sweeper)
 
 
@@ -724,12 +736,21 @@ def _write_json(path, data):
 
 
 async def _json_body(request: Request):
-    body = await request.body()
-    if len(body) > MAX_JSON_BODY:
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_JSON_BODY:
         raise HTTPException(413, "Request is too large")
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_JSON_BODY:
+            raise HTTPException(413, "Request is too large")
+    def reject_constant(value):
+        raise ValueError(f"{value} is not allowed")
+
     try:
-        data = json.loads(body or b"{}")
-    except json.JSONDecodeError as exc:
+        # NaN/Infinity are not JSON; refusing them keeps stored files valid.
+        data = json.loads(body or b"{}", parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(400, "Invalid JSON") from exc
     if not isinstance(data, dict):
         raise HTTPException(400, "Expected a JSON object")
@@ -749,19 +770,33 @@ def _calibration_ready(directory):
     return data if data and data.get("state") == "ready" else None
 
 
+# Bump when analytics logic changes so cached analyses are recomputed on deploy.
+ANALYTICS_VERSION = 3
+
+
 def compute_analysis(directory):
     """analysis.json from result + calibration + review; cached until an input changes."""
     from app.vision.analytics import analyse
 
     inputs = [directory / "result.json", directory / "calibration.json", directory / "review.json"]
-    stamp = [p.stat().st_mtime_ns if p.is_file() else 0 for p in inputs]
+
+    def stamp():
+        return [ANALYTICS_VERSION] + [
+            [p.stat().st_mtime_ns, p.stat().st_size] if p.is_file() else 0 for p in inputs
+        ]
+
     cached = _read_json(directory / "analysis.json")
-    if cached and cached.get("inputs") == stamp:
+    if cached and cached.get("inputs") == stamp():
         return cached
     with post_lock:
+        # Another request may have computed it while we waited.
+        cached = _read_json(directory / "analysis.json")
+        if cached and cached.get("inputs") == stamp():
+            return cached
+        key = stamp()
         result = json.loads(inputs[0].read_text())
         analysis = analyse(result, _calibration_ready(directory), _read_json(inputs[2]))
-        analysis["inputs"] = stamp
+        analysis["inputs"] = key
         _write_json(directory / "analysis.json", analysis)
     return analysis
 
@@ -820,17 +855,31 @@ def _run_calibration(directory, body):
         _write_json(status_path, {"state": "done", "progress": 100, "finishedAt": time.time()})
     except Exception as exc:  # noqa: BLE001 - reported to the user; previous calibration kept
         _write_json(status_path, {"state": "failed", "error": str(exc)[:300], "finishedAt": time.time()})
+    finally:
+        with calibrating_lock:
+            calibrating.discard(directory.name)
 
 
 @app.post("/jobs/{job_id}/calibration")
 async def save_calibration(job_id: str, request: Request):
-    from app.vision.calibrate import preview
-
     directory, path = _finished_result(job_id)
     body = await _json_body(request)
-    running = _read_json(directory / "calibration-job.json") or {}
-    if running.get("state") == "processing" and time.time() - running.get("startedAt", 0) < 1800:
-        raise HTTPException(409, "A calibration for this match is already being applied")
+    # In-memory, so a calibration interrupted by a restart never blocks a retry.
+    with calibrating_lock:
+        if job_id in calibrating:
+            raise HTTPException(409, "A calibration for this match is already being applied")
+        calibrating.add(job_id)
+    try:
+        return await _start_calibration(job_id, directory, path, body)
+    except BaseException:
+        with calibrating_lock:
+            calibrating.discard(job_id)
+        raise
+
+
+async def _start_calibration(job_id, directory, path, body):
+    from app.vision.calibrate import preview
+
     result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
     try:
         fit = await asyncio.to_thread(preview, result, body)
@@ -865,13 +914,13 @@ def _clean_decision(d, index):
         if not (0 <= t <= 6 * 3600):
             raise HTTPException(400, "Invalid event time")
         out.update(type=d["type"], t=round(t, 2), id=f"added-{uuid.uuid4().hex[:10]}")
-        if d.get("team") in (0, 1):
+        if isinstance(d.get("team"), int) and not isinstance(d.get("team"), bool) and d["team"] in (0, 1):
             out["team"] = d["team"]
         if isinstance(d.get("outcome"), str):
             out["outcome"] = d["outcome"][:40]
-        for key in ("x", "y"):
-            if isinstance(d.get(key), (int, float)) and abs(d[key]) < 200:
-                out[key] = float(d[key])
+        x, y = d.get("x"), d.get("y")
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and abs(v) < 200 for v in (x, y)):
+            out["x"], out["y"] = float(x), float(y)
         return out
     if d["action"] == "direction":
         if d.get("value") not in ("left", "right"):
@@ -893,7 +942,7 @@ def _clean_decision(d, index):
         raise HTTPException(400, "Unknown event")
     out["eventId"] = event
     if d["action"] == "team":
-        if d.get("value") not in (0, 1):
+        if isinstance(d.get("value"), bool) or d.get("value") not in (0, 1):
             raise HTTPException(400, "Team must be 0 or 1")
         out["value"] = d["value"]
     elif d["action"] in ("type", "outcome"):
@@ -919,13 +968,29 @@ async def add_review(job_id: str, request: Request):
     if not isinstance(decisions, list) or not 1 <= len(decisions) <= 200:
         raise HTTPException(400, "Send between 1 and 200 decisions")
     cleaned = [_clean_decision(d, i) for i, d in enumerate(decisions)]
-    with post_lock:
-        # Append-only: the model's output and every change stay auditable.
-        current = _read_json(directory / "review.json", {"decisions": []})
-        if len(current["decisions"]) + len(cleaned) > 20000:
-            raise HTTPException(409, "Too many review decisions for one match")
-        current["decisions"].extend(cleaned)
-        _write_json(directory / "review.json", current)
+    # Record which moment each decision was made on, so it survives re-analysis
+    # (event ids are positions and change when the analysis is recomputed).
+    current = await asyncio.to_thread(compute_analysis, directory)
+    by_id = {e["id"]: e for e in current.get("events", [])}
+    for d in cleaned:
+        event = by_id.get(d.get("eventId"))
+        if event is not None:
+            d["event"] = {k: event.get(k) for k in ("type", "t", "team", "outcome")}
+    def append():
+        with post_lock:
+            # Append-only: the model's output and every change stay auditable.
+            log = _read_json(directory / "review.json", {"decisions": []})
+            if len(log["decisions"]) + len(cleaned) > 20000:
+                return None
+            log["decisions"].extend(cleaned)
+            _write_json(directory / "review.json", log)
+            return len(log["decisions"])
+
+    # The lock is taken in a worker thread: blocking the event loop would stall
+    # uploads and every other request while an analysis is being computed.
+    total = await asyncio.to_thread(append)
+    if total is None:
+        raise HTTPException(409, "Too many review decisions for one match")
     data = await asyncio.to_thread(compute_analysis, directory)
-    return {"decisions": len(current["decisions"]), "added": [c for c in cleaned if c["action"] == "add"], "analysis": data}
+    return {"decisions": total, "added": [c for c in cleaned if c["action"] == "add"], "analysis": data}
 

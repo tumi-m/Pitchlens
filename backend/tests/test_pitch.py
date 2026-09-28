@@ -231,3 +231,36 @@ def test_build_follows_a_panning_video_and_recovers_after_motion_failure(tmp_pat
     # every frame stays within half a metre.
     assert max(errors) < 0.5, [(i, round(e, 2)) for i, e in enumerate(errors)]
     assert out["lineAligned"] >= 5
+
+
+def test_line_alignment_works_on_a_blue_indoor_court():
+    H = camera_homography()
+    frame = render(H)
+    court = np.all(frame == (40, 140, 40), axis=2)
+    frame[court] = (150, 80, 30)  # blue-ish court, BGR
+    truth = np.linalg.inv(H)
+    cal = {"H": truth.tolist(), "k1": 0.0, "size": list(SIZE)}
+    drifted = truth @ np.linalg.inv(np.array([[1.0, 0, -6.0], [0, 1.0, 2.0], [0, 0, 1]]))
+    assert pitch.line_mask(frame).sum() == 0  # the grass rule finds nothing here
+    mask = pitch.line_mask(frame, restrict_to_grass=False)
+    refined, score = pitch.align_to_lines(frame, cal, drifted, TEMPLATE, precomputed=mask)
+    assert refined is not None and score > 0.6
+    probe = pitch.apply(H, [[10.0, 5.0], [30.0, 15.0]])
+    assert np.linalg.norm(pitch.apply(refined, probe) - [[10, 5], [30, 15]], axis=1).max() < 0.35
+
+
+def test_template_dimensions_are_bounded():
+    with pytest.raises(ValueError):
+        pitch.normalise_template({"length": 40, "width": 20, "centreRadius": 1e9})
+    with pytest.raises(ValueError):
+        pitch.normalise_template({"length": "forty", "width": 20})
+    with pytest.raises(ValueError):
+        pitch.normalise_template(["not", "a", "dict"])
+
+
+def test_forcing_distortion_with_four_clicks_does_not_invent_a_lens():
+    H = camera_homography()
+    names = ["corner-far-left", "corner-far-right", "corner-near-right", "corner-near-left"]
+    world = np.array([pitch.landmarks(TEMPLATE)[n] for n in names])
+    cal = pitch.fit(pitch.apply(H, world) + [[1.5, -1], [0, 1], [-1, 0], [1, 1]], world, SIZE, distortion="on")
+    assert cal["k1"] == 0.0

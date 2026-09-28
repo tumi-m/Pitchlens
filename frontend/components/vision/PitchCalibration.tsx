@@ -246,8 +246,8 @@ export function PitchCalibration({
         {(
           [
             [-5, "−5 s"],
-            [-0.2, "◀"],
-            [0.2, "▶"],
+            [-0.01, "◀ frame"],
+            [0.01, "frame ▶"],
             [5, "+5 s"],
           ] as const
         ).map(([delta, label]) => (

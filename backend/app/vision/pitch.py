@@ -74,18 +74,36 @@ def normalise_template(spec):
         spec = PRESETS.get(spec)
         if spec is None:
             raise ValueError("Unknown pitch preset")
+    if not isinstance(spec, dict):
+        raise ValueError("Pitch dimensions must be an object or a preset name")
     base = dict(PRESETS["five-a-side"])
-    base.update({k: v for k, v in (spec or {}).items() if k in base})
-    length, width = float(base["length"]), float(base["width"])
+    base.update({k: v for k, v in spec.items() if k in base})
+    try:
+        length, width = float(base["length"]), float(base["width"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Pitch length and width must be numbers") from exc
     if not (10 <= length <= 130 and 5 <= width <= 100 and length >= width * 0.8):
         raise ValueError("Pitch dimensions must be 10-130 m long and 5-100 m wide")
-    goal = float(base["goalWidth"] or 3.0)
+    try:
+        goal = float(base["goalWidth"] or 3.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Goal width must be a number") from exc
     if not 1 <= goal <= min(8, width):
         raise ValueError("Goal width must be between 1 m and 8 m")
     out = {"length": length, "width": width, "goalWidth": goal}
-    for key in ("centreRadius", "areaRadius", "areaDepth", "areaWidth", "penaltySpot"):
+    limits = {"centreRadius": width / 2, "areaRadius": width / 2, "areaDepth": length / 2, "areaWidth": width, "penaltySpot": length / 2}
+    for key, limit in limits.items():
         value = base.get(key)
-        out[key] = float(value) if value not in (None, "", 0) else None
+        if value in (None, "", 0):
+            out[key] = None
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a number") from exc
+        if not (0 < value <= limit):
+            raise ValueError(f"{key} must be between 0 and {limit:.1f} m for this pitch")
+        out[key] = value
     if out["areaDepth"] and not out["areaWidth"]:
         out["areaDepth"] = None
     return out
@@ -193,6 +211,9 @@ def distort(points, k1, size):
     u = (points - centre) / scale
     ru = np.linalg.norm(u, axis=1, keepdims=True)
     # rd / (1 + k1 rd^2) = ru  ->  k1 ru rd^2 - rd + ru = 0
+    if k1 > 0:
+        # Beyond this radius the division model has no inverse; clamp rather than fold.
+        ru = np.minimum(ru, 0.999 / (2 * math.sqrt(k1)))
     with np.errstate(divide="ignore", invalid="ignore"):
         disc = 1 - 4 * k1 * ru**2
         rd = np.where(
@@ -405,7 +426,9 @@ def fit(image_points, pitch_points, size, distortion="auto", line_clicks=None):
             "Add a corner, a goal post or a point on another line."
         )
     constraints = 2 * n + len(line_clicks)
-    use_distortion = distortion == "on" or (distortion == "auto" and constraints >= 12)
+    # With fewer constraints than this the lens term is not identifiable: it
+    # would absorb click error and invent a fisheye.
+    use_distortion = distortion in ("on", "auto") and constraints >= 12
     plain = _solve(image_points, pitch_points, line_clicks, size, [0.0], False)
     G, k1 = plain
     if use_distortion:
@@ -559,10 +582,16 @@ def static_camera(frames):
     ]
     if len(moves) < max(5, len(frames) * 0.5):
         return False
-    return float(np.percentile(moves, 95)) < 0.6
+    # A fixed camera that was bumped or re-aimed moves for a moment: not static.
+    return float(np.percentile(moves, 95)) < 0.6 and float(np.max(moves)) < 3.0
 
 
-def propagate(frames, anchors, static=None):
+def _elapsed(frames, earlier, later):
+    a, b = frames[earlier].get("t"), frames[later].get("t")
+    return 0.0 if a is None or b is None else b - a
+
+
+def propagate(frames, anchors, static=None, max_seconds=12.0):
     """Per-frame image->pitch homographies (in undistorted-pixel terms) from anchors.
 
     anchors: {frame index: 3x3 image->pitch homography} for frames that were
@@ -586,6 +615,10 @@ def propagate(frames, anchors, static=None):
         for i in range(index + 1, n):
             if frames[i]["scene"] != scene or i in anchors:
                 break
+            # A moving camera's motion chain drifts: without a re-alignment to the
+            # painted lines, stop trusting it after max_seconds.
+            if not static and _elapsed(frames, index, i) > max_seconds:
+                break
             a = IDENTITY if static else _affine(frames[i])
             if a is None:
                 break
@@ -596,6 +629,8 @@ def propagate(frames, anchors, static=None):
         to_anchor = IDENTITY.copy()
         for i in range(index - 1, -1, -1):
             if frames[i]["scene"] != scene or i in anchors:
+                break
+            if not static and _elapsed(frames, i, index) > max_seconds:
                 break
             a = IDENTITY if static else _affine(frames[i + 1])
             if a is None:
@@ -609,8 +644,13 @@ def propagate(frames, anchors, static=None):
 # ---------------------------------------------------------------- line alignment
 
 
-def line_mask(frame, pitch_colour=None):
-    """Thin bright markings on the playing surface (the painted lines)."""
+def line_mask(frame, pitch_colour=None, restrict_to_grass=True):
+    """Thin bright markings (the painted lines).
+
+    By default only on grass-coloured ground. With restrict_to_grass=False the
+    caller restricts the mask to the calibrated pitch area instead, which also
+    works on blue or red indoor courts.
+    """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     lightness = lab[:, :, 0]
     h = frame.shape[0]
@@ -619,11 +659,28 @@ def line_mask(frame, pitch_colour=None):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     bright = (tophat >= max(18, np.percentile(tophat, 97))) & (hsv[:, :, 1] < 90)
     mask = bright.astype(np.uint8) * 255
-    # Only markings on the playing surface: grass-coloured surroundings.
-    grass = cv2.inRange(hsv, np.array([25, 30, 25]), np.array([100, 255, 255]))
-    grass = cv2.dilate(grass, np.ones((k, k), np.uint8))
-    mask &= grass
+    if restrict_to_grass:
+        # Only markings on the playing surface: grass-coloured surroundings.
+        grass = cv2.inRange(hsv, np.array([25, 30, 25]), np.array([100, 255, 255]))
+        grass = cv2.dilate(grass, np.ones((k, k), np.uint8))
+        mask &= grass
     return mask
+
+
+def pitch_region(calibration, H, template, shape, margin_m=1.5):
+    """Mask of the image area covered by the pitch (plus a margin) under H."""
+    L, W = template["length"], template["width"]
+    outline = [(x, -margin_m) for x in np.linspace(-margin_m, L + margin_m, 24)]
+    outline += [(L + margin_m, y) for y in np.linspace(-margin_m, W + margin_m, 12)]
+    outline += [(x, W + margin_m) for x in np.linspace(L + margin_m, -margin_m, 24)]
+    outline += [(-margin_m, y) for y in np.linspace(W + margin_m, -margin_m, 12)]
+    pts = pitch_to_image(calibration, outline, H)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    region = np.zeros(shape[:2], np.uint8)
+    if len(pts) >= 3:
+        pts = np.clip(pts, -4 * shape[1], 4 * shape[1]).astype(np.int32)
+        cv2.fillPoly(region, [cv2.convexHull(pts)], 255)
+    return region
 
 
 def _chamfer_field(mask, cap):
@@ -651,6 +708,11 @@ def align_to_lines(frame, calibration, H, template, max_nfev=200, precomputed=No
     h, w = frame.shape[:2]
     cap = max(6.0, h * 0.03)
     mask = precomputed if precomputed is not None else line_mask(frame)
+    # Keep markings near where the pitch should be (walls, boards and adverts
+    # outside it also have bright lines).
+    region = pitch_region(calibration, H, template, (h, w), margin_m=2.0 + (search or 0) / max(1.0, h) * 10)
+    region = cv2.dilate(region, np.ones((max(3, int(h * 0.08)),) * 2, np.uint8))
+    mask = mask & region
     if mask.sum() / 255 < h * w * 0.002:
         return None, 0.0
     field = _chamfer_field(mask, cap)

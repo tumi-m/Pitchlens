@@ -201,7 +201,7 @@ export function MatchReport({
           </div>
           <Group title="Possession">
             <Row
-              label="Ball possession"
+              label="Ball possession (time)"
               a={{ value: possessionShown ? A.possession : null, note: possessionShown && range ? `95%: ${Math.round(range[0])}–${Math.round(range[1])}%` : undefined }}
               b={{ value: possessionShown ? B.possession : null }}
               colours={colours}
@@ -211,6 +211,14 @@ export function MatchReport({
                   ? `From winning the ball to losing it, passes in flight included, over the ${cov.possessionPercent}% of in-play time the ball could be followed.`
                   : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (60% needed for a fair split).`
               }
+            />
+            <Row
+              label="Possession by passes"
+              a={{ value: A.passShare ?? null }}
+              b={{ value: B.passShare ?? null }}
+              colours={colours}
+              format={pct}
+              hint="Each team's share of all detected passes. Many stats sites define possession this way; it can differ from the time-based figure above."
             />
             <Row label="Possessions" a={{ value: A.possessions }} b={{ value: B.possessions }} colours={colours} />
             <Row label="Average possession" a={{ value: A.averagePossession }} b={{ value: B.averagePossession }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />

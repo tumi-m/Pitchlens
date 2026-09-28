@@ -200,10 +200,10 @@ def stitch_tracks(projected, sample_fps):
         item["team"] = top[0][0] if top and top[0][1] >= 0.6 * total else -1
         item["start"], item["end"] = item["frames"][0][0], item["frames"][-1][0]
 
-    def motion(frames, at_end):
+    def motion(frames, at_end, force_image=False):
         """(position, velocity per second, metric?) at one end of a fragment."""
         seq = frames[-6:] if at_end else frames[:6]
-        metric = all(fr[1] is not None for fr in seq)
+        metric = not force_image and all(fr[1] is not None for fr in seq)
         pts = [(fr[0], fr[1] if metric else fr[2]) for fr in seq]
         t0, p0 = pts[-1] if at_end else pts[0]
         if len(pts) >= 2 and pts[-1][0] > pts[0][0]:
@@ -248,6 +248,9 @@ def stitch_tracks(projected, sample_fps):
                         error = min(math.dist(predicted, pb), math.dist(pa, pb))
                         limit = vmax * gap + 1.5
                     else:
+                        # One side lacks pitch positions: compare both in image space.
+                        pa, va, _, ha = motion(a["last"]["frames"], True, force_image=True)
+                        pb, _, _, hb = motion(b["first"]["frames"], False, force_image=True)
                         height = (ha + hb) / 2
                         predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
                         error = min(math.dist(predicted, pb), math.dist(pa, pb)) / height
@@ -334,7 +337,8 @@ def attacking_directions(projected, template, player_of=None):
     votes = []
     for b in sorted(bins):
         a, c = bins[b]
-        if len(a) >= 5 and len(c) >= 5:
+        # A few seconds of a bin (e.g. the last partial minute) is not evidence.
+        if len(a) >= 30 and len(c) >= 30:
             diff = (np.mean(a) - np.mean(c)) / L
             # team 0 deeper on the left (smaller x) -> team 0 attacks right
             votes.append((b, 1 if diff < 0 else -1, abs(diff)))
@@ -342,6 +346,8 @@ def attacking_directions(projected, template, player_of=None):
         return {"segments": [], "confidence": 0.0, "source": "insufficient"}
     best = None
     for split in range(len(votes) + 1):
+        if 0 < split < len(votes) and (split < 2 or len(votes) - split < 2):
+            continue  # a change of ends needs at least two minutes of evidence each side
         for first in (1, -1):
             score = sum(w for i, (_, v, w) in enumerate(votes) if v == (first if i < split else -first))
             # A switch must be earned: without one, the whole match is one direction.
@@ -362,6 +368,28 @@ def attacking_directions(projected, template, player_of=None):
     if len(segments) == 2:
         segments[0]["end"] = segments[1]["start"]
     return {"segments": segments, "confidence": round(agree / total, 2), "source": "team-depth"}
+
+
+def assign_goalkeepers(projected, template, directions):
+    """A goalkeeper without a kit team belongs to the team defending the goal they stand in.
+
+    The kit clustering never labels keepers (they wear their own colours), so
+    without this a keeper could never control the ball and real saves were
+    reported as unresolved shots.
+    """
+    if not template or not directions or not directions.get("segments"):
+        return
+    L = template["length"]
+    for f in projected:
+        for p in f["players"]:
+            if p["role"] != "goalkeeper" or p["team"] in (0, 1) or not p["xy"]:
+                continue
+            side = 1 if p["xy"][0] > L / 2 else -1  # which end the keeper is at
+            for team in (0, 1):
+                sign = attack_sign(directions, team, f["t"])
+                if sign is not None and sign == -side:  # this team defends that end
+                    p["team"] = team
+                    break
 
 
 def attack_sign(directions, team, t):
@@ -766,7 +794,10 @@ def detect_shot(projected, template, directions, spell, sample_fps):
         return None
     beyond = None
     for t, xy, _, inferred in path:
-        if (xy[0] - goal_x) * sign >= 0.2 and not inferred:
+        # Just behind the line (net depth plus one sample of travel) counts; a
+        # ball in the air projects far further behind it and does not.
+        behind = (xy[0] - goal_x) * sign
+        if 0.2 <= behind <= 3.0 and not inferred:
             beyond = (t, xy)
             break
     return {
@@ -806,7 +837,12 @@ def detect_kickoffs(projected, dead_intervals, directions, template, sample_fps)
     centre = (L / 2, W / 2)
     found = []
     need = max(2, int(round(sample_fps)))  # ~1 s on the spot
+    switches = [seg["start"] for seg in directions["segments"][1:]]
     for first, last in dead_intervals:
+        stopped = projected[last]["t"] - projected[first]["t"]
+        # Half time (long break, change of ends) restarts from the centre too.
+        if stopped > 90 or any(abs(projected[last]["t"] - sw) < 300 for sw in switches):
+            continue
         window = range(max(first, last - 3 * need), min(len(projected), last + need + 1))
         on_spot = Counter()
         own_half_ok = 0
@@ -968,13 +1004,48 @@ def detect_events(projected, states, spells, template, directions, sample_fps, i
 ON_TARGET = {"on-target", "saved", "goal-candidate", "goal"}
 
 
+REANCHOR_SECONDS = 1.0
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def apply_review(events, review):
-    """Apply a reviewer's append-only decisions. Later decisions win."""
+    """Apply a reviewer's append-only decisions. Later decisions win.
+
+    Automatic event ids are positions in the current event list, which change
+    whenever the analysis is recomputed (new calibration, new code). A decision
+    therefore also records the event it was made on (`event`: type, t, team);
+    it re-attaches to the matching event within a second, and a confirmed
+    moment that no longer exists is kept as a reviewer moment rather than
+    silently moving to another event.
+    """
     if not review:
         return events, {}
     by_id = {e["id"]: dict(e) for e in events}
-    added = []
+    current = list(by_id.values())
+    added = {}
+    kept = {}  # decision event id -> reviewer moment kept from a vanished event
     overrides = {}
+
+    def resolve(d):
+        eid = d.get("eventId")
+        if eid in added:
+            return added[eid]
+        if eid in kept:
+            return kept[eid]
+        fp = d.get("event")
+        candidate = by_id.get(eid)
+        if not isinstance(fp, dict) or not _number(fp.get("t")):
+            return candidate  # decisions made before fingerprints existed
+        if candidate is not None and candidate["type"] == fp.get("type") and abs(candidate["t"] - fp["t"]) <= 0.05:
+            return candidate
+        options = [e for e in current if e["type"] == fp.get("type") and abs(e["t"] - fp["t"]) <= REANCHOR_SECONDS]
+        if options:
+            return min(options, key=lambda e: (e.get("team") != fp.get("team"), abs(e["t"] - fp["t"])))
+        return None
+
     for d in review.get("decisions", []):
         action = d.get("action")
         if action == "add":
@@ -987,11 +1058,11 @@ def apply_review(events, review):
                 "status": "confirmed",
                 "source": "reviewer",
                 **({"outcome": d["outcome"]} if d.get("outcome") else {}),
-                **({"x": d["x"], "y": d["y"]} if d.get("x") is not None else {}),
+                **({"x": float(d["x"]), "y": float(d["y"])} if _number(d.get("x")) and _number(d.get("y")) else {}),
             }
             if item["type"] == "shot":
                 item["onTarget"] = item.get("outcome", "on-target") in ON_TARGET
-            added.append(item)
+            added[item["id"]] = item
             continue
         if action == "direction":
             overrides["direction"] = d.get("value")
@@ -999,11 +1070,26 @@ def apply_review(events, review):
         if action == "score":
             overrides["score"] = d.get("value")
             continue
-        target = by_id.get(d.get("eventId"))
+        target = resolve(d)
         if target is None:
-            target = next((a for a in added if a["id"] == d.get("eventId")), None)
-        if target is None:
-            continue
+            fp = d.get("event")
+            if action in ("accept", "team", "type", "outcome") and isinstance(fp, dict) and _number(fp.get("t")) and fp.get("type"):
+                target = {
+                    "id": f"kept-{d.get('eventId')}",
+                    "type": fp["type"],
+                    "t": float(fp["t"]),
+                    "team": fp.get("team") if fp.get("team") in (0, 1) else None,
+                    "confidence": 1.0,
+                    "status": "confirmed",
+                    "source": "reviewer",
+                    "note": "Confirmed by the reviewer; the automatic detection changed after re-analysis.",
+                    **({"outcome": fp["outcome"]} if fp.get("outcome") else {}),
+                }
+                if target["type"] == "shot":
+                    target["onTarget"] = target.get("outcome") in ON_TARGET
+                kept[d.get("eventId")] = target
+            else:
+                continue
         if action == "accept":
             target["status"] = "confirmed"
         elif action == "reject":
@@ -1021,9 +1107,27 @@ def apply_review(events, review):
             target["status"] = "confirmed"
             if target["type"] == "shot":
                 target["onTarget"] = d["value"] in ON_TARGET
-    merged = [e for e in by_id.values()] + [a for a in added if a["id"] not in by_id]
+    merged = current + list(added.values()) + list(kept.values())
     merged.sort(key=lambda e: e["t"])
     return merged, overrides
+
+
+def confirmed_goals(events, team):
+    """Distinct confirmed goals for a team: goal moments, confirmed goal candidates and
+    shots whose confirmed outcome is a goal, merged when they describe the same goal."""
+    moments = sorted(
+        e["t"]
+        for e in events
+        if e.get("team") == team
+        and e["status"] == "confirmed"
+        and (e["type"] in ("goal", "goal-candidate") or (e["type"] == "shot" and e.get("outcome") in ("goal", "goal-candidate")))
+    )
+    count, last = 0, None
+    for t in moments:
+        if last is None or t - last > 3.0:
+            count += 1
+        last = t
+    return count
 
 
 # --------------------------------------------------------------------- stats
@@ -1073,6 +1177,7 @@ def summarise(projected, states, spells, events, template, directions, player_of
     coverage = total_possession / in_play_seconds if in_play_seconds else 0.0
     shown = coverage >= PARAMS["possessionMinCoverage"] and total_possession > 0
     interval = share_interval(sequences) if shown else None
+    all_passes = [e for e in live if e["type"] == "pass" and e.get("team") in (0, 1)]
     teams = []
     for team in (0, 1):
         passes = count("pass", team)
@@ -1081,13 +1186,7 @@ def summarise(projected, states, spells, events, template, directions, player_of
         accuracy = None
         if len(reliable) >= PARAMS["minPassesForAccuracy"]:
             accuracy = round(sum(1 for e in reliable if e.get("outcome") == "complete") / len(reliable) * 100, 1)
-        goals_confirmed = sum(
-            1
-            for e in live
-            if e.get("team") == team
-            and e["status"] == "confirmed"
-            and (e["type"] in ("goal", "goal-candidate") or (e["type"] == "shot" and e.get("outcome") in ("goal", "goal-candidate") and e.get("source") == "reviewer"))
-        )
+        goals_confirmed = confirmed_goals(live, team)
         own = [s for s in sequences if s["team"] == team]
         teams.append(
             {
@@ -1099,6 +1198,9 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 "passes": passes,
                 "passesComplete": complete,
                 "passAccuracy": accuracy,
+                # Share of all detected passes (the definition many stats sites use for
+                # possession), as a cross-check on the time-based share.
+                "passShare": round(passes["value"] / len(all_passes) * 100, 1) if len(all_passes) >= PARAMS["minPassesForAccuracy"] else None,
                 "shots": count("shot", team) if template else None,
                 "shotsOnTarget": count("shot", team, lambda e: e.get("onTarget") is True) if template else None,
                 "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"]} if template else None,
@@ -1208,6 +1310,7 @@ def analyse(result, calibration=None, review=None):
         if switch is not None:
             segments.append({"start": switch, "end": math.inf, "team0Attacks": other})
         directions = {"segments": segments, "confidence": 1.0, "source": "reviewer"}
+    assign_goalkeepers(projected, template, directions)
     calibration_error = float(calibration.get("rms") or 0) if calibration else 0.0
     states, ball_velocity, velocities = control_states(projected, player_of, calibration_error)
     spells = control_spells(projected, states, sample_fps)
