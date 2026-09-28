@@ -1,0 +1,46 @@
+{
+  "note": "Retrospective diagnostic labels, visually inspected after inference; not held-out evaluation. Coordinates in 640x360 source. Occluded frame 305.2 excluded.",
+  "tolerancePixels": 3,
+  "labels": [
+    {
+      "t": 301.8,
+      "x": 493,
+      "y": 170
+    },
+    {
+      "t": 302,
+      "x": 517.5,
+      "y": 171.5
+    },
+    {
+      "t": 302.2,
+      "x": 540,
+      "y": 171
+    },
+    {
+      "t": 302.8,
+      "x": 565,
+      "y": 173
+    },
+    {
+      "t": 303,
+      "x": 563.25,
+      "y": 173
+    },
+    {
+      "t": 303.2,
+      "x": 560,
+      "y": 173
+    },
+    {
+      "t": 304.8,
+      "x": 545,
+      "y": 172
+    },
+    {
+      "t": 305,
+      "x": 544.25,
+      "y": 172
+    }
+  ]
+}

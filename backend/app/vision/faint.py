@@ -66,7 +66,11 @@ def difference_candidates(previous, current, matrix, players, diameter, limit=8,
     found = []
     lo, hi = diameter * 0.4, diameter * 2.2
     for i in range(1, count):
-        bw, bh, area = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
+        bw, bh, area = (
+            stats[i, cv2.CC_STAT_WIDTH],
+            stats[i, cv2.CC_STAT_HEIGHT],
+            stats[i, cv2.CC_STAT_AREA],
+        )
         size = max(bw, bh)
         if not lo <= size <= hi or area < 0.35 * bw * bh:
             continue
@@ -74,14 +78,22 @@ def difference_candidates(previous, current, matrix, players, diameter, limit=8,
         if min(bw, bh) / max(bw, bh) < 0.4:
             continue
         cx, cy = centroids[i]
-        energy = float(diff[stats[i, cv2.CC_STAT_TOP] : stats[i, cv2.CC_STAT_TOP] + bh,
-                            stats[i, cv2.CC_STAT_LEFT] : stats[i, cv2.CC_STAT_LEFT] + bw].mean())
+        energy = float(
+            diff[
+                stats[i, cv2.CC_STAT_TOP] : stats[i, cv2.CC_STAT_TOP] + bh,
+                stats[i, cv2.CC_STAT_LEFT] : stats[i, cv2.CC_STAT_LEFT] + bw,
+            ].mean()
+        )
         found.append(
             {
                 "x": round(float(cx), 1),
                 "y": round(float(cy), 1),
-                "box": [round(float(cx - bw / 2), 1), round(float(cy - bh / 2), 1),
-                        round(float(cx + bw / 2), 1), round(float(cy + bh / 2), 1)],
+                "box": [
+                    round(float(cx - bw / 2), 1),
+                    round(float(cy - bh / 2), 1),
+                    round(float(cx + bw / 2), 1),
+                    round(float(cy + bh / 2), 1),
+                ],
                 # Deliberately weak: only a consistent trajectory can promote it,
                 # and it never outranks a detector response the tracker accepts.
                 "confidence": round(min(0.15, 0.05 + energy / 510), 3),
@@ -109,7 +121,9 @@ def _warp_point(xy, matrix):
     return matrix @ np.array([xy[0], xy[1], 1.0])
 
 
-def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_length=3, min_evidence=0.55):
+def confirm_chains(
+    frames, matrices, diagonal, sample_fps=6.0, window=6, min_length=3, min_evidence=0.55
+):
     """Track-before-detect over all sampled frames.
 
     `matrices[i]` maps frame i-1 coordinates into frame i coordinates. A chain is
@@ -183,12 +197,12 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
             ok &= np.linalg.norm(here[:, None, :] - predicted[None], axis=2) <= tolerance[None, :]
             candidate = np.where(ok, scores[k][None, :] + conf[i][:, None] - 0.02 * back, -np.inf)
             for j in range(m):
-                l = int(np.argmax(candidate[j]))
-                if candidate[j, l] > score[j]:
-                    score[j] = candidate[j, l]
-                    length[j] = lengths[k][l] + 1
-                    prev[j] = (k, l)
-                    velocity[j] = step[j, l] / back
+                previous_index = int(np.argmax(candidate[j]))
+                if candidate[j, previous_index] > score[j]:
+                    score[j] = candidate[j, previous_index]
+                    length[j] = lengths[k][previous_index] + 1
+                    prev[j] = (k, previous_index)
+                    velocity[j] = step[j, previous_index] / back
         scores[i], lengths[i], velocities[i] = score, length, velocity
         for j in range(m):
             best[(i, j)] = (float(score[j]), int(length[j]), prev[j])
@@ -196,6 +210,7 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
     # Walk chains from their strongest end, longest first, without reuse.
     promoted = {}
     used = set()
+    chain_id = -2
     for key in sorted(order, key=lambda k: -best[k][0]):
         if key in used or best[key][1] < min_length or best[key][0] < min_evidence:
             continue
@@ -212,9 +227,9 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
             continue
         members = [frames[i]["ballCandidates"][j] for i, j in chain]
         neural = [m for m in members if m.get("source", "detector") != "motion"]
-        # A path made only of motion blobs needs to be long to count: feet,
-        # socks and hands also make small bright moving blobs.
-        if not neural and len(chain) < 2 * min_length:
+        # Motion alone cannot identify a ball: feet, socks and hands also
+        # make small bright moving blobs.
+        if not neural:
             continue
         if neural and max(m["confidence"] for m in neural) < 0.1 and len(chain) < min_length + 2:
             continue
@@ -223,12 +238,53 @@ def confirm_chains(frames, matrices, diagonal, sample_fps=6.0, window=6, min_len
         evidence = sum(m["confidence"] for m in members) - 0.02 * (span - (len(chain) - 1))
         if evidence < min_evidence:
             continue
-        mean_conf = sum(m["confidence"] for m in members) / len(members)
-        chain_conf = round(min(0.6 if neural else 0.4, mean_conf + 0.04 * len(chain)), 3)
+        neural_keys = [
+            (k, j)
+            for k, j in chain
+            if frames[k]["ballCandidates"][j].get("source", "detector") != "motion"
+            and frames[k]["ballCandidates"][j]["confidence"] >= 0.1
+        ]
+
+        def carry(point, source, target):
+            transform = np.eye(3)
+            lo, hi = sorted((source, target))
+            for k in range(lo + 1, hi + 1):
+                if matrices[k] is None or not np.isfinite(matrices[k]).all():
+                    return None
+                transform = np.vstack([matrices[k], [0, 0, 1]]) @ transform
+            vector = np.array([point["x"], point["y"], 1.0])
+            try:
+                return (
+                    transform @ vector if source <= target else np.linalg.solve(transform, vector)
+                )[:2]
+            except np.linalg.LinAlgError:
+                return None
+
+        def corroborated_motion(index, point):
+            # A neural hit at the start of a 20-second chain cannot authenticate
+            # every subsequent moving sock. Require local, bracketing detections.
+            reach = max(1, math.ceil(sample_fps * 0.5))
+            before = [(k, j) for k, j in neural_keys if 0 < index - k <= reach]
+            after = [(k, j) for k, j in neural_keys if 0 < k - index <= reach]
+            if not before or not after:
+                return False
+            ka, ja = max(before)
+            kb, jb = min(after)
+            a = carry(frames[ka]["ballCandidates"][ja], ka, index)
+            b = carry(frames[kb]["ballCandidates"][jb], kb, index)
+            if a is None or b is None:
+                return False
+            fraction = (index - ka) / (kb - ka)
+            predicted = a + fraction * (b - a)
+            return np.linalg.norm(predicted - [point["x"], point["y"]]) <= max(3, diagonal * 0.005)
+
+        chain_id -= 1
         for i, j in chain:
-            used.add((i, j))
             candidate = dict(frames[i]["ballCandidates"][j])
-            candidate["confidence"] = max(candidate["confidence"], chain_conf)
+            if candidate.get("source") == "motion" and not corroborated_motion(i, candidate):
+                continue
+            used.add((i, j))
+            candidate["recoveryChainId"] = chain_id
             candidate["chainEvidence"] = round(float(evidence), 3)
             candidate["chainLength"] = len(chain)
             promoted[i] = candidate
@@ -268,7 +324,10 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
         if run:
             # "Confident" means the detector was fairly sure, not merely above
             # the tracker's 0.15 entry bar: a 0.17 blob still for 14 s is a marking.
-            weak = all(frames[i]["ball"].get("recovered") or frames[i]["ball"]["confidence"] < 0.3 for i in run)
+            weak = all(
+                frames[i]["ball"].get("recovered") or frames[i]["ball"]["confidence"] < 0.3
+                for i in run
+            )
             limit = max(2, int(round((seconds if weak else confident_seconds) * sample_fps)))
             attended = sum(_attended(frames[i], frames[i]["ball"]) for i in run)
             if len(run) >= limit and attended * 2 < len(run):
@@ -304,35 +363,77 @@ def recover_ball(frames, matrices, diagonal, sample_fps, max_bridge=0.5):
     Returns counts: {"recovered": n, "inferred": n, "droppedStatic": n}.
     """
     promoted = confirm_chains(frames, matrices, diagonal, sample_fps)
+    # An offline hypothesis has its own identity. Reuse an online identity only
+    # when a single existing track corroborates that chain; never label all
+    # recovered paths -1 and accidentally join different objects.
+    anchors = {}
+    for i, candidate in promoted.items():
+        ball = frames[i]["ball"]
+        if ball is not None and ball.get("trackId", -1) >= 0:
+            if (
+                math.hypot(ball["x"] - candidate["x"], ball["y"] - candidate["y"])
+                <= diagonal * 0.01
+            ):
+                anchors.setdefault(candidate["recoveryChainId"], set()).add(ball["trackId"])
     recovered = 0
     for i, candidate in promoted.items():
         if frames[i]["ball"] is None:
-            frames[i]["ball"] = {**candidate, "trackId": -1, "observed": True, "recovered": True}
+            chain = candidate["recoveryChainId"]
+            ids = anchors.get(chain, set())
+            track_id = next(iter(ids)) if len(ids) == 1 else chain
+            frames[i]["ball"] = {
+                **candidate,
+                "trackId": track_id,
+                "observed": True,
+                "recovered": True,
+            }
             recovered += 1
-    # Bridge gaps between observed positions that are close in time and space.
+    # Reject static hypotheses before interpolation, so guessed positions cannot
+    # break a static run or leave ghost bridges after its endpoints are removed.
+    dropped = drop_static_balls(frames, matrices, diagonal, sample_fps)
     inferred = 0
-    # `max_bridge` is the unobserved time allowed inside a chain.
     max_gap = max(1, int(round(max_bridge * sample_fps))) + 1
     last = None
     for i, f in enumerate(frames):
-        if f["ball"] is not None and not f["ball"].get("inferred"):
-            if last is not None and 1 < i - last <= max_gap and frames[last]["scene"] == f["scene"]:
-                a, b = frames[last]["ball"], f["ball"]
-                # The online tracker's own gate: never join what it refused to join.
-                reach = diagonal * (0.025 + 0.3 * (i - last) / sample_fps)
-                if math.hypot(a["x"] - b["x"], a["y"] - b["y"]) <= reach:
+        if f["ball"] is None or f["ball"].get("inferred"):
+            continue
+        if last is not None and 1 < i - last <= max_gap and frames[last]["scene"] == f["scene"]:
+            a, b = frames[last]["ball"], f["ball"]
+            track_id = a.get("trackId", -1)
+            elapsed = f["t"] - frames[last]["t"]
+            same_track = track_id != -1 and track_id == b.get("trackId", -1)
+            transforms = [np.eye(3)]
+            for k in range(last + 1, i + 1):
+                matrix = matrices[k]
+                if matrix is None or not np.isfinite(matrix).all():
+                    break
+                transforms.append(np.vstack([matrix, [0, 0, 1]]) @ transforms[-1])
+            if (
+                same_track
+                and 0 < elapsed <= max_bridge + 1 / sample_fps + 1e-6
+                and len(transforms) == i - last + 1
+            ):
+                origin = np.array([a["x"], a["y"], 1.0])
+                destination = np.array([b["x"], b["y"], 1.0])
+                reach = diagonal * (0.025 + 0.3 * elapsed)
+                if np.linalg.norm((transforms[-1] @ origin - destination)[:2]) <= reach:
+                    try:
+                        endpoint = np.linalg.solve(transforms[-1], destination)
+                    except np.linalg.LinAlgError:
+                        last = i
+                        continue
                     for k in range(last + 1, i):
-                        s = (k - last) / (i - last)
+                        fraction = (frames[k]["t"] - frames[last]["t"]) / elapsed
+                        xy = transforms[k - last] @ (origin + fraction * (endpoint - origin))
                         frames[k]["ball"] = {
-                            "x": round(a["x"] + (b["x"] - a["x"]) * s, 1),
-                            "y": round(a["y"] + (b["y"] - a["y"]) * s, 1),
+                            "x": round(float(xy[0]), 1),
+                            "y": round(float(xy[1]), 1),
                             "box": None,
                             "confidence": round(min(a["confidence"], b["confidence"]) * 0.8, 3),
-                            "trackId": a.get("trackId", -1),
+                            "trackId": track_id,
                             "observed": False,
                             "inferred": True,
                         }
                         inferred += 1
-            last = i
-    dropped = drop_static_balls(frames, matrices, diagonal, sample_fps)
+        last = i
     return {"recovered": recovered, "inferred": inferred, "droppedStatic": dropped}

@@ -141,10 +141,12 @@ consistency over time.
    zoom or a pan. Chains of at least three members with enough summed evidence
    are promoted to observed ball positions (`recovered: true`); a stronger
    chain always keeps its frames against a weaker parallel one. Motion-only
-   chains must be twice as long and are capped at 0.4 confidence; chains with
-   neural corroboration at 0.6.
+   chains are rejected. A motion candidate needs neural detections bracketing
+   it within 0.5 seconds and agreement with their camera-compensated path.
+   Raw confidence is preserved; chain length never inflates it.
 4. **Gap bridging.** Up to 0.5 s of missing positions between two observations
-   that the online tracker's own distance gate would link are interpolated and
+   on the same identified track, with valid camera transforms, are interpolated
+   in camera-compensated coordinates using source timestamps and
    marked `inferred: true`. They count for possession continuity but never as
    observed frames (`ballFramesInferred`), and pass candidates require an
    observed ball throughout the transfer.
@@ -160,6 +162,15 @@ consistency over time.
 
 Run `VISION_FAINT=0` to compare against single-frame detection.
 
+## Engine 2.1: complementary detector evidence
+
+The player network already computes a ball class. Its ball detections scoring at
+least 0.6 are now fused with tiled ball detections using NMS, with no additional
+network forward pass. Set `VISION_AUX_BALL=0` for an ablation. Results identify
+these detections with `source: "player-model"`. Distinct recovered chains retain
+separate identities; interpolation cannot join unrelated tracks. Static rejection
+runs before interpolation to avoid leaving bridges between discarded objects.
+
 ### Possession on small players
 
 Control means a team player's foot point within 0.55 body heights of the ball,
@@ -168,4 +179,5 @@ margin). On a 23-pixel player (a whole pitch filmed at 360p) the foot point
 and the ball centre each wobble by a few pixels, which alone exceeded the
 0.55-height radius; on large players the slack is negligible. Measured on a
 20-second 360p diagnostic of the reported night match, possession coverage
-went from 6% to 26% of the analysed time.
+went from 6% to 26% of the analysed time (engine 2.0 ball output; engine
+2.1 recovers fewer motion-only positions, so expect a lower figure).
