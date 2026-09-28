@@ -51,7 +51,10 @@ function analysis(calibrated: boolean, shotStatus: "proposed" | "confirmed" = "p
   const template = { length: 40, width: 20, goalWidth: 3, centreRadius: 3, areaRadius: 6, areaDepth: null, areaWidth: null, penaltySpot: 6 };
   const team = (i: number) => ({
     controlSeconds: i ? 0.8 : 2.4,
+    possessionSeconds: i ? 1 : 3,
     possession: i ? 25 : 75,
+    possessions: i ? 1 : 2,
+    averagePossession: i ? 1 : 1.5,
     passes: count(i ? 1 : 4),
     passesComplete: count(i ? 0 : 3),
     passAccuracy: i ? 0 : 75,
@@ -60,7 +63,7 @@ function analysis(calibrated: boolean, shotStatus: "proposed" | "confirmed" = "p
     goals: calibrated ? { value: 0, candidates: 0 } : null,
     interceptions: count(i ? 1 : 0),
     tackles: count(0),
-    territory: calibrated ? (i ? 10 : 60) : null,
+    fieldTilt: calibrated ? (i ? 20 : 80) : null,
   });
   return {
     schemaVersion: 1,
@@ -72,7 +75,7 @@ function analysis(calibrated: boolean, shotStatus: "proposed" | "confirmed" = "p
       : [],
     stats: {
       teams: [team(0), team(1)],
-      coverage: { controlPercent: 80, ballStatePercent: 95, calibratedPercent: calibrated ? 100 : 0, contestedSeconds: 0, looseSeconds: 0.6, unknownSeconds: 0 },
+      coverage: { possessionPercent: 100, possessionShown: true, possessionInterval: [60, 90], controlPercent: 80, ballStatePercent: 95, calibratedPercent: calibrated ? 100 : 0, inPlaySeconds: 4, deadBallSeconds: 0, contestedSeconds: 0, looseSeconds: 0.6, unknownSeconds: 0 },
       momentum: [0.5],
       heatmaps: calibrated ? { "0": [[0.2, 0.3], [0.1, 0.4]], "1": [[0.5, 0.1], [0.3, 0.1]] } : null,
       averagePositions: calibrated ? [{ player: 1, team: 0, x: 12, y: 10, seconds: 30 }] : null,

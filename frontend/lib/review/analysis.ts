@@ -156,7 +156,11 @@ export type CountStat = { value: number; confirmed: number; pending: number };
 
 export type TeamStats = {
   controlSeconds: number;
+  /** Team possession: won ball to lost ball, including passes in flight. */
+  possessionSeconds: number;
   possession: number | null;
+  possessions: number;
+  averagePossession: number | null;
   passes: CountStat;
   passesComplete: CountStat;
   passAccuracy: number | null;
@@ -165,7 +169,8 @@ export type TeamStats = {
   goals: { value: number; candidates: number } | null;
   interceptions: CountStat;
   tackles: CountStat;
-  territory: number | null;
+  /** Share of both teams' attacking-third control that was this team's. */
+  fieldTilt: number | null;
 };
 
 export type AnalysisEvent = {
@@ -191,6 +196,8 @@ export type AnalysisEvent = {
   needsReview?: boolean;
   source?: string;
   note?: string;
+  evidence?: string[];
+  restartAt?: number;
 };
 
 export type Analysis = {
@@ -202,9 +209,16 @@ export type Analysis = {
   stats: {
     teams: [TeamStats, TeamStats];
     coverage: {
+      /** Share of in-play time assigned to a team's possession. */
+      possessionPercent: number;
+      possessionShown: boolean;
+      /** 95% interval for the first team's possession share. */
+      possessionInterval: [number, number] | null;
       controlPercent: number;
       ballStatePercent: number;
       calibratedPercent: number;
+      inPlaySeconds: number;
+      deadBallSeconds: number;
       contestedSeconds: number;
       looseSeconds: number;
       unknownSeconds: number;
@@ -214,7 +228,9 @@ export type Analysis = {
     averagePositions: { player: number; team: number; x: number; y: number; seconds: number }[] | null;
     shotMap: { id: string; team: number; x: number; y: number; outcome?: string; status: string; t: number }[] | null;
     tracks: { fragments: number; players: number };
+    possessionSequences?: { team: number; start: number; end: number; seconds: number }[];
   };
+  kickoffs?: { t: number; team: number }[];
   review: { decisions: number; confirmed: number; rejected: number; pending: number };
   /** [t, [[player, team, x, y]...] | null, [bx, by, inferred] | null] per sampled frame. */
   positions: [number, [number, number, number, number][] | null, [number, number, number] | null][] | null;

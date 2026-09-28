@@ -9,17 +9,28 @@ physical distances, speeds and the goals. Without one, only image-space
 possession and pass/turnover candidates are produced; shots, goals, heatmaps
 and directions are reported as unavailable, never as zero.
 
-The event logic follows the two-step design of Vidal-Codina et al. (2022,
-"Automatic event detection in football using tracking data"): first decide who
-controls the ball in each frame, then read events from changes of control
-combined with the ball's movement and the pitch geometry. Control uses a
-distance-plus-relative-speed test in the spirit of Link & Hoernig (2017,
-"Individual ball possession in soccer"). Thresholds are adapted for small-sided
-pitches, 5-6 sampled frames per second and image-derived positions with
-measurement error; see PARAMS.
+Method (see docs/market-ready/DECISIONS.md for sources and trade-offs):
+- Two steps, after Vidal-Codina et al. (2022, Sports Engineering, "Automatic
+  event detection in football using tracking data"): decide who controls the
+  ball in each frame, then read events from changes of control, the ball's
+  movement and the pitch geometry. Possession zone ~1 m (their 0.5-1.0 m),
+  widened by the calibration error because our positions come from one camera.
+- Team possession runs from one team's won ball to the other team's, including
+  the ball's flight between teammates, excluding dead-ball time. Link & Hoernig
+  (2017, PLOS ONE) show player-on-ball control is only ~18 of ~56 minutes of
+  team possession, so a control-time share would be biased and noisy.
+- Shots are judged by what happens next (keeper collects = save, defender in
+  front = block, beyond the line = goal candidate): ball height is not
+  observable from one camera at 5-6 frames per second. Goals are never counted
+  from geometry alone; a restart from the centre spot corroborates.
+- Momentum weights control by closeness to the goal being attacked, in the
+  spirit of Sofascore/Opta "attack momentum".
+Thresholds are starting values for small-sided pitches at 5-6 sampled frames
+per second; they are meant to be re-fitted from reviewed matches.
 """
 
 import math
+import random
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -28,25 +39,48 @@ from app.vision import pitch as pitchlib
 from app.vision.metrics import possession_owner as image_owner
 
 PARAMS = {
-    # Control: the ball within reach of a player's feet...
-    "controlRadius": 1.2,  # m, before adding calibration error
-    # ...moving with the player rather than past them.
-    "maxRelativeSpeed": 6.0,  # m/s
-    # A second opponent this close as well makes it a contest, not control.
-    "contestMargin": 0.6,  # m
+    # Control (possession zone). Vidal-Codina: 0.5-1.0 m on elite tracking;
+    # databallpy default 1.5 m. Ours: 1.1 m + 1.5 x calibration error, capped.
+    "controlRadius": 1.1,
+    "maxControlRadius": 2.0,
+    # Duel zone: an opponent this much further out still contests the ball.
+    "duelExtra": 0.5,
+    # The ball must move with the player (gain validation, after Vidal-Codina).
+    "maxRelativeSpeed": 4.0,  # m/s, plus 2 x calibration error
     "minControlSeconds": 0.3,
+    # A control spell survives this many unseen samples (ball hidden at the feet).
+    "bridgeSamples": 3,
     # Passes and turnovers.
-    "maxTransferSeconds": 5.0,
-    "minPassDistance": 2.0,  # m of ball travel between two players
+    "maxTransferSmall": 4.0,  # s, pitches up to 45 m long (5-a-side)
+    "maxTransferLarge": 5.0,  # s, larger pitches
+    "minPassDistance": 2.0,  # m of ball travel
+    "tackleMaxTravel": 2.0,  # m: shorter opponent gains are tackles, not interceptions
+    "tackleMaxGap": 0.8,  # s
+    "minPassesForAccuracy": 20,  # attempts per team before an accuracy % is shown
     # Shots.
-    "minShotSpeed": 7.0,  # m/s of the ball just after release
-    "shotHorizon": 2.0,  # s to reach the goal line
-    "goalMargin": 1.0,  # m either side of the posts still counted as on target band
-    "maxShotDistance": 0.75,  # fraction of pitch length from the goal
+    "minShotSpeed": 8.0,  # m/s; 6-8 m/s kept as low-confidence candidates
+    "lowShotSpeed": 6.0,
+    "maxShotOrigin": 0.6,  # fraction of pitch length from the target goal line
+    "shotBand": 2.0,  # m beyond the posts for the extrapolated crossing
+    "shotTimeToLine": 1.5,  # s
+    "saveWindow": 1.5,  # s for a keeper-area gain after a shot
+    "onTargetMargin": 0.3,  # m outside the posts (ball radius + noise)
+    # Possession sequences and dead ball.
+    "maxPossessionGap": 5.0,  # s of unseen/loose ball a possession survives
+    "deadBallSpeed": 1.5,  # m/s mean player speed...
+    "deadBallSeconds": 3.0,  # ...for at least this long
+    "possessionMinCoverage": 0.6,  # share of in-play time before possession % is shown
+    # Kick-off after a goal (centre restart).
+    "kickoffCentreRadius": 1.5,
+    "kickoffOwnHalfShare": 0.8,
+    "kickoffWindow": (10.0, 90.0),
+    # Momentum.
+    "momentumGoalScale": 8.0,  # m, exp(-distance to attacked goal / scale)
+    "momentumHalfLifeMinutes": 1.5,
     # Positions and tracks.
-    "offPitchMargin": 2.0,  # m: projected positions further out are not trusted
-    "maxPlayerSpeed": 8.5,  # m/s for linking track fragments
-    "maxStitchGap": 3.0,  # s
+    "offPitchMargin": 2.0,
+    "maxPlayerSpeed": 8.5,
+    "maxStitchGap": 3.0,
     "directionBinSeconds": 60.0,
 }
 
@@ -262,99 +296,127 @@ def attack_sign(directions, team, t):
 # --------------------------------------------------------------------- control
 
 
-def _velocities(projected, key):
-    """Finite-difference ball velocity (m/s) per frame, None where unknown."""
-    out = [None] * len(projected)
-    for i in range(1, len(projected) - 1):
-        a, b = projected[i - 1], projected[i + 1]
-        if a["scene"] != b["scene"]:
+def _central_difference(projected, positions):
+    """Velocity (m/s) per frame from a {frame index: (x, y)} track, central difference."""
+    out = {}
+    for i, xy in positions.items():
+        a, b = positions.get(i - 1), positions.get(i + 1)
+        if a is None or b is None:
             continue
-        pa, pb = key(a), key(b)
-        if pa is None or pb is None:
+        if projected[i - 1]["scene"] != projected[i + 1]["scene"]:
             continue
-        dt = b["t"] - a["t"]
+        dt = projected[i + 1]["t"] - projected[i - 1]["t"]
         if dt > 0:
-            out[i] = ((pb[0] - pa[0]) / dt, (pb[1] - pa[1]) / dt)
+            out[i] = ((b[0] - a[0]) / dt, (b[1] - a[1]) / dt)
     return out
 
 
-def control_states(projected, player_of, calibration_error=0.0):
-    """Per-frame ball state: control (by whom), contested, loose or unknown."""
+def ball_positions(projected):
+    """Grounded, on-pitch ball positions by frame (metres)."""
+    return {
+        i: f["ball"]["xy"]
+        for i, f in enumerate(projected)
+        if f["ball"] and f["ball"]["xy"] is not None and f["ball"]["onPitch"]
+    }
 
-    def ball_xy(f):
-        b = f["ball"]
-        return b["xy"] if b and b["xy"] and b["onPitch"] else None
 
-    ball_velocity = _velocities(projected, ball_xy)
-    player_tracks = defaultdict(dict)
+def fragment_positions(projected):
+    tracks = defaultdict(dict)
     for i, f in enumerate(projected):
         for p in f["players"]:
             if p["xy"]:
-                player_tracks[p["id"]][i] = p["xy"]
-    radius = PARAMS["controlRadius"] + 1.5 * calibration_error
+                tracks[p["id"]][i] = p["xy"]
+    return tracks
+
+
+def control_states(projected, player_of, calibration_error=0.0):
+    """Per-frame ball state: control (by whom), contested, loose or unknown.
+
+    Calibrated frames use metres: the nearest player within the possession
+    zone controls the ball if it moves with them and no opponent is inside the
+    duel zone. Uncalibrated frames fall back to the image-space rule.
+    """
+    balls = ball_positions(projected)
+    ball_velocity = _central_difference(projected, balls)
+    tracks = fragment_positions(projected)
+    velocities = {pid: _central_difference(projected, pos) for pid, pos in tracks.items()}
+    radius = min(PARAMS["maxControlRadius"], PARAMS["controlRadius"] + 1.5 * calibration_error)
+    duel = radius + PARAMS["duelExtra"]
+    relative_limit = PARAMS["maxRelativeSpeed"] + 2 * calibration_error
     states = []
     for i, f in enumerate(projected):
         b = f["ball"]
         if b is None:
             states.append({"state": "unknown"})
             continue
-        if f["calibrated"] and ball_xy(f) is not None:
-            bxy = ball_xy(f)
-            near = []
-            for p in f["players"]:
-                if p["team"] not in (0, 1) or not p["xy"]:
-                    continue
-                d = math.dist(p["xy"], bxy)
-                if d <= radius + PARAMS["contestMargin"]:
-                    near.append((d, p))
-            near.sort(key=lambda x: x[0])
+        if f["calibrated"]:
+            if i not in balls:
+                # Projected off the pitch: in the air or a false detection.
+                states.append({"state": "loose", "airborne": True})
+                continue
+            bxy = balls[i]
+            near = sorted(
+                (
+                    (math.dist(p["xy"], bxy), k, p)
+                    for k, p in enumerate(f["players"])
+                    if p["team"] in (0, 1) and p["xy"] and math.dist(p["xy"], bxy) <= duel
+                ),
+                key=lambda x: (x[0], x[1]),
+            )
             if not near or near[0][0] > radius:
                 states.append({"state": "loose", "ball": bxy})
                 continue
-            d0, p0 = near[0]
-            # Ball moving past the player rather than with them is not control.
-            bv = ball_velocity[i]
-            track = player_tracks[p0["id"]]
-            pv = None
-            if (i - 1) in track and (i + 1) in track and projected[i + 1]["t"] > projected[i - 1]["t"]:
-                dt = projected[i + 1]["t"] - projected[i - 1]["t"]
-                pv = ((track[i + 1][0] - track[i - 1][0]) / dt, (track[i + 1][1] - track[i - 1][1]) / dt)
-            if bv is not None and pv is not None and math.dist(bv, pv) > PARAMS["maxRelativeSpeed"]:
+            d0, _, p0 = near[0]
+            rivals = [x for x in near[1:] if x[2]["team"] != p0["team"]]
+            if rivals:
+                states.append({"state": "contested", "ball": bxy, "teams": [p0["team"], rivals[0][2]["team"]]})
+                continue
+            bv = ball_velocity.get(i)
+            pv = velocities.get(p0["id"], {}).get(i)
+            if bv is not None and pv is not None and math.dist(bv, pv) > relative_limit:
                 states.append({"state": "loose", "ball": bxy, "passing": True})
                 continue
-            rivals = [x for x in near[1:] if x[1]["team"] != p0["team"] and x[0] - d0 < PARAMS["contestMargin"]]
-            if rivals:
-                states.append({"state": "contested", "ball": bxy, "teams": [p0["team"], rivals[0][1]["team"]]})
-                continue
-            states.append({"state": "control", "ball": bxy, "player": player_of.get(p0["id"], p0["id"]), "fragment": p0["id"], "team": p0["team"], "distance": round(d0, 2)})
-        else:
-            # Uncalibrated: the image-space proximity rule used by metrics.py.
-            owner = image_owner(
-                [{"id": p["id"], "team": p["team"], "box": p["box"]} for p in f["players"]],
-                b["raw"],
+            states.append(
+                {
+                    "state": "control",
+                    "ball": bxy,
+                    "player": player_of.get(p0["id"], p0["id"]),
+                    "fragment": p0["id"],
+                    "team": p0["team"],
+                    "distance": round(d0, 2),
+                }
             )
+        else:
+            owner = image_owner([{"id": p["id"], "team": p["team"], "box": p["box"]} for p in f["players"]], b["raw"])
             if owner is None:
                 states.append({"state": "loose", "image": True})
             else:
-                states.append({"state": "control", "player": player_of.get(owner["id"], owner["id"]), "fragment": owner["id"], "team": owner["team"], "image": True})
-    return states, ball_velocity
+                states.append(
+                    {"state": "control", "player": player_of.get(owner["id"], owner["id"]), "fragment": owner["id"], "team": owner["team"], "image": True}
+                )
+    return states, ball_velocity, velocities
 
 
 def control_spells(projected, states, sample_fps):
-    """Consecutive frames of control by one player, ignoring single-frame flicker."""
-    spells = []
+    """Runs of control by one player, bridging a few frames where the ball is hidden."""
     minimum = max(2, math.ceil(PARAMS["minControlSeconds"] * sample_fps))
-    current = None
+    bridge = PARAMS["bridgeSamples"] + 1
+    spells, current = [], None
     for i, (f, s) in enumerate(zip(projected, states)):
-        key = (s.get("player"), s.get("team"), f["scene"]) if s["state"] == "control" else None
-        if key and current and current["key"] == key and i - current["last"] <= 2:
+        if s["state"] != "control":
+            # Another state that shows the ball elsewhere ends the spell.
+            if current and s["state"] in ("loose", "contested") and not s.get("airborne"):
+                spells.append(current)
+                current = None
+            continue
+        key = (s.get("player"), s.get("team"), f["scene"])
+        if current and current["key"] == key and i - current["last"] <= bridge:
             current["last"] = i
             current["frames"].append(i)
             continue
-        if key:
-            if current:
-                spells.append(current)
-            current = {"key": key, "first": i, "last": i, "frames": [i]}
+        if current:
+            spells.append(current)
+        current = {"key": key, "first": i, "last": i, "frames": [i]}
     if current:
         spells.append(current)
     out = []
@@ -378,6 +440,118 @@ def control_spells(projected, states, sample_fps):
     return out
 
 
+# --------------------------------------------------------------------- in play
+
+
+def dead_ball(projected, velocities, ball_velocity, sample_fps):
+    """Frames when play is stopped: everyone slow and the ball still or unseen.
+
+    Needs pitch positions; without them every frame counts as in play.
+    Returns (in_play list, dead intervals [(first, last)]).
+    """
+    n = len(projected)
+    if not any(f["calibrated"] for f in projected):
+        return [True] * n, []
+    speeds = [None] * n
+    for i in range(n):
+        values = [math.hypot(*v[i]) for v in velocities.values() if i in v]
+        if len(values) >= 4:
+            speeds[i] = float(np.mean(values))
+    window = max(1, int(round(sample_fps)))
+    smooth = [None] * n
+    for i in range(n):
+        chunk = [s for s in speeds[max(0, i - window // 2) : i + window // 2 + 1] if s is not None]
+        smooth[i] = float(np.mean(chunk)) if chunk else None
+    candidate = []
+    for i, f in enumerate(projected):
+        bv = ball_velocity.get(i)
+        still = f["ball"] is None or bv is None or math.hypot(*bv) < 1.0
+        candidate.append(smooth[i] is not None and smooth[i] < PARAMS["deadBallSpeed"] and still)
+    minimum = int(math.ceil(PARAMS["deadBallSeconds"] * sample_fps))
+    in_play = [True] * n
+    intervals = []
+    i = 0
+    while i < n:
+        if not candidate[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and candidate[j + 1] and projected[j + 1]["scene"] == projected[i]["scene"]:
+            j += 1
+        if j - i + 1 >= minimum:
+            intervals.append((i, j))
+            for k in range(i, j + 1):
+                in_play[k] = False
+        i = j + 1
+    return in_play, intervals
+
+
+# --------------------------------------------------------------------- possession
+
+
+def possession_sequences(projected, spells, in_play, sample_fps):
+    """Team possession: from one team's won ball until the other team wins it.
+
+    The ball's flight between teammates belongs to the team that played it;
+    a possession ends at the next opponent control, a cut, dead ball, or after
+    maxPossessionGap seconds without any control (then the time is unknown).
+    """
+    n = len(projected)
+    owner = [None] * n
+    for k, s in enumerate(spells):
+        for i in range(s["first"], s["last"] + 1):
+            if in_play[i]:
+                owner[i] = s["team"]
+        nxt = spells[k + 1] if k + 1 < len(spells) else None
+        if nxt and nxt["scene"] == s["scene"] and nxt["start"] - s["end"] <= PARAMS["maxPossessionGap"]:
+            between = range(s["last"] + 1, nxt["first"])
+            if all(in_play[i] for i in between):
+                for i in between:
+                    owner[i] = s["team"]
+    dt = 1 / sample_fps
+    seconds = [0.0, 0.0]
+    sequences = []
+    current = None
+    for i, team in enumerate(owner):
+        if team is not None:
+            seconds[team] += dt
+        if current and team == current["team"] and projected[i]["scene"] == current["scene"]:
+            current["last"] = i
+            continue
+        if current:
+            sequences.append(current)
+            current = None
+        if team is not None:
+            current = {"team": team, "first": i, "last": i, "scene": projected[i]["scene"]}
+    if current:
+        sequences.append(current)
+    for s in sequences:
+        s["start"] = round(projected[s["first"]]["t"], 2)
+        s["end"] = round(projected[s["last"]]["t"] + dt, 2)
+        s["seconds"] = round((s["last"] - s["first"] + 1) * dt, 2)
+        del s["scene"]
+    in_play_seconds = sum(in_play) * dt
+    return owner, sequences, seconds, in_play_seconds
+
+
+def share_interval(sequences, iterations=400, seed=7):
+    """95% bootstrap interval of team 0's possession share, resampling possessions."""
+    if len(sequences) < 4:
+        return None
+    rng = random.Random(seed)
+    shares = []
+    for _ in range(iterations):
+        sample = [rng.choice(sequences) for _ in sequences]
+        a = sum(s["seconds"] for s in sample if s["team"] == 0)
+        b = sum(s["seconds"] for s in sample if s["team"] == 1)
+        if a + b:
+            shares.append(a / (a + b) * 100)
+    if not shares:
+        return None
+    shares.sort()
+    return [round(shares[int(0.025 * len(shares))], 1), round(shares[int(0.975 * len(shares)) - 1], 1)]
+
+
 # --------------------------------------------------------------------- events
 
 
@@ -398,8 +572,20 @@ def _visible_fraction(projected, first, last):
     return seen / n
 
 
-def detect_shot(projected, template, directions, spell, next_first, ball_velocity, sample_fps=6):
-    """A shot: right after release the ball heads fast towards the goal the team attacks."""
+def in_keeper_zone(xy, goal_x, template):
+    """Inside (or at the edge of) the goal area of the goal at goal_x."""
+    if xy is None:
+        return False
+    c = template["width"] / 2
+    if template.get("areaRadius"):
+        return math.dist(xy, (goal_x, c)) <= template["areaRadius"] + 1.0
+    if template.get("areaDepth") and template.get("areaWidth"):
+        return abs(xy[0] - goal_x) <= template["areaDepth"] + 1.0 and abs(xy[1] - c) <= template["areaWidth"] / 2 + 1.0
+    return math.dist(xy, (goal_x, c)) <= max(4.0, 0.15 * template["length"])
+
+
+def detect_shot(projected, template, directions, spell, sample_fps):
+    """Release towards the attacked goal: fast, from within range, heading between the posts (+ band)."""
     if not template or spell["endBall"] is None:
         return None
     sign = attack_sign(directions, spell["team"], spell["end"])
@@ -409,117 +595,161 @@ def detect_shot(projected, template, directions, spell, next_first, ball_velocit
     goal_x = L if sign == 1 else 0.0
     origin = spell["endBall"]
     distance_to_goal = abs(goal_x - origin[0])
-    if distance_to_goal > PARAMS["maxShotDistance"] * L:
+    if distance_to_goal > PARAMS["maxShotOrigin"] * L:
         return None
-    horizon_frames = int(math.ceil(PARAMS["shotHorizon"] * sample_fps)) + 1
-    end = min(len(projected) - 1, spell["last"] + horizon_frames)
-    if next_first is not None:
-        end = min(end, next_first)
-    path = [p for p in _ball_path(projected, spell["last"] + 1, end) if p[0] - spell["end"] <= PARAMS["shotHorizon"]]
-    if not path:
+    horizon = PARAMS["shotTimeToLine"] + 0.5
+    end = min(len(projected) - 1, spell["last"] + int(math.ceil(horizon * sample_fps)) + 1)
+    path = [p for p in _ball_path(projected, spell["last"] + 1, end) if p[0] - spell["end"] <= horizon]
+    # Velocity from the samples after the ball has left the foot (the release
+    # frame often still shows it there): at least two moving samples within
+    # ~0.8 s, fitted with a straight line.
+    moving = [(t, xy) for t, xy, _, inferred in path if not inferred and math.dist(xy, origin) > 0.5 and t - spell["end"] <= 0.8 + 1e-6]
+    if len(moving) < 2:
         return None
-    # Velocity from a straight-line fit over the first second after release:
-    # the release frame itself often still shows the ball at the foot, so a
-    # two-point difference would read a hard shot as a stationary ball.
-    early = [(spell["end"], origin)] + [(t, xy) for t, xy, _, _ in path if t - spell["end"] <= 1.0]
-    if len(early) < 3:
-        return None
-    ts = np.array([e[0] for e in early]) - spell["end"]
-    xs = np.array([e[1][0] for e in early])
-    ys = np.array([e[1][1] for e in early])
+    ts = np.array([m[0] for m in moving])
     if np.ptp(ts) <= 0:
         return None
-    vx = float(np.polyfit(ts, xs, 1)[0])
-    vy = float(np.polyfit(ts, ys, 1)[0])
+    vx = float(np.polyfit(ts, [m[1][0] for m in moving], 1)[0])
+    vy = float(np.polyfit(ts, [m[1][1] for m in moving], 1)[0])
     speed = math.hypot(vx, vy)
-    if speed < PARAMS["minShotSpeed"] or vx * sign <= 0:
+    if speed < PARAMS["lowShotSpeed"] or vx * sign <= 0:
         return None
-    # Where would the ball cross the goal line?
-    time_to_line = (goal_x - origin[0]) / vx
-    if time_to_line <= 0 or time_to_line > PARAMS["shotHorizon"] * 1.5:
+    first_t, first_xy = moving[0]
+    time_to_line = (goal_x - first_xy[0]) / vx
+    if time_to_line <= 0 or time_to_line > PARAMS["shotTimeToLine"]:
         return None
-    cross_y = origin[1] + vy * time_to_line
+    cross_y = first_xy[1] + vy * time_to_line
     centre = W / 2
-    on_target = abs(cross_y - centre) <= g / 2
-    in_band = abs(cross_y - centre) <= g / 2 + PARAMS["goalMargin"] * 3
-    if not in_band:
+    if abs(cross_y - centre) > g / 2 + PARAMS["shotBand"]:
         return None
-    # Did the ball actually cross the line between the posts (goal candidate)?
-    crossed = None
-    for t, xy, onPitch, inferred in path:
-        beyond = (xy[0] - goal_x) * sign
-        if beyond >= -0.3 and abs(xy[1] - centre) <= g / 2 + 0.3:
-            crossed = (t, xy)
+    beyond = None
+    for t, xy, _, inferred in path:
+        if (xy[0] - goal_x) * sign >= 0.2 and not inferred:
+            beyond = (t, xy)
             break
     return {
         "speed": round(speed, 1),
         "distance": round(distance_to_goal, 1),
-        "onTarget": bool(on_target),
         "crossY": round(cross_y, 2),
-        "goalCandidate": crossed is not None,
         "goalX": goal_x,
         "sign": sign,
+        "beyond": beyond,
+        "lowSpeed": speed < PARAMS["minShotSpeed"],
     }
 
 
-def detect_events(projected, states, spells, template, directions, sample_fps, ball_velocity):
+def shot_outcome(shot, spell, nxt, template):
+    """What happened next decides the outcome; ball height is not observable."""
+    W, g = template["width"], template["goalWidth"]
+    centre = W / 2
+    between_posts = abs(shot["crossY"] - centre) <= g / 2 + PARAMS["onTargetMargin"]
+    if shot["beyond"] is not None:
+        if abs(shot["beyond"][1][1] - centre) <= g / 2 + 0.1:
+            return "goal-candidate", True
+        return "off-target", False
+    if nxt and nxt["team"] != spell["team"] and nxt["start"] - spell["end"] <= PARAMS["saveWindow"]:
+        where = nxt["startBall"]
+        if in_keeper_zone(where, shot["goalX"], template):
+            return ("saved", True) if between_posts else ("off-target", False)
+        if where is not None and abs(where[0] - shot["goalX"]) >= 1.5:
+            return "blocked", False
+    return "unresolved", None
+
+
+def detect_kickoffs(projected, dead_intervals, directions, template, sample_fps):
+    """Centre restarts: play stopped, both teams in their own half, a player on the centre spot."""
+    if not template or not directions or not directions.get("segments"):
+        return []
+    L, W = template["length"], template["width"]
+    centre = (L / 2, W / 2)
+    found = []
+    need = max(2, int(round(sample_fps)))  # ~1 s on the spot
+    for first, last in dead_intervals:
+        window = range(max(first, last - 3 * need), min(len(projected), last + need + 1))
+        on_spot = Counter()
+        own_half_ok = 0
+        checked = 0
+        for i in window:
+            f = projected[i]
+            if not f["calibrated"]:
+                continue
+            by_team = {0: [], 1: []}
+            for p in f["players"]:
+                if p["team"] in (0, 1) and p["xy"]:
+                    by_team[p["team"]].append(p)
+                    if math.dist(p["xy"], centre) <= PARAMS["kickoffCentreRadius"]:
+                        on_spot[p["team"]] += 1
+            ok = True
+            for team, players in by_team.items():
+                if len(players) < 2:
+                    ok = False
+                    break
+                sign = attack_sign(directions, team, f["t"])
+                if sign is None:
+                    ok = False
+                    break
+                own = sum(1 for p in players if (p["xy"][0] - L / 2) * sign <= 0.5)
+                if own / len(players) < PARAMS["kickoffOwnHalfShare"]:
+                    ok = False
+            checked += 1
+            own_half_ok += ok
+        if not checked or own_half_ok / checked < 0.6 or not on_spot:
+            continue
+        team, samples = on_spot.most_common(1)[0]
+        if samples < need:
+            continue
+        found.append({"t": round(projected[last]["t"], 2), "team": team, "frame": last})
+    return found
+
+
+def detect_events(projected, states, spells, template, directions, sample_fps, in_play, dead_intervals):
     events = []
 
     def add(kind, t, team, confidence, **extra):
         events.append(
             {
-                "id": f"ev-{len(events)}",
+                "id": "",
                 "type": kind,
                 "t": round(float(t), 2),
                 "team": int(team) if team is not None else None,
-                "confidence": round(float(confidence), 2),
+                "confidence": round(float(max(0.05, min(0.95, confidence))), 2),
                 "status": "proposed",
                 **extra,
             }
         )
 
+    small = template is not None and template["length"] <= 45
+    max_transfer = PARAMS["maxTransferSmall"] if small else PARAMS["maxTransferLarge"]
+    shots = []
     for k, spell in enumerate(spells):
         nxt = spells[k + 1] if k + 1 < len(spells) else None
-        shot = detect_shot(projected, template, directions, spell, nxt["first"] if nxt else None, ball_velocity, sample_fps)
+        shot = detect_shot(projected, template, directions, spell, sample_fps)
         if shot:
-            outcome = "goal-candidate" if shot["goalCandidate"] else "on-target" if shot["onTarget"] else "off-target"
-            if nxt and not shot["goalCandidate"] and nxt["team"] != spell["team"] and nxt["start"] - spell["end"] <= PARAMS["shotHorizon"] + 0.5:
-                # Opponent collected it: saved (if on target) or blocked.
-                outcome = "saved" if shot["onTarget"] else "blocked"
-            add(
-                "shot",
-                spell["end"],
-                spell["team"],
-                min(0.9, 0.35 + 0.05 * shot["speed"] / 2),
-                player=spell["player"],
-                x=round(spell["endBall"][0], 2),
-                y=round(spell["endBall"][1], 2),
-                outcome=outcome,
-                onTarget=shot["onTarget"] or shot["goalCandidate"],
-                speed=shot["speed"],
-                distance=shot["distance"],
-                needsReview=True,
-            )
-            if shot["goalCandidate"]:
-                add(
-                    "goal-candidate",
-                    spell["end"],
-                    spell["team"],
-                    0.3,
-                    player=spell["player"],
-                    x=round(spell["endBall"][0], 2),
-                    y=round(spell["endBall"][1], 2),
-                    needsReview=True,
-                    note="Ball projected across the goal line between the posts. Only a reviewer can confirm a goal.",
-                )
+            outcome, on_target = shot_outcome(shot, spell, nxt, template)
+            confidence = 0.45 + (0.0 if shot["lowSpeed"] else 0.15) + (0.15 if outcome in ("saved", "goal-candidate", "off-target") else 0)
+            item = {
+                "player": spell["player"],
+                "x": round(spell["endBall"][0], 2),
+                "y": round(spell["endBall"][1], 2),
+                "outcome": outcome,
+                "onTarget": on_target,
+                "speed": shot["speed"],
+                "distance": shot["distance"],
+                "needsReview": True,
+            }
+            add("shot", spell["end"], spell["team"], confidence, **item)
+            shots.append(events[-1])
+            if outcome == "goal-candidate":
+                add("goal-candidate", spell["end"], spell["team"], 0.35, player=spell["player"], x=item["x"], y=item["y"], evidence=["ball-over-line"], needsReview=True,
+                    note="Ball seen beyond the goal line between the posts. Only a reviewer can confirm a goal.")
             continue
-        if not nxt or nxt["scene"] != spell["scene"]:
+        if not nxt or nxt["scene"] != spell["scene"] or nxt["player"] == spell["player"]:
             continue
         gap = nxt["start"] - spell["end"]
-        if gap <= 0 or gap > PARAMS["maxTransferSeconds"]:
+        if gap <= 0 or gap > max_transfer:
             continue
-        if nxt["player"] == spell["player"]:
-            continue
+        if not all(in_play[i] for i in range(spell["last"], nxt["first"] + 1)):
+            continue  # a stoppage in between: a restart, not a pass
         seen = _visible_fraction(projected, spell["last"], nxt["first"])
         travel = None
         if spell["endBall"] is not None and nxt["startBall"] is not None:
@@ -538,28 +768,53 @@ def detect_events(projected, states, spells, template, directions, sample_fps, b
         if nxt["team"] == spell["team"]:
             if travel is not None and travel < PARAMS["minPassDistance"]:
                 continue
-            add("pass", spell["end"], spell["team"], min(0.9, confidence), outcome="complete", length=round(travel, 1) if travel is not None else None, **common)
+            add("pass", spell["end"], spell["team"], confidence, outcome="complete", length=round(travel, 1) if travel is not None else None, **common)
         else:
-            short = travel is not None and travel < PARAMS["minPassDistance"]
-            if short:
-                add("tackle", nxt["start"], nxt["team"], min(0.8, confidence - 0.05), lostBy=spell["team"], **common)
+            tackle = travel is not None and travel < PARAMS["tackleMaxTravel"] and gap < PARAMS["tackleMaxGap"]
+            if tackle:
+                add("tackle", nxt["start"], nxt["team"], confidence - 0.05, lostBy=spell["team"], **common)
             else:
-                add("pass", spell["end"], spell["team"], min(0.85, confidence), outcome="intercepted", length=round(travel, 1) if travel is not None else None, **common)
-                add("interception", nxt["start"], nxt["team"], min(0.85, confidence), lostBy=spell["team"], **common)
-    # Ball leaving the pitch (not for walled cages).
+                add("pass", spell["end"], spell["team"], confidence - 0.05, outcome="intercepted", length=round(travel, 1) if travel is not None else None, **common)
+                add("interception", nxt["start"], nxt["team"], confidence - 0.05, lostBy=spell["team"], **common)
+    # Ball out of play (lined pitches only; a walled cage keeps it in).
     if template and not template.get("walls"):
         L, W = template["length"], template["width"]
-        out_run = 0
+        run = 0
         for i, f in enumerate(projected):
             b = f["ball"]
-            outside = bool(b and b["xy"] and not b["inferred"] and (b["xy"][0] < -0.75 or b["xy"][0] > L + 0.75 or b["xy"][1] < -0.75 or b["xy"][1] > W + 0.75))
-            out_run = out_run + 1 if outside else 0
-            if out_run == 2:
-                add("out", projected[i - 1]["t"], None, 0.4, x=round(b["xy"][0], 2), y=round(b["xy"][1], 2), needsReview=False)
+            outside = bool(
+                b and b["xy"] is not None and not b["inferred"] and b["onPitch"]
+                and (b["xy"][0] < -0.5 or b["xy"][0] > L + 0.5 or b["xy"][1] < -0.5 or b["xy"][1] > W + 0.5)
+            )
+            run = run + 1 if outside else 0
+            if run == 2:
+                last_team = next((s["team"] for s in reversed(spells) if s["last"] < i), None)
+                add("out", projected[i - 1]["t"], last_team, 0.4, x=round(b["xy"][0], 2), y=round(b["xy"][1], 2), needsReview=False)
+    # Restarts from the centre spot after a goal corroborate (or reveal) goals.
+    kickoffs = detect_kickoffs(projected, dead_intervals, directions, template, sample_fps)
+    start_t = projected[0]["t"] if projected else 0
+    lo, hi = PARAMS["kickoffWindow"]
+    for ko in kickoffs:
+        if ko["t"] - start_t < 20:
+            continue  # the match's own kick-off
+        scorer = 1 - ko["team"]
+        prior = [s for s in shots if s["team"] == scorer and lo <= ko["t"] - s["t"] <= hi]
+        if prior:
+            shot = prior[-1]
+            existing = next((e for e in events if e["type"] == "goal-candidate" and abs(e["t"] - shot["t"]) < 0.01), None)
+            if existing:
+                existing["evidence"].append("centre-restart")
+                existing["confidence"] = round(min(0.8, existing["confidence"] + 0.3), 2)
+            else:
+                add("goal-candidate", shot["t"], scorer, 0.45, x=shot.get("x"), y=shot.get("y"), evidence=["centre-restart"], restartAt=ko["t"], needsReview=True,
+                    note="Play restarted from the centre spot after this shot, as it does after a goal. Only a reviewer can confirm a goal.")
+        else:
+            add("goal-candidate", max(start_t, ko["t"] - lo), scorer, 0.25, evidence=["centre-restart"], restartAt=ko["t"], needsReview=True,
+                note="Play restarted from the centre spot, as it does after a goal; the shot itself was not seen. Only a reviewer can confirm a goal.")
     events.sort(key=lambda e: e["t"])
     for i, e in enumerate(events):
         e["id"] = f"ev-{i}"
-    return events
+    return events, kickoffs
 
 
 # --------------------------------------------------------------------- review
@@ -637,43 +892,47 @@ def _grid(points, template, nx=12, ny=8):
     return (grid / total).round(4).tolist() if total else None
 
 
-def summarise(projected, states, spells, events, template, directions, player_of, sample_fps, duration, start):
+def summarise(projected, states, spells, events, template, directions, player_of, sample_fps, duration, start, in_play, owner, sequences, possession_seconds, in_play_seconds):
     dt = 1 / sample_fps
     control = [0.0, 0.0]
-    contested = 0.0
-    loose = 0.0
-    unknown = 0.0
-    territory = [0.0, 0.0]  # control seconds in the opponent's half
+    contested = loose = unknown = 0.0
+    tilt = [0.0, 0.0]  # control time in the attacking third
     for f, s in zip(projected, states):
         if s["state"] == "control":
             control[s["team"]] += dt
             if template and s.get("ball") is not None:
                 sign = attack_sign(directions, s["team"], f["t"])
-                if sign is not None and (s["ball"][0] - template["length"] / 2) * sign > 0:
-                    territory[s["team"]] += dt
+                goal_x = template["length"] if sign == 1 else 0.0
+                if sign is not None and abs(s["ball"][0] - goal_x) <= template["length"] / 3:
+                    tilt[s["team"]] += dt
         elif s["state"] == "contested":
             contested += dt
         elif s["state"] == "loose":
             loose += dt
         else:
             unknown += dt
-    total_control = sum(control)
     live = [e for e in events if e["status"] != "rejected"]
 
-    def count(kind, team, **match):
-        items = [e for e in live if e["type"] == kind and e.get("team") == team and all(e.get(k) == v for k, v in match.items())]
+    def count(kind, team, predicate=None):
+        items = [e for e in live if e["type"] == kind and e.get("team") == team and (predicate is None or predicate(e))]
         return {
             "value": len(items),
             "confirmed": sum(1 for e in items if e["status"] == "confirmed"),
             "pending": sum(1 for e in items if e["status"] == "proposed"),
         }
 
+    total_possession = sum(possession_seconds)
+    coverage = total_possession / in_play_seconds if in_play_seconds else 0.0
+    shown = coverage >= PARAMS["possessionMinCoverage"] and total_possession > 0
+    interval = share_interval(sequences) if shown else None
     teams = []
     for team in (0, 1):
         passes = count("pass", team)
-        complete = count("pass", team, outcome="complete")
-        shots = count("shot", team)
-        on_target = count("shot", team, onTarget=True)
+        complete = count("pass", team, lambda e: e.get("outcome") == "complete")
+        reliable = [e for e in live if e["type"] == "pass" and e.get("team") == team and (e["status"] == "confirmed" or e["confidence"] >= 0.5)]
+        accuracy = None
+        if len(reliable) >= PARAMS["minPassesForAccuracy"]:
+            accuracy = round(sum(1 for e in reliable if e.get("outcome") == "complete") / len(reliable) * 100, 1)
         goals_confirmed = sum(
             1
             for e in live
@@ -681,31 +940,38 @@ def summarise(projected, states, spells, events, template, directions, player_of
             and e["status"] == "confirmed"
             and (e["type"] in ("goal", "goal-candidate") or (e["type"] == "shot" and e.get("outcome") in ("goal", "goal-candidate") and e.get("source") == "reviewer"))
         )
+        own = [s for s in sequences if s["team"] == team]
         teams.append(
             {
                 "controlSeconds": round(control[team], 1),
-                "possession": round(control[team] / total_control * 100, 1) if total_control else None,
+                "possessionSeconds": round(possession_seconds[team], 1),
+                "possession": round(possession_seconds[team] / total_possession * 100, 1) if shown else None,
+                "possessions": len(own),
+                "averagePossession": round(sum(s["seconds"] for s in own) / len(own), 1) if own else None,
                 "passes": passes,
                 "passesComplete": complete,
-                "passAccuracy": round(complete["value"] / passes["value"] * 100, 1) if passes["value"] else None,
-                "shots": shots if template else None,
-                "shotsOnTarget": on_target if template else None,
+                "passAccuracy": accuracy,
+                "shots": count("shot", team) if template else None,
+                "shotsOnTarget": count("shot", team, lambda e: e.get("onTarget") is True) if template else None,
                 "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"]} if template else None,
                 "interceptions": count("interception", team),
                 "tackles": count("tackle", team),
-                "territory": round(territory[team] / control[team] * 100, 1) if template and control[team] else None,
+                "fieldTilt": round(tilt[team] / sum(tilt) * 100, 1) if template and sum(tilt) > 0 else None,
             }
         )
-    covered = total_control + contested + loose
-    coverage = {
-        "controlPercent": round(total_control / duration * 100, 1) if duration else 0,
-        "ballStatePercent": round(covered / duration * 100, 1) if duration else 0,
+    coverage_block = {
+        "possessionPercent": round(coverage * 100, 1),
+        "possessionShown": shown,
+        "possessionInterval": interval,
+        "controlPercent": round(sum(control) / duration * 100, 1) if duration else 0,
+        "ballStatePercent": round((sum(control) + contested + loose) / duration * 100, 1) if duration else 0,
         "calibratedPercent": round(sum(1 for f in projected if f["calibrated"]) / max(1, len(projected)) * 100, 1),
+        "inPlaySeconds": round(in_play_seconds, 1),
+        "deadBallSeconds": round(max(0.0, len(projected) * dt - in_play_seconds), 1),
         "contestedSeconds": round(contested, 1),
         "looseSeconds": round(loose, 1),
         "unknownSeconds": round(unknown, 1),
     }
-    # Momentum: per-minute control difference, with control in the opponent's half counting double.
     minutes = max(1, math.ceil(duration / 60))
     per_minute = [[0.0, 0.0] for _ in range(minutes)]
     for f, s in zip(projected, states):
@@ -715,13 +981,22 @@ def summarise(projected, states, spells, events, template, directions, player_of
         weight = 1.0
         if template and s.get("ball") is not None:
             sign = attack_sign(directions, s["team"], f["t"])
-            if sign is not None and (s["ball"][0] - template["length"] / 2) * sign > 0:
-                weight = 2.0
-        per_minute[m][s["team"]] += weight
-    momentum = [round((a - b) / (a + b), 2) if a + b >= 2 else None for a, b in per_minute]
-    heatmaps = None
-    average_positions = None
-    shot_map = None
+            if sign is not None:
+                goal_x = template["length"] if sign == 1 else 0.0
+                distance = math.dist(s["ball"], (goal_x, template["width"] / 2))
+                weight = math.exp(-distance / PARAMS["momentumGoalScale"])
+        per_minute[m][s["team"]] += weight * dt
+    raw = [(a - b) / max(a + b, 1e-9) if a + b > 0 else None for a, b in per_minute]
+    # Exponentially weighted smoothing (half-life in minutes), leaving gaps as gaps.
+    alpha = 1 - 0.5 ** (1 / PARAMS["momentumHalfLifeMinutes"])
+    momentum, level = [], None
+    for v in raw:
+        if v is None:
+            momentum.append(None)
+            continue
+        level = v if level is None else level + alpha * (v - level)
+        momentum.append(round(level, 2))
+    heatmaps = average_positions = shot_map = None
     if template:
         normalised = {0: [], 1: []}
         per_player = defaultdict(list)
@@ -731,7 +1006,6 @@ def summarise(projected, states, spells, events, template, directions, player_of
                     continue
                 sign = attack_sign(directions, p["team"], f["t"]) or 1
                 x, y = p["xy"]
-                # Everyone attacks to the right in the normalised view.
                 nx_, ny_ = (x, y) if sign == 1 else (template["length"] - x, template["width"] - y)
                 normalised[p["team"]].append((nx_, ny_))
                 per_player[(player_of.get(p["id"], p["id"]), p["team"])].append((nx_, ny_))
@@ -751,11 +1025,12 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 shot_map.append({"id": e["id"], "team": e["team"], "x": round(x, 1), "y": round(y, 1), "outcome": e.get("outcome"), "status": e["status"], "t": e["t"]})
     return {
         "teams": teams,
-        "coverage": coverage,
+        "coverage": coverage_block,
         "momentum": momentum,
         "heatmaps": heatmaps,
         "averagePositions": average_positions,
         "shotMap": shot_map,
+        "possessionSequences": sequences[-400:],
         "tracks": {"fragments": len(player_of), "players": len(set(player_of.values()))},
     }
 
@@ -776,7 +1051,7 @@ def analyse(result, calibration=None, review=None):
     if review:
         _, overrides = apply_review([], review)
     if overrides.get("direction") in ("left", "right") and template:
-        # Reviewer says which way team 0 attacks in the first half; keep the detected switch time if any.
+        # Reviewer says which way team 0 attacks first; keep the detected switch time, if any.
         switch = directions["segments"][1]["start"] if directions and len(directions.get("segments", [])) == 2 else None
         first = overrides["direction"]
         other = "left" if first == "right" else "right"
@@ -785,15 +1060,18 @@ def analyse(result, calibration=None, review=None):
             segments.append({"start": switch, "end": math.inf, "team0Attacks": other})
         directions = {"segments": segments, "confidence": 1.0, "source": "reviewer"}
     calibration_error = float(calibration.get("rms") or 0) if calibration else 0.0
-    states, ball_velocity = control_states(projected, player_of, calibration_error)
+    states, ball_velocity, velocities = control_states(projected, player_of, calibration_error)
     spells = control_spells(projected, states, sample_fps)
-    events = detect_events(projected, states, spells, template, directions, sample_fps, ball_velocity)
+    in_play, dead_intervals = dead_ball(projected, velocities, ball_velocity, sample_fps)
+    owner, sequences, possession_seconds, in_play_seconds = possession_sequences(projected, spells, in_play, sample_fps)
+    events, kickoffs = detect_events(projected, states, spells, template, directions, sample_fps, in_play, dead_intervals)
     events, _ = apply_review(events, review)
-    stats = summarise(projected, states, spells, events, template, directions, player_of, sample_fps, duration, start)
+    stats = summarise(projected, states, spells, events, template, directions, player_of, sample_fps, duration, start, in_play, owner, sequences, possession_seconds, in_play_seconds)
     serial_directions = None
     if directions:
         serial_directions = {
             **directions,
+            "confidence": float(directions.get("confidence", 0)),
             "segments": [{**s, "end": None if s["end"] == math.inf else s["end"]} for s in directions["segments"]],
         }
     return {
@@ -801,8 +1079,9 @@ def analyse(result, calibration=None, review=None):
         "calibrated": template is not None,
         "template": template,
         "directions": serial_directions,
-        "params": PARAMS,
+        "params": {k: list(v) if isinstance(v, tuple) else v for k, v in PARAMS.items()},
         "events": events,
+        "kickoffs": kickoffs,
         "stats": stats,
         "review": {
             "decisions": len(review.get("decisions", [])) if review else 0,

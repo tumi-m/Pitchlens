@@ -108,7 +108,8 @@ export function MatchReport({
   const goalsKnown = analysis.calibrated && A.goals && B.goals;
   const candidates = (A.goals?.candidates ?? 0) + (B.goals?.candidates ?? 0);
   const reviewedGoals = (A.goals?.value ?? 0) + (B.goals?.value ?? 0);
-  const possessionShown = cov.controlPercent >= 15;
+  const possessionShown = cov.possessionShown;
+  const range = cov.possessionInterval;
   const pct = (v: number) => `${Math.round(v)}%`;
   const events = analysis.events.filter((e) => e.status !== "rejected" && ["shot", "goal", "goal-candidate", "interception", "tackle", "pass"].includes(e.type));
   const keyEvents = events.filter((e) => e.type !== "pass");
@@ -160,7 +161,8 @@ export function MatchReport({
         </div>
         <p className="relative border-t border-white/10 px-5 py-2.5 text-xs text-pitch-muted flex flex-wrap gap-x-4 gap-y-1 justify-center">
           <span>Ball state known {cov.ballStatePercent}% of the time</span>
-          <span>Control observed {cov.controlPercent}%</span>
+          <span>Possession followed {cov.possessionPercent}% of play</span>
+          {cov.deadBallSeconds > 0 && <span>Ball out of play {clockTime(cov.deadBallSeconds)}</span>}
           <span>Pitch mapped {cov.calibratedPercent}%</span>
           <span>{analysis.stats.tracks.players} player tracks</span>
         </p>
@@ -194,34 +196,47 @@ export function MatchReport({
           <Group title="Possession">
             <Row
               label="Ball possession"
-              a={{ value: possessionShown ? A.possession : null }}
+              a={{ value: possessionShown ? A.possession : null, note: possessionShown && range ? `95%: ${Math.round(range[0])}–${Math.round(range[1])}%` : undefined }}
               b={{ value: possessionShown ? B.possession : null }}
               colours={colours}
               format={pct}
               hint={
                 possessionShown
-                  ? `Share of the ${cov.controlPercent}% of the match where a player clearly controlled the ball.`
-                  : "Withheld: the ball was clearly controlled for too little of the match to give a fair split."
+                  ? `From winning the ball to losing it, passes in flight included, over the ${cov.possessionPercent}% of in-play time the ball could be followed.`
+                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (60% needed for a fair split).`
               }
             />
-            <Row label="Control time" a={{ value: A.controlSeconds }} b={{ value: B.controlSeconds }} colours={colours} format={(v) => clockTime(v)} />
+            <Row label="Possessions" a={{ value: A.possessions }} b={{ value: B.possessions }} colours={colours} />
+            <Row label="Average possession" a={{ value: A.averagePossession }} b={{ value: B.averagePossession }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
             <Row
-              label="Territory"
-              a={{ value: A.territory }}
-              b={{ value: B.territory }}
+              label="Field tilt"
+              a={{ value: A.fieldTilt }}
+              b={{ value: B.fieldTilt }}
               colours={colours}
               format={pct}
-              hint="Share of a team's own ball control that happened in the opponent's half."
+              hint="Share of all ball control in an attacking third that was this team's: who pinned whom back."
             />
           </Group>
           <Group title="Passing">
             <Row label="Passes" a={count(A.passes)} b={count(B.passes)} colours={colours} hint="Ball moved from one player to another (to a teammate or intercepted). Unseen transfers get lower confidence." />
             <Row label="Accurate passes" a={count(A.passesComplete)} b={count(B.passesComplete)} colours={colours} />
-            <Row label="Pass accuracy" a={{ value: A.passAccuracy }} b={{ value: B.passAccuracy }} colours={colours} format={pct} />
+            <Row
+              label="Pass accuracy"
+              a={{ value: A.passAccuracy, note: A.passAccuracy === null && A.passes.value ? "needs 20+ passes" : undefined }}
+              b={{ value: B.passAccuracy, note: B.passAccuracy === null && B.passes.value ? "needs 20+ passes" : undefined }}
+              colours={colours}
+              format={pct}
+            />
           </Group>
           <Group title="Attacking">
             <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up." />
-            <Row label="Shots on target" a={count(A.shotsOnTarget)} b={count(B.shotsOnTarget)} colours={colours} />
+            <Row
+              label="Shots on target"
+              a={count(A.shotsOnTarget)}
+              b={count(B.shotsOnTarget)}
+              colours={colours}
+              hint="Counted when the outcome shows it: a goal, or the keeper collecting a ball heading between the posts. Ball height cannot be seen from one camera."
+            />
             <Row
               label="Possible goals"
               a={{ value: A.goals ? A.goals.candidates : null }}
