@@ -113,6 +113,9 @@ def work(directory, status, event):
             cancelled=event.is_set,
             profile=status.get("profile", "general"),
             sample_fps=status.get("sampleFps", 3),
+            max_seconds=status.get("maxSeconds"),
+            start_seconds=status.get("startSeconds", 0),
+            ball_search=status.get("ballSearch", "exhaustive"),
         )
         ran_on_gpu = False
         if gpu.modal_enabled():
@@ -294,6 +297,7 @@ def health():
         "profiles": available_profiles(),
         "activeJob": active is not None,
         "mode": "computer-vision",
+        "diagnostics": True,
         "maxBytes": MAX_BYTES,
         "maxChunk": MAX_CHUNK,
         "retentionHours": RETENTION_HOURS or None,
@@ -323,6 +327,8 @@ def jobs(request: Request):
 def begin(directory, status, size):
     """Decode-check the stored video and hand it to the single inference thread."""
     metadata = probe(directory / "video")
+    if status.get("startSeconds", 0) >= metadata["duration"]:
+        raise ValueError("Diagnostic start must be inside the video")
     job_id = status["id"]
     with lock:
         # Cancelled or released while the probe ran: never queue work for it.
@@ -350,7 +356,7 @@ async def create(request: Request):
     ):
         raise HTTPException(415, "Upload a video file")
     profile = request.query_params.get("profile", "general")
-    if profile not in ("general", "broadcast"):
+    if profile not in ("general", "broadcast", "small-ball"):
         raise HTTPException(400, "Unknown footage profile")
     if profile not in available_profiles():
         raise HTTPException(503, "The selected vision models are not installed")
@@ -360,6 +366,18 @@ async def create(request: Request):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
+    ball_search = request.query_params.get("search", "exhaustive")
+    if ball_search not in ("exhaustive", "adaptive"):
+        raise HTTPException(400, "Invalid ball search mode")
+    diagnostic = request.query_params.get("diagnostic", "false")
+    if diagnostic not in ("true", "false"):
+        raise HTTPException(400, "Invalid diagnostic option")
+    try:
+        start_seconds = int(request.query_params.get("start", "0"))
+    except ValueError as exc:
+        raise HTTPException(400, "Diagnostic start must be a whole number of seconds") from exc
+    if not 0 <= start_seconds < 4 * 3600 or (diagnostic == "false" and start_seconds != 0):
+        raise HTTPException(400, "Invalid diagnostic start")
     owner = request.query_params.get("owner")
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
@@ -393,6 +411,9 @@ async def create(request: Request):
         "progress": 0,
         "profile": profile,
         "sampleFps": sample_fps,
+        "maxSeconds": 20 if diagnostic == "true" else None,
+        "startSeconds": start_seconds,
+        "ballSearch": ball_search,
     }
     if owner:
         status["owner"] = owner
@@ -478,7 +499,7 @@ async def create_from_url(request: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     profile = request.query_params.get("profile", "general")
-    if profile not in ("general", "broadcast"):
+    if profile not in ("general", "broadcast", "small-ball"):
         raise HTTPException(400, "Unknown footage profile")
     if profile not in available_profiles():
         raise HTTPException(503, "The selected vision models are not installed")

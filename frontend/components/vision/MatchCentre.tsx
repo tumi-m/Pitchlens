@@ -174,6 +174,7 @@ const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p
 export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
   const [hover, setHover] = useState<number | null>(null);
   const duration = result.analysedDuration || 1;
+  const start = result.analysedStart ?? 0;
   // A share built on a sliver of the match is noise: withhold it below 20%.
   const shareKnown =
     stats.controlCoverage >= 20 &&
@@ -265,7 +266,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
         {lowEvidence && (
           <p className="relative border-t border-white/10 px-5 py-3 text-xs text-amber-200/90 bg-amber-400/5">
             The ball was tracked near a player for only {stats.controlCoverage}% of the video, so control and pass figures describe that part only.
-            Film at 1080p from one fixed, high camera for complete stats.
+            A higher camera and more pixels on the ball may help, but cannot guarantee complete stats.
           </p>
         )}
       </motion.section>
@@ -372,7 +373,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
                 const h = v === null ? 0 : Math.max(1.5, Math.abs(v) * 36);
                 const up = (v ?? 0) >= 0;
                 return (
-                  <g key={i} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)} onClick={() => onSeek(i * 60)} className="cursor-pointer">
+                  <g key={i} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)} onClick={() => onSeek(start + i * 60)} className="cursor-pointer">
                     <rect x={i * 10} y="0" width="10" height="80" fill="transparent" />
                     {v === null ? (
                       <rect x={i * 10 + 2} y="39" width="6" height="2" fill="rgba(255,255,255,0.15)" />
@@ -423,7 +424,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
             const maxY = Math.max(1, ...stats.cumulative.map(([, a, b]) => Math.max(a, b)));
             const W = 600;
             const H = 160;
-            const x = (t: number) => (t / duration) * W;
+            const x = (t: number) => ((t - start) / duration) * W;
             const y = (v: number) => H - (v / maxY) * (H - 12) - 4;
             const step = (i: 1 | 2) =>
               stats.cumulative.map(([t, a, b], k) => `${k ? "L" : "M"}${x(t).toFixed(1)},${y(i === 1 ? a : b).toFixed(1)}`).join(" ");
@@ -490,7 +491,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
                 onClick={() => onSeek(Math.max(0, e.t - 2))}
                 title={`${clockTime(e.t)} · ${names[e.team]} · ${e.type === "pass-candidate" ? "pass candidate" : "turnover won"}`}
                 className="absolute -translate-x-1/2 w-6 h-6 rounded-full flex items-center justify-center shadow-lg ring-2 ring-[#11162a]"
-                style={{ left: `${(e.t / duration) * 100}%`, top: above ? 0 : "auto", bottom: above ? "auto" : 0, background: colours[e.team] }}
+                style={{ left: `${((e.t - start) / duration) * 100}%`, top: above ? 0 : "auto", bottom: above ? "auto" : 0, background: colours[e.team] }}
                 initial={{ scale: 0 }}
                 whileInView={{ scale: 1 }}
                 viewport={{ once: true }}

@@ -2,9 +2,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
+import { inspectVideo, VideoPreflight } from "@/lib/review/preflight";
+import { clockTime } from "@/lib/review/vision";
 import { Navbar } from "@/components/ui/Navbar";
 import { AnimatePresence, motion } from "framer-motion";
-import { checkFootage, FootageCheck } from "@/lib/review/footageCheck";
+import { gradeFootage } from "@/lib/review/footageCheck";
 import {
   VisionHealth,
   VisionError,
@@ -17,25 +19,6 @@ import {
 export function VisionUpload({ onManual }: { onManual: () => void }) {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
-  const [check, setCheck] = useState<FootageCheck | null>(null);
-  const [checking, setChecking] = useState(false);
-  const checkRun = useRef<AbortController | null>(null);
-  useEffect(() => {
-    checkRun.current?.abort();
-    setCheck(null);
-    if (!file) return;
-    const controller = new AbortController();
-    checkRun.current = controller;
-    setChecking(true);
-    checkFootage(file, controller.signal)
-      .then((result) => {
-        if (!controller.signal.aborted) setCheck(result);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setChecking(false);
-      });
-    return () => controller.abort();
-  }, [file]);
   const [source, setSource] = useState<"file" | "youtube">("file");
   const [link, setLink] = useState("");
   const [rights, setRights] = useState(false);
@@ -43,7 +26,6 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     /^https?:\/\/((www\.|m\.)?youtube\.com\/(watch\?|shorts\/|live\/)|youtu\.be\/)/.test(
       link.trim(),
     );
-  const ready = source === "file" ? !!file : linkOk && rights;
   const [title, setTitle] = useState("");
   const [health, setHealth] = useState<VisionHealth | null>(null);
   const [error, setError] = useState("");
@@ -52,6 +34,28 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [phase, setPhase] = useState("");
   const [profile, setProfile] = useState("general");
   const [fps, setFps] = useState("3");
+  const [adaptive, setAdaptive] = useState(false);
+  const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [diagnostic, setDiagnostic] = useState(false);
+  const [start, setStart] = useState(0);
+  useEffect(() => {
+    setPreflight(null);
+    setStart(0);
+    if (!file) { setChecking(false); return; }
+    const controller = new AbortController();
+    setChecking(true);
+    inspectVideo(file, controller.signal).then((result) => {
+      if (!controller.signal.aborted) setPreflight(result);
+    }).catch((e) => {
+      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Video check failed");
+    }).finally(() => { if (!controller.signal.aborted) setChecking(false); });
+    return () => controller.abort();
+  }, [file]);
+  const check = preflight
+    ? gradeFootage(preflight.width, preflight.height, preflight.duration, preflight.motion)
+    : null;
+  const ready = source === "file" ? !!file && !!preflight && !checking : linkOk && rights;
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
   const upload = useRef<AbortController | null>(null);
@@ -62,6 +66,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
       .then((r) => r.json().catch(() => ({})))
       .then((x: VisionHealth) => {
         setHealth({ ...x, available: x.available === true });
+        setDiagnostic(x.diagnostics === true);
         // Football-trained detector (players, keepers, referees + tiled ball
         // model) beats the general people detector whenever it is installed.
         if (x.profiles?.includes("broadcast")) setProfile("broadcast");
@@ -117,6 +122,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         title: title.trim() || file.name,
         profile,
         fps,
+        diagnostic,
+        start: diagnostic ? start : 0,
+        search: adaptive && profile !== "general" ? "adaptive" : "exhaustive",
         signal: controller.signal,
         onProgress: (p) => {
           setPercent(p);
@@ -335,56 +343,143 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </label>
             </div>
           )}
+          {source === "file" && checking && (
+            <p role="status" className="text-sm text-pitch-muted">
+              Checking the video on this device before upload…
+            </p>
+          )}
           <AnimatePresence>
-            {file && (checking || check) && (
-              <motion.div
+            {source === "file" && preflight && check && (
+              <motion.section
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0 }}
-                className="glass-card p-5"
+                className="glass-card p-5 space-y-4"
+                aria-label="Video readiness"
                 aria-live="polite"
               >
-                {checking && !check ? (
-                  <p className="text-sm text-pitch-muted">Checking the footage…</p>
-                ) : check ? (
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between gap-4">
-                      <div>
-                        <p className="text-xs uppercase tracking-widest text-pitch-muted">Footage check</p>
-                        <p className="font-semibold">
-                          {check.width}×{check.height} · {Math.round(check.duration / 60)} min · ball ≈ {check.ballPixels}px wide
-                        </p>
-                      </div>
-                      <span
-                        className="px-3 py-1 rounded-full text-sm font-bold"
-                        style={{
-                          background:
-                            check.grade === "great" ? "#22c55e" : check.grade === "good" ? "#84cc16" : check.grade === "limited" ? "#f59e0b" : "#ef4444",
-                          color: "#0b0f1a",
-                        }}
-                      >
-                        {check.score}/100 · {check.grade}
-                      </span>
-                    </div>
-                    <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
-                      <motion.div
-                        className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
-                        initial={{ width: 0 }}
-                        animate={{ width: `${check.score}%` }}
-                        transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-                      />
-                    </div>
-                    <ul className="text-sm text-pitch-muted space-y-1">
-                      {check.notes.map((n) => (
-                        <li key={n}>· {n}</li>
-                      ))}
-                      {check.grade === "great" && check.notes.length <= 1 && (
-                        <li>· One fixed, high camera showing the whole pitch gives the best results.</li>
-                      )}
-                    </ul>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <h2 className="font-semibold">Video checked on your device</h2>
+                    <p className="text-sm text-pitch-muted">
+                      {preflight.width} × {preflight.height} · {clockTime(preflight.duration)} · ball ≈{" "}
+                      {check.ballPixels}px wide · No video uploaded yet.
+                    </p>
                   </div>
-                ) : null}
-              </motion.div>
+                  <span
+                    className="px-3 py-1 rounded-full text-sm font-bold shrink-0"
+                    style={{
+                      background:
+                        check.grade === "great"
+                          ? "#22c55e"
+                          : check.grade === "good"
+                            ? "#84cc16"
+                            : check.grade === "limited"
+                              ? "#f59e0b"
+                              : "#ef4444",
+                      color: "#0b0f1a",
+                    }}
+                  >
+                    {check.score}/100 · {check.grade}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                  <motion.div
+                    className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
+                    initial={{ width: 0 }}
+                    animate={{ width: `${check.score}%` }}
+                    transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+                  />
+                </div>
+                <ul className="text-sm text-pitch-muted space-y-1">
+                  {check.notes.map((n) => (
+                    <li key={n}>· {n}</li>
+                  ))}
+                  {check.height <= 360 && (
+                    <li>
+                      · Low-resolution footage is supported: faint balls are confirmed across
+                      frames rather than one frame at a time. Test a short section with visible
+                      play first.
+                    </li>
+                  )}
+                  {check.grade === "great" && check.notes.length <= 1 && (
+                    <li>· One fixed, high camera showing the whole pitch gives the best results.</li>
+                  )}
+                </ul>
+                <div className="grid grid-cols-3 gap-2">
+                  {preflight.samples.map((sample) => (
+                    <button
+                      key={sample.t}
+                      type="button"
+                      disabled={busy}
+                      className="text-xs text-left"
+                      onClick={() => {
+                        setStart(Math.max(0, Math.floor(sample.t)));
+                        setDiagnostic(health?.diagnostics === true);
+                      }}
+                    >
+                      {/* Native image: these are local canvas previews, not remote assets. */}
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={sample.image}
+                        alt={`Video sample at ${clockTime(sample.t)}`}
+                        className="rounded w-full"
+                      />
+                      Test from {clockTime(sample.t)}
+                    </button>
+                  ))}
+                </div>
+                <label className="flex gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={diagnostic}
+                    disabled={busy || !health?.diagnostics}
+                    onChange={(e) => setDiagnostic(e.target.checked)}
+                  />
+                  Test 20 seconds before analysing the full match
+                </label>
+                {!health?.diagnostics && (
+                  <p className="text-sm text-amber-200">
+                    This worker needs an update to support short tests. Submitting now analyses
+                    the full video.
+                  </p>
+                )}
+                {diagnostic && (
+                  <label className="block text-sm">
+                    Test start (seconds)
+                    <input
+                      aria-label="Test start (seconds)"
+                      type="number"
+                      min="0"
+                      max={Math.max(0, Math.ceil(preflight.duration) - 1)}
+                      step="1"
+                      value={start}
+                      disabled={busy}
+                      className="pitch-input ml-3 w-28"
+                      onChange={(e) =>
+                        setStart(
+                          Math.max(
+                            0,
+                            Math.min(
+                              Math.ceil(preflight.duration) - 1,
+                              Math.floor(Number(e.target.value) || 0),
+                            ),
+                          ),
+                        )
+                      }
+                    />
+                  </label>
+                )}
+                <p className="text-xs text-pitch-muted">
+                  {Math.ceil(
+                    (diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) *
+                      Number(fps),
+                  ).toLocaleString()}{" "}
+                  frames requested. The short test still transfers the file to the analysis
+                  server; only the selected section is analysed. Detection coverage is not an
+                  accuracy score.
+                </p>
+              </motion.section>
             )}
           </AnimatePresence>
           <label className="block text-sm">
@@ -430,6 +525,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             <label className="text-sm">Footage type
               <select className="pitch-input w-full mt-2" value={profile}
                 disabled={busy} onChange={(e) => setProfile(e.target.value)}>
+                <option value="small-ball" disabled={!profiles.includes("small-ball")}>Small ball / lightweight players · experimental</option>
                 <option value="broadcast" disabled={!profiles.includes("broadcast")}>
                   Football-trained models · recommended
                 </option>
@@ -445,6 +541,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </select>
             </label>
           </div>
+          {source === "file" && profile !== "general" && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
           <p className="text-xs text-pitch-muted">
             Detailed analysis follows fast movement more closely and takes longer.
             The football-trained models come from Roboflow&apos;s football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.

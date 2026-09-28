@@ -100,59 +100,70 @@ def confirm_chains(frames, matrices, diagonal, window=6, min_length=3, min_evide
     positions follow a near-constant velocity. Chains with at least `min_length`
     members and summed evidence >= `min_evidence` are confirmed.
     Returns a list of {frame index -> candidate} promotions.
+
+    Every comparison happens in the *current* frame's pixels: earlier candidates
+    are carried forward through at most `window` camera transforms. A global
+    reference frame would inherit every zoom the camera ever made, which turns
+    pixel gates into nonsense after a few minutes of broadcast footage.
     """
     n = len(frames)
-    # Cumulative camera transform so any two frames can be compared in a common
-    # coordinate system (that of frame 0 within the current scene).
-    cumulative = [np.array([[1.0, 0, 0], [0, 1.0, 0]])]
-    for i in range(1, n):
-        m = matrices[i] if matrices[i] is not None else np.array([[1.0, 0, 0], [0, 1.0, 0]])
-        prev = cumulative[-1]
-        composed = np.vstack([m, [0, 0, 1]]) @ np.vstack([prev, [0, 0, 1]])
-        cumulative.append(composed[:2])
+    identity = np.eye(3)
+    local = []
+    for i in range(n):
+        m = matrices[i] if i > 0 and matrices[i] is not None else None
+        local.append(np.vstack([m, [0, 0, 1]]) if m is not None else identity)
 
-    def world(i, c):
-        return _warp_point((c["x"], c["y"]), cumulative[i])
+    def carry(point, transform):
+        return (transform @ np.array([point[0], point[1], 1.0]))[:2]
 
     # Physical plausibility in image space. A hard pass crosses a small pitch in
     # about a second, i.e. up to ~0.15 of the frame diagonal per sampled frame
     # at 6 fps; anything faster is a jump between unrelated blobs.
     max_step = diagonal * 0.15
     gate = diagonal * 0.03  # prediction tolerance per frame of separation
-    best = {}  # (frame, candidate index) -> (score, length, previous key)
+    # (frame, candidate) -> (score, length, previous key, velocity in own frame's pixels)
+    best = {}
     order = []
     for i in range(n):
-        for j, c in enumerate(frames[i].get("ballCandidates", [])):
+        candidates = frames[i].get("ballCandidates", [])
+        if not candidates:
+            continue
+        # transform[back] maps frame i-back coordinates into frame i coordinates.
+        transform = [identity]
+        for back in range(1, window + 1):
+            k = i - back
+            if k < 0 or frames[k]["scene"] != frames[i]["scene"]:
+                break
+            transform.append(transform[-1] @ local[k + 1])
+        for j, c in enumerate(candidates):
             key = (i, j)
-            score, length, prev = c["confidence"], 1, None
-            wj = world(i, c)
+            score, length, prev, velocity = c["confidence"], 1, None, None
+            here = np.array([c["x"], c["y"]])
             # Link to the best chain ending within the window that predicts this point.
-            for back in range(1, window + 1):
+            for back in range(1, len(transform)):
                 k = i - back
-                if k < 0 or frames[k]["scene"] != frames[i]["scene"]:
-                    break
                 for l, ck in enumerate(frames[k].get("ballCandidates", [])):
                     pk = (k, l)
                     if pk not in best:
                         continue
-                    s0, len0, prev0 = best[pk]
-                    wk = world(k, ck)
-                    if prev0 is not None:
-                        pv = world(prev0[0], frames[prev0[0]]["ballCandidates"][prev0[1]])
-                        velocity = (wk - pv) / max(1, k - prev0[0])
-                        predicted = wk + velocity * back
-                    else:
-                        predicted = wk
-                    if np.linalg.norm(wj - wk) > max_step * back:
+                    s0, len0, _, v0 = best[pk]
+                    there = carry((ck["x"], ck["y"]), transform[back])
+                    step = here - there
+                    if np.linalg.norm(step) > max_step * back:
                         continue
-                    error = np.linalg.norm(wj - predicted)
-                    tolerance = gate * back + (0 if prev0 is not None else max_step * 0.6)
-                    if error > tolerance:
+                    if v0 is not None:
+                        # Velocity is a direction: rotate/scale it, never translate it.
+                        predicted = there + transform[back][:2, :2] @ v0 * back
+                        tolerance = gate * back
+                    else:
+                        predicted = there
+                        tolerance = gate * back + max_step * 0.6
+                    if np.linalg.norm(here - predicted) > tolerance:
                         continue
                     candidate_score = s0 + c["confidence"] - 0.02 * back
                     if candidate_score > score:
-                        score, length, prev = candidate_score, len0 + 1, pk
-            best[key] = (score, length, prev)
+                        score, length, prev, velocity = candidate_score, len0 + 1, pk, step / back
+            best[key] = (score, length, prev, velocity)
             order.append(key)
     # Walk chains from their strongest end, longest first, without reuse.
     promoted = {}
@@ -167,6 +178,10 @@ def confirm_chains(frames, matrices, diagonal, window=6, min_length=3, min_evide
             cursor = best[cursor][2]
         if len(chain) < min_length:
             continue
+        # A stronger chain already owns one of these frames: a parallel, weaker
+        # path (a sock, a second ball) must not replace it.
+        if any(i in promoted for i, _ in chain):
+            continue
         members = [frames[i]["ballCandidates"][j] for i, j in chain]
         neural = [m for m in members if m.get("source", "detector") != "motion"]
         # A path made only of motion blobs needs to be long to count: feet,
@@ -175,7 +190,11 @@ def confirm_chains(frames, matrices, diagonal, window=6, min_length=3, min_evide
             continue
         if neural and max(m["confidence"] for m in neural) < 0.1 and len(chain) < min_length + 2:
             continue
-        evidence = best[key][0]
+        # Evidence of the chain actually walked (it may have stopped at a used key).
+        span = chain[0][0] - chain[-1][0]
+        evidence = sum(m["confidence"] for m in members) - 0.02 * (span - (len(chain) - 1))
+        if evidence < min_evidence:
+            continue
         mean_conf = sum(m["confidence"] for m in members) / len(members)
         chain_conf = round(min(0.6 if neural else 0.4, mean_conf + 0.04 * len(chain)), 3)
         for i, j in chain:

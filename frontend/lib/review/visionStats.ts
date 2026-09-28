@@ -81,7 +81,7 @@ export function matchStats(result: VisionResult): MatchStats {
   for (const f of frames) {
     const owner = possessionOwner(f);
     if (owner === null) continue;
-    perMinute[Math.min(minutes - 1, Math.floor(f.t / 60))][owner]++;
+    perMinute[Math.min(minutes - 1, Math.max(0, Math.floor((f.t - (result.analysedStart ?? 0)) / 60)))][owner]++;
   }
   const momentum = perMinute.map(([a, b]) =>
     a + b >= 2 ? Math.round(((a - b) / (a + b)) * 100) / 100 : null,
@@ -106,7 +106,7 @@ export function matchStats(result: VisionResult): MatchStats {
   const aShare = m.teamSeconds[0] + m.teamSeconds[1] > 0 ? m.teamSeconds[0] / (m.teamSeconds[0] + m.teamSeconds[1]) : 0;
   const shareRange =
     chainCount >= 2 ? wilson(Math.round(aShare * chainCount), chainCount) : null;
-  const cumulative: [number, number, number][] = [[0, 0, 0]];
+  const cumulative: [number, number, number][] = [[result.analysedStart ?? 0, 0, 0]];
   if (pos) {
     let a = 0;
     let b = 0;
@@ -116,7 +116,7 @@ export function matchStats(result: VisionResult): MatchStats {
       else b += c.controlSeconds;
       cumulative.push([c.end, a, b]);
     }
-    cumulative.push([result.analysedDuration, a, b]);
+    cumulative.push([(result.analysedStart ?? 0) + result.analysedDuration, a, b]);
   }
   return {
     controlSeconds: [m.teamSeconds[0] ?? 0, m.teamSeconds[1] ?? 0],

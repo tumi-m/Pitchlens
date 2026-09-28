@@ -414,7 +414,9 @@ def test_model_paths_do_not_depend_on_shell_directory(monkeypatch, tmp_path):
 
 
 # ── Hosted worker: chunked uploads, ownership, retention ──────────────────
-FIXTURE = __import__("pathlib").Path(__file__).resolve().parents[2] / "frontend/tests/fixtures/review.mp4"
+FIXTURE = (
+    __import__("pathlib").Path(__file__).resolve().parents[2] / "frontend/tests/fixtures/review.mp4"
+)
 
 
 @pytest.fixture
@@ -456,7 +458,9 @@ def test_chunked_upload_resumes_starts_and_scopes_listing_to_owner(hosted):
     assert client.post(f"/jobs/{job['id']}/start").status_code == 409
     step = 100_000
     for offset in range(0, len(data), step):
-        r = client.put(f"/jobs/{job['id']}/video?offset={offset}", content=data[offset : offset + step])
+        r = client.put(
+            f"/jobs/{job['id']}/video?offset={offset}", content=data[offset : offset + step]
+        )
         assert r.status_code == 200 and r.json()["received"] == min(len(data), offset + step)
     # A retried chunk is acknowledged without being written twice.
     assert client.put(f"/jobs/{job['id']}/video?offset=0", content=data[:step]).json() == {
@@ -695,9 +699,7 @@ def test_youtube_links_are_reduced_to_a_single_video_id():
 
 def test_youtube_job_downloads_then_analyses(hosted, monkeypatch):
     server, client, submitted = hosted
-    response = client.post(
-        "/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ&owner=" + "c" * 32
-    )
+    response = client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ&owner=" + "c" * 32)
     assert response.status_code == 200, response.text
     job = response.json()
     assert job["status"] == "uploading" and job["title"] == "YouTube match"
@@ -832,7 +834,9 @@ def test_gpu_can_copy_installed_weights_but_nothing_else(service, monkeypatch, t
     weights.write_bytes(b"weights")
     monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(weights))
     assert client.get("/models/football-ball.onnx").content == b"weights"
-    assert client.get("/models/football-ball.onnx", headers={"Authorization": ""}).status_code == 401
+    assert (
+        client.get("/models/football-ball.onnx", headers={"Authorization": ""}).status_code == 401
+    )
     assert client.get("/models/status.json").status_code == 404
     assert client.get("/models/..%2F..%2Fetc%2Fpasswd").status_code == 404
 
@@ -962,6 +966,58 @@ def test_implausibly_fast_jumps_do_not_join_a_chain():
     assert confirm_chains(frames, [identity] * 6, diagonal=734) == {}
 
 
+def test_stationary_ball_survives_an_accelerating_pan():
+    """Camera compensation must cancel motion, not double it: an accelerating pan
+    used to break every chain that a constant pan happened to keep."""
+    from app.vision.faint import confirm_chains
+
+    pans = [0, 0, 0, 150, 200, 200, 200, 200, 200]
+    x, frames, matrices = 1400.0, [], []
+    for pan in pans:
+        x -= pan  # the pitch (and the ball on it) shifts left as the camera pans right
+        frames.append({"scene": 0, "ball": None,
+                       "ballCandidates": [{"x": x, "y": 500.0, "box": None, "confidence": 0.2}]})
+        matrices.append(np.array([[1.0, 0, -pan], [0, 1.0, 0]]))
+    promoted = confirm_chains(frames, matrices, diagonal=2203)
+    assert sorted(promoted) == list(range(len(pans)))
+
+
+def test_gates_stay_in_current_pixels_after_a_long_zoom():
+    """A minute of zooming must not change what 'plausible speed' means after the next cut."""
+    from app.vision.faint import confirm_chains
+
+    zoom = np.array([[1.2, 0, 0], [0, 1.2, 0]])
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames, matrices = [], []
+    for i in range(10):  # scene 0: static noise candidate while the camera zooms in
+        frames.append({"scene": 0, "ball": None,
+                       "ballCandidates": [{"x": 5.0 * 1.2**i, "y": 5.0 * 1.2**i, "box": None, "confidence": 0.05}]})
+        matrices.append(zoom if i else identity)
+    for i in range(8):  # scene 1: a clean 30 px/frame ball path
+        frames.append({"scene": 1, "ball": None,
+                       "ballCandidates": [{"x": 100.0 + 30 * i, "y": 200.0, "box": None, "confidence": 0.2}]})
+        matrices.append(None if i == 0 else identity)
+    promoted = confirm_chains(frames, matrices, diagonal=734)
+    assert sorted(promoted) == list(range(10, 18))
+
+
+def test_a_weaker_parallel_chain_cannot_overwrite_a_stronger_one():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = [
+        {"scene": 0, "ball": None, "ballCandidates": [
+            {"x": 100.0 + 12 * i, "y": 100.0, "box": None, "confidence": 0.5},
+            {"x": 400.0 + 12 * i, "y": 300.0, "box": None, "confidence": 0.12, "source": "motion"},
+        ]}
+        for i in range(8)
+    ]
+    promoted = confirm_chains(frames, [identity] * 8, diagonal=734)
+    assert len(promoted) == 8
+    assert all(promoted[i]["x"] == 100.0 + 12 * i for i in range(8))
+    assert all(promoted[i].get("source") != "motion" for i in range(8))
+
+
 def test_long_stationary_ball_is_dropped_as_a_marking():
     from app.vision.faint import drop_static_balls
 
@@ -972,3 +1028,166 @@ def test_long_stationary_ball_is_dropped_as_a_marking():
     assert drop_static_balls(frames, [identity] * 20, 734, sample_fps=5) == 20
     assert all(f["ball"] is None for f in frames)
     assert drop_static_balls(moving, [identity] * 20, 734, sample_fps=5) == 0
+
+
+def test_diagnostic_metrics_use_source_timestamp_offset():
+    frames = [frame(120), frame(120.2), frame(120.4), frame(120.6)]
+    out = derive_metrics(frames, 5, 0.8, start_seconds=120)
+    assert out["teamSeconds"] == [0.8, 0]
+    assert out["unknownSeconds"] == 0
+
+
+def test_invalid_diagnostic_and_search_options_rejected(service, monkeypatch, tmp_path):
+    _, client = service
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    monkeypatch.setenv("VISION_MODEL_PATH", str(model))
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(model))
+    for query in ("diagnostic=yes", "start=-1", "start=nan", "start=120", "search=magic"):
+        response = client.post(
+            f"/jobs?{query}", content=b"x", headers={"Content-Type": "video/mp4"}
+        )
+        assert response.status_code == 400
+
+
+def test_focused_ball_search_falls_back_after_miss_and_restores_coordinates():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    class Model:
+        calls = 0
+
+        def predict(self, images, **kwargs):
+            self.calls += 1
+            results = []
+            for image in images:
+                ys, xs = np.where(image[:, :, 0] > 0)
+                boxes = (
+                    np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
+                    if len(xs)
+                    else np.empty((0, 4))
+                )
+                results.append(
+                    SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.full(len(boxes), 0.8)))
+                )
+            return results
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    image = np.zeros((360, 640, 3), np.uint8)
+    image[76:85, 96:105] = 255
+    found = detector.detect(image, focus=[100, 80])
+    assert len(found) == 1 and found[0]["x"] == 100
+    assert detector.model.calls == 1
+    image[:] = 0
+    image[276:285, 536:545] = 255
+    found = detector.detect(image, focus=[100, 80])
+    assert len(found) == 1 and (found[0]["x"], found[0]["y"]) == (540, 280)
+    # A miss sweeps the remaining tiles in one batched call; no tile is repeated.
+    assert detector.model.calls == 3
+
+
+def test_player_reacquisition_velocity_uses_elapsed_gap():
+    from app.vision.tracking import MotionTracker
+
+    tracker = MotionTracker()
+    identity = np.float32([[1, 0, 0], [0, 1, 0]])
+    tracker.update([player()], 0, identity)
+    tracker.update([], 0.2, identity)
+    tracker.update([], 0.4, identity)
+    tracker.update([player(x=6)], 0.6, identity)
+    assert len(tracker.tracks) == 1
+    assert tracker.tracks[0].velocity[0] == pytest.approx(5)
+
+
+def test_short_diagnostic_reuses_detection_and_survives_unknown_kits(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import cv2
+    import torch
+    import ultralytics
+
+    from app.vision import engine
+
+    video = tmp_path / "fixture.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (80, 60))
+    for _ in range(25):
+        writer.write(np.full((60, 80, 3), (40, 150, 40), np.uint8))
+    writer.release()
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test")
+    calls = []
+
+    class Model:
+        names = {0: "referee"}
+
+        def predict(self, image, **options):
+            calls.append(options)
+            return [
+                SimpleNamespace(
+                    boxes=SimpleNamespace(
+                        xyxy=torch.tensor([[10, 10, 30, 50]]),
+                        conf=torch.tensor([0.9]),
+                        cls=torch.tensor([0]),
+                    )
+                )
+            ]
+
+    monkeypatch.setattr(ultralytics, "YOLO", lambda path: Model())
+    monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
+    monkeypatch.setattr(
+        engine,
+        "create_ball_detector",
+        lambda *args: SimpleNamespace(
+            detect=lambda *a, **k: [], detect_batch=lambda frames, **k: [[] for _ in frames]
+        ),
+    )
+    result = engine.run_video(
+        video, tmp_path / "result.json", start_seconds=1, max_seconds=1, sample_fps=6
+    )
+    assert len(calls) == len(result["frames"]) == 5
+    assert all(c["agnostic_nms"] for c in calls)
+    assert result["teams"] == []
+    assert result["metrics"]["unknownSeconds"] == 1
+    assert result["frames"][0]["t"] == 1
+    assert result["frames"][-1]["t"] < 2
+    assert "Team assignments" in result["limitations"][0]
+
+
+def test_gpu_receives_bounded_diagnostic_options(tmp_path, monkeypatch):
+    import gzip
+    import sys
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from app.vision import gpu
+
+    calls = []
+
+    def remote_gen(*args):
+        calls.append(args)
+        return iter([{"result_gz": gzip.compress(b'{"frames":[]}')}])
+
+    monkeypatch.setattr(gpu, "public_base", lambda: "https://worker.example")
+    monkeypatch.setitem(
+        sys.modules,
+        "app.vision.modal_app",
+        SimpleNamespace(
+            app=SimpleNamespace(run=nullcontext), analyse=SimpleNamespace(remote_gen=remote_gen)
+        ),
+    )
+    gpu.run_on_modal(
+        "a" * 32,
+        tmp_path / "result.json",
+        "fixture-token",
+        lambda **kw: None,
+        lambda: False,
+        "small-ball",
+        6,
+        max_seconds=20,
+        start_seconds=300,
+        ball_search="adaptive",
+    )
+    assert calls[0][2:] == ("small-ball", 6, 20, 300, "adaptive")
+    assert (tmp_path / "result.json").read_text() == '{"frames":[]}'

@@ -43,6 +43,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
           });
           if (stopped) return;
           setResult(data);
+          setTime(data.analysedStart ?? 0);
           loaded = true;
         }
       } catch (e) {
@@ -166,6 +167,11 @@ export function VisionReport({ jobId }: { jobId: string }) {
               </a>
             )}
           </header>
+          {result?.performance && <div className="glass-card p-4 text-sm space-y-2">
+            <p>Processing took {result.performance.totalSeconds.toFixed(1)}s on {result.performance.device} · players {result.performance.playerInferenceSeconds.toFixed(1)}s · ball {result.performance.ballInferenceSeconds.toFixed(1)}s.</p>
+            <p>{(result.performance.totalSeconds / result.analysedDuration).toFixed(1)} seconds processing per second of footage. Full matches may take a different amount of time.</p>
+            {result.analysedDuration < result.video.duration - .5 && <p className="text-amber-200">Diagnostic section: {clockTime(result.analysedStart ?? 0)}–{clockTime((result.analysedStart ?? 0) + result.analysedDuration)}. These results do not describe the full match.</p>}
+          </div>}
           {error && (
             <p role="alert" className="text-red-300 glass-card p-4">
               {error}
@@ -208,6 +214,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   >
                     <video
                       ref={player}
+                    onLoadedMetadata={() => { if (player.current) player.current.currentTime = result?.analysedStart ?? 0; }}
                       controls
                       playsInline
                       preload="metadata"
@@ -421,8 +428,8 @@ function DetectionTimeline({
   const bins = useMemo(
     () =>
       Array.from({ length: 80 }, (_, i) => {
-        const start = (result.analysedDuration * i) / 80,
-          end = (result.analysedDuration * (i + 1)) / 80;
+        const start = (result.analysedStart ?? 0) + (result.analysedDuration * i) / 80,
+          end = (result.analysedStart ?? 0) + (result.analysedDuration * (i + 1)) / 80;
         const frames = result.frames.filter((f) => f.t >= start && f.t < end);
         return {
           start,
@@ -454,9 +461,9 @@ function DetectionTimeline({
         ))}
       </div>
       <div className="flex justify-between text-xs text-pitch-muted mt-2">
-        <span>0:00</span>
+        <span>{clockTime(result.analysedStart ?? 0)}</span>
         <span>Click a bar to inspect</span>
-        <span>{clockTime(result.analysedDuration)}</span>
+        <span>{clockTime((result.analysedStart ?? 0) + result.analysedDuration)}</span>
       </div>
     </section>
   );

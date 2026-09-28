@@ -25,7 +25,7 @@ def possession_owner(players, ball):
     return candidates[0][1]
 
 
-def derive_metrics(frames, sample_fps, duration):
+def derive_metrics(frames, sample_fps, duration, start_seconds=0):
     dt = 1 / sample_fps
     # Require consecutive observations, never bridge unseen-ball intervals.
     runs = []
@@ -45,7 +45,7 @@ def derive_metrics(frames, sample_fps, duration):
     timestamps = [f["t"] for f in frames]
     events = []
     for i, r in enumerate(stable):
-        length = min(duration - r["start"], r["samples"] * dt)
+        length = min(start_seconds + duration - r["start"], r["samples"] * dt)
         seconds[r["key"][1]] += max(0, length)
         if i == 0:
             continue
@@ -89,7 +89,7 @@ def derive_metrics(frames, sample_fps, duration):
             }
         )
     coverage = sum(seconds)
-    chains = possession_chains(stable, events, dt, duration)
+    chains = possession_chains(stable, events, dt, start_seconds + duration)
     return {
         "sampledFrames": len(frames),
         "playerFrames": sum(bool(f["players"]) for f in frames),

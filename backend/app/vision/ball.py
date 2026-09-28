@@ -122,6 +122,33 @@ class TiledBallDetector:
                 out.append((x0, y0, frame[y0:y1, x0:x1]))
         return out
 
+    def _predict(self, crops, threshold):
+        self.inference_calls = getattr(self, "inference_calls", 0) + 1
+        return self.model.predict(
+            crops,
+            imgsz=640,
+            conf=threshold,
+            classes=self.classes,
+            device=self.device,
+            quantize=16 if str(self.device).startswith("cuda") else None,
+            verbose=False,
+        )
+
+    @staticmethod
+    def _collect(result, x0, y0):
+        out = []
+        for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+            box = [box[0] + x0, box[1] + y0, box[2] + x0, box[3] + y0]
+            out.append(
+                {
+                    "x": round((box[0] + box[2]) / 2, 1),
+                    "y": round((box[1] + box[3]) / 2, 1),
+                    "box": [round(v, 1) for v in box],
+                    "confidence": round(confidence, 3),
+                }
+            )
+        return out
+
     def detect_batch(self, frames, threshold=0.2):
         """Detect in several frames with one model call. Returns a list per frame."""
         crops, owners = [], []
@@ -131,31 +158,44 @@ class TiledBallDetector:
                 owners.append((index, x0, y0))
         if not crops:
             return [[] for _ in frames]
-        results = self.model.predict(
-            crops,
-            imgsz=640,
-            conf=threshold,
-            classes=self.classes,
-            device=self.device,
-            quantize=16 if str(self.device).startswith("cuda") else None,
-            verbose=False,
-        )
+        results = self._predict(crops, threshold)
         per_frame = [[] for _ in frames]
         for result, (index, x0, y0) in zip(results, owners):
-            for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
-                box = [box[0] + x0, box[1] + y0, box[2] + x0, box[3] + y0]
-                per_frame[index].append(
-                    {
-                        "x": round((box[0] + box[2]) / 2, 1),
-                        "y": round((box[1] + box[3]) / 2, 1),
-                        "box": [round(v, 1) for v in box],
-                        "confidence": round(confidence, 3),
-                    }
-                )
+            per_frame[index].extend(self._collect(result, x0, y0))
         return [self._suppress(found, threshold) for found in per_frame]
 
-    def detect(self, frame, threshold=0.2):
-        return self.detect_batch([frame], threshold)[0]
+    def detect(self, frame, threshold=0.2, focus=None):
+        """Single frame. With `focus` (last known ball position) the tile around
+        it is searched first; a clear hit there saves the remaining tiles."""
+        if focus is None:
+            return self.detect_batch([frame], threshold)[0]
+        h, w = frame.shape[:2]
+        tiles = self.tiles(frame)
+
+        def margin(tile):
+            x0, y0, crop = tile
+            th, tw = crop.shape[:2]
+            return min(focus[0] - x0, x0 + tw - focus[0], focus[1] - y0, y0 + th - focus[1])
+
+        selected = max(tiles, key=margin)
+        found = []
+        if margin(selected) >= min(h, w) * 0.08:
+            x0, y0, crop = selected
+            found = self._collect(self._predict([crop], threshold)[0], x0, y0)
+            tiles.remove(selected)
+            # One clear hit next to the last position settles it; weak candidates
+            # (kept for track-before-detect) do not make the tile "ambiguous".
+            strong = [f for f in found if f["confidence"] >= 0.35]
+            if (
+                len(strong) == 1
+                and np.hypot(strong[0]["x"] - focus[0], strong[0]["y"] - focus[1]) < min(h, w) * 0.15
+            ):
+                return self._suppress(found, threshold)
+        if tiles:
+            results = self._predict([t[2] for t in tiles], threshold)
+            for result, (x0, y0, _) in zip(results, tiles):
+                found.extend(self._collect(result, x0, y0))
+        return self._suppress(found, threshold)
 
     @staticmethod
     def _suppress(found, threshold):

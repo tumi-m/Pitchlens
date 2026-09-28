@@ -62,10 +62,16 @@ app = modal.App("pitchlens-vision", image=image)
 models_volume = modal.Volume.from_name("pitchlens-models", create_if_missing=True)
 
 
-@app.function(
-    gpu=GPU, timeout=3 * 3600, max_containers=2, volumes={"/cache": models_volume}
-)
-def analyse(video_url: str, token: str, profile: str, sample_fps: int):
+@app.function(gpu=GPU, timeout=3 * 3600, max_containers=2, volumes={"/cache": models_volume})
+def analyse(
+    video_url: str,
+    token: str,
+    profile: str,
+    sample_fps: int,
+    max_seconds=None,
+    start_seconds=0,
+    ball_search="exhaustive",
+):
     """Generator: yields progress dicts, then {"result_gz": bytes}."""
     import gzip
     import queue
@@ -74,7 +80,6 @@ def analyse(video_url: str, token: str, profile: str, sample_fps: int):
     import requests
 
     from app.vision.engine import run_video
-
     from app.vision.profiles import model_paths
 
     missing = [p for p in model_paths(profile) if not p.is_file()]
@@ -111,6 +116,9 @@ def analyse(video_url: str, token: str, profile: str, sample_fps: int):
                 progress=lambda **kw: updates.put(kw),
                 profile=profile,
                 sample_fps=sample_fps,
+                max_seconds=max_seconds,
+                start_seconds=start_seconds,
+                ball_search=ball_search,
             )
         except ValueError as exc:  # footage problem, shown to the user as-is
             outcome["error"] = str(exc)

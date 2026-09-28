@@ -106,7 +106,7 @@ class MotionTracker:
                     continue
                 p = self.tracks[i]
                 d = observations[j]
-                elapsed = max(0.05, step)
+                elapsed = max(0.05, t - p.seen)
                 residual = (centre(d["box"]) - centre(p.box)) / elapsed
                 p.velocity = p.velocity + 0.5 * residual
                 p.box = np.array(d["box"])

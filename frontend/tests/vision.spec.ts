@@ -5,10 +5,12 @@ const ID = "a".repeat(32);
 const FIXTURE = path.join(__dirname, "fixtures/review.mp4");
 
 async function mockChunkedWorker(page: Page) {
-  const calls = { created: 0, chunks: [] as number[], started: 0, owner: "" };
+  const calls = { created: 0, chunks: [] as number[], started: 0, owner: "", diagnostic: "", start: "" };
   let received = 0;
   await page.route(/\/api\/vision\/jobs\?/, async (r) => {
     calls.created++;
+    calls.diagnostic = new URL(r.request().url()).searchParams.get("diagnostic") || "";
+    calls.start = new URL(r.request().url()).searchParams.get("start") || "";
     calls.owner = (await r.request().headerValue("x-pitchlens-owner")) || "";
     await r.fulfill({
       json: {
@@ -62,11 +64,14 @@ test("automatic upload sends the video in chunks and opens the worker job", asyn
   page,
 }) => {
   await page.route("**/api/vision/health", (r) =>
-    r.fulfill({ json: { available: true, hosted: false } }),
+    r.fulfill({ json: { available: true, hosted: false, diagnostics: true } }),
   );
   const calls = await mockChunkedWorker(page);
   await page.goto("/upload");
   await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await expect(page.getByRole("heading", { name: "Video checked on your device" })).toBeVisible();
+  expect(calls.created).toBe(0);
+  await page.getByLabel("Test start (seconds)").fill("1");
   await page
     .getByRole("button", { name: "Analyse video automatically", exact: true })
     .click();
@@ -77,6 +82,8 @@ test("automatic upload sends the video in chunks and opens the worker job", asyn
     0,
   );
   expect(calls.created).toBe(1);
+  expect(calls.diagnostic).toBe("true");
+  expect(calls.start).toBe("1");
   expect(calls.chunks[0]).toBe(0);
   expect(calls.started).toBe(1);
   expect(calls.owner).toMatch(/^[a-f0-9]{32}$/);
@@ -171,7 +178,7 @@ test("a YouTube link is sent to the worker only after the rights confirmation", 
   page,
 }) => {
   await page.route("**/api/vision/health", (r) =>
-    r.fulfill({ json: { available: true, hosted: false } }),
+    r.fulfill({ json: { available: true, hosted: false, diagnostics: true } }),
   );
   let requested = "";
   await page.route(/\/api\/vision\/jobs\/from-url\?/, (r) => {
@@ -198,4 +205,15 @@ test("a YouTube link is sent to the worker only after the rights confirmation", 
   await analyse.click();
   await expect(page.getByRole("heading", { name: "Downloading from YouTube" })).toBeVisible();
   expect(new URL(requested).searchParams.get("url")).toBe("https://youtu.be/dQw4w9WgXcQ");
+});
+
+
+test("corrupt footage is rejected before an upload is reserved", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true } }));
+  const calls = await mockChunkedWorker(page);
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles({name: "broken.mp4", mimeType: "video/mp4", buffer: Buffer.from("not a video")});
+  await expect(page.getByRole("alert").filter({ hasText: "could not decode" })).toBeVisible();
+  await expect(page.getByRole("button", {name: "Analyse video automatically", exact: true})).toBeDisabled();
+  expect(calls.created).toBe(0);
 });

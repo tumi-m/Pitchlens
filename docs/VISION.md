@@ -130,10 +130,14 @@ consistency over time.
    become extra low-confidence candidates (`source: "motion"`).
 3. **Track-before-detect.** `faint.confirm_chains` links candidates across up
    to six sampled frames when they follow a near-constant velocity (tolerance
-   3% of the frame diagonal per frame, top speed 15% per frame). Chains of at
-   least three members with enough summed evidence are promoted to observed
-   ball positions (`recovered: true`). Motion-only chains must be twice as long
-   and are capped at 0.4 confidence; chains with neural corroboration at 0.6.
+   3% of the frame diagonal per frame, top speed 15% per frame). Earlier
+   candidates are carried into the current frame's pixels through the
+   intervening camera transforms, so the gates mean the same thing after a
+   zoom or a pan. Chains of at least three members with enough summed evidence
+   are promoted to observed ball positions (`recovered: true`); a stronger
+   chain always keeps its frames against a weaker parallel one. Motion-only
+   chains must be twice as long and are capped at 0.4 confidence; chains with
+   neural corroboration at 0.6.
 4. **Gap bridging.** Up to 0.5 s of missing positions inside a confirmed path
    are interpolated and marked `inferred: true`. They count for possession
    continuity but never as observed frames (`ballFramesInferred`).

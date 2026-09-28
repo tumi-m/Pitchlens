@@ -1,5 +1,5 @@
 /**
- * Pre-upload footage check: what the analysis can expect from this file,
+ * Pre-upload footage grade: what the analysis can expect from this file,
  * measured in the browser before a single byte is uploaded.
  */
 export type FootageCheck = {
@@ -103,56 +103,36 @@ const seek = (video: HTMLVideoElement, t: number) =>
   });
 
 /**
- * Reads metadata and, when the browser can decode the file, samples pairs of
- * frames 0.5 s apart at several points to estimate how often the picture
- * changes abruptly (cuts/replays). Never throws: returns null if unreadable.
+ * Samples pairs of frames 0.5 s apart at several points of an already-loaded
+ * video and returns how often the picture changes abruptly (cuts/replays):
+ * 0 = never, 1 = at every sample. Undefined when too few pairs could be read.
+ * Never throws.
  */
-export async function checkFootage(file: File, signal?: AbortSignal): Promise<FootageCheck | null> {
-  const url = URL.createObjectURL(file);
-  const video = document.createElement("video");
-  video.muted = true;
-  video.preload = "metadata";
-  video.src = url;
+export async function estimateMotion(
+  video: HTMLVideoElement,
+  duration: number,
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  if (!isFinite(duration) || duration <= 10) return undefined;
   try {
-    const ready = await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(false), 8000);
-      video.onloadedmetadata = () => {
-        clearTimeout(timer);
-        resolve(true);
-      };
-      video.onerror = () => {
-        clearTimeout(timer);
-        resolve(false);
-      };
-    });
-    if (!ready || !video.videoWidth) return null;
-    const { videoWidth: width, videoHeight: height, duration } = video;
-    let motion: number | undefined;
-    if (isFinite(duration) && duration > 10) {
-      const canvas = document.createElement("canvas");
-      canvas.width = 64;
-      canvas.height = 36;
-      let pairs = 0;
-      let cuts = 0;
-      for (const fraction of [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]) {
-        if (signal?.aborted) break;
-        const t = duration * fraction;
-        if (!(await seek(video, t))) break;
-        const a = frameSignature(video, canvas);
-        if (!(await seek(video, Math.min(duration - 0.1, t + 0.5)))) break;
-        const b = frameSignature(video, canvas);
-        if (!a || !b) break;
-        pairs++;
-        if (bhattacharyya(a, b) > 0.35) cuts++;
-      }
-      if (pairs >= 3) motion = cuts / pairs;
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 36;
+    let pairs = 0;
+    let cuts = 0;
+    for (const fraction of [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]) {
+      if (signal?.aborted) break;
+      const t = duration * fraction;
+      if (!(await seek(video, t))) break;
+      const a = frameSignature(video, canvas);
+      if (!(await seek(video, Math.min(duration - 0.1, t + 0.5)))) break;
+      const b = frameSignature(video, canvas);
+      if (!a || !b) break;
+      pairs++;
+      if (bhattacharyya(a, b) > 0.35) cuts++;
     }
-    return gradeFootage(width, height, isFinite(duration) ? duration : 0, motion);
+    return pairs >= 3 ? cuts / pairs : undefined;
   } catch {
-    return null;
-  } finally {
-    video.removeAttribute("src");
-    video.load();
-    URL.revokeObjectURL(url);
+    return undefined;
   }
 }

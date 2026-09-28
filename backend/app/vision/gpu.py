@@ -25,7 +25,18 @@ def public_base():
     return f"https://{domain}" if domain else ""
 
 
-def run_on_modal(job_id, output, token, progress, cancelled, profile, sample_fps):
+def run_on_modal(
+    job_id,
+    output,
+    token,
+    progress,
+    cancelled,
+    profile,
+    sample_fps,
+    max_seconds=None,
+    start_seconds=0,
+    ball_search="exhaustive",
+):
     """Stream progress from the GPU function and write its result to `output`."""
     base = public_base()
     if not base:
@@ -37,7 +48,13 @@ def run_on_modal(job_id, output, token, progress, cancelled, profile, sample_fps
     try:
         with app.run():
             stream = analyse.remote_gen(
-                f"{base}/jobs/{job_id}/video", token, profile, int(sample_fps)
+                f"{base}/jobs/{job_id}/video",
+                token,
+                profile,
+                int(sample_fps),
+                max_seconds,
+                start_seconds,
+                ball_search,
             )
             for item in stream:
                 if cancelled():

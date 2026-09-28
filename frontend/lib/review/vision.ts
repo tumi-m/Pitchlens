@@ -41,6 +41,13 @@ export type VisionResult = {
   ballModelSha256?: string;
   video: { duration: number; width: number; height: number; fps: number };
   analysedDuration: number;
+  analysedStart?: number;
+  performance?: {
+    totalSeconds: number;
+    playerInferenceSeconds: number;
+    ballInferenceSeconds: number;
+    device: string;
+  };
   sampleFps: number;
   teams: { id: number; label: string; colour: string }[];
   metrics: {
@@ -85,6 +92,7 @@ export type VisionResult = {
   limitations: string[];
 };
 export type VisionHealth = {
+  diagnostics?: boolean;
   available: boolean;
   profiles?: string[];
   /** Worker runs on a server (not this computer). */
@@ -210,6 +218,9 @@ export async function uploadToVision(
     title: string;
     profile?: string;
     fps?: string;
+    diagnostic?: boolean;
+    start?: number;
+    search?: "exhaustive" | "adaptive";
     signal?: AbortSignal;
     onProgress?: (percent: number) => void;
   },
@@ -220,6 +231,9 @@ export async function uploadToVision(
     profile: options.profile || "general",
     fps: options.fps || "3",
     size: String(file.size),
+    diagnostic: String(options.diagnostic ?? false),
+    start: String(options.start ?? 0),
+    search: options.search ?? "exhaustive",
   });
   signal?.throwIfAborted();
   // Never abort the reservation mid-flight: the worker would stay reserved
