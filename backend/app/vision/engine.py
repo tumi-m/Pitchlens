@@ -427,6 +427,10 @@ def run_video(
                 if c in people and inside_field(mask, box)
             ]
             players = tracker.update(observations, t, matrix, cut=cut)
+            # Masking uses every on-pitch detection: the tracker only lists a new
+            # player once confirmed (on the next frame), and an unmasked limb would
+            # look like a moving ball or a camera-motion feature.
+            detected = [{"box": o["box"]} for o in observations]
             if raw_candidates is None:
                 # Adaptive: look where the ball just was first, sweep the whole
                 # frame when that tile is empty or ambiguous, and at least twice a second.
@@ -440,7 +444,7 @@ def run_video(
                 timings["ballInferenceSeconds"] += time.monotonic() - tick
             # Weak neural candidates plus difference-imaging candidates; the
             # track-before-detect pass after the loop decides which are real.
-            diameter = ball_size_prior(players, frame.shape[0])
+            diameter = ball_size_prior(detected or players, frame.shape[0])
             raw_candidates = fuse_ball_candidates(
                 raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
             )
@@ -448,12 +452,12 @@ def run_video(
             motion = []
             if motion_ok and not cut:
                 motion = difference_candidates(
-                    previous_frame, frame, matrix, players, diameter, mask=mask
+                    previous_frame, frame, matrix, detected, diameter, mask=mask
                 )
             candidates = merge_candidates(detector, motion)
             strong = strong_candidates(candidates)
             previous_frame = frame
-            previous_boxes = [p["box"] for p in players]
+            previous_boxes = [p["box"] for p in detected]
             # Airborne balls can be outside the green surface; temporal association
             # resolves candidates instead of rejecting them by background colour.
             ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)

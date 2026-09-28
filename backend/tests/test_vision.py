@@ -1583,3 +1583,36 @@ def test_byte_tracker_tolerates_one_wrong_kit_colour():
         for p in tracker.update([{"team": team, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}], k * 0.2, identity):
             ids.add(p["id"])
     assert len(ids) == 1
+
+
+def test_byte_tracker_confirms_tracks_at_one_sample_per_second():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    lists = []
+    for k in range(6):
+        x = 100 + 20 * k
+        lists.append(tracker.update([{"team": 0, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}], float(k), identity))
+    out = [p for frame in lists for p in frame]  # read after late additions landed
+    assert len(out) == 6 and len({p["id"] for p in out}) == 1
+
+
+def test_established_kit_never_takes_the_other_teams_player():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    for k in range(5):  # player A (kit 0) well established
+        tracker.update([{"team": 0, "role": "player", "box": [100, 100, 112, 130], "confidence": 0.9}], k * 0.2, identity)
+    # A is now only weakly detected while B (kit 1) appears right next to him.
+    out = tracker.update(
+        [
+            {"team": 0, "role": "player", "box": [101, 100, 113, 130], "confidence": 0.2},
+            {"team": 1, "role": "player", "box": [106, 100, 118, 130], "confidence": 0.9},
+        ],
+        1.0,
+        identity,
+    )
+    a = [p for p in out if p["team"] == 0]
+    assert a and all(p["team"] == 0 for p in out if p["id"] == a[0]["id"])

@@ -225,6 +225,7 @@ class ByteTracker:
         self.tracks = []
         self.next_id = 1
         self.last_time = None
+        self.interval = None
 
     def _cost(self, track, obs, t, gate_scale):
         predicted = track.kf.box()
@@ -237,7 +238,10 @@ class ByteTracker:
         cost = 0.65 * distance / gate + 0.35 * (1 - overlap(predicted, np.array(obs["box"])))
         team = track.team
         if team >= 0 and obs["team"] >= 0 and team != obs["team"]:
-            cost += 0.35  # soft: one frame of wrong colour should not break a track
+            a, b = track.team_votes
+            if a + b >= 3 and max(a, b) >= 2 * min(a, b):
+                return None  # an established kit never jumps to the other team's player
+            cost += 0.35  # soft while the kit is uncertain: one misread frame should not break a track
         # Prefer tracks seen recently when two compete for one detection.
         return cost + 0.05 * min(gap, 3.0)
 
@@ -265,10 +269,16 @@ class ByteTracker:
             self.tracks = []
         dt = t - self.last_time if self.last_time is not None else 0.0
         self.last_time = t
+        if dt > 0:
+            self.interval = dt if self.interval is None else 0.8 * self.interval + 0.2 * dt
+        # In samples, not only seconds: at one frame per second a new track must
+        # still get the chance to be seen a second time.
+        tentative = max(self.TENTATIVE_SECONDS, 2.5 * (self.interval or 0.0))
+        lost = max(self.LOST_SECONDS, 3.5 * (self.interval or 0.0))
         self.tracks = [
             tr
             for tr in self.tracks
-            if (tr.confirmed and t - tr.seen <= self.LOST_SECONDS) or (not tr.confirmed and t - tr.born <= self.TENTATIVE_SECONDS)
+            if (tr.confirmed and t - tr.seen <= lost) or (not tr.confirmed and t - tr.born <= tentative)
         ]
         for tr in self.tracks:
             tr.kf.compensate(matrix)
