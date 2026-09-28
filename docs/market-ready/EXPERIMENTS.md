@@ -3,6 +3,35 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E8 · Event engine against human-labelled events (Metrica open data, 2026-09-28)
+- Data: Metrica Sports sample games 1 and 2 (25 fps optical tracking with
+  hand-labelled events; acknowledged, not redistributed). Game 1 = development
+  (all tuning), game 2 = held out (run once per setting after tuning stopped).
+- Harness: `backend/scripts/evaluate_on_tracking_data.py` converts tracking to
+  Pitchlens frames and degrades it: 5 fps, position noise, ball missing at
+  random and extra at players' feet, IDs fragmented; then runs the unchanged
+  analytics and scores passes, shots, interceptions (one-to-one, ±1 s / ±2 s)
+  and possession (per 0.2 s, event-derived labels).
+- Changes found necessary on game 1: gain validation on either side of a
+  frame (reception/release), duel zone = possession zone, single-frame
+  touches (direction change) and hidden single sightings, noise-scaled
+  relative-speed test, wider shot band with "teammate collects = not a shot",
+  stitching solved per connected group (a dense matrix used 13 GB) and
+  repeated until stable (a player split into 40 fragments stayed split).
+- Held-out game 2:
+
+| Degradation | Pass P / R / F1 | Shot F1 | Interception F1 | Possession agreement / coverage | Share error |
+|---|---|---|---|---|---|
+| none | 0.83 / 0.82 / 0.83 | 0.40 | 0.45 | 93.8% / 90% | 0.8 pts |
+| moderate (0.3 m players, 0.5 m ball, 30% + 30% at feet dropped, new ID every ~5 s) | 0.75 / 0.52 / 0.62 | 0.20 | 0.21 | 91.5% / 77% | 1.2 pts |
+| heavy (0.5 m / 0.8 m, 40% + 40%, ~3 s) | 0.65 / 0.29 / 0.40 | 0.08 | 0.10 | 86.5% / 48% (share withheld) | 3.4 pts |
+
+- Reading: possession share meets the ≤5-point target at every level; pass
+  detection is in the published range for independent data (F1 ~0.71);
+  shots are weak under degradation (as the literature reports) and stay
+  review-gated. Limits: 11-a-side professional data, positions are better than
+  a 360p camera before degradation, only two matches.
+
 ## E7 · ByteTrack-style tracker and optimal stitching (2026-09-28)
 - Replay of the 3-min indoor clip's recorded detections through both trackers.
 - Legacy: 329 IDs, median track 2.7 s, 63 IDs with ≤2 sightings, 99.6% of

@@ -45,9 +45,12 @@ PARAMS = {
     "controlRadius": 1.1,
     "maxControlRadius": 2.0,
     # Duel zone: an opponent this much further out still contests the ball.
-    "duelExtra": 0.5,
+    "duelExtra": 0.0,  # duel zone = possession zone (Vidal-Codina: both 1.0 m)
     # The ball must move with the player (gain validation, after Vidal-Codina).
-    "maxRelativeSpeed": 4.0,  # m/s, plus 2 x calibration error
+    "maxRelativeSpeed": 4.0,  # m/s, plus 2 x calibration error; tested on either side of the frame
+    # A single-frame touch counts when the ball clearly changes direction there.
+    "touchTurnDegrees": 30.0,
+    "touchMinSpeed": 2.0,  # m/s on both sides of the turn
     "minControlSeconds": 0.3,
     # A control spell survives this many unseen samples (ball hidden at the feet).
     "bridgeSamples": 3,
@@ -61,9 +64,11 @@ PARAMS = {
     # Shots.
     "minShotSpeed": 8.0,  # m/s; 6-8 m/s kept as low-confidence candidates
     "lowShotSpeed": 6.0,
-    "maxShotOrigin": 0.6,  # fraction of pitch length from the target goal line
-    "shotBand": 2.0,  # m beyond the posts for the extrapolated crossing
-    "shotTimeToLine": 1.5,  # s
+    "maxShotOrigin": 0.6,  # fraction of pitch length from the target goal line...
+    "maxShotDistance": 32.0,  # ...and never further than this (m)
+    "shotBand": 2.0,  # m beyond the posts, at least...
+    "shotBandWidth": 0.12,  # ...or this fraction of the pitch width (wide misses are shots too)
+    "shotTimeToLine": 2.5,  # s
     "saveWindow": 1.5,  # s for a keeper-area gain after a shot
     "onTargetMargin": 0.3,  # m outside the posts (ball radius + noise)
     # Possession sequences and dead ball.
@@ -209,63 +214,93 @@ def stitch_tracks(projected, sample_fps):
 
     chains = [{"frags": [f["id"]], "start": f["start"], "end": f["end"], "scene": f["scene"], "team": f["team"], "first": f, "last": f} for f in fragments.values()]
     vmax = PARAMS["maxPlayerSpeed"]
+    # Tightest gaps first; each round links every chain at most once, so rounds
+    # repeat until nothing more links (a player broken into many fragments is
+    # rejoined end to end).
     for max_gap in (0.6, 1.5, PARAMS["maxStitchGap"]):
-        enders = sorted(chains, key=lambda c: c["end"])
-        starters = sorted(chains, key=lambda c: c["start"])
-        start_times = [c["start"] for c in starters]
-        pairs = {}
-        for a_i, a in enumerate(enders):
-            pa, va, ma, ha = motion(a["last"]["frames"], True)
-            lo = bisect_right(start_times, a["end"])
-            hi = bisect_right(start_times, a["end"] + max_gap)
-            for b_i in range(lo, hi):
-                b = starters[b_i]
-                if b is a or b["scene"] != a["scene"]:
+        for _round in range(200):
+            before = len(chains)
+            enders = sorted(chains, key=lambda c: c["end"])
+            starters = sorted(chains, key=lambda c: c["start"])
+            start_times = [c["start"] for c in starters]
+            pairs = {}
+            for a_i, a in enumerate(enders):
+                pa, va, ma, ha = motion(a["last"]["frames"], True)
+                lo = bisect_right(start_times, a["end"])
+                hi = bisect_right(start_times, a["end"] + max_gap)
+                for b_i in range(lo, hi):
+                    b = starters[b_i]
+                    if b is a or b["scene"] != a["scene"]:
+                        continue
+                    gap = b["start"] - a["end"]
+                    if gap <= 0:
+                        continue
+                    if a["team"] in (0, 1) and b["team"] in (0, 1) and a["team"] != b["team"]:
+                        continue
+                    pb, _, mb, hb = motion(b["first"]["frames"], False)
+                    if ma and mb:
+                        speed = math.hypot(*va)
+                        if speed > vmax:
+                            va = (va[0] / speed * vmax, va[1] / speed * vmax)
+                        predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
+                        # Short fragments give jittery velocities: take the better of
+                        # "stood still" and "kept going".
+                        error = min(math.dist(predicted, pb), math.dist(pa, pb))
+                        limit = vmax * gap + 1.5
+                    else:
+                        height = (ha + hb) / 2
+                        predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
+                        error = min(math.dist(predicted, pb), math.dist(pa, pb)) / height
+                        limit = 1.2 * gap + 0.8  # body heights
+                    if error > limit:
+                        continue
+                    pairs[(a_i, b_i)] = error / limit + 0.5 * gap / max_gap
+            if not pairs:
+                break
+            # Solve each connected group of candidate links on its own: a dense
+            # enders x starters matrix is O(n^2) memory (13 GB at 40k fragments).
+            parent = {}
+
+            def find(x):
+                parent.setdefault(x, x)
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for a_i, b_i in pairs:
+                ra, rb = find(("a", a_i)), find(("b", b_i))
+                if ra != rb:
+                    parent[ra] = rb
+            groups = defaultdict(list)
+            for key in pairs:
+                groups[find(("a", key[0]))].append(key)
+            chosen = []
+            for keys in groups.values():
+                rows_idx = sorted({k[0] for k in keys})
+                cols_idx = sorted({k[1] for k in keys})
+                r_pos = {r: i for i, r in enumerate(rows_idx)}
+                c_pos = {c: j for j, c in enumerate(cols_idx)}
+                cost = np.full((len(rows_idx), len(cols_idx)), 1e6)
+                for a_i, b_i in keys:
+                    cost[r_pos[a_i], c_pos[b_i]] = pairs[(a_i, b_i)]
+                rows, cols = linear_sum_assignment(cost)
+                chosen.extend((rows_idx[r], cols_idx[c]) for r, c in zip(rows, cols) if cost[r, c] < 1e6)
+            merged = set()
+            for a_i, b_i in chosen:
+                a, b = enders[a_i], starters[b_i]
+                if id(a) in merged or id(b) in merged:
                     continue
-                gap = b["start"] - a["end"]
-                if gap <= 0:
-                    continue
-                if a["team"] in (0, 1) and b["team"] in (0, 1) and a["team"] != b["team"]:
-                    continue
-                pb, _, mb, hb = motion(b["first"]["frames"], False)
-                if ma and mb:
-                    speed = math.hypot(*va)
-                    if speed > vmax:
-                        va = (va[0] / speed * vmax, va[1] / speed * vmax)
-                    predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
-                    # Short fragments give jittery velocities: take the better of
-                    # "stood still" and "kept going".
-                    error = min(math.dist(predicted, pb), math.dist(pa, pb))
-                    limit = vmax * gap + 1.5
-                else:
-                    height = (ha + hb) / 2
-                    predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
-                    error = min(math.dist(predicted, pb), math.dist(pa, pb)) / height
-                    limit = 1.2 * gap + 0.8  # body heights
-                if error > limit:
-                    continue
-                pairs[(a_i, b_i)] = error / limit + 0.5 * gap / max_gap
-        if not pairs:
-            continue
-        cost = np.full((len(enders), len(starters)), 1e6)
-        for (a_i, b_i), c in pairs.items():
-            cost[a_i, b_i] = c
-        rows, cols = linear_sum_assignment(cost)
-        merged = set()
-        for a_i, b_i in zip(rows, cols):
-            if cost[a_i, b_i] >= 1e6:
-                continue
-            a, b = enders[a_i], starters[b_i]
-            if id(a) in merged or id(b) in merged:
-                continue
-            a["frags"] += b["frags"]
-            a["end"], a["last"] = b["end"], b["last"]
-            if a["team"] == -1:
-                a["team"] = b["team"]
-            merged.add(id(b))
-            merged.add(id(a))
-            b["frags"] = []
-        chains = [c for c in chains if c["frags"]]
+                a["frags"] += b["frags"]
+                a["end"], a["last"] = b["end"], b["last"]
+                if a["team"] == -1:
+                    a["team"] = b["team"]
+                merged.add(id(b))
+                merged.add(id(a))
+                b["frags"] = []
+            chains = [c for c in chains if c["frags"]]
+            if len(chains) == before:
+                break
     player_of = {}
     for number, chain in enumerate(sorted(chains, key=lambda c: c["start"]), start=1):
         for frag in chain["frags"]:
@@ -358,6 +393,40 @@ def _central_difference(projected, positions):
     return out
 
 
+def _one_sided(projected, positions):
+    """Backward and forward velocities (m/s) per frame, None where a neighbour is missing."""
+    back, fwd = {}, {}
+    for i, xy in positions.items():
+        for j, store in ((i - 1, back), (i + 1, fwd)):
+            other = positions.get(j)
+            if other is None or projected[j]["scene"] != projected[i]["scene"]:
+                continue
+            dt = projected[i]["t"] - projected[j]["t"]
+            if dt:
+                store[i] = ((xy[0] - other[0]) / dt, (xy[1] - other[1]) / dt)
+    return back, fwd
+
+
+def _sample_rate(projected):
+    gaps = [b["t"] - a["t"] for a, b in zip(projected, projected[1:]) if b["t"] > a["t"]]
+    return 1 / float(np.median(gaps)) if gaps else 5.0
+
+
+def ball_position_noise(projected, balls):
+    """Robust estimate (m) of ball position noise from second differences."""
+    values = []
+    for i, xy in balls.items():
+        a, b = balls.get(i - 1), balls.get(i + 1)
+        if a is None or b is None:
+            continue
+        values.append(math.hypot(a[0] - 2 * xy[0] + b[0], a[1] - 2 * xy[1] + b[1]))
+    if len(values) < 20:
+        return 0.3
+    # |second difference| ~ sqrt(6) sigma per axis for white noise; the median
+    # keeps genuine kicks (large accelerations) from dominating.
+    return float(np.median(values)) / (math.sqrt(6) * 1.18)
+
+
 def ball_positions(projected):
     """Grounded, on-pitch ball positions by frame (metres)."""
     return {
@@ -385,11 +454,18 @@ def control_states(projected, player_of, calibration_error=0.0):
     """
     balls = ball_positions(projected)
     ball_velocity = _central_difference(projected, balls)
+    ball_back, ball_fwd = _one_sided(projected, balls)
     tracks = fragment_positions(projected)
     velocities = {pid: _central_difference(projected, pos) for pid, pos in tracks.items()}
     radius = min(PARAMS["maxControlRadius"], PARAMS["controlRadius"] + 1.5 * calibration_error)
     duel = radius + PARAMS["duelExtra"]
-    relative_limit = PARAMS["maxRelativeSpeed"] + 2 * calibration_error
+    # Velocity noise from one camera at 5-6 fps can exceed the 4 m/s relative-speed
+    # test itself: estimate the ball's position noise from the data (robust second
+    # differences) and widen the test to 2.5 sigma of the relative velocity.
+    noise = ball_position_noise(projected, balls)
+    dt = 1 / max(1e-6, _sample_rate(projected))
+    sigma_v = math.sqrt(2) * math.sqrt(noise**2 + (0.3 + calibration_error) ** 2) / dt
+    relative_limit = max(PARAMS["maxRelativeSpeed"] + 2 * calibration_error, 2.5 * sigma_v)
     states = []
     for i, f in enumerate(projected):
         b = f["ball"]
@@ -418,9 +494,19 @@ def control_states(projected, player_of, calibration_error=0.0):
             if rivals:
                 states.append({"state": "contested", "ball": bxy, "teams": [p0["team"], rivals[0][2]["team"]]})
                 continue
-            bv = ball_velocity.get(i)
-            pv = velocities.get(p0["id"], {}).get(i)
-            if bv is not None and pv is not None and math.dist(bv, pv) > relative_limit:
+            # Gain validation: the ball moves with the player on at least one side
+            # of this frame (arriving and being stopped, or leaving the foot),
+            # or it visibly changes direction here (a one-touch).
+            pv = velocities.get(p0["id"], {}).get(i) or (0.0, 0.0)
+            vb, vf = ball_back.get(i), ball_fwd.get(i)
+            sides = [v for v in (vb, vf) if v is not None]
+            touch = False
+            if vb is not None and vf is not None:
+                sb, sf = math.hypot(*vb), math.hypot(*vf)
+                if sb >= PARAMS["touchMinSpeed"] and sf >= PARAMS["touchMinSpeed"]:
+                    cos = (vb[0] * vf[0] + vb[1] * vf[1]) / (sb * sf)
+                    touch = math.degrees(math.acos(max(-1.0, min(1.0, cos)))) >= PARAMS["touchTurnDegrees"]
+            if sides and not touch and min(math.dist(v, pv) for v in sides) > relative_limit:
                 states.append({"state": "loose", "ball": bxy, "passing": True})
                 continue
             states.append(
@@ -431,6 +517,7 @@ def control_states(projected, player_of, calibration_error=0.0):
                     "fragment": p0["id"],
                     "team": p0["team"],
                     "distance": round(d0, 2),
+                    "touch": touch,
                 }
             )
         else:
@@ -468,7 +555,15 @@ def control_spells(projected, states, sample_fps):
         spells.append(current)
     out = []
     for s in spells:
-        if len(s["frames"]) < minimum:
+        single = len(s["frames"]) == 1
+        one_touch = single and states[s["frames"][0]].get("touch")
+        # One sighting with the ball unseen on both sides (hidden at the feet) is
+        # control we could not confirm longer, not evidence against it.
+        i = s["frames"][0]
+        hidden = single and all(
+            j < 0 or j >= len(states) or states[j]["state"] == "unknown" for j in (i - 1, i + 1)
+        )
+        if len(s["frames"]) < minimum and not one_touch and not hidden:
             continue
         player, team, scene = s["key"]
         out.append(
@@ -642,7 +737,7 @@ def detect_shot(projected, template, directions, spell, sample_fps):
     goal_x = L if sign == 1 else 0.0
     origin = spell["endBall"]
     distance_to_goal = abs(goal_x - origin[0])
-    if distance_to_goal > PARAMS["maxShotOrigin"] * L:
+    if distance_to_goal > min(PARAMS["maxShotOrigin"] * L, PARAMS["maxShotDistance"]):
         return None
     horizon = PARAMS["shotTimeToLine"] + 0.5
     end = min(len(projected) - 1, spell["last"] + int(math.ceil(horizon * sample_fps)) + 1)
@@ -667,7 +762,7 @@ def detect_shot(projected, template, directions, spell, sample_fps):
         return None
     cross_y = first_xy[1] + vy * time_to_line
     centre = W / 2
-    if abs(cross_y - centre) > g / 2 + PARAMS["shotBand"]:
+    if abs(cross_y - centre) > g / 2 + max(PARAMS["shotBand"], PARAMS["shotBandWidth"] * W):
         return None
     beyond = None
     for t, xy, _, inferred in path:
@@ -771,6 +866,9 @@ def detect_events(projected, states, spells, template, directions, sample_fps, i
     for k, spell in enumerate(spells):
         nxt = spells[k + 1] if k + 1 < len(spells) else None
         shot = detect_shot(projected, template, directions, spell, sample_fps)
+        # A teammate collecting the ball soon after makes it a pass or a cross.
+        if shot and nxt and nxt["team"] == spell["team"] and nxt["scene"] == spell["scene"] and nxt["start"] - spell["end"] <= PARAMS["shotTimeToLine"]:
+            shot = None
         if shot:
             outcome, on_target = shot_outcome(shot, spell, nxt, template)
             confidence = 0.45 + (0.0 if shot["lowSpeed"] else 0.15) + (0.15 if outcome in ("saved", "goal-candidate", "off-target") else 0)

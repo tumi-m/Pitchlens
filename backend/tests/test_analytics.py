@@ -338,3 +338,22 @@ def test_entered_score_is_reported_and_validated(tmp_path, monkeypatch):
     assert client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "score", "value": [3, True]}]}).status_code == 400
     ok = client.post(f"/jobs/{job_id}/review", json={"decisions": [{"action": "score", "value": [3, 2]}]})
     assert ok.status_code == 200 and ok.json()["analysis"]["enteredScore"] == [3, 2]
+
+
+def test_stitching_scales_to_heavily_fragmented_matches():
+    import time
+    import tracemalloc
+
+    rng = np.random.default_rng(0)
+    frames = []
+    for k in range(3000):  # 10 minutes at 5 fps, 10 players, new fragment id every ~1 s
+        players = [player(1000 * j + k // 5, j % 2, (5 + j * 3 + rng.normal(0, 0.2), 10 + rng.normal(0, 0.2))) for j in range(10)]
+        frames.append({"t": round(k * 0.2, 2), "scene": 0, "players": players, "ball": None, "camera": [1, 0, 0, 0, 1, 0]})
+    projected, _ = analytics.project(frames, calibration_for(frames))
+    tracemalloc.start()
+    started = time.monotonic()
+    mapping = analytics.stitch_tracks(projected, FPS)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert len(mapping) == 6000 and len(set(mapping.values())) <= 60
+    assert peak < 200 * 1024 * 1024 and time.monotonic() - started < 60

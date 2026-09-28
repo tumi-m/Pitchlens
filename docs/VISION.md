@@ -181,3 +181,50 @@ and the ball centre each wobble by a few pixels, which alone exceeded the
 20-second 360p diagnostic of the reported night match, possession coverage
 went from 6% to 26% of the analysed time (engine 2.0 ball output; engine
 2.1 recovers fewer motion-only positions, so expect a lower figure).
+## Match analytics 3.0: pitch calibration, events and review
+
+This supersedes the "What is measured" and "Boundaries" sections above where
+they differ. Design decisions and sources: `docs/market-ready/DECISIONS.md`.
+
+**Pitch setup (calibration).** In the report, *Set up the pitch* lets a person
+pick a pitch preset or enter its size, pause on one frame and click four or
+more named landmarks (corners, halfway-line ends, centre spot, goal-post
+bases, box corners, penalty spots) plus optional points along straight lines.
+`backend/app/vision/pitch.py` fits a homography with one radial-distortion term
+(division model) by minimising image-pixel error, grid-searching the lens term
+(fisheye included) and keeping it only if held-out clicks agree better. The
+fit reports pixel error, leave-one-out error per landmark, the implied field
+of view and camera height, and refuses folded or collinear click sets.
+`calibrate.py` carries the calibration through the recorded camera motion and
+re-aligns it to the painted lines every second, at motion failures and after
+cuts, so a panning camera stays calibrated; unaligned stretches are left
+uncalibrated rather than guessed. The report draws the projected lines on the
+video for every frame as a visible check.
+
+**Analytics (`analytics.py`).** Runs on every change in about a second:
+- Ball state per frame: control (possession zone 1.1 m + 1.5 × calibration
+  error, ball moving with the player), contested, loose, or unknown.
+- Team possession from one team's won ball to the other's, passes in flight
+  included, dead ball excluded; the share is shown only with ≥60% coverage and
+  with a 95% interval.
+- Passes (complete / intercepted), interceptions, tackles, shots with
+  outcome-based on-target (keeper save, block, beyond the line), goal
+  candidates corroborated by centre-spot restarts, ball out of play on lined
+  pitches, field tilt, attack momentum, heatmaps, average positions, shot map.
+- Without calibration: possession, passes and interceptions only; shots,
+  goals, heatmaps are `null` (shown as a dash).
+
+**Review (`/jobs/{id}/review`).** Append-only decisions: confirm, reject,
+switch team, set shot outcome, add missed moments, set attacking direction,
+enter the final score. Goals count only when confirmed. Every decision is
+kept; analysis is recomputed from the model output plus decisions.
+
+**Tracking.** Default tracker since pipeline 2.2 is ByteTrack-style (Kalman,
+two-pass association, 3.5 s lost buffer, two-sighting confirmation);
+`VISION_TRACKER=legacy` restores the previous one. Track IDs remain short-term
+fragments, stitched offline; they are not player identities.
+
+**Evaluation.** `python backend/scripts/evaluate_match.py JOB_DIR labels.json`
+scores ball, events, possession and calibration against labels (format in
+`backend/app/evaluation/metrics.py`), and derives precision from a reviewer's
+decisions. See `docs/market-ready/RELEASE-GATES.md` for targets.
