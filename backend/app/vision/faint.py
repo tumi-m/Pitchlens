@@ -1,0 +1,264 @@
+"""Faint-object ball recovery: track-before-detect for small, low-resolution balls.
+
+A ball at 360p is a handful of pixels that seldom passes a detector's confidence
+bar in any single frame, yet it traces a smooth path across frames. Astronomers
+find faint moving objects the same way ("shift-and-stack", track-before-detect):
+keep weak evidence and confirm it by consistency over time.
+
+Two candidate sources feed the confirmation step:
+  1. the ball detector run at a low threshold (weak neural evidence), and
+  2. camera-compensated frame differencing (difference imaging), which finds
+     small fast-moving blobs the detector missed.
+A chain of candidates on a near-constant-velocity path over several frames is
+promoted to observed ball positions. Isolated blips stay unconfirmed.
+Gaps of at most `max_bridge` seconds inside a confirmed chain are bridged with
+positions marked `inferred: True`; they are never reported as observed.
+"""
+
+import math
+
+import cv2
+import numpy as np
+
+
+def ball_size_prior(players, frame_height):
+    """Expected ball diameter in pixels: about 1/8 of a player's height."""
+    heights = [p["box"][3] - p["box"][1] for p in players] if players else []
+    if heights:
+        return max(3.0, float(np.median(heights)) / 8)
+    return max(3.0, frame_height / 70)
+
+
+def difference_candidates(previous, current, matrix, players, diameter, limit=8, mask=None):
+    """Small bright blobs that moved against the camera-compensated background.
+
+    `mask` is the detected playing surface; candidates outside a generously
+    dilated version of it (spectators, boards, walls) are discarded.
+    """
+    if previous is None or matrix is None:
+        return []
+    h, w = current.shape[:2]
+    warped = cv2.warpAffine(previous, matrix, (w, h), flags=cv2.INTER_LINEAR)
+    grey_now = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+    grey_prev = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    diff = cv2.absdiff(grey_now, grey_prev)
+    # Border pixels the warp could not fill look like motion.
+    diff[:3, :] = 0
+    diff[-3:, :] = 0
+    diff[:, :3] = 0
+    diff[:, -3:] = 0
+    # Players move too: blank their boxes so limbs are not mistaken for balls.
+    for p in players:
+        x1, y1, x2, y2 = [int(v) for v in p["box"]]
+        cv2.rectangle(diff, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), 0, -1)
+    if mask is not None and mask.any():
+        k = max(3, int(h * 0.08))
+        region = cv2.dilate(mask, np.ones((k, k), np.uint8))
+        diff[region == 0] = 0
+    threshold = max(24, int(np.percentile(diff, 99.5)))
+    _, binary = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+    k = max(1, int(diameter / 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    found = []
+    lo, hi = diameter * 0.4, diameter * 2.2
+    for i in range(1, count):
+        bw, bh, area = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
+        size = max(bw, bh)
+        if not lo <= size <= hi or area < 0.35 * bw * bh:
+            continue
+        # Roundness: a ball's blob is compact; a limb or line is elongated.
+        if min(bw, bh) / max(bw, bh) < 0.4:
+            continue
+        cx, cy = centroids[i]
+        energy = float(diff[stats[i, cv2.CC_STAT_TOP] : stats[i, cv2.CC_STAT_TOP] + bh,
+                            stats[i, cv2.CC_STAT_LEFT] : stats[i, cv2.CC_STAT_LEFT] + bw].mean())
+        found.append(
+            {
+                "x": round(float(cx), 1),
+                "y": round(float(cy), 1),
+                "box": [round(float(cx - bw / 2), 1), round(float(cy - bh / 2), 1),
+                        round(float(cx + bw / 2), 1), round(float(cy + bh / 2), 1)],
+                # Deliberately weak: only a consistent trajectory can promote it.
+                "confidence": round(min(0.3, 0.05 + energy / 255), 3),
+                "source": "motion",
+            }
+        )
+    found.sort(key=lambda c: -c["confidence"])
+    return found[:limit]
+
+
+def _warp_point(xy, matrix):
+    return matrix @ np.array([xy[0], xy[1], 1.0])
+
+
+def confirm_chains(frames, matrices, diagonal, window=6, min_length=3, min_evidence=0.55):
+    """Track-before-detect over all sampled frames.
+
+    `matrices[i]` maps frame i-1 coordinates into frame i coordinates. A chain is
+    a sequence of candidates in consecutive-ish frames whose camera-compensated
+    positions follow a near-constant velocity. Chains with at least `min_length`
+    members and summed evidence >= `min_evidence` are confirmed.
+    Returns a list of {frame index -> candidate} promotions.
+    """
+    n = len(frames)
+    # Cumulative camera transform so any two frames can be compared in a common
+    # coordinate system (that of frame 0 within the current scene).
+    cumulative = [np.array([[1.0, 0, 0], [0, 1.0, 0]])]
+    for i in range(1, n):
+        m = matrices[i] if matrices[i] is not None else np.array([[1.0, 0, 0], [0, 1.0, 0]])
+        prev = cumulative[-1]
+        composed = np.vstack([m, [0, 0, 1]]) @ np.vstack([prev, [0, 0, 1]])
+        cumulative.append(composed[:2])
+
+    def world(i, c):
+        return _warp_point((c["x"], c["y"]), cumulative[i])
+
+    # Physical plausibility in image space. A hard pass crosses a small pitch in
+    # about a second, i.e. up to ~0.15 of the frame diagonal per sampled frame
+    # at 6 fps; anything faster is a jump between unrelated blobs.
+    max_step = diagonal * 0.15
+    gate = diagonal * 0.03  # prediction tolerance per frame of separation
+    best = {}  # (frame, candidate index) -> (score, length, previous key)
+    order = []
+    for i in range(n):
+        for j, c in enumerate(frames[i].get("ballCandidates", [])):
+            key = (i, j)
+            score, length, prev = c["confidence"], 1, None
+            wj = world(i, c)
+            # Link to the best chain ending within the window that predicts this point.
+            for back in range(1, window + 1):
+                k = i - back
+                if k < 0 or frames[k]["scene"] != frames[i]["scene"]:
+                    break
+                for l, ck in enumerate(frames[k].get("ballCandidates", [])):
+                    pk = (k, l)
+                    if pk not in best:
+                        continue
+                    s0, len0, prev0 = best[pk]
+                    wk = world(k, ck)
+                    if prev0 is not None:
+                        pv = world(prev0[0], frames[prev0[0]]["ballCandidates"][prev0[1]])
+                        velocity = (wk - pv) / max(1, k - prev0[0])
+                        predicted = wk + velocity * back
+                    else:
+                        predicted = wk
+                    if np.linalg.norm(wj - wk) > max_step * back:
+                        continue
+                    error = np.linalg.norm(wj - predicted)
+                    tolerance = gate * back + (0 if prev0 is not None else max_step * 0.6)
+                    if error > tolerance:
+                        continue
+                    candidate_score = s0 + c["confidence"] - 0.02 * back
+                    if candidate_score > score:
+                        score, length, prev = candidate_score, len0 + 1, pk
+            best[key] = (score, length, prev)
+            order.append(key)
+    # Walk chains from their strongest end, longest first, without reuse.
+    promoted = {}
+    used = set()
+    for key in sorted(order, key=lambda k: -best[k][0]):
+        if key in used or best[key][1] < min_length or best[key][0] < min_evidence:
+            continue
+        chain = []
+        cursor = key
+        while cursor is not None and cursor not in used:
+            chain.append(cursor)
+            cursor = best[cursor][2]
+        if len(chain) < min_length:
+            continue
+        members = [frames[i]["ballCandidates"][j] for i, j in chain]
+        neural = [m for m in members if m.get("source", "detector") != "motion"]
+        # A path made only of motion blobs needs to be long to count: feet,
+        # socks and hands also make small bright moving blobs.
+        if not neural and len(chain) < 2 * min_length:
+            continue
+        if neural and max(m["confidence"] for m in neural) < 0.1 and len(chain) < min_length + 2:
+            continue
+        evidence = best[key][0]
+        mean_conf = sum(m["confidence"] for m in members) / len(members)
+        chain_conf = round(min(0.6 if neural else 0.4, mean_conf + 0.04 * len(chain)), 3)
+        for i, j in chain:
+            used.add((i, j))
+            candidate = dict(frames[i]["ballCandidates"][j])
+            candidate["confidence"] = max(candidate["confidence"], chain_conf)
+            candidate["chainEvidence"] = round(float(evidence), 3)
+            candidate["chainLength"] = len(chain)
+            promoted[i] = candidate
+    return promoted
+
+
+def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0):
+    """A 'ball' that has not moved for several seconds (after cancelling camera
+    motion) is a pitch marking, a logo or a stray object, not the match ball."""
+    limit = max(2, int(round(seconds * sample_fps)))
+    tolerance = diagonal * 0.004
+    run = []  # indices of consecutive frames with a near-stationary ball
+    dropped = 0
+
+    def flush():
+        nonlocal dropped
+        if len(run) >= limit:
+            for i in run:
+                frames[i]["ball"] = None
+                dropped += 1
+        run.clear()
+
+    previous = None
+    for i, f in enumerate(frames):
+        b = f["ball"]
+        if b is None or b.get("inferred"):
+            flush()
+            previous = None
+            continue
+        if previous is not None and matrices[i] is not None and frames[i - 1]["scene"] == f["scene"]:
+            expected = _warp_point(previous, matrices[i])
+            if np.linalg.norm(np.array([b["x"], b["y"]]) - expected) <= tolerance:
+                if not run:
+                    run.append(i - 1)
+                run.append(i)
+            else:
+                flush()
+        else:
+            flush()
+        previous = (b["x"], b["y"])
+    flush()
+    return dropped
+
+
+def recover_ball(frames, matrices, diagonal, sample_fps, max_bridge=0.5):
+    """Fill missing ball observations from confirmed chains; bridge short gaps.
+
+    Returns counts: {"recovered": n, "inferred": n, "droppedStatic": n}.
+    """
+    promoted = confirm_chains(frames, matrices, diagonal)
+    recovered = 0
+    for i, candidate in promoted.items():
+        if frames[i]["ball"] is None:
+            frames[i]["ball"] = {**candidate, "trackId": -1, "observed": True, "recovered": True}
+            recovered += 1
+    # Bridge gaps between observed positions that are close in time and space.
+    inferred = 0
+    # `max_bridge` is the unobserved time allowed inside a chain.
+    max_gap = max(1, int(round(max_bridge * sample_fps))) + 1
+    last = None
+    for i, f in enumerate(frames):
+        if f["ball"] is not None and not f["ball"].get("inferred"):
+            if last is not None and 1 < i - last <= max_gap and frames[last]["scene"] == f["scene"]:
+                a, b = frames[last]["ball"], f["ball"]
+                if math.hypot(a["x"] - b["x"], a["y"] - b["y"]) <= diagonal * 0.12 * (i - last):
+                    for k in range(last + 1, i):
+                        s = (k - last) / (i - last)
+                        frames[k]["ball"] = {
+                            "x": round(a["x"] + (b["x"] - a["x"]) * s, 1),
+                            "y": round(a["y"] + (b["y"] - a["y"]) * s, 1),
+                            "box": None,
+                            "confidence": round(min(a["confidence"], b["confidence"]) * 0.8, 3),
+                            "trackId": a.get("trackId", -1),
+                            "observed": False,
+                            "inferred": True,
+                        }
+                        inferred += 1
+            last = i
+    dropped = drop_static_balls(frames, matrices, diagonal, sample_fps)
+    return {"recovered": recovered, "inferred": inferred, "droppedStatic": dropped}

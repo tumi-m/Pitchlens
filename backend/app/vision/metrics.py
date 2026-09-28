@@ -93,7 +93,8 @@ def derive_metrics(frames, sample_fps, duration):
     return {
         "sampledFrames": len(frames),
         "playerFrames": sum(bool(f["players"]) for f in frames),
-        "ballFrames": sum(f["ball"] is not None for f in frames),
+        "ballFrames": sum(f["ball"] is not None and not f["ball"].get("inferred") for f in frames),
+        "ballFramesInferred": sum(bool(f["ball"] and f["ball"].get("inferred")) for f in frames),
         "teamSeconds": [round(x, 2) for x in seconds],
         "unknownSeconds": round(max(0, duration - coverage), 2),
         "possessionShare": [round(x / coverage * 100, 1) if coverage else None for x in seconds],

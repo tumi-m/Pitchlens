@@ -21,7 +21,16 @@ export type VisionFrame = {
   t: number;
   scene: number;
   players: VisionPlayer[];
-  ball: { x: number; y: number; box: number[]; confidence: number } | null;
+  ball: {
+    x: number;
+    y: number;
+    box: number[] | null;
+    confidence: number;
+    /** Bridged between two observations on a confirmed path; not seen by the detector. */
+    inferred?: boolean;
+    /** Confirmed by consistency across frames rather than a single-frame detection. */
+    recovered?: boolean;
+  } | null;
 };
 export type VisionResult = {
   schemaVersion: 1;
@@ -38,6 +47,7 @@ export type VisionResult = {
     sampledFrames: number;
     playerFrames: number;
     ballFrames: number;
+    ballFramesInferred?: number;
     teamSeconds: number[];
     unknownSeconds: number;
     possessionShare: (number | null)[];

@@ -367,10 +367,17 @@ def test_tiled_ball_inference_merges_overlap_and_preserves_source_coordinates():
     from app.vision.ball import TiledBallDetector
 
     class Model:
-        def predict(self, image, **kwargs):
-            ys, xs = np.where(image[:, :, 0] > 0)
-            boxes = np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
-            return [SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.array([0.8])))]
+        def predict(self, images, **kwargs):
+            out = []
+            for image in images:
+                ys, xs = np.where(image[:, :, 0] > 0)
+                if len(xs):
+                    boxes = np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
+                    conf = np.array([0.8])
+                else:
+                    boxes, conf = np.zeros((0, 4)), np.zeros(0)
+                out.append(SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=conf)))
+            return out
 
     detector = TiledBallDetector.__new__(TiledBallDetector)
     detector.model, detector.classes, detector.device = Model(), [0], "cpu"
@@ -861,3 +868,107 @@ def test_pan_is_not_a_cut_but_a_new_shot_is():
     compare = lambda a, b: cv2.compareHist(colour_signature(a), colour_signature(b), cv2.HISTCMP_BHATTACHARYYA)
     assert compare(pitch, panned) < 0.2
     assert compare(pitch, crowd) > 0.5
+
+
+# ── Faint-object ball recovery (track-before-detect) ─────────────────────
+def test_weak_candidates_on_a_smooth_path_are_confirmed_but_blips_are_not():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for i in range(8):
+        cands = [{"x": 100 + 12 * i, "y": 200 - 3 * i, "box": None, "confidence": 0.12}]
+        if i == 4:
+            cands.append({"x": 500, "y": 50, "box": None, "confidence": 0.14})  # isolated blip
+        frames.append({"scene": 0, "ball": None, "ballCandidates": cands})
+    promoted = confirm_chains(frames, [identity] * 8, diagonal=734)
+    assert sorted(promoted) == list(range(8))
+    assert all(promoted[i]["x"] == 100 + 12 * i for i in range(8))
+    assert promoted[4]["y"] != 50
+
+
+def test_chain_never_crosses_a_scene_cut():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = [
+        {"scene": 0 if i < 4 else 1, "ball": None,
+         "ballCandidates": [{"x": 100 + 10 * i, "y": 100, "box": None, "confidence": 0.1}]}
+        for i in range(6)
+    ]
+    promoted = confirm_chains(frames, [identity] * 6, diagonal=734, min_length=3, min_evidence=0.25)
+    assert set(promoted) == {0, 1, 2, 3}
+
+
+def test_recovery_bridges_short_gaps_as_inferred_not_observed():
+    from app.vision.faint import recover_ball
+    from app.vision.metrics import derive_metrics
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for i in range(6):
+        ball = {"x": 100 + 20 * i, "y": 100, "box": [0, 0, 4, 4], "confidence": 0.7, "trackId": 1}
+        frames.append(
+            {"t": i * 0.2, "scene": 0, "players": [], "ball": None if i in (2, 3) else ball,
+             "ballCandidates": []}
+        )
+    counts = recover_ball(frames, [identity] * 6, diagonal=734, sample_fps=5, max_bridge=0.5)
+    assert counts["inferred"] == 2
+    assert frames[2]["ball"]["inferred"] and frames[2]["ball"]["x"] == 140
+    metrics = derive_metrics(frames, 5, 1.2)
+    assert metrics["ballFrames"] == 4 and metrics["ballFramesInferred"] == 2
+
+
+def test_difference_candidates_find_a_small_moving_blob_and_ignore_players():
+    from app.vision.faint import difference_candidates
+
+    prev = np.full((360, 640, 3), 60, np.uint8)
+    cur = prev.copy()
+    cur[180:186, 300:306] = 255  # ball-sized moving blob
+    cur[50:110, 100:130] = 255  # a player-sized change, inside a player box
+    players = [{"box": [100, 50, 130, 110]}]
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    found = difference_candidates(prev, cur, identity, players, diameter=6)
+    assert len(found) == 1
+    assert abs(found[0]["x"] - 302.5) < 1.5 and found[0]["source"] == "motion"
+    assert found[0]["confidence"] <= 0.3
+
+
+def test_motion_only_chains_need_to_be_long_and_stay_low_confidence():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    def run(n, source):
+        frames = [
+            {"scene": 0, "ball": None,
+             "ballCandidates": [{"x": 100 + 10 * i, "y": 100, "box": None, "confidence": 0.2, "source": source}]}
+            for i in range(n)
+        ]
+        return confirm_chains(frames, [identity] * n, diagonal=734)
+    assert run(4, "motion") == {}  # four socks in a row are not a ball
+    promoted = run(7, "motion")
+    assert len(promoted) == 7 and max(p["confidence"] for p in promoted.values()) <= 0.4
+
+
+def test_implausibly_fast_jumps_do_not_join_a_chain():
+    from app.vision.faint import confirm_chains
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = [
+        {"scene": 0, "ball": None,
+         "ballCandidates": [{"x": 100 + (300 if i % 2 else 0), "y": 100, "box": None, "confidence": 0.2}]}
+        for i in range(6)
+    ]
+    assert confirm_chains(frames, [identity] * 6, diagonal=734) == {}
+
+
+def test_long_stationary_ball_is_dropped_as_a_marking():
+    from app.vision.faint import drop_static_balls
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    ball = {"x": 50.0, "y": 50.0, "box": [48, 48, 52, 52], "confidence": 0.5, "trackId": 3}
+    frames = [{"scene": 0, "ball": dict(ball)} for _ in range(20)]
+    moving = [{"scene": 0, "ball": {**ball, "x": 50.0 + 15 * i}} for i in range(20)]
+    assert drop_static_balls(frames, [identity] * 20, 734, sample_fps=5) == 20
+    assert all(f["ball"] is None for f in frames)
+    assert drop_static_balls(moving, [identity] * 20, 734, sample_fps=5) == 0

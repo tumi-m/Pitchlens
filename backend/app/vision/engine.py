@@ -15,6 +15,7 @@ from threadpoolctl import threadpool_limits
 
 from app.vision.ball import create_ball_detector
 from app.vision.ball_tracking import BallTracker
+from app.vision.faint import ball_size_prior, difference_candidates, recover_ball
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
 from app.vision.tracking import MotionTracker, camera_motion
@@ -230,21 +231,32 @@ def run_video(
     if not people:
         raise ValueError("Player model must contain a named person/player class.")
 
-    def detect(frame):
-        r = model.predict(
-            frame,
-            conf=0.18,
+    def detect_batch(batch):
+        """Player detection for a list of frames in one model call."""
+        results = model.predict(
+            batch,
+            conf=0.15,
             imgsz=1280 if "player" in names.values() else 960,
             classes=people,
             device=device,
             # FP16 on a GPU roughly doubles throughput at no practical accuracy cost.
             quantize=16 if device.startswith("cuda") else None,
             verbose=False,
-        )[0]
-        boxes = r.boxes.xyxy.cpu().numpy()
-        scores = r.boxes.conf.cpu().numpy()
-        classes = r.boxes.cls.cpu().numpy().astype(int)
-        return boxes, scores, classes
+        )
+        return [
+            (
+                r.boxes.xyxy.cpu().numpy(),
+                r.boxes.conf.cpu().numpy(),
+                r.boxes.cls.cpu().numpy().astype(int),
+            )
+            for r in results
+        ]
+
+    def detect(frame):
+        return detect_batch([frame])[0]
+
+    # Batches amortise model overhead; a GPU processes 8 frames almost as fast as one.
+    batch_size = int(os.getenv("VISION_BATCH", "8" if device.startswith("cuda") else "2"))
 
     progress(stage="Learning kit colours from the footage", progress=1)
     cap = cv2.VideoCapture(str(path))
@@ -293,43 +305,16 @@ def run_video(
         progress=5,
         processedSeconds=0,
     )
-    try:
-        while frame_num / meta["fps"] < duration:
-            if cancelled():
-                raise InterruptedError("Analysis cancelled")
-            ok = cap.grab()
-            if not ok:
-                # Container frame counts are estimates: trimmed clips (edit lists)
-                # routinely declare several seconds more than they hold. The real
-                # end of the stream is the end of the analysis, reported below.
-                if frames:
-                    break
-                raise ValueError("Video decoding stopped before the requested duration.")
-            if frame_num % stride:
-                frame_num += 1
-                continue
-            ok, frame = cap.retrieve()
-            if not ok:
-                if frames:
-                    break
-                raise ValueError("Video decoding stopped before the end.")
-            # Phone footage is often variable frame rate: prefer the decoder's
-            # presentation time so overlays line up with the video.
-            position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            index_time = frame_num / meta["fps"]
-            # Trust decoder timestamps only while they agree with the frame count:
-            # fragmented/streaming MP4s can report drifting or offset positions,
-            # which would misplace every overlay box.
-            t = (
-                position
-                if math.isfinite(position)
-                and position > last_t
-                and abs(position - index_time) <= 0.5
-                else index_time
-            )
-            if frames and t <= last_t:
-                t = last_t + 1 / meta["fps"]
-            last_t = t
+    matrices = []  # per sampled frame: affine mapping the previous frame into this one
+    pending = []  # decoded frames awaiting a batched detection
+
+    def process(batch):
+        nonlocal previous_gray, previous_frame, previous_boxes, scene, reported
+        detections = detect_batch([b[1] for b in batch])
+        ball_batches = ball_detector.detect_batch([b[1] for b in batch], threshold=0.05)
+        for (t, frame), (boxes, scores, classes), raw_candidates in zip(
+            batch, detections, ball_batches
+        ):
             mask = field_mask(frame)
             pitch = pitch_colour(frame, mask)
             gray = colour_signature(frame)
@@ -345,7 +330,6 @@ def run_video(
             if cut:
                 scene += 1
             previous_gray = gray
-            boxes, scores, classes = detect(frame)
             observations = [
                 {
                     "team": assign_team(jersey(frame, box, pitch), centres, use_hue=not role_aware)
@@ -359,12 +343,23 @@ def run_video(
                 if c in people and inside_field(mask, box)
             ]
             players = tracker.update(observations, t, matrix, cut=cut)
+            # Weak neural candidates plus difference-imaging candidates; the
+            # track-before-detect pass after the loop decides which are real.
+            diameter = ball_size_prior(players, frame.shape[0])
+            candidates = list(raw_candidates)
+            if motion_ok and not cut:
+                candidates += difference_candidates(
+                    previous_frame, frame, matrix, players, diameter, mask=mask
+                )
+            candidates.sort(key=lambda c: -c["confidence"])
+            candidates = candidates[:12]
+            strong = [c for c in candidates if c["confidence"] >= 0.15]
             previous_frame = frame
             previous_boxes = [p["box"] for p in players]
-            candidates = ball_detector.detect(frame, threshold=0.15)
             # Airborne balls can be outside the green surface; temporal association
             # resolves candidates instead of rejecting them by background colour.
-            ball = ball_tracker.update(candidates, t, matrix, frame.shape, cut=cut)
+            ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
+            matrices.append(None if cut or not motion_ok else matrix)
             frames.append(
                 {
                     "t": round(t, 3),
@@ -382,25 +377,78 @@ def run_video(
                 elapsed = now - started
                 progress(
                     stage="Detecting players, tracking kits and following the ball",
-                    progress=round(5 + t / duration * 90, 1),
+                    progress=round(5 + t / duration * 88, 1),
                     processedSeconds=round(t, 1),
                     elapsedSeconds=round(elapsed),
                     etaSeconds=round(elapsed / max(t, 0.1) * (duration - t)),
                 )
+
+    try:
+        while frame_num / meta["fps"] < duration:
+            if cancelled():
+                raise InterruptedError("Analysis cancelled")
+            ok = cap.grab()
+            if not ok:
+                # Container frame counts are estimates: trimmed clips (edit lists)
+                # routinely declare several seconds more than they hold. The real
+                # end of the stream is the end of the analysis, reported below.
+                if frames or pending:
+                    break
+                raise ValueError("Video decoding stopped before the requested duration.")
+            if frame_num % stride:
+                frame_num += 1
+                continue
+            ok, frame = cap.retrieve()
+            if not ok:
+                if frames or pending:
+                    break
+                raise ValueError("Video decoding stopped before the end.")
+            # Phone footage is often variable frame rate: prefer the decoder's
+            # presentation time so overlays line up with the video.
+            position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            index_time = frame_num / meta["fps"]
+            # Trust decoder timestamps only while they agree with the frame count:
+            # fragmented/streaming MP4s can report drifting or offset positions,
+            # which would misplace every overlay box.
+            t = (
+                position
+                if math.isfinite(position)
+                and position > last_t
+                and abs(position - index_time) <= 0.5
+                else index_time
+            )
+            if (frames or pending) and t <= last_t:
+                t = last_t + 1 / meta["fps"]
+            last_t = t
+            pending.append((t, frame))
+            if len(pending) >= batch_size:
+                process(pending)
+                pending = []
             frame_num += 1
+        if pending:
+            process(pending)
+            pending = []
     finally:
         cap.release()
     if not frames or not any(f["players"] for f in frames):
         raise ValueError(
             "No on-pitch players detected. This video cannot be analysed by the installed model."
         )
+    progress(stage="Confirming faint ball tracks across frames", progress=94)
+    diagonal = math.hypot(meta["width"], meta["height"])
+    # VISION_FAINT=0 disables track-before-detect recovery (for comparisons).
+    faint = (
+        recover_ball(frames, matrices, diagonal, effective_fps)
+        if os.getenv("VISION_FAINT", "1") != "0"
+        else {"recovered": 0, "inferred": 0, "disabled": True}
+    )
     progress(stage="Measuring temporal observations", progress=96)
     analysed_duration = min(duration, max(frame_num / meta["fps"], last_t))
     vote_teams(frames)
     metrics = derive_metrics(frames, effective_fps, analysed_duration)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-1.6",
+        "pipelineVersion": "local-vision-2.0",
         "profile": profile,
         "source": "computer-vision",
         "videoSha256": file_sha256(path),
@@ -409,7 +457,8 @@ def run_video(
         "ballModel": ball_path.name,
         "ballModelSha256": file_sha256(ball_path),
         "ballInference": "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles",
-        "ballTracking": "camera-compensated-observations",
+        "ballTracking": "camera-compensated-observations+track-before-detect",
+        "ballRecovery": faint,
         "video": meta,
         "analysedDuration": analysed_duration,
         "sampleFps": effective_fps,
@@ -418,6 +467,7 @@ def run_video(
         "frames": frames,
         "limitations": [
             "Ball confidence scores are not calibrated probabilities.",
+            "Faint ball positions are confirmed by consistency across frames (track-before-detect); short gaps on a confirmed path are bridged and marked inferred.",
             "Possession is visible ball-to-player proximity, not official match possession.",
             "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
             "Track IDs change after occlusion and cuts; they are not player identities.",

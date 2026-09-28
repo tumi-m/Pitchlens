@@ -1,5 +1,6 @@
 """Football-specific ONNX inference with standard letterbox/NMS decoding."""
 
+import math
 import os
 from pathlib import Path
 
@@ -29,6 +30,9 @@ class BallDetector:
         self.height, self.width = self.input.shape[2:]
         if not isinstance(self.height, int) or not isinstance(self.width, int):
             raise ValueError("Ball model must declare fixed input dimensions")
+
+    def detect_batch(self, frames, threshold=0.2):
+        return [self.detect(frame, threshold) for frame in frames]
 
     def detect(self, frame, threshold=0.2):
         height, width = frame.shape[:2]
@@ -83,7 +87,16 @@ class BallDetector:
 
 
 class TiledBallDetector:
-    """Local YOLO weights trained for tiles, including Roboflow's football example."""
+    """Local YOLO weights trained for tiles, including Roboflow's football example.
+
+    Tiles are sized so a ball is always presented near the model's training
+    scale: a 360p frame is split into two tiles that get upscaled, a 1080p
+    frame into eight. All tiles of a batch of frames go through the model in
+    one call, which is where a GPU earns its keep.
+    """
+
+    TILE = 480  # native pixels per tile side before resizing to imgsz 640
+    OVERLAP = 48
 
     def __init__(self, path, device="cpu"):
         from ultralytics import YOLO
@@ -94,32 +107,58 @@ class TiledBallDetector:
             raise ValueError("Ball model must contain a named ball class")
         self.device = device
 
-    def detect(self, frame, threshold=0.2):
+    def tiles(self, frame):
         h, w = frame.shape[:2]
-        found = []
-        # Four overlapping half-frame crops preserve the training scale at any resolution.
-        for y in sorted({0, max(0, h // 2 - 50)}):
-            for x in sorted({0, max(0, w // 2 - 50)}):
-                tile = frame[y : min(h, y + h // 2 + 50), x : min(w, x + w // 2 + 50)]
-                result = self.model.predict(
-                    tile,
-                    imgsz=640,
-                    conf=threshold,
-                    classes=self.classes,
-                    device=self.device,
-                    quantize=16 if str(self.device).startswith("cuda") else None,
-                    verbose=False,
-                )[0]
-                for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
-                    box = [box[0] + x, box[1] + y, box[2] + x, box[3] + y]
-                    found.append(
-                        {
-                            "x": (box[0] + box[2]) / 2,
-                            "y": (box[1] + box[3]) / 2,
-                            "box": box,
-                            "confidence": confidence,
-                        }
-                    )
+        cols = max(1, math.ceil(w / self.TILE))
+        rows = max(1, math.ceil(h / self.TILE))
+        tw, th = math.ceil(w / cols), math.ceil(h / rows)
+        out = []
+        for r in range(rows):
+            for c in range(cols):
+                x0 = max(0, c * tw - self.OVERLAP)
+                y0 = max(0, r * th - self.OVERLAP)
+                x1 = min(w, (c + 1) * tw + self.OVERLAP)
+                y1 = min(h, (r + 1) * th + self.OVERLAP)
+                out.append((x0, y0, frame[y0:y1, x0:x1]))
+        return out
+
+    def detect_batch(self, frames, threshold=0.2):
+        """Detect in several frames with one model call. Returns a list per frame."""
+        crops, owners = [], []
+        for index, frame in enumerate(frames):
+            for x0, y0, tile in self.tiles(frame):
+                crops.append(tile)
+                owners.append((index, x0, y0))
+        if not crops:
+            return [[] for _ in frames]
+        results = self.model.predict(
+            crops,
+            imgsz=640,
+            conf=threshold,
+            classes=self.classes,
+            device=self.device,
+            quantize=16 if str(self.device).startswith("cuda") else None,
+            verbose=False,
+        )
+        per_frame = [[] for _ in frames]
+        for result, (index, x0, y0) in zip(results, owners):
+            for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+                box = [box[0] + x0, box[1] + y0, box[2] + x0, box[3] + y0]
+                per_frame[index].append(
+                    {
+                        "x": round((box[0] + box[2]) / 2, 1),
+                        "y": round((box[1] + box[3]) / 2, 1),
+                        "box": [round(v, 1) for v in box],
+                        "confidence": round(confidence, 3),
+                    }
+                )
+        return [self._suppress(found, threshold) for found in per_frame]
+
+    def detect(self, frame, threshold=0.2):
+        return self.detect_batch([frame], threshold)[0]
+
+    @staticmethod
+    def _suppress(found, threshold):
         if not found:
             return []
         boxes = [

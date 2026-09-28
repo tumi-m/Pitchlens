@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
 import { AnimatePresence, motion } from "framer-motion";
+import { checkFootage, FootageCheck } from "@/lib/review/footageCheck";
 import {
   VisionHealth,
   VisionError,
@@ -16,6 +17,25 @@ import {
 export function VisionUpload({ onManual }: { onManual: () => void }) {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
+  const [check, setCheck] = useState<FootageCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+  const checkRun = useRef<AbortController | null>(null);
+  useEffect(() => {
+    checkRun.current?.abort();
+    setCheck(null);
+    if (!file) return;
+    const controller = new AbortController();
+    checkRun.current = controller;
+    setChecking(true);
+    checkFootage(file, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setCheck(result);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setChecking(false);
+      });
+    return () => controller.abort();
+  }, [file]);
   const [source, setSource] = useState<"file" | "youtube">("file");
   const [link, setLink] = useState("");
   const [rights, setRights] = useState(false);
@@ -315,6 +335,58 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </label>
             </div>
           )}
+          <AnimatePresence>
+            {file && (checking || check) && (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+                className="glass-card p-5"
+                aria-live="polite"
+              >
+                {checking && !check ? (
+                  <p className="text-sm text-pitch-muted">Checking the footage…</p>
+                ) : check ? (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <p className="text-xs uppercase tracking-widest text-pitch-muted">Footage check</p>
+                        <p className="font-semibold">
+                          {check.width}×{check.height} · {Math.round(check.duration / 60)} min · ball ≈ {check.ballPixels}px wide
+                        </p>
+                      </div>
+                      <span
+                        className="px-3 py-1 rounded-full text-sm font-bold"
+                        style={{
+                          background:
+                            check.grade === "great" ? "#22c55e" : check.grade === "good" ? "#84cc16" : check.grade === "limited" ? "#f59e0b" : "#ef4444",
+                          color: "#0b0f1a",
+                        }}
+                      >
+                        {check.score}/100 · {check.grade}
+                      </span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                      <motion.div
+                        className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${check.score}%` }}
+                        transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+                      />
+                    </div>
+                    <ul className="text-sm text-pitch-muted space-y-1">
+                      {check.notes.map((n) => (
+                        <li key={n}>· {n}</li>
+                      ))}
+                      {check.grade === "great" && check.notes.length <= 1 && (
+                        <li>· One fixed, high camera showing the whole pitch gives the best results.</li>
+                      )}
+                    </ul>
+                  </div>
+                ) : null}
+              </motion.div>
+            )}
+          </AnimatePresence>
           <label className="block text-sm">
             Match title
             <input
