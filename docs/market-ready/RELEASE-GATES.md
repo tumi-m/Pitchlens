@@ -29,7 +29,7 @@ distinguishable kits.
 | Ball: precision of emitted positions | ≥ 98% | Unknown on held-out labels (retrospective: 8/8 on one night clip) |
 | Ball: visible-ball recall at max(3 px, ½ diameter) | ≥ 90% | Unknown |
 | Players: recall at IoU ≥ 0.5 | ≥ 95% | Unknown |
-| Team: accuracy on emitted labels / coverage | ≥ 98% / ≥ 90% | Unknown (coverage 74-84% of observations on local clips) |
+| Team: accuracy on emitted labels / coverage | ≥ 98% / ≥ 90% | Coverage 89% on the 3-min indoor clip with the new tracker (was 80%); accuracy unknown |
 | Calibration: held-out landmark error | median ≤ 1 m, p95 ≤ 2 m | Synthetic: ≤ 0.5 m through a pan with motion gaps; real footage unknown |
 | Possession share error vs adjudicated labels | MAE ≤ 5 pts, p95 ≤ 10 pts, coverage ≥ 85% | Tracking-level proxy (E8, held-out 11v11 match): 0.8-3.4 pts; coverage 48-90% depending on degradation. Not yet measured from video |
 | Passes | precision ≥ 95%, recall ≥ 85% | Tracking-level proxy (E8): P 0.65-0.83, R 0.29-0.82. Not met |

@@ -41,6 +41,8 @@ Development data only unless marked; none of these is a held-out result.
 - After offline stitching: 151 player tracks (previously 209). Possession
   followed (41%) and event counts unchanged: no regression.
 - Decision: new tracker is the default (`VISION_TRACKER=legacy` reverts).
+- Side effect: with longer tracks the per-track kit vote covers 89% of player
+  observations (legacy tracker: 80%). Accuracy of those labels is unmeasured.
 
 ## E6 · Research-grounded analytics on real results (2026-09-28)
 - Data: owner's 20 s GPU diagnostic of the night 5-a-side (360p, uncalibrated);
