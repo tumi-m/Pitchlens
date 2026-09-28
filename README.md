@@ -1,6 +1,6 @@
 # Pitchlens
 
-**Automatic computer vision is available.** Run it on your computer with [the vision setup guide](docs/VISION.md), or put it online for the Vercel site with [DEPLOY-VISION.md](docs/DEPLOY-VISION.md). Upload a video to run player/ball detection, kit grouping, tracking and evidence-linked possession/pass candidates. Manual review remains a secondary workflow.
+**Automatic computer vision is available.** Run it on your computer with [the vision setup guide](docs/VISION.md), or put it online for the Vercel site with [DEPLOY-VISION.md](docs/DEPLOY-VISION.md). Upload a video to get a Sofascore-style match report: possession, passes and interceptions automatically; after a two-minute pitch setup (or a saved venue for fixed cameras) also shots, shot map, heatmaps and average positions. Goals and shots are proposed for fast human confirmation, and every figure shows how much of the match it covers. Manual review remains a secondary workflow. What is measured, and how well, is in [docs/market-ready](docs/market-ready/STATUS.md).
 
 Football video review grounded in footage.
 
@@ -28,7 +28,7 @@ Open http://localhost:3000. No Firebase account, paid service or environment fil
 
 **Data stays on this device:** IndexedDB stores video; localStorage stores review metadata. Clearing browser data removes reviews. Exported JSON contains timestamps, notes, observed counts and optional frame evidence, but not the video. Keep your original footage. Import the exported JSON from Your Matches, then reconnect the original video. Imports create a separate review and are labelled as supplied, unverified observations. Files up to 3 MB and 10,000 tags are supported.
 
-**Manual-mode measurements:** duration and resolution come from the video decoder. Event counts come from explicitly labelled manual tags. Untagged events are unknown. This mode does not calculate automatic analytics. The vision mode separately estimates observed possession and pass candidates, with explicit coverage; it does not measure goals, xG or calibrated pitch heatmaps.
+**Manual-mode measurements:** duration and resolution come from the video decoder. Event counts come from explicitly labelled manual tags. Untagged events are unknown. This mode does not calculate automatic analytics. The vision mode separately estimates possession, passes and (with a pitch setup) shots and heatmaps, with explicit coverage; goals count only when a person confirms them, and xG, speed and distance are not measured.
 
 ## Optional AI frame inspection
 
@@ -42,7 +42,8 @@ Development permits local guest inference. **Production requires proof of access
 
 - `frontend/app/upload`: automatic vision upload by default; optional manual review.
 - `frontend/app/vision`, `components/vision`, `app/api/vision`: job progress, detection overlays, estimates and local-worker proxy.
-- `backend/app/vision`: local YOLO + football ONNX engine with camera-motion tracking, temporal measurements and authenticated worker.
+- `backend/app/vision`: local YOLO + football ONNX engine with camera-motion tracking, temporal measurements and authenticated worker; `pitch.py`/`calibrate.py` pitch calibration, `analytics.py` possession, events and stats, reviewer decisions and venues in `server.py`.
+- `backend/app/evaluation`, `backend/scripts/evaluate_*.py`: accuracy measurement against labels and against public labelled tracking data.
 - `frontend/components/review/ReviewRoom.tsx`: player, timeline, manual tags, notes, export, deletion.
 - `frontend/lib/review`: typed evidence contract, summary calculations, IndexedDB video storage.
 - `frontend/app/api/infer`: bounded JPEG proxy, explicit errors, production token verification.
