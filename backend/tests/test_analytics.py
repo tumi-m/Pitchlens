@@ -521,3 +521,15 @@ def test_venue_reuse_is_verified_against_the_painted_lines(tmp_path):
     bad = {**good, "H": (np.linalg.inv(H) @ np.linalg.inv(moved)).tolist()}
     with pytest.raises(ValueError, match="do not line up"):
         calibrate.build_from_venue(result, bad, video)
+
+
+def test_a_shot_is_inferred_when_the_shooters_touch_was_not_seen():
+    frames = build_match()
+    # Hide the ball whenever player 2 has it: the release is never observed.
+    for f in frames:
+        if f["ball"] is not None and abs(f["ball"]["x"] - img((18.3, 12))[0]) < 1:
+            f["ball"] = None
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    shots = [e for e in out["events"] if e["type"] == "shot"]
+    assert len(shots) == 1 and shots[0]["team"] == 0 and shots[0].get("inferred")
+    assert shots[0]["needsReview"] and shots[0]["confidence"] <= 0.35

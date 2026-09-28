@@ -33,7 +33,7 @@ distinguishable kits.
 | Calibration: held-out landmark error | median ≤ 1 m, p95 ≤ 2 m | Synthetic: ≤ 0.5 m through a pan with motion gaps; real footage unknown |
 | Possession share error vs adjudicated labels | MAE ≤ 5 pts, p95 ≤ 10 pts, coverage ≥ 85% | Tracking-level proxy (E8, held-out 11v11 match): 0.8-3.4 pts; coverage 48-90% depending on degradation. Not yet measured from video |
 | Passes | precision ≥ 95%, recall ≥ 85% | Tracking-level proxy (E8): P 0.65-0.83, R 0.29-0.82. Not met |
-| Shots | precision ≥ 95%, recall ≥ 90% | Tracking-level proxy (E8): F1 0.08-0.40. Not met; always reviewed |
+| Shots | precision ≥ 95%, recall ≥ 90% | Tracking-level proxy (E9): recall 46-92%, precision 31-39%. Not met; always reviewed |
 | Held-out sample | ≥ 30 matches, ≥ 5 venues, ≥ 100 examples per event | 0 (owner to supply footage) |
 
 ## Gate 3 · Advanced player analytics

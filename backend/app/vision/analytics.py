@@ -830,6 +830,48 @@ def shot_outcome(shot, spell, nxt, template):
     return "unresolved", None
 
 
+def inferred_shots(projected, spells, template, directions, sample_fps, known, add):
+    L, W, g = template["length"], template["width"], template["goalWidth"]
+    centre = W / 2
+    band = g / 2 + max(PARAMS["shotBand"], PARAMS["shotBandWidth"] * W)
+    seen = [(i, f["t"], f["ball"]["xy"]) for i, f in enumerate(projected) if f["ball"] and f["ball"]["xy"] is not None and not f["ball"]["inferred"]]
+    spell_starts = [s["first"] for s in spells]
+    found = []
+    last_t = -math.inf
+    for k in range(len(seen) - 2):
+        (i0, t0, p0), (i1, t1, p1), (i2, t2, p2) = seen[k], seen[k + 1], seen[k + 2]
+        if t2 - t0 > 0.8 or projected[i0]["scene"] != projected[i2]["scene"] or t0 - last_t < 3.0:
+            continue
+        vx = np.polyfit([t0, t1, t2], [p0[0], p1[0], p2[0]], 1)[0]
+        vy = np.polyfit([t0, t1, t2], [p0[1], p1[1], p2[1]], 1)[0]
+        speed = math.hypot(vx, vy)
+        if speed < PARAMS["minShotSpeed"] or abs(vx) < 1e-6:
+            continue
+        goal_x = L if vx > 0 else 0.0
+        if abs(goal_x - p0[0]) > min(PARAMS["maxShotOrigin"] * L, PARAMS["maxShotDistance"]):
+            continue
+        ttl = (goal_x - p0[0]) / vx
+        if not 0 < ttl <= PARAMS["shotTimeToLine"]:
+            continue
+        cross = p0[1] + vy * ttl
+        if abs(cross - centre) > band:
+            continue
+        # The team attacking that goal took it.
+        team = next((tm for tm in (0, 1) if attack_sign(directions, tm, t0) == (1 if goal_x == L else -1)), None)
+        if team is None or any(abs(e["t"] - t0) <= 2.0 for e in known + found):
+            continue
+        nxt = next((s for s in spells if s["first"] > i0), None)
+        if nxt is not None and nxt["team"] == team and nxt["start"] - t0 <= PARAMS["shotTimeToLine"]:
+            continue  # a teammate collected it: a pass or cross
+        on_target = abs(cross - centre) <= g / 2 + PARAMS["onTargetMargin"]
+        add("shot", t0, team, 0.3, x=round(p0[0], 2), y=round(p0[1], 2), outcome="unresolved", onTarget=None if on_target else False,
+            speed=round(speed, 1), distance=round(abs(goal_x - p0[0]), 1), needsReview=True, inferred=True,
+            note="The ball was seen flying towards goal; the shooter's touch was not seen.")
+        found.append({"t": t0, "team": team})
+        last_t = t0
+    return found
+
+
 def detect_kickoffs(projected, dead_intervals, directions, template, sample_fps):
     """Centre restarts: play stopped, both teams in their own half, a player on the centre spot."""
     if not template or not directions or not directions.get("segments"):
@@ -958,6 +1000,12 @@ def detect_events(projected, states, spells, template, directions, sample_fps, i
             else:
                 add("pass", spell["end"], spell["team"], confidence - 0.05, outcome="intercepted", length=round(travel, 1) if travel is not None else None, **common)
                 add("interception", nxt["start"], nxt["team"], confidence - 0.05, lostBy=spell["team"], **common)
+    # Shots whose release was not seen (the ball hidden at the shooter's feet):
+    # a fast ball heading for a goal from shooting range, not collected by a
+    # teammate of the attacking side. Lower confidence; always reviewed.
+    if template and directions and directions.get("segments"):
+        shots += inferred_shots(projected, spells, template, directions, sample_fps, shots, add)
+
     # Ball out of play (lined pitches only; a walled cage keeps it in).
     if template and not template.get("walls"):
         L, W = template["length"], template["width"]

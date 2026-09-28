@@ -3,6 +3,18 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E9 · Shots inferred from the ball's flight (2026-09-28)
+- Hypothesis: most missed shots have the release hidden at the feet; a fast
+  ball heading for goal from range, not collected by the attacking side, is a
+  shot by the team attacking that goal.
+- Tuned on game 1 (speed bar 8 m/s kept: 10-12 m/s cost more recall than they
+  saved in false shots). Held-out game 2, shot recall / F1:
+  none 33% → 92% / 0.40 → 0.54; moderate 13% → 67% / 0.20 → 0.45;
+  heavy 4% → 46% / 0.08 → 0.37. Precision ~0.31-0.39: about two proposals per
+  real shot, which the reviewer confirms or rejects. Goal candidates on clean
+  tracking: 5 of 5 real goals flagged, no false ones.
+- Decision: adopt, marked `inferred`, confidence 0.3, always reviewed.
+
 ## E8 · Event engine against human-labelled events (Metrica open data, 2026-09-28)
 - Data: Metrica Sports sample games 1 and 2 (25 fps optical tracking with
   hand-labelled events; acknowledged, not redistributed). Game 1 = development
