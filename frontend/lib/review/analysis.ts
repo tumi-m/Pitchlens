@@ -168,18 +168,19 @@ export type TeamStats = {
   /** Team possession: won ball to lost ball, including passes in flight. */
   possessionSeconds: number;
   possession: number | null;
-  possessions: number;
+  /** Null when no kit labels were available (unmeasured, not zero). */
+  possessions: number | null;
   averagePossession: number | null;
-  passes: CountStat;
-  passesComplete: CountStat;
+  passes: CountStat | null;
+  passesComplete: CountStat | null;
   passAccuracy: number | null;
   /** Share of all detected passes: the pass-based possession definition, as a cross-check. */
   passShare?: number | null;
   shots: CountStat | null;
   shotsOnTarget: CountStat | null;
   goals: { value: number; candidates: number } | null;
-  interceptions: CountStat;
-  tackles: CountStat;
+  interceptions: CountStat | null;
+  tackles: CountStat | null;
   /** Share of both teams' attacking-third control that was this team's. */
   fieldTilt: number | null;
 };

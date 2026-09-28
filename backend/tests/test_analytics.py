@@ -622,3 +622,92 @@ def test_an_unverifiable_venue_is_refused_for_a_moving_camera():
     venue = {"id": "v", "name": "Court", "template": TEMPLATE, "size": [640, 360], "k1": 0.0, "H": np.linalg.inv(TO_IMAGE).tolist()}
     with pytest.raises(ValueError, match="no longer on the server"):
         calibrate.build_from_venue(result, venue, None)
+
+
+def test_a_stale_accept_never_confirms_a_goal_the_reviewer_did_not_see():
+    from app.vision.analytics import apply_review, confirmed_goals
+
+    # The reviewer accepted a shot whose outcome was unknown.
+    review = {"decisions": [{"action": "accept", "eventId": "ev-1", "event": {"type": "shot", "t": 3.6, "team": 0, "outcome": "unresolved"}}]}
+    # Re-analysis (new calibration or direction) now reads it as a possible goal.
+    after = [
+        {"id": "ev-0", "type": "pass", "t": 1.0, "team": 0, "status": "proposed"},
+        {"id": "ev-1", "type": "shot", "t": 3.6, "team": 0, "status": "proposed", "outcome": "goal-candidate", "onTarget": True},
+    ]
+    merged, _ = apply_review(after, review)
+    shots = [e for e in merged if e["type"] == "shot"]
+    assert len(shots) == 1 and shots[0]["status"] == "confirmed" and shots[0]["outcome"] == "unresolved"
+    assert confirmed_goals(merged, 0) == 0
+    # A fingerprint without an outcome is read as an unresolved shot too.
+    review["decisions"][0]["event"].pop("outcome")
+    merged, _ = apply_review(after, review)
+    assert confirmed_goals(merged, 0) == 0
+
+
+def test_an_outfield_defender_winning_the_ball_near_goal_is_a_block_not_a_save():
+    frames = build_match()
+    for f in frames:
+        f["players"].append(player(14, 1, (36.5, 11.2)))
+        if f["ball"] is not None and f["ball"]["x"] > img((36.0, 0))[0]:
+            f["ball"] = ball((36.8, 11.2))
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    shot = next(e for e in out["events"] if e["type"] == "shot")
+    assert shot["outcome"] == "blocked" and shot["onTarget"] is False
+    assert out["stats"]["teams"][0]["shotsOnTarget"]["value"] == 0
+
+
+def test_the_opening_kick_off_after_a_warm_up_is_not_a_possible_goal():
+    frames = []
+    t = 0.0
+
+    def add(players, ball_xy):
+        nonlocal t
+        frames.append({"t": round(t, 2), "scene": 0, "players": players, "ball": ball(ball_xy) if ball_xy else None, "camera": [1, 0, 0, 0, 1, 0]})
+        t += 0.2
+
+    moving = lambda k: [player(1, 0, (10 + 0.3 * (k % 10), 8)), player(2, 0, (14, 12 + 0.3 * (k % 7))), player(3, 0, (6, 5 + 0.3 * (k % 5))),
+                        player(11, 1, (26 - 0.3 * (k % 10), 9)), player(12, 1, (30, 6 + 0.3 * (k % 6))), player(13, 1, (33, 14 - 0.3 * (k % 8)))]
+    for k in range(150):  # 30 s of warm-up
+        add(moving(k), (10.3 + 0.3 * (k % 10), 8))
+    # Line-up: everyone in their own half, team 1 on the centre spot, then kick-off.
+    still = [player(1, 0, (12, 8)), player(2, 0, (15, 13)), player(3, 0, (8, 6)), player(11, 1, (20.5, 10)), player(12, 1, (26, 6)), player(13, 1, (28, 14))]
+    for k in range(100):
+        add(still, (20, 10) if k > 80 else None)
+    for k in range(20):
+        add(moving(200 + k), (20 + 0.5 * k, 10))
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    assert out["kickoffs"] and out["kickoffs"][0]["t"] > 20
+    assert not any(e["type"] == "goal-candidate" for e in out["events"])
+
+
+def test_counts_are_unmeasured_not_zero_without_kit_labels():
+    frames = build_match()
+    for f in frames:
+        for p in f["players"]:
+            p["team"] = -1
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    team0 = out["stats"]["teams"][0]
+    for key in ("passes", "passesComplete", "shots", "shotsOnTarget", "interceptions", "tackles", "possessions"):
+        assert team0[key] is None, key
+    # A pass the reviewer logged by hand is counted.
+    review = {"decisions": [{"action": "add", "type": "pass", "t": 1.0, "team": 0}]}
+    out = analytics.analyse(result_for(frames), calibration_for(frames), review=review)
+    assert out["stats"]["teams"][0]["passes"]["value"] == 1
+
+
+def test_an_off_pitch_bystander_does_not_split_a_player_across_a_missed_frame():
+    def run(bystander_start):
+        frames = []
+        for k in range(21):
+            players = []
+            if k != 10:
+                players.append(player(1 if k < 10 else 2, 0, (5 + 0.8 * k, 10)))
+            if bystander_start is not None and k >= bystander_start:
+                players.append(player(3, -1, (20, -2.5)))  # beyond the off-pitch margin
+            frames.append({"t": round(k * 0.2, 2), "scene": 0, "players": players, "ball": None, "camera": [1, 0, 0, 0, 1, 0]})
+        projected, _ = analytics.project(frames, calibration_for(frames))
+        return analytics.stitch_tracks(projected, FPS)
+
+    for start in (None, 10, 12):
+        mapping = run(start)
+        assert mapping[1] == mapping[2], start

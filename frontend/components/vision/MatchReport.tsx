@@ -237,8 +237,8 @@ export function MatchReport({
             <Row label="Accurate passes" a={count(A.passesComplete)} b={count(B.passesComplete)} colours={colours} />
             <Row
               label="Pass accuracy"
-              a={{ value: A.passAccuracy, note: A.passAccuracy === null && A.passes.value ? "needs 20+ passes" : undefined }}
-              b={{ value: B.passAccuracy, note: B.passAccuracy === null && B.passes.value ? "needs 20+ passes" : undefined }}
+              a={{ value: A.passAccuracy, note: A.passAccuracy === null && A.passes?.value ? "needs 20+ passes" : undefined }}
+              b={{ value: B.passAccuracy, note: B.passAccuracy === null && B.passes?.value ? "needs 20+ passes" : undefined }}
               colours={colours}
               format={pct}
             />
@@ -287,6 +287,10 @@ export function MatchReport({
               </div>
               {analysis.stats.shotMap?.length ? (
                 <ShotMap analysis={analysis} colours={colours} names={names} onSeek={onSeek} />
+              ) : A.shots === null ? (
+                <p className="text-sm text-pitch-muted py-6 text-center">
+                  Shots need to know which way each team attacks. Set the direction in the review, or add shots you saw.
+                </p>
               ) : (
                 <p className="text-sm text-pitch-muted py-6 text-center">No shots detected. Add any you saw in the review.</p>
               )}

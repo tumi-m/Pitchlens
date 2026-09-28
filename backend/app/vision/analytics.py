@@ -248,12 +248,14 @@ def stitch_tracks(projected, sample_fps):
                         error = min(math.dist(predicted, pb), math.dist(pa, pb))
                         limit = vmax * gap + 1.5
                     else:
-                        # One side lacks pitch positions: compare both in image space.
-                        pa, va, _, ha = motion(a["last"]["frames"], True, force_image=True)
-                        pb, _, _, hb = motion(b["first"]["frames"], False, force_image=True)
-                        height = (ha + hb) / 2
-                        predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
-                        error = min(math.dist(predicted, pb), math.dist(pa, pb)) / height
+                        # One side lacks pitch positions: compare both in image space
+                        # (locals, so the ender's metric motion stays intact for the
+                        # next candidate).
+                        ia, iva, _, iha = motion(a["last"]["frames"], True, force_image=True)
+                        ib, _, _, ihb = motion(b["first"]["frames"], False, force_image=True)
+                        height = (iha + ihb) / 2
+                        predicted = (ia[0] + iva[0] * gap, ia[1] + iva[1] * gap)
+                        error = min(math.dist(predicted, ib), math.dist(ia, ib)) / height
                         limit = 1.2 * gap + 0.8  # body heights
                     if error > limit:
                         continue
@@ -544,6 +546,7 @@ def control_states(projected, player_of, calibration_error=0.0):
                     "player": player_of.get(p0["id"], p0["id"]),
                     "fragment": p0["id"],
                     "team": p0["team"],
+                    "role": p0.get("role"),
                     "distance": round(d0, 2),
                     "touch": touch,
                 }
@@ -605,6 +608,7 @@ def control_spells(projected, states, sample_fps):
                 "end": projected[s["last"]]["t"],
                 "startBall": states[s["first"]].get("ball"),
                 "endBall": states[s["last"]].get("ball"),
+                "role": states[s["first"]].get("role"),
             }
         )
     return out
@@ -823,6 +827,11 @@ def shot_outcome(shot, spell, nxt, template):
         return "off-target", False
     if nxt and nxt["team"] != spell["team"] and nxt["start"] - spell["end"] <= PARAMS["saveWindow"]:
         where = nxt["startBall"]
+        if nxt.get("role") == "player":
+            # A role-aware detector says an outfield defender won it: a block,
+            # wherever it happened. The keeper-zone rule below is the fallback
+            # when the detector cannot tell keepers apart.
+            return "blocked", False
         if in_keeper_zone(where, shot["goalX"], template):
             return ("saved", True) if between_posts else ("off-target", False)
         if where is not None and abs(where[0] - shot["goalX"]) >= 1.5:
@@ -1024,11 +1033,17 @@ def detect_events(projected, states, spells, template, directions, sample_fps, i
     kickoffs = detect_kickoffs(projected, dead_intervals, directions, template, sample_fps)
     start_t = projected[0]["t"] if projected else 0
     lo, hi = PARAMS["kickoffWindow"]
-    for ko in kickoffs:
+    for k, ko in enumerate(kickoffs):
         if ko["t"] - start_t < 20:
             continue  # the match's own kick-off
+        # The first restart may also be the match's own kick-off (a recording
+        # that starts during the warm-up or line-up): it only counts as goal
+        # evidence when a shot by the would-be scorer was seen just before it.
+        opening = k == 0
         scorer = 1 - ko["team"]
         prior = [s for s in shots if s["team"] == scorer and lo <= ko["t"] - s["t"] <= hi]
+        if opening and not prior:
+            continue
         if prior:
             shot = prior[-1]
             existing = next((e for e in events if e["type"] == "goal-candidate" and abs(e["t"] - shot["t"]) < 0.01), None)
@@ -1088,12 +1103,34 @@ def apply_review(events, review):
         candidate = by_id.get(eid)
         if not isinstance(fp, dict) or not _number(fp.get("t")):
             return candidate  # decisions made before fingerprints existed
-        if candidate is not None and candidate["type"] == fp.get("type") and abs(candidate["t"] - fp["t"]) <= 0.05:
+
+        seen_outcome = fp.get("outcome")
+        if seen_outcome is None and fp.get("type") == "shot":
+            seen_outcome = "unresolved"
+
+        def differs(e):
+            team = fp.get("team") in (0, 1) and e.get("team") != fp["team"]
+            outcome = seen_outcome is not None and (e.get("outcome") or "unresolved") != seen_outcome
+            return team + outcome
+
+        if candidate is not None and candidate["type"] == fp.get("type") and abs(candidate["t"] - fp["t"]) <= 0.05 and not differs(candidate):
             return candidate
         options = [e for e in current if e["type"] == fp.get("type") and abs(e["t"] - fp["t"]) <= REANCHOR_SECONDS]
-        if options:
-            return min(options, key=lambda e: (e.get("team") != fp.get("team"), abs(e["t"] - fp["t"])))
-        return None
+        if not options:
+            return None
+        target = min(options, key=lambda e: (differs(e), abs(e["t"] - fp["t"])))
+        if differs(target):
+            # Re-analysis now reads this moment differently (another team, or an
+            # outcome such as a possible goal). The reviewer judged what they saw,
+            # so their view stands; a goal is never confirmed on their behalf.
+            if fp.get("team") in (0, 1):
+                target["team"] = fp["team"]
+            if seen_outcome is not None:
+                target["outcome"] = seen_outcome
+                if target["type"] == "shot":
+                    target["onTarget"] = seen_outcome in ON_TARGET
+            target["note"] = "Re-detected differently after re-analysis; the reviewer's reading is kept."
+        return target
 
     for d in review.get("decisions", []):
         action = d.get("action")
@@ -1229,6 +1266,17 @@ def summarise(projected, states, spells, events, template, directions, player_of
     shown = coverage >= PARAMS["possessionMinCoverage"] and total_possession > 0
     interval = share_interval(sequences) if shown else None
     all_passes = [e for e in live if e["type"] == "pass" and e.get("team") in (0, 1)]
+    # Without kit labels nobody can control the ball, and without an attacking
+    # direction no shot can be recognised: those counts are unmeasured, not zero,
+    # unless a reviewer has logged such events by hand.
+    has_teams = sum(control) > 0
+    has_direction = bool(directions and directions.get("segments"))
+
+    def measured(kinds, basis):
+        return basis or any(e["type"] in kinds and e.get("source") == "reviewer" for e in live)
+
+    teams_ok = measured(("pass", "interception", "tackle"), has_teams)
+    shots_ok = template is not None and measured(("shot", "goal", "goal-candidate"), has_direction)
     teams = []
     for team in (0, 1):
         passes = count("pass", team)
@@ -1244,22 +1292,22 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 "controlSeconds": round(control[team], 1),
                 "possessionSeconds": round(possession_seconds[team], 1),
                 "possession": round(possession_seconds[team] / total_possession * 100, 1) if shown else None,
-                "possessions": len(own),
+                "possessions": len(own) if has_teams else None,
                 "averagePossession": round(sum(s["seconds"] for s in own) / len(own), 1) if own else None,
-                "passes": passes,
-                "passesComplete": complete,
+                "passes": passes if teams_ok else None,
+                "passesComplete": complete if teams_ok else None,
                 "passAccuracy": accuracy,
                 # Share of all detected passes (the definition many stats sites use for
                 # possession), as a cross-check on the time-based share.
                 "passShare": round(passes["value"] / len(all_passes) * 100, 1)
                 if shown and len(all_passes) >= PARAMS["minPassesForAccuracy"]
                 else None,
-                "shots": count("shot", team) if template else None,
-                "shotsOnTarget": count("shot", team, lambda e: e.get("onTarget") is True) if template else None,
+                "shots": count("shot", team) if shots_ok else None,
+                "shotsOnTarget": count("shot", team, lambda e: e.get("onTarget") is True) if shots_ok else None,
                 # Confirmed goals count with or without a pitch setup; candidates need one.
-                "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"] if template else None},
-                "interceptions": count("interception", team),
-                "tackles": count("tackle", team),
+                "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"] if shots_ok else None},
+                "interceptions": count("interception", team) if teams_ok else None,
+                "tackles": count("tackle", team) if teams_ok else None,
                 # Withheld on a sliver of evidence (seconds of final-third control).
                 "fieldTilt": round(tilt[team] / sum(tilt) * 100, 1) if template and sum(tilt) >= PARAMS["minTiltSeconds"] else None,
             }
