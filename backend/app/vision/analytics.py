@@ -622,11 +622,12 @@ def dead_ball(projected, velocities, ball_velocity, sample_fps):
     n = len(projected)
     if not any(f["calibrated"] for f in projected):
         return [True] * n, []
-    speeds = [None] * n
-    for i in range(n):
-        values = [math.hypot(*v[i]) for v in velocities.values() if i in v]
-        if len(values) >= 4:
-            speeds[i] = float(np.mean(values))
+    # One pass over the fragments (not frames x fragments: 12k x 5k on a full match).
+    per_frame = defaultdict(list)
+    for track in velocities.values():
+        for i, v in track.items():
+            per_frame[i].append(math.hypot(*v))
+    speeds = [float(np.mean(per_frame[i])) if len(per_frame.get(i, ())) >= 4 else None for i in range(n)]
     window = max(1, int(round(sample_fps)))
     smooth = [None] * n
     for i in range(n):
