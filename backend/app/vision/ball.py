@@ -1,5 +1,6 @@
 """Football-specific ONNX inference with standard letterbox/NMS decoding."""
 
+import os
 from pathlib import Path
 
 import cv2
@@ -12,10 +13,17 @@ class BallDetector:
 
         ort.disable_telemetry_events()
         options = ort.SessionOptions()
-        options.intra_op_num_threads = 4
+        from app.vision.engine import worker_threads
+
+        options.intra_op_num_threads = worker_threads()
         options.inter_op_num_threads = 1
+        # On a GPU worker (VISION_DEVICE=cuda) use CUDA; ONNX Runtime falls back
+        # to the CPU provider if CUDA libraries are unavailable.
+        providers = ["CPUExecutionProvider"]
+        if os.getenv("VISION_DEVICE", "cpu").startswith("cuda"):
+            providers.insert(0, "CUDAExecutionProvider")
         self.session = ort.InferenceSession(
-            str(Path(path)), sess_options=options, providers=["CPUExecutionProvider"]
+            str(Path(path)), sess_options=options, providers=providers
         )
         self.input = self.session.get_inputs()[0]
         self.height, self.width = self.input.shape[2:]
@@ -103,6 +111,7 @@ class TiledBallDetector:
                 conf=threshold,
                 classes=self.classes,
                 device=self.device,
+                quantize=16 if str(self.device).startswith("cuda") else None,
                 verbose=False,
             )[0]
             self.inference_calls = getattr(self, "inference_calls", 0) + 1

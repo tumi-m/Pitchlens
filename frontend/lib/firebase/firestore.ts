@@ -20,17 +20,37 @@ import type { Match, Team, UserProfile } from "@/lib/types";
 
 // ── LocalStorage fallback for when Firebase is unavailable ────────────────
 const LS_KEY = "pitchlens_matches";
+/** Running count of legacy (pre-review) records removed from this browser. */
+export const LEGACY_PURGED_KEY = "pitchlens_legacy_purged";
 
 function getLocalMatches(): Record<string, Match> {
   if (typeof window === "undefined") return {};
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed
-      : {};
+    parsed = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
   } catch {
     return {};
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  // Older Pitchlens versions stored simulated statistics (or unfinished
+  // skeletons) here without a `review`. Only manual reviews are real data.
+  const kept: Record<string, Match> = {};
+  let dropped = 0;
+  for (const [id, entry] of Object.entries(parsed as Record<string, any>)) {
+    if (entry && typeof entry === "object" && entry.review) kept[id] = entry;
+    else dropped++;
+  }
+  if (dropped) {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(kept));
+      const previous = Number(localStorage.getItem(LEGACY_PURGED_KEY)) || 0;
+      localStorage.setItem(LEGACY_PURGED_KEY, String(previous + dropped));
+      window.dispatchEvent(new Event("pitchlens-legacy-purged"));
+    } catch {
+      // Storage is read-only or full; legacy entries stay hidden regardless.
+    }
+  }
+  return kept;
 }
 
 function setLocalMatch(id: string, data: Partial<Match>) {
@@ -135,29 +155,6 @@ export async function deleteTeam(userId: string, teamId: string) {
 }
 
 // ── Matches ────────────────────────────────────────────────────────────────
-export async function createMatch(matchData: Partial<Match>): Promise<string> {
-  if (!isFirebaseConfigured()) {
-    const id =
-      "match_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
-    const now = { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 };
-    setLocalMatch(id, {
-      ...matchData,
-      status: "processing",
-      createdAt: now,
-      updatedAt: now,
-    } as any);
-    return id;
-  }
-  const ref = doc(collection(db, "matches"));
-  await setDoc(ref, {
-    ...matchData,
-    status: "uploading",
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-  return ref.id;
-}
-
 export async function getMatch(matchId: string): Promise<Match | null> {
   if (!isFirebaseConfigured()) {
     return getLocalMatch(matchId);
@@ -261,19 +258,6 @@ export async function reprocessMatch(matchId: string): Promise<void> {
   const functions = getFunctions();
   const fn = httpsCallable(functions, "reprocessMatch");
   await fn({ matchId });
-}
-
-export async function saveMatchStats(
-  matchId: string,
-  stats: any,
-): Promise<void> {
-  // Always save locally first — instant, never blocks the UI
-  setLocalMatch(matchId, {
-    status: "completed",
-    stats,
-    processingProgress: 100,
-    updatedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
-  } as any);
 }
 
 export { serverTimestamp, Timestamp };

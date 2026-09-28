@@ -73,7 +73,7 @@ test("invalid video fails visibly and does not create a fabricated match", async
     buffer: Buffer.from("this is not a video"),
   });
   await page.getByRole("button", { name: "Open review room" }).click();
-  await expect(page.getByRole("alert")).toContainText("cannot be decoded");
+  await expect(page.getByRole("alert").filter({ hasText: /\S/ })).toContainText("cannot be decoded");
   await page.goto("/dashboard");
   await expect(page.getByText("No matches yet")).toBeVisible();
 });
@@ -258,6 +258,7 @@ test("invalid imports leave the workspace unchanged", async ({ page }) => {
     mimeType: "application/json",
     buffer: Buffer.from('{"schemaVersion": 99}'),
   });
-  await expect(page.getByRole("alert")).toBeVisible();
+  // Next.js also renders an empty role="alert" route announcer.
+  await expect(page.getByRole("alert").filter({ hasText: /\S/ })).toBeVisible();
   await expect(page.getByText("No matches yet", { exact: true })).toBeVisible();
 });

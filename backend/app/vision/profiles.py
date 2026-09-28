@@ -3,6 +3,16 @@
 import os
 from pathlib import Path
 
+# Pinned SHA-256 of downloadable weights; a GPU copying weights verifies these.
+KNOWN_SHA256 = {
+    "yolo11s.pt": "85a76fe86dd8afe384648546b56a7a78580c7cb7b404fc595f97969322d502d5",
+    "football-ball.onnx": "9fd2031e5bced9dff47a48bae8c6809dd56493124ef8924ae28a3ce26a17a441",
+    "roboflow-football-ball.pt": "678fbad05134f19c5094cb8d273812ec9c6691228180d46832551ecf99ed2912",
+    "roboflow-football-player.pt": (
+        "75b09c377fbf9d0791d23f6cfb689f5aed6eaa43a6818bd1fb884cf7507fffaf"
+    ),
+}
+
 
 def model_paths(profile="general"):
     root = Path(__file__).resolve().parents[2]

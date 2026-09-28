@@ -5,7 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const ts = require('typescript');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pitchlens-tests-'));
-for (const name of ['types', 'portable']) {
+for (const name of ['types', 'portable', 'visionStats']) {
   const source = fs.readFileSync(path.join(__dirname, '../lib/review', `${name}.ts`), 'utf8');
   fs.writeFileSync(path.join(dir, `${name}.js`), ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText);
 }
@@ -68,4 +68,21 @@ test('fingerprint is stable and prevents matching a changed same-size sample', a
   assert.notEqual(first, second);
   const original = {...parse(fixture()).review,videoFingerprint:first};
   assert.throws(() => validateLinkedVideo(original,{...original,videoFingerprint:second}), /does not match/);
+});
+
+
+test('diagnostic momentum and cumulative control use source timestamp offsets', () => {
+  const { matchStats } = require(path.join(dir, 'visionStats.js'));
+  const frames = [120, 120.2, 180, 180.2].map((t, i) => ({
+    t, scene: 0, players: [{id: i, team: i < 2 ? 0 : 1, box: [0, 0, 20, 60]}],
+    ball: {x: 10, y: 60, confidence: .8},
+  }));
+  const stats = matchStats({analysedStart: 120, analysedDuration: 120, frames, metrics: {
+    events: [], sampledFrames: 4, playerFrames: 4, ballFrames: 4, possessionCoverage: 1,
+    teamSeconds: [.4, .4], possessionShare: [50, 50],
+    possessions: {teams: [], chains: [{team: 0, start: 120, end: 120.4, controlSeconds: .4, passes: 0}]},
+  }});
+  assert.deepEqual(stats.momentum, [1, -1]);
+  assert.equal(stats.cumulative[0][0], 120);
+  assert.equal(stats.cumulative.at(-1)[0], 240);
 });

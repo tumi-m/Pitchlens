@@ -1,6 +1,6 @@
 # Local computer vision
 
-The default upload now runs automatic analysis. The former manual review room remains available as an explicit secondary mode, and existing reviews have an automatic-analysis button.
+The default upload now runs automatic analysis. To run it for the public website instead of on your own computer, deploy the same worker as a container: see [DEPLOY-VISION.md](DEPLOY-VISION.md). The former manual review room remains available as an explicit secondary mode, and existing reviews have an automatic-analysis button.
 
 ## Start
 
@@ -45,7 +45,7 @@ Score, xG, physical speed/distance, calibrated pitch heatmaps and exhaustive pas
 
 ## Storage and access
 
-Videos, status and results live in `backend/.vision/<job-id>/`. Jobs use random IDs, a loopback-only worker and a server-only token. Next.js proxies streaming upload and HTTP Range playback, allows only the local host and restricts proxy paths. Cross-site upload requests are rejected. Files are not sent to Firebase. No automatic retention/deletion is performed; stop the worker and remove unneeded job directories to reclaim disk. This single-user local design must not be exposed as a public multi-user service.
+Videos, status and results live in `backend/.vision/<job-id>/`. Jobs use random IDs, a loopback-only worker and a server-only token. Next.js proxies streaming upload and HTTP Range playback, allows only the local host and restricts proxy paths. Cross-site upload requests are rejected. Files are not sent to Firebase. No automatic retention/deletion is performed; stop the worker and remove unneeded job directories to reclaim disk. Do not expose the local loopback setup publicly. The hosted setup in [DEPLOY-VISION.md](DEPLOY-VISION.md) adds what a public deployment needs: 4 MB resumable upload chunks through the website, an HTTPS-only worker URL, a required access code, per-browser job listing, footage retention, restart recovery and an unauthenticated `/healthz` for the platform.
 
 ## Reproduce without the browser
 

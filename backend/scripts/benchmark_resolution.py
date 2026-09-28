@@ -84,9 +84,11 @@ def main():
     args.output.write_text(
         json.dumps(
             {
-                "caveat": ("Diagnostic only. Downsampled stills are not native low-resolution "
-                           "compressed video. Labels may overlap model training sources. "
-                           "No claim of held-out accuracy."),
+                "caveat": (
+                    "Diagnostic only. Downsampled stills are not native low-resolution "
+                    "compressed video. Labels may overlap model training sources. "
+                    "No claim of held-out accuracy."
+                ),
                 "summary": summary,
                 "measurements": measurements,
             },

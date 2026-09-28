@@ -1,26 +1,42 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, ScanLine, Loader2 } from "lucide-react";
-import { Navbar } from "@/components/ui/Navbar";
+import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
 import { inspectVideo, VideoPreflight } from "@/lib/review/preflight";
-import { visionJson, VisionJob, clockTime } from "@/lib/review/vision";
+import { clockTime } from "@/lib/review/vision";
+import { Navbar } from "@/components/ui/Navbar";
+import { AnimatePresence, motion } from "framer-motion";
+import {
+  VisionHealth,
+  VisionError,
+  uploadToVision,
+  analyseYouTube,
+  visionAccessCode,
+  setVisionAccessCode,
+} from "@/lib/review/vision";
 
 export function VisionUpload({ onManual }: { onManual: () => void }) {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
+  const [source, setSource] = useState<"file" | "youtube">("file");
+  const [link, setLink] = useState("");
+  const [rights, setRights] = useState(false);
+  const linkOk =
+    /^https?:\/\/((www\.|m\.)?youtube\.com\/(watch\?|shorts\/|live\/)|youtu\.be\/)/.test(
+      link.trim(),
+    );
   const [title, setTitle] = useState("");
-  const [available, setAvailable] = useState<boolean | null>(null);
+  const [health, setHealth] = useState<VisionHealth | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [percent, setPercent] = useState(0);
-  const [profiles, setProfiles] = useState<string[]>(["general"]);
+  const [phase, setPhase] = useState("");
   const [profile, setProfile] = useState("general");
-  const [adaptive, setAdaptive] = useState(false);
   const [fps, setFps] = useState("3");
+  const [adaptive, setAdaptive] = useState(false);
   const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
   const [checking, setChecking] = useState(false);
-  const [diagnostic, setDiagnostic] = useState(true);
+  const [diagnostic, setDiagnostic] = useState(false);
   const [start, setStart] = useState(0);
   useEffect(() => {
     setPreflight(null);
@@ -35,54 +51,99 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     }).finally(() => { if (!controller.signal.aborted) setChecking(false); });
     return () => controller.abort();
   }, [file]);
-  const xhr = useRef<XMLHttpRequest | null>(null);
+  const ready = source === "file" ? !!file && !!preflight && !checking : linkOk && rights;
+  const [code, setCode] = useState("");
+  const [needsCode, setNeedsCode] = useState(false);
+  const upload = useRef<AbortController | null>(null);
   useEffect(() => {
-    visionJson<{ available: boolean; profiles?: string[] }>("health")
-      .then((x) => { setAvailable(x.available); setProfiles(x.profiles ?? ["general"]); })
-      .catch(() => setAvailable(false));
-    return () => xhr.current?.abort();
+    setCode(visionAccessCode());
+    // Read the body even on 503: it says whether the worker is unset, down or local.
+    fetch("/api/vision/health", { cache: "no-store" })
+      .then((r) => r.json().catch(() => ({})))
+      .then((x: VisionHealth) => {
+        setHealth({ ...x, available: x.available === true });
+        setDiagnostic(x.diagnostics === true);
+        // Football-trained detector (players, keepers, referees + tiled ball
+        // model) beats the general people detector whenever it is installed.
+        if (x.profiles?.includes("broadcast")) setProfile("broadcast");
+        // A GPU makes denser sampling affordable: more frames catch more of the ball.
+        if (x.gpu) setFps("6");
+        setNeedsCode(!!x.accessRequired && !visionAccessCode());
+      })
+      .catch(() => setHealth({ available: false }));
+    return () => upload.current?.abort();
   }, []);
+  const available = health?.available === true;
+  const hosted = health?.hosted === true;
+  // Local setup instructions only make sense to someone running the site themselves.
+  const local =
+    health?.hosted === false ||
+    (typeof window !== "undefined" &&
+      ["localhost", "127.0.0.1"].includes(window.location.hostname));
+  const retention = health?.retentionHours
+    ? health.retentionHours >= 48
+      ? `${Math.round(health.retentionHours / 24)} days`
+      : `${Math.round(health.retentionHours)} hours`
+    : "";
+  const profiles = health?.profiles ?? ["general"];
   async function submit() {
-    if (!file || !preflight || checking) return;
+    if (!ready) return;
+    if (health?.accessRequired) {
+      if (!code.trim()) {
+        setNeedsCode(true);
+        setError("Enter the access code first.");
+        return;
+      }
+      setVisionAccessCode(code.trim());
+    }
+    const controller = new AbortController();
+    upload.current = controller;
     setError("");
     setBusy(true);
     setPercent(0);
+    setPhase("Reserving the analysis server");
     try {
-      const job = await new Promise<VisionJob>((resolve, reject) => {
-        const req = new XMLHttpRequest();
-        xhr.current = req;
-        req.open(
-          "POST",
-          `/api/vision/jobs?title=${encodeURIComponent(title.trim() || file.name)}&profile=${profile}&fps=${fps}&search=${adaptive && profile !== "general" ? "adaptive" : "exhaustive"}&diagnostic=${diagnostic}&start=${diagnostic ? start : 0}`,
-        );
-        req.setRequestHeader(
-          "Content-Type",
-          file.type || "application/octet-stream",
-        );
-        req.upload.onprogress = (e) => {
-          if (e.lengthComputable)
-            setPercent(Math.round((e.loaded / e.total) * 100));
-        };
-        req.onload = () => {
-          try {
-            const data = JSON.parse(req.responseText);
-            if (req.status >= 200 && req.status < 300) resolve(data);
-            else reject(new Error(data.detail || "Upload failed"));
-          } catch {
-            reject(new Error("Invalid worker response"));
-          }
-        };
-        req.onerror = () =>
-          reject(new Error("Could not reach the vision worker."));
-        req.onabort = () => reject(new Error("Upload cancelled."));
-        req.send(file);
+      if (source === "youtube") {
+        setPhase("Sending the link to the analysis server");
+        const job = await analyseYouTube(link.trim(), {
+          title: title.trim(),
+          profile,
+          fps,
+        });
+        router.push(`/vision/${job.id}`);
+        return;
+      }
+      if (!file) return;
+      const job = await uploadToVision(file, {
+        title: title.trim() || file.name,
+        profile,
+        fps,
+        diagnostic,
+        start: diagnostic ? start : 0,
+        search: adaptive && profile !== "general" ? "adaptive" : "exhaustive",
+        signal: controller.signal,
+        onProgress: (p) => {
+          setPercent(p);
+          setPhase(p < 100 ? "Uploading" : "Checking the video");
+        },
       });
-      xhr.current = null;
       router.push(`/vision/${job.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to start analysis");
+      if (e instanceof VisionError && e.code === "access") {
+        setVisionAccessCode("");
+        setCode("");
+        setNeedsCode(true);
+      }
+      setError(
+        e instanceof DOMException && e.name === "AbortError"
+          ? "Upload cancelled. Your file is still selected."
+          : e instanceof Error
+            ? e.message
+            : "Unable to start analysis",
+      );
       setBusy(false);
-      xhr.current = null;
+    } finally {
+      upload.current = null;
     }
   }
   return (
@@ -92,7 +153,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         <div className="max-w-3xl mx-auto space-y-7">
           <div>
             <p className="text-pitch-green text-xs tracking-widest uppercase mb-3">
-              Computer vision · Local processing
+              Computer vision · {hosted ? "Pitchlens analysis server" : "Local processing"}
             </p>
             <h1 className="text-4xl font-bold mb-4">
               Let the footage do the talking.
@@ -115,39 +176,108 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </div>
             ))}
           </div>
-          {available === false && (
+          {health && !available && (
             <div
               role="alert"
               className="border border-amber-500/40 bg-amber-500/10 rounded-xl p-4 text-sm space-y-2"
             >
-              <p className="font-semibold">
-                Start the local vision worker to analyse a match.
-              </p>
-              <p>
-                This runs on your computer with downloaded model weights. No
-                Roboflow key is needed.
-              </p>
-              <code className="block break-all">
-                python scripts/start_vision.py
-              </code>
-              <p>
-                Run from the backend folder after following docs/VISION.md. Then
-                reload this page.
-              </p>
+              {local ? (
+                <>
+                  <p className="font-semibold">
+                    Start the local vision worker to analyse a match.
+                  </p>
+                  <p>
+                    This runs on your computer with downloaded model weights. No
+                    Roboflow key is needed.
+                  </p>
+                  <code className="block break-all">
+                    python scripts/start_vision.py
+                  </code>
+                  <p>
+                    Run from the backend folder after following docs/VISION.md.
+                    Then reload this page.
+                  </p>
+                </>
+              ) : health.configured === false ? (
+                <>
+                  <p className="font-semibold">
+                    Automatic analysis isn&apos;t switched on for this site yet.
+                  </p>
+                  <p>
+                    Manual review works meanwhile. Site owner: see
+                    docs/DEPLOY-VISION.md.
+                  </p>
+                </>
+              ) : !health.detail || /^Cannot reach/.test(health.detail) ? (
+                <>
+                  <p className="font-semibold">
+                    The analysis server is not responding.
+                  </p>
+                  <p>
+                    It may be starting up or redeploying. Reload this page in a
+                    minute, or use manual review.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-semibold">
+                    Automatic analysis is unavailable.
+                  </p>
+                  <p>{health.detail}</p>
+                  <p>Manual review works meanwhile.</p>
+                </>
+              )}
             </div>
           )}
-          <label className="block glass-card border-2 border-dashed border-pitch-green/40 p-10 text-center cursor-pointer">
-            <Upload className="mx-auto text-pitch-green mb-4" />
+          <div
+            role="tablist"
+            aria-label="Video source"
+            className="flex gap-1 p-1 rounded-xl border border-pitch-indigo-soft/30 bg-pitch-indigo-deep/40"
+          >
+            {(
+              [
+                ["file", "Upload a file"],
+                ["youtube", "YouTube link"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                role="tab"
+                aria-selected={source === value}
+                disabled={busy}
+                onClick={() => {
+                  setSource(value);
+                  setError("");
+                }}
+                className={`flex-1 py-2.5 rounded-lg text-sm font-medium ${source === value ? "bg-pitch-indigo-soft/50 text-pitch-white" : "text-pitch-muted"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {source === "file" ? (
+          <label className={`block glass-card border-2 border-dashed p-10 text-center cursor-pointer transition-all duration-300 hover:-translate-y-0.5 hover:border-pitch-green/80 hover:shadow-[0_0_40px_-12px_rgba(46,204,113,0.5)] ${file ? "border-pitch-green/80 bg-pitch-green/5" : "border-pitch-green/40"}`}>
+            <motion.span
+              className="inline-block"
+              animate={file ? { scale: [1, 1.15, 1] } : { y: [0, -5, 0] }}
+              transition={file ? { duration: 0.4 } : { duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
+              key={file ? file.name : "idle"}
+            >
+              <Upload className="mx-auto text-pitch-green mb-4" />
+            </motion.span>
             <span className="block font-semibold break-all">
               {file ? file.name : "Choose your match video"}
             </span>
             <span className="text-sm text-pitch-muted block mt-2">
-              MP4 · Up to 500 MB · Video stays on this computer
+              MP4 or MOV (H.264/HEVC) · Up to 500 MB ·{" "}
+              {hosted
+                ? `Uploaded to the Pitchlens analysis server${retention ? `; footage deleted after ${retention}` : ""}`
+                : "Video stays on this computer"}
             </span>
             <input
               aria-label="Video for computer vision"
               type="file"
-              accept="video/mp4,.mp4"
+              accept="video/mp4,video/quicktime,.mp4,.mov"
               disabled={busy}
               className="mt-5 max-w-full text-sm"
               onChange={(e) => {
@@ -158,26 +288,66 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   setError("Video exceeds 500 MB");
                   return;
                 }
-                if (!/\.mp4$/i.test(f.name)) {
+                if (!/\.(mp4|mov)$/i.test(f.name)) {
                   setFile(null);
-                  setError("Choose an MP4 video.");
+                  setError("Choose an MP4 or MOV video.");
                   return;
                 }
                 setFile(f);
-                setTitle(f.name.replace(/\.mp4$/i, ""));
+                setTitle(f.name.replace(/\.(mp4|mov)$/i, ""));
                 setError("");
               }}
             />
           </label>
-          {checking && <p role="status">Checking video on this device before upload…</p>}
-          {preflight && (
+          ) : (
+            <div className="glass-card p-6 space-y-4">
+              <label className="block text-sm">
+                YouTube video link
+                <input
+                  aria-label="YouTube video link"
+                  type="url"
+                  inputMode="url"
+                  placeholder="https://www.youtube.com/watch?v=…"
+                  className="pitch-input w-full mt-2"
+                  value={link}
+                  onChange={(e) => setLink(e.target.value)}
+                  disabled={busy}
+                />
+              </label>
+              {link.trim() && !linkOk && (
+                <p className="text-sm text-red-300">
+                  Paste a link to a single YouTube video (youtube.com/watch?v=… or youtu.be/…).
+                </p>
+              )}
+              <p className="text-sm text-pitch-muted">
+                The analysis server fetches the best version up to 1080p (under 500 MB,
+                up to three hours) — nothing is downloaded to your device. Public or
+                unlisted videos only. Best results: one fixed, high camera showing the
+                whole pitch, at 1080p.
+              </p>
+              <label className="flex gap-3 items-start text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={rights}
+                  onChange={(e) => setRights(e.target.checked)}
+                  disabled={busy}
+                />
+                <span>
+                  I filmed this video or have the owner&apos;s permission to analyse it.
+                </span>
+              </label>
+            </div>
+          )}
+          {source === "file" && checking && <p role="status">Checking video on this device before upload…</p>}
+          {source === "file" && preflight && (
             <section className="glass-card p-5 space-y-4" aria-label="Video readiness">
               <h2 className="font-semibold">Video checked on your device</h2>
               <p className="text-sm">{preflight.width} × {preflight.height} · {clockTime(preflight.duration)} · No video uploaded yet.</p>
               <div className="grid grid-cols-3 gap-2">
                 {preflight.samples.map((sample) => (
                   <button key={sample.t} type="button" disabled={busy} className="text-xs text-left"
-                    onClick={() => { setStart(Math.max(0, Math.floor(sample.t))); setDiagnostic(true); }}>
+                    onClick={() => { setStart(Math.max(0, Math.floor(sample.t))); setDiagnostic(health?.diagnostics === true); }}>
                     {/* Native image: these are local canvas previews, not remote assets. */}
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img src={sample.image} alt={`Video sample at ${clockTime(sample.t)}`} className="rounded w-full" />
@@ -186,14 +356,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 ))}
               </div>
               {preflight.height <= 360 && <p className="text-sm text-amber-200">Low-resolution footage is supported. A ball only a few pixels wide may be indistinguishable from markings or compression noise; test a short section with visible play first.</p>}
-              <label className="flex gap-2 text-sm"><input type="checkbox" checked={diagnostic} disabled={busy}
+              <label className="flex gap-2 text-sm"><input type="checkbox" checked={diagnostic} disabled={busy || !health?.diagnostics}
                 onChange={(e) => setDiagnostic(e.target.checked)} />Test 20 seconds before analysing the full match</label>
+              {!health?.diagnostics && <p className="text-sm text-amber-200">This worker needs an update to support short tests. Submitting now analyses the full video.</p>}
               {diagnostic && <label className="block text-sm">Test start (seconds)
                 <input aria-label="Test start (seconds)" type="number" min="0" max={Math.max(0, Math.ceil(preflight.duration) - 1)} step="1"
                   value={start} disabled={busy} className="pitch-input ml-3 w-28"
                   onChange={(e) => setStart(Math.max(0, Math.min(Math.ceil(preflight.duration) - 1, Math.floor(Number(e.target.value) || 0))))} />
               </label>}
-              <p className="text-xs text-pitch-muted">{Math.ceil((diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) * Number(fps)).toLocaleString()} frames requested. The short test still transfers the file to your local worker; only the selected section is analysed. Detection coverage is not an accuracy score.</p>
+              <p className="text-xs text-pitch-muted">{Math.ceil((diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) * Number(fps)).toLocaleString()} frames requested. The short test still transfers the file to the analysis server; only the selected section is analysed. Detection coverage is not an accuracy score.</p>
             </section>
           )}
           <label className="block text-sm">
@@ -207,9 +378,31 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               disabled={busy}
             />
           </label>
+          {needsCode && (
+            <label className="block text-sm">
+              <span className="flex items-center gap-2">
+                <KeyRound size={15} className="text-pitch-green" /> Access code
+              </span>
+              <input
+                aria-label="Access code"
+                type="password"
+                autoComplete="off"
+                className="pitch-input w-full mt-2"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                disabled={busy}
+              />
+              <span className="text-xs text-pitch-muted block mt-1">
+                Analysis runs on paid servers. Ask the Pitchlens owner for the code.
+              </span>
+            </label>
+          )}
           <p className="text-sm text-pitch-muted">
-            Processing time depends on video length and hardware. The report
-            shows detection coverage and unknown time. Kit groups need your team
+            {health?.gpu
+              ? "Analysis runs on a GPU: expect several minutes for a full match (the first run of the day can take a few extra minutes to start). "
+              : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
+            The report shows a live time estimate, and you can leave and come
+            back. It shows detection coverage and unknown time. Kit groups need your team
             names; automatic pass candidates are estimates. Score, xG and
             physical speed are not yet measured.
           </p>
@@ -217,13 +410,11 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             <label className="text-sm">Footage type
               <select className="pitch-input w-full mt-2" value={profile}
                 disabled={busy} onChange={(e) => setProfile(e.target.value)}>
-                <option value="general">Indoor / small-sided · baseline</option>
-                <option value="small-ball" disabled={!profiles.includes("small-ball")}>
-                  Small ball / low resolution · experimental
-                </option>
+                <option value="small-ball" disabled={!profiles.includes("small-ball")}>Small ball / lightweight players · experimental</option>
                 <option value="broadcast" disabled={!profiles.includes("broadcast")}>
-                  Full-pitch broadcast · experimental
+                  Football-trained models · recommended
                 </option>
+                <option value="general">General people detector · indoor baseline</option>
               </select>
             </label>
             <label className="text-sm">Analysis detail
@@ -235,18 +426,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </select>
             </label>
           </div>
-          {profile !== "general" && <label className="flex gap-2 text-sm">
-            <input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />
-            Experimental faster ball search: focus between full-frame sweeps. Test coverage before using.
-          </label>}
-          {preflight && preflight.height <= 360 && profiles.includes("small-ball") && profile === "general" &&
-            <button type="button" disabled={busy} onClick={() => setProfile("small-ball")} className="pitch-button-secondary">
-              Try the small-ball detector on this low-resolution video
-            </button>}
+          {source === "file" && profile !== "general" && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
           <p className="text-xs text-pitch-muted">
-            Small-ball mode uses cropped football detection and takes more compute than the baseline.
             Detailed analysis follows fast movement more closely and takes longer.
-            The broadcast model has not been validated for indoor matches.
+            The football-trained models come from Roboflow&apos;s football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.
           </p>
           {error && (
             <p role="alert" className="text-red-300">
@@ -254,16 +437,14 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </p>
           )}
           <button
-            disabled={!file || !preflight || checking || !available || busy}
+            disabled={!ready || !available || busy}
             onClick={submit}
             className="pitch-button-primary w-full py-4"
           >
             {busy ? (
               <>
                 <Loader2 size={18} className="animate-spin" />
-                {percent < 100
-                  ? `Uploading to local worker · ${percent}%`
-                  : "Opening video…"}
+                {phase === "Uploading" ? `Uploading · ${percent}%` : `${phase}…`}
               </>
             ) : (
               <>
@@ -271,14 +452,48 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </>
             )}
           </button>
-          {busy && (
-            <button
-              onClick={() => xhr.current?.abort()}
-              className="pitch-button-secondary"
-            >
-              Cancel upload
-            </button>
-          )}
+          <AnimatePresence>
+            {busy && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="glass-card p-5 space-y-3 overflow-hidden"
+                aria-live="polite"
+              >
+                <div className="flex items-baseline justify-between">
+                  <span className="text-sm text-pitch-muted">
+                    {phase === "Uploading"
+                      ? "Sending your video in secure 4 MB pieces"
+                      : `${phase}…`}
+                  </span>
+                  <span className="text-2xl font-black tabular-nums">{percent}%</span>
+                </div>
+                <div className="relative h-2.5 rounded-full bg-white/10 overflow-hidden">
+                  <motion.div
+                    className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
+                    animate={{ width: `${Math.max(3, percent)}%` }}
+                    transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+                  />
+                  <motion.div
+                    className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/40 to-transparent"
+                    animate={{ left: ["-35%", "110%"] }}
+                    transition={{ duration: 1.6, repeat: Infinity, ease: "linear" }}
+                  />
+                </div>
+                <p className="text-xs text-pitch-muted">
+                  Keep this tab open until the upload finishes. After that the analysis
+                  runs on the server and you can leave.
+                </p>
+                <button
+                  onClick={() => upload.current?.abort()}
+                  className="pitch-button-secondary"
+                >
+                  Cancel upload
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
           <button
             onClick={onManual}
             disabled={busy}

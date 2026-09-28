@@ -1,17 +1,39 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getApps, initializeApp, applicationDefault } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
+import { timingSafeEqual } from "node:crypto";
 export const maxDuration = 30;
 export const runtime = "nodejs";
 const MAX_BODY = 1_500_000;
 let active = 0;
 let windowStart = Date.now();
 let requests = 0;
+// Production spends the owner's Roboflow credits, so callers must prove access:
+// a Firebase sign-in when Firebase is configured, otherwise the shared access code.
+function accessMode() {
+  const production = process.env.NODE_ENV === "production";
+  const firebase =
+    !!process.env.NEXT_PUBLIC_FIREBASE_API_KEY &&
+    !!process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
+  const code = process.env.VISION_ACCESS_CODE || "";
+  if (!production) return { kind: "open" as const };
+  if (firebase) return { kind: "firebase" as const };
+  if (code) return { kind: "code" as const, code };
+  return { kind: "closed" as const };
+}
+function sameSecret(given: string | null, expected: string) {
+  if (!given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 export async function GET() {
+  const mode = accessMode();
   return NextResponse.json(
     {
-      configured: !!process.env.ROBOFLOW_API_KEY,
-      requiresSignIn: process.env.NODE_ENV === "production",
+      configured: !!process.env.ROBOFLOW_API_KEY && mode.kind !== "closed",
+      requiresSignIn: mode.kind === "firebase",
+      accessRequired: mode.kind === "code",
     },
     { headers: { "Cache-Control": "no-store" } },
   );
@@ -22,7 +44,24 @@ export async function POST(request: NextRequest) {
       { error: "Frame detection is not configured." },
       { status: 503 },
     );
-  if (process.env.NODE_ENV === "production") {
+  const mode = accessMode();
+  if (mode.kind === "closed")
+    return NextResponse.json(
+      { error: "Set VISION_ACCESS_CODE or Firebase sign-in to enable AI detection." },
+      { status: 503 },
+    );
+  const sent = request.headers.get("x-pitchlens-access");
+  if (mode.kind === "code" && !sameSecret(sent, mode.code))
+    return NextResponse.json(
+      {
+        error: sent
+          ? "That access code was not accepted"
+          : "Enter the access code to use AI detection",
+        code: "access",
+      },
+      { status: 401 },
+    );
+  if (mode.kind === "firebase") {
     try {
       const token = request.headers
         .get("authorization")

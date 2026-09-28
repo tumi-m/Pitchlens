@@ -2,6 +2,7 @@
 import { VisionJobs } from "@/components/vision/VisionJobs";
 import { ImportReview } from "@/components/review/ImportReview";
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
@@ -11,10 +12,13 @@ import {
   AlertCircle,
   Loader2,
   BarChart3,
+  Info,
+  X,
 } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
 import { useAuthContext } from "@/components/auth/AuthProvider";
 import { useUserMatches } from "@/lib/hooks/useMatch";
+import { LEGACY_PURGED_KEY } from "@/lib/firebase/firestore";
 import { cn } from "@/lib/utils/cn";
 import { format } from "date-fns";
 import { AuthModal } from "@/components/auth/AuthModal";
@@ -49,6 +53,7 @@ export default function DashboardIndexPage() {
             </div>
           </div>
 
+          <LegacyPurgedNotice />
           <VisionJobs />
           {loading ? (
             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -141,23 +146,6 @@ function MatchCard({ match }: { match: Match }) {
           {match.review.events.length} tagged moments
         </p>
       )}
-      {match.stats && (
-        <div className="flex items-center gap-2 mt-2">
-          <span className="text-2xl font-black text-pitch-white">
-            {match.stats.score.home}
-          </span>
-          <span className="text-pitch-muted">–</span>
-          <span className="text-2xl font-black text-pitch-white">
-            {match.stats.score.away}
-          </span>
-          <div className="ml-auto flex gap-2 text-xs text-pitch-muted">
-            <span>
-              xG {match.stats.shots.home.xG.toFixed(1)}–
-              {match.stats.shots.away.xG.toFixed(1)}
-            </span>
-          </div>
-        </div>
-      )}
 
       <div className="mt-3 flex items-center justify-between">
         <p className="text-pitch-muted text-xs">
@@ -177,6 +165,54 @@ function MatchCard({ match }: { match: Match }) {
   );
 }
 
+function readPurgedCount(): number {
+  try {
+    return Number(localStorage.getItem(LEGACY_PURGED_KEY)) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** One-time notice after legacy simulated-statistics records were purged. */
+function LegacyPurgedNotice() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    const read = () => setCount(readPurgedCount());
+    read();
+    window.addEventListener("pitchlens-legacy-purged", read);
+    return () => window.removeEventListener("pitchlens-legacy-purged", read);
+  }, []);
+  if (count <= 0) return null;
+  const dismiss = () => {
+    try {
+      localStorage.removeItem(LEGACY_PURGED_KEY);
+    } catch {
+      // Storage unavailable; hiding the notice for this view is enough.
+    }
+    setCount(0);
+  };
+  return (
+    <div
+      role="status"
+      className="flex items-start gap-3 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200 text-sm"
+    >
+      <Info size={16} className="shrink-0 mt-0.5" />
+      <p className="flex-1">
+        Removed {count} {count === 1 ? "match" : "matches"} created by an older
+        Pitchlens version that used simulated statistics.
+      </p>
+      <button
+        type="button"
+        onClick={dismiss}
+        aria-label="Dismiss notice"
+        className="shrink-0 text-amber-200/70 hover:text-amber-100 transition-colors"
+      >
+        <X size={16} />
+      </button>
+    </div>
+  );
+}
+
 function EmptyState() {
   return (
     <div className="text-center py-20">
@@ -187,8 +223,8 @@ function EmptyState() {
         No matches yet
       </h2>
       <p className="text-pitch-muted mb-6">
-        Upload your first match to start seeing the hidden geometry of your
-        game.
+        Upload a match video to detect players and the ball automatically, or
+        open a manual review to tag moments yourself.
       </p>
       <Link href="/upload" className="pitch-button-primary">
         Upload First Match
