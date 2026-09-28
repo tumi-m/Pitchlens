@@ -16,6 +16,11 @@ def model_paths(profile="general"):
             resolve(os.getenv("VISION_MODEL_PATH", "models/yolo11s.pt")),
             resolve(os.getenv("VISION_BALL_MODEL_PATH", "models/football-ball.onnx")),
         )
+    if profile == "small-ball":
+        return (
+            resolve(os.getenv("VISION_MODEL_PATH", "models/yolo11s.pt")),
+            root / "models/roboflow-football-ball.pt",
+        )
     if profile == "broadcast":
         return (
             root / "models/roboflow-football-player.pt",
@@ -26,5 +31,7 @@ def model_paths(profile="general"):
 
 def available_profiles():
     return [
-        name for name in ("general", "broadcast") if all(p.is_file() for p in model_paths(name))
+        name
+        for name in ("general", "broadcast", "small-ball")
+        if all(p.is_file() for p in model_paths(name))
     ]

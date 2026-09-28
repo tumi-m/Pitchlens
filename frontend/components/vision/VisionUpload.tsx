@@ -3,7 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2 } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
-import { visionJson, VisionJob } from "@/lib/review/vision";
+import { inspectVideo, VideoPreflight } from "@/lib/review/preflight";
+import { visionJson, VisionJob, clockTime } from "@/lib/review/vision";
 
 export function VisionUpload({ onManual }: { onManual: () => void }) {
   const router = useRouter();
@@ -15,7 +16,25 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [percent, setPercent] = useState(0);
   const [profiles, setProfiles] = useState<string[]>(["general"]);
   const [profile, setProfile] = useState("general");
+  const [adaptive, setAdaptive] = useState(false);
   const [fps, setFps] = useState("3");
+  const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [diagnostic, setDiagnostic] = useState(true);
+  const [start, setStart] = useState(0);
+  useEffect(() => {
+    setPreflight(null);
+    setStart(0);
+    if (!file) { setChecking(false); return; }
+    const controller = new AbortController();
+    setChecking(true);
+    inspectVideo(file, controller.signal).then((result) => {
+      if (!controller.signal.aborted) setPreflight(result);
+    }).catch((e) => {
+      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Video check failed");
+    }).finally(() => { if (!controller.signal.aborted) setChecking(false); });
+    return () => controller.abort();
+  }, [file]);
   const xhr = useRef<XMLHttpRequest | null>(null);
   useEffect(() => {
     visionJson<{ available: boolean; profiles?: string[] }>("health")
@@ -24,7 +43,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     return () => xhr.current?.abort();
   }, []);
   async function submit() {
-    if (!file) return;
+    if (!file || !preflight || checking) return;
     setError("");
     setBusy(true);
     setPercent(0);
@@ -34,7 +53,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         xhr.current = req;
         req.open(
           "POST",
-          `/api/vision/jobs?title=${encodeURIComponent(title.trim() || file.name)}&profile=${profile}&fps=${fps}`,
+          `/api/vision/jobs?title=${encodeURIComponent(title.trim() || file.name)}&profile=${profile}&fps=${fps}&search=${adaptive && profile !== "general" ? "adaptive" : "exhaustive"}&diagnostic=${diagnostic}&start=${diagnostic ? start : 0}`,
         );
         req.setRequestHeader(
           "Content-Type",
@@ -150,6 +169,33 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               }}
             />
           </label>
+          {checking && <p role="status">Checking video on this device before upload…</p>}
+          {preflight && (
+            <section className="glass-card p-5 space-y-4" aria-label="Video readiness">
+              <h2 className="font-semibold">Video checked on your device</h2>
+              <p className="text-sm">{preflight.width} × {preflight.height} · {clockTime(preflight.duration)} · No video uploaded yet.</p>
+              <div className="grid grid-cols-3 gap-2">
+                {preflight.samples.map((sample) => (
+                  <button key={sample.t} type="button" disabled={busy} className="text-xs text-left"
+                    onClick={() => { setStart(Math.max(0, Math.floor(sample.t))); setDiagnostic(true); }}>
+                    {/* Native image: these are local canvas previews, not remote assets. */}
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={sample.image} alt={`Video sample at ${clockTime(sample.t)}`} className="rounded w-full" />
+                    Test from {clockTime(sample.t)}
+                  </button>
+                ))}
+              </div>
+              {preflight.height <= 360 && <p className="text-sm text-amber-200">Low-resolution footage is supported. A ball only a few pixels wide may be indistinguishable from markings or compression noise; test a short section with visible play first.</p>}
+              <label className="flex gap-2 text-sm"><input type="checkbox" checked={diagnostic} disabled={busy}
+                onChange={(e) => setDiagnostic(e.target.checked)} />Test 20 seconds before analysing the full match</label>
+              {diagnostic && <label className="block text-sm">Test start (seconds)
+                <input aria-label="Test start (seconds)" type="number" min="0" max={Math.max(0, Math.ceil(preflight.duration) - 1)} step="1"
+                  value={start} disabled={busy} className="pitch-input ml-3 w-28"
+                  onChange={(e) => setStart(Math.max(0, Math.min(Math.ceil(preflight.duration) - 1, Math.floor(Number(e.target.value) || 0))))} />
+              </label>}
+              <p className="text-xs text-pitch-muted">{Math.ceil((diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) * Number(fps)).toLocaleString()} frames requested. The short test still transfers the file to your local worker; only the selected section is analysed. Detection coverage is not an accuracy score.</p>
+            </section>
+          )}
           <label className="block text-sm">
             Match title
             <input
@@ -172,6 +218,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               <select className="pitch-input w-full mt-2" value={profile}
                 disabled={busy} onChange={(e) => setProfile(e.target.value)}>
                 <option value="general">Indoor / small-sided · baseline</option>
+                <option value="small-ball" disabled={!profiles.includes("small-ball")}>
+                  Small ball / low resolution · experimental
+                </option>
                 <option value="broadcast" disabled={!profiles.includes("broadcast")}>
                   Full-pitch broadcast · experimental
                 </option>
@@ -186,7 +235,16 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </select>
             </label>
           </div>
+          {profile !== "general" && <label className="flex gap-2 text-sm">
+            <input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />
+            Experimental faster ball search: focus between full-frame sweeps. Test coverage before using.
+          </label>}
+          {preflight && preflight.height <= 360 && profiles.includes("small-ball") && profile === "general" &&
+            <button type="button" disabled={busy} onClick={() => setProfile("small-ball")} className="pitch-button-secondary">
+              Try the small-ball detector on this low-resolution video
+            </button>}
           <p className="text-xs text-pitch-muted">
+            Small-ball mode uses cropped football detection and takes more compute than the baseline.
             Detailed analysis follows fast movement more closely and takes longer.
             The broadcast model has not been validated for indoor matches.
           </p>
@@ -196,7 +254,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </p>
           )}
           <button
-            disabled={!file || !available || busy}
+            disabled={!file || !preflight || checking || !available || busy}
             onClick={submit}
             className="pitch-button-primary w-full py-4"
           >

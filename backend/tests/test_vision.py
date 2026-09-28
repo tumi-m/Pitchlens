@@ -404,3 +404,57 @@ def test_model_paths_do_not_depend_on_shell_directory(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     assert model_paths() == before
     assert all(p.is_absolute() for p in before)
+
+
+def test_diagnostic_metrics_use_source_timestamp_offset():
+    frames = [frame(120), frame(120.2), frame(120.4), frame(120.6)]
+    out = derive_metrics(frames, 5, 0.8, start_seconds=120)
+    assert out["teamSeconds"] == [0.8, 0]
+    assert out["unknownSeconds"] == 0
+
+
+def test_invalid_diagnostic_and_search_options_rejected(service, monkeypatch, tmp_path):
+    _, client = service
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    monkeypatch.setenv("VISION_MODEL_PATH", str(model))
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(model))
+    for query in ("diagnostic=yes", "start=-1", "start=nan", "start=120", "search=magic"):
+        response = client.post(
+            f"/jobs?{query}", content=b"x", headers={"Content-Type": "video/mp4"}
+        )
+        assert response.status_code == 400
+
+
+def test_focused_ball_search_falls_back_after_miss_and_restores_coordinates():
+    from types import SimpleNamespace
+
+    from app.vision.ball import TiledBallDetector
+
+    class Model:
+        calls = 0
+
+        def predict(self, image, **kwargs):
+            self.calls += 1
+            ys, xs = np.where(image[:, :, 0] > 0)
+            boxes = (
+                np.array([[xs.min(), ys.min(), xs.max(), ys.max()]])
+                if len(xs)
+                else np.empty((0, 4))
+            )
+            return [
+                SimpleNamespace(boxes=SimpleNamespace(xyxy=boxes, conf=np.full(len(boxes), 0.8)))
+            ]
+
+    detector = TiledBallDetector.__new__(TiledBallDetector)
+    detector.model, detector.classes, detector.device = Model(), [0], "cpu"
+    image = np.zeros((360, 640, 3), np.uint8)
+    image[76:85, 96:105] = 255
+    found = detector.detect(image, focus=[100, 80])
+    assert len(found) == 1 and found[0]["x"] == 100
+    assert detector.model.calls == 1
+    image[:] = 0
+    image[276:285, 536:545] = 255
+    found = detector.detect(image, focus=[100, 80])
+    assert len(found) == 1 and (found[0]["x"], found[0]["y"]) == (540, 280)
+    assert detector.model.calls == 5  # miss triggers all four tiles, no tile repeated

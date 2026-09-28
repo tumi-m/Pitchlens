@@ -80,6 +80,9 @@ def work(directory, status, event):
             cancelled=event.is_set,
             profile=status.get("profile", "general"),
             sample_fps=status.get("sampleFps", 3),
+            max_seconds=status.get("maxSeconds"),
+            start_seconds=status.get("startSeconds", 0),
+            ball_search=status.get("ballSearch", "exhaustive"),
         )
         update(status="completed", stage="Analysis complete", progress=100)
     except InterruptedError:
@@ -133,7 +136,7 @@ async def create(request: Request):
     ):
         raise HTTPException(415, "Upload a video file")
     profile = request.query_params.get("profile", "general")
-    if profile not in ("general", "broadcast"):
+    if profile not in ("general", "broadcast", "small-ball"):
         raise HTTPException(400, "Unknown footage profile")
     if profile not in available_profiles():
         raise HTTPException(503, "The selected vision models are not installed")
@@ -143,6 +146,18 @@ async def create(request: Request):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
+    ball_search = request.query_params.get("search", "exhaustive")
+    if ball_search not in ("exhaustive", "adaptive"):
+        raise HTTPException(400, "Invalid ball search mode")
+    diagnostic = request.query_params.get("diagnostic", "false")
+    if diagnostic not in ("true", "false"):
+        raise HTTPException(400, "Invalid diagnostic option")
+    try:
+        start_seconds = int(request.query_params.get("start", "0"))
+    except ValueError as exc:
+        raise HTTPException(400, "Diagnostic start must be a whole number of seconds") from exc
+    if not 0 <= start_seconds < 4 * 3600 or (diagnostic == "false" and start_seconds != 0):
+        raise HTTPException(400, "Invalid diagnostic start")
     job_id = uuid.uuid4().hex
     with lock:
         if active is not None:
@@ -162,6 +177,9 @@ async def create(request: Request):
         "progress": 0,
         "profile": profile,
         "sampleFps": sample_fps,
+        "maxSeconds": 20 if diagnostic == "true" else None,
+        "startSeconds": start_seconds,
+        "ballSearch": ball_search,
     }
     write_status(directory, status)
     try:
@@ -175,6 +193,8 @@ async def create(request: Request):
         if not size:
             raise HTTPException(400, "Video file is empty")
         metadata = await asyncio.to_thread(probe, directory / "video")
+        if start_seconds >= metadata["duration"]:
+            raise ValueError("Diagnostic start must be inside the video")
         status.update(video=metadata, fileSize=size, status="processing")
         write_status(directory, status)
         event = threading.Event()

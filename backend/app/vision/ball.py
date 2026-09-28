@@ -86,31 +86,59 @@ class TiledBallDetector:
             raise ValueError("Ball model must contain a named ball class")
         self.device = device
 
-    def detect(self, frame, threshold=0.2):
+    def detect(self, frame, threshold=0.2, focus=None):
         h, w = frame.shape[:2]
+        tiles = [
+            (x, y, min(w, x + w // 2 + 50), min(h, y + h // 2 + 50))
+            for y in sorted({0, max(0, h // 2 - 50)})
+            for x in sorted({0, max(0, w // 2 - 50)})
+        ]
         found = []
-        # Four overlapping half-frame crops preserve the training scale at any resolution.
-        for y in sorted({0, max(0, h // 2 - 50)}):
-            for x in sorted({0, max(0, w // 2 - 50)}):
-                tile = frame[y : min(h, y + h // 2 + 50), x : min(w, x + w // 2 + 50)]
-                result = self.model.predict(
-                    tile,
-                    imgsz=640,
-                    conf=threshold,
-                    classes=self.classes,
-                    device=self.device,
-                    verbose=False,
-                )[0]
-                for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
-                    box = [box[0] + x, box[1] + y, box[2] + x, box[3] + y]
-                    found.append(
-                        {
-                            "x": (box[0] + box[2]) / 2,
-                            "y": (box[1] + box[3]) / 2,
-                            "box": box,
-                            "confidence": confidence,
-                        }
-                    )
+
+        def infer(tile):
+            x, y, right, bottom = tile
+            result = self.model.predict(
+                frame[y:bottom, x:right],
+                imgsz=640,
+                conf=threshold,
+                classes=self.classes,
+                device=self.device,
+                verbose=False,
+            )[0]
+            self.inference_calls = getattr(self, "inference_calls", 0) + 1
+            detections = []
+            for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+                box = [box[0] + x, box[1] + y, box[2] + x, box[3] + y]
+                detections.append(
+                    {
+                        "x": (box[0] + box[2]) / 2,
+                        "y": (box[1] + box[3]) / 2,
+                        "box": box,
+                        "confidence": confidence,
+                    }
+                )
+            return detections
+
+        if focus is not None:
+            # Keep the training crop scale: select an existing tile instead of zooming
+            # arbitrarily. A miss/ambiguous observation searches the remaining tiles.
+            def margin(tile):
+                x, y, right, bottom = tile
+                return min(focus[0] - x, right - focus[0], focus[1] - y, bottom - focus[1])
+
+            selected = max(tiles, key=margin)
+            if margin(selected) >= min(h, w) * 0.08:
+                found = infer(selected)
+                tiles.remove(selected)
+                if (
+                    len(found) == 1
+                    and found[0]["confidence"] >= 0.35
+                    and np.hypot(found[0]["x"] - focus[0], found[0]["y"] - focus[1])
+                    < min(h, w) * 0.15
+                ):
+                    return found
+        for tile in tiles:
+            found.extend(infer(tile))
         if not found:
             return []
         boxes = [

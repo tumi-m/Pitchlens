@@ -30,6 +30,13 @@ export type VisionResult = {
   ballModelSha256?: string;
   video: { duration: number; width: number; height: number; fps: number };
   analysedDuration: number;
+  analysedStart?: number;
+  performance?: {
+    totalSeconds: number;
+    playerInferenceSeconds: number;
+    ballInferenceSeconds: number;
+    device: string;
+  };
   sampleFps: number;
   teams: { id: number; label: string; colour: string }[];
   metrics: {
