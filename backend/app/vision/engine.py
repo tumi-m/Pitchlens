@@ -28,7 +28,7 @@ from app.vision.faint import (
 )
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
-from app.vision.tracking import MotionTracker, camera_motion
+from app.vision.tracking import ByteTracker, MotionTracker, camera_motion
 
 
 def file_sha256(path):
@@ -356,7 +356,8 @@ def run_video(
         kit_warning = str(exc) + " Team assignments and possession are unavailable."
     timings["setupSeconds"] = time.monotonic() - total_started
     cap = cv2.VideoCapture(str(path))
-    tracker = MotionTracker()
+    # VISION_TRACKER=legacy restores the pre-2.2 tracker (for comparisons).
+    tracker = MotionTracker() if os.getenv("VISION_TRACKER", "byte") == "legacy" else ByteTracker()
     ball_tracker = BallTracker()
     frames = []
     scene = 0
@@ -569,7 +570,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.1",
+        "pipelineVersion": "local-vision-2.2",
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},

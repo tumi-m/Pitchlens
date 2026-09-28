@@ -3,6 +3,16 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E7 · ByteTrack-style tracker and optimal stitching (2026-09-28)
+- Replay of the 3-min indoor clip's recorded detections through both trackers.
+- Legacy: 329 IDs, median track 2.7 s, 63 IDs with ≤2 sightings, 99.6% of
+  observations kept. New (Kalman, two passes, 3.5 s lost buffer, 2-hit
+  confirmation, soft kit cost, start threshold 0.4, pre-confirmation sightings
+  restored): 192 IDs (-42%), median 4.8 s, 6 short IDs, 96.8% kept.
+- After offline stitching: 151 player tracks (previously 209). Possession
+  followed (41%) and event counts unchanged: no regression.
+- Decision: new tracker is the default (`VISION_TRACKER=legacy` reverts).
+
 ## E6 · Research-grounded analytics on real results (2026-09-28)
 - Data: owner's 20 s GPU diagnostic of the night 5-a-side (360p, uncalibrated);
   owner's earlier full-match export (pipeline 1.5); 3-min indoor clip with a

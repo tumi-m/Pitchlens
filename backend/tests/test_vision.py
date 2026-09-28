@@ -1543,3 +1543,43 @@ def test_motion_recovery_requires_local_bracketing_neural_evidence():
     assert 1 in promoted  # one observed blob between two detector hits
     assert all(i <= 2 for i in promoted)  # no authentication of the entire later motion chain
     assert promoted[1]["confidence"] == 0.1  # trajectory length never invents detector confidence
+
+
+def test_byte_tracker_keeps_identity_through_a_short_occlusion_and_confirms_before_counting():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for k in range(20):
+        x = 100 + 6 * k
+        obs = [] if 8 <= k <= 14 else [{"team": 0, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}]
+        frames.append(tracker.update(obs, k * 0.2, identity))
+    ids = {p["id"] for f in frames for p in f}
+    assert len(ids) == 1  # 1.4 s unseen is within the lost-track buffer
+    assert len(frames[0]) == 1  # the first sighting is restored once the track is confirmed
+
+
+def test_byte_tracker_does_not_invent_tracks_from_one_off_false_positives():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    out = tracker.update([{"team": -1, "role": "player", "box": [300, 100, 312, 130], "confidence": 0.95}], 0.0, identity)
+    for k in range(1, 6):
+        out += tracker.update([], k * 0.2, identity)
+    assert out == []
+
+
+def test_byte_tracker_tolerates_one_wrong_kit_colour():
+    from app.vision.tracking import ByteTracker
+
+    tracker = ByteTracker()
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    ids = set()
+    for k in range(10):
+        team = 1 if k == 5 else 0  # a single frame of mis-read colour
+        x = 100 + 5 * k
+        for p in tracker.update([{"team": team, "role": "player", "box": [x, 100, x + 12, 130], "confidence": 0.9}], k * 0.2, identity):
+            ids.add(p["id"])
+    assert len(ids) == 1

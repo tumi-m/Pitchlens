@@ -31,6 +31,7 @@ per second; they are meant to be re-fitted from reviewed matches.
 
 import math
 import random
+from bisect import bisect_right
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -168,61 +169,106 @@ def project(frames, calibration):
 
 
 def stitch_tracks(projected, sample_fps):
-    """Join short track fragments into longer player tracks.
+    """Join track fragments into longer player tracks (offline, both directions).
 
-    The online tracker drops an identity after 1.2 s unseen, so one player
-    becomes dozens of fragments. Offline we can look both ways: a fragment that
-    ends is continued by one that starts shortly after, nearby (within a
-    running speed), with the same kit, and never overlapping in time.
+    Multi-pass optimal matching, tightest time gaps first (0.6 s, 1.5 s, 3 s):
+    a chain that ends is linked to one that starts shortly after if the start
+    lies where the first chain's recent motion predicts (within a running
+    speed), the kits do not clearly disagree, and the two never overlap in
+    time. Uses metres when the pitch is calibrated, body heights otherwise.
     Returns {fragment id: player id}.
     """
+    from scipy.optimize import linear_sum_assignment
+
     fragments = {}
     for index, f in enumerate(projected):
         for p in f["players"]:
             item = fragments.setdefault(p["id"], {"id": p["id"], "frames": [], "teams": Counter(), "scene": f["scene"]})
-            item["frames"].append((index, f["t"], p["xy"], foot_point(p["box"]), p["height"]))
+            item["frames"].append((f["t"], p["xy"], foot_point(p["box"]), p["height"]))
             if p["team"] in (0, 1):
                 item["teams"][p["team"]] += 1
     for item in fragments.values():
-        item["team"] = item["teams"].most_common(1)[0][0] if item["teams"] else -1
-        item["start"], item["end"] = item["frames"][0][1], item["frames"][-1][1]
-    order = sorted(fragments.values(), key=lambda x: x["start"])
-    player_of = {}
-    tails = []  # open player tracks: dict(player, last fragment)
-    next_player = 1
-    vmax, gap_max = PARAMS["maxPlayerSpeed"], PARAMS["maxStitchGap"]
-    for frag in order:
-        best, best_cost = None, None
-        first = frag["frames"][0]
-        for tail in tails:
-            last = tail["last"]
-            if last["scene"] != frag["scene"]:
-                continue
-            gap = frag["start"] - last["end"]
-            if gap <= 0 or gap > gap_max:
-                continue
-            if frag["team"] in (0, 1) and last["team"] in (0, 1) and frag["team"] != last["team"]:
-                continue
-            end = last["frames"][-1]
-            if end[2] is not None and first[2] is not None:
-                distance = math.dist(end[2], first[2])
-                limit = vmax * gap + 1.5
-            else:
-                height = max(10.0, (end[4] + first[4]) / 2)
-                distance = math.dist(end[3], first[3]) / height
-                limit = 1.2 * gap + 0.8  # body heights
-            if distance > limit:
-                continue
-            cost = distance / limit + gap / gap_max
-            if best_cost is None or cost < best_cost:
-                best, best_cost = tail, cost
-        if best is None:
-            tails.append({"player": next_player, "last": frag})
-            player_of[frag["id"]] = next_player
-            next_player += 1
+        votes = item["teams"]
+        total = sum(votes.values())
+        top = votes.most_common(1)
+        item["team"] = top[0][0] if top and top[0][1] >= 0.6 * total else -1
+        item["start"], item["end"] = item["frames"][0][0], item["frames"][-1][0]
+
+    def motion(frames, at_end):
+        """(position, velocity per second, metric?) at one end of a fragment."""
+        seq = frames[-6:] if at_end else frames[:6]
+        metric = all(fr[1] is not None for fr in seq)
+        pts = [(fr[0], fr[1] if metric else fr[2]) for fr in seq]
+        t0, p0 = pts[-1] if at_end else pts[0]
+        if len(pts) >= 2 and pts[-1][0] > pts[0][0]:
+            v = ((pts[-1][1][0] - pts[0][1][0]) / (pts[-1][0] - pts[0][0]), (pts[-1][1][1] - pts[0][1][1]) / (pts[-1][0] - pts[0][0]))
         else:
-            best["last"] = frag
-            player_of[frag["id"]] = best["player"]
+            v = (0.0, 0.0)
+        return p0, v, metric, max(10.0, float(np.median([fr[3] for fr in seq])))
+
+    chains = [{"frags": [f["id"]], "start": f["start"], "end": f["end"], "scene": f["scene"], "team": f["team"], "first": f, "last": f} for f in fragments.values()]
+    vmax = PARAMS["maxPlayerSpeed"]
+    for max_gap in (0.6, 1.5, PARAMS["maxStitchGap"]):
+        enders = sorted(chains, key=lambda c: c["end"])
+        starters = sorted(chains, key=lambda c: c["start"])
+        start_times = [c["start"] for c in starters]
+        pairs = {}
+        for a_i, a in enumerate(enders):
+            pa, va, ma, ha = motion(a["last"]["frames"], True)
+            lo = bisect_right(start_times, a["end"])
+            hi = bisect_right(start_times, a["end"] + max_gap)
+            for b_i in range(lo, hi):
+                b = starters[b_i]
+                if b is a or b["scene"] != a["scene"]:
+                    continue
+                gap = b["start"] - a["end"]
+                if gap <= 0:
+                    continue
+                if a["team"] in (0, 1) and b["team"] in (0, 1) and a["team"] != b["team"]:
+                    continue
+                pb, _, mb, hb = motion(b["first"]["frames"], False)
+                if ma and mb:
+                    speed = math.hypot(*va)
+                    if speed > vmax:
+                        va = (va[0] / speed * vmax, va[1] / speed * vmax)
+                    predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
+                    # Short fragments give jittery velocities: take the better of
+                    # "stood still" and "kept going".
+                    error = min(math.dist(predicted, pb), math.dist(pa, pb))
+                    limit = vmax * gap + 1.5
+                else:
+                    height = (ha + hb) / 2
+                    predicted = (pa[0] + va[0] * gap, pa[1] + va[1] * gap)
+                    error = min(math.dist(predicted, pb), math.dist(pa, pb)) / height
+                    limit = 1.2 * gap + 0.8  # body heights
+                if error > limit:
+                    continue
+                pairs[(a_i, b_i)] = error / limit + 0.5 * gap / max_gap
+        if not pairs:
+            continue
+        cost = np.full((len(enders), len(starters)), 1e6)
+        for (a_i, b_i), c in pairs.items():
+            cost[a_i, b_i] = c
+        rows, cols = linear_sum_assignment(cost)
+        merged = set()
+        for a_i, b_i in zip(rows, cols):
+            if cost[a_i, b_i] >= 1e6:
+                continue
+            a, b = enders[a_i], starters[b_i]
+            if id(a) in merged or id(b) in merged:
+                continue
+            a["frags"] += b["frags"]
+            a["end"], a["last"] = b["end"], b["last"]
+            if a["team"] == -1:
+                a["team"] = b["team"]
+            merged.add(id(b))
+            merged.add(id(a))
+            b["frags"] = []
+        chains = [c for c in chains if c["frags"]]
+    player_of = {}
+    for number, chain in enumerate(sorted(chains, key=lambda c: c["start"]), start=1):
+        for frag in chain["frags"]:
+            player_of[frag] = number
     return player_of
 
 
