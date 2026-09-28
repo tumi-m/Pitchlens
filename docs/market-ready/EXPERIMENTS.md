@@ -22,6 +22,10 @@ Development data only unless marked; none of these is a held-out result.
   on its old calibration, masks from the wrong frame on variable-frame-rate
   video, clicks between analysed frames accepted, 500s on malformed input.
 - Backend tests 150 → 163; browser tests 10 → 11 on the vision pages.
+- Held-out Metrica game 2 (moderate degradation) re-run after the fixes:
+  passes, shots and possession unchanged (pass F1 0.62, shot F1 0.45,
+  agreement 89.6%); goal-candidate precision 2/3 → 2/2 (the opening
+  kick-off no longer raises a false candidate).
 
 ## E10 · Possession through longer unseen gaps (2026-09-28)
 - Possession gap (ball unseen or loose between two controls) 5 s → 8 s, tuned
