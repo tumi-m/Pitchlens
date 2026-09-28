@@ -13,7 +13,12 @@ import numpy as np
 from sklearn.cluster import KMeans
 from threadpoolctl import threadpool_limits
 
-from app.vision.ball import TiledBallDetector, create_ball_detector
+from app.vision.ball import (
+    TiledBallDetector,
+    auxiliary_ball_candidates,
+    create_ball_detector,
+    fuse_ball_candidates,
+)
 from app.vision.ball_tracking import BallTracker
 from app.vision.faint import (
     ball_size_prior,
@@ -256,6 +261,9 @@ def run_video(
     people = [
         i for i, n in names.items() if n.lower() in ("person", "player", "goalkeeper", "referee")
     ]
+    ball_classes = [i for i, n in names.items() if n.lower() in ("ball", "sports ball")]
+    if os.getenv("VISION_AUX_BALL", "1") == "0":
+        ball_classes = []
     if not people:
         raise ValueError("Player model must contain a named person/player class.")
 
@@ -266,7 +274,7 @@ def run_video(
             batch,
             conf=0.15,
             imgsz=1280 if "player" in names.values() else 960,
-            classes=people,
+            classes=people + ball_classes,
             # One person can receive conflicting player/referee/keeper labels.
             # Suppress duplicate boxes across roles before tracking and possession.
             agnostic_nms=True,
@@ -432,6 +440,9 @@ def run_video(
             # Weak neural candidates plus difference-imaging candidates; the
             # track-before-detect pass after the loop decides which are real.
             diameter = ball_size_prior(players, frame.shape[0])
+            raw_candidates = fuse_ball_candidates(
+                raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
+            )
             detector = sorted(raw_candidates, key=lambda c: -c["confidence"])
             motion = []
             if motion_ok and not cut:
@@ -551,7 +562,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.0",
+        "pipelineVersion": "local-vision-2.1",
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},
@@ -567,10 +578,13 @@ def run_video(
         "ballModel": ball_path.name,
         "ballModelSha256": file_sha256(ball_path),
         "ballInference": "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles",
-        "ballSearch": ball_search if isinstance(ball_detector, TiledBallDetector) else "whole-frame",
+        "ballSearch": ball_search
+        if isinstance(ball_detector, TiledBallDetector)
+        else "whole-frame",
         "ballTileCalls": getattr(ball_detector, "inference_calls", None),
         "ballTracking": "camera-compensated-observations+track-before-detect",
         "ballRecovery": faint,
+        "auxiliaryBallDetector": bool(ball_classes),
         "video": meta,
         "analysedDuration": analysed_duration,
         "analysedStart": start_seconds,
@@ -581,7 +595,8 @@ def run_video(
         "limitations": ([kit_warning] if kit_warning else [])
         + [
             "Ball confidence scores are not calibrated probabilities.",
-            "Faint ball positions are confirmed by consistency across frames (track-before-detect); short gaps on a confirmed path are bridged and marked inferred.",
+            "Faint ball candidates require temporal and neural support; "
+            "short gaps on the same track are camera-compensated and marked inferred.",
             "Possession is visible ball-to-player proximity, not official match possession.",
             "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
             "Track IDs change after occlusion and cuts; they are not player identities.",

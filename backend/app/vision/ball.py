@@ -157,7 +157,12 @@ class TiledBallDetector:
     def _collect(result, x0, y0, scale=1.0):
         out = []
         for box, confidence in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
-            box = [(box[0] + x0) / scale, (box[1] + y0) / scale, (box[2] + x0) / scale, (box[3] + y0) / scale]
+            box = [
+                (box[0] + x0) / scale,
+                (box[1] + y0) / scale,
+                (box[2] + x0) / scale,
+                (box[3] + y0) / scale,
+            ]
             out.append(
                 {
                     "x": round((box[0] + box[2]) / 2, 1),
@@ -209,7 +214,8 @@ class TiledBallDetector:
             strong = [f for f in found if f["confidence"] >= 0.35]
             if (
                 len(strong) == 1
-                and np.hypot(strong[0]["x"] - focus[0], strong[0]["y"] - focus[1]) < min(h, w) * 0.15
+                and np.hypot(strong[0]["x"] - focus[0], strong[0]["y"] - focus[1])
+                < min(h, w) * 0.15
             ):
                 return self._suppress(found, threshold)
         if tiles:
@@ -232,3 +238,27 @@ class TiledBallDetector:
 
 def create_ball_detector(path, device="cpu"):
     return BallDetector(path) if Path(path).suffix == ".onnx" else TiledBallDetector(path, device)
+
+
+def fuse_ball_candidates(primary, auxiliary):
+    """Combine two detector views without counting the same ball twice."""
+    return TiledBallDetector._suppress(primary + auxiliary, 0.05)
+
+
+def auxiliary_ball_candidates(boxes, scores, classes, ball_classes):
+    """Use the ball head already computed by the player network (no extra forward pass).
+
+    The high entry threshold limits extra distractors from a general-purpose model.
+    Scores remain the detector's raw scores, not calibrated probabilities.
+    """
+    return [
+        {
+            "x": float((box[0] + box[2]) / 2),
+            "y": float((box[1] + box[3]) / 2),
+            "box": [float(v) for v in box],
+            "confidence": float(score),
+            "source": "player-model",
+        }
+        for box, score, cls in zip(boxes, scores, classes)
+        if cls in ball_classes and score >= 0.6 and box[2] > box[0] and box[3] > box[1]
+    ]

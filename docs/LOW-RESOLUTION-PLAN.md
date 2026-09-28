@@ -134,3 +134,40 @@ trajectory consistency across frames, gap bridging marked `inferred`, static
 rejection, batched tiled inference and a browser-side footage grade before
 upload. Adaptive ball search, agnostic NMS, calibration reuse, the kit
 fallback and the `performance` timings from this plan are all kept.
+
+## Engine 2.1 verification — 28 September 2026
+
+Integrated after main `90a47aa`, preserving Claude Code's batching, GPU offload,
+preflight checks, and kit voting. Reused the player network's existing ball head
+(scores >=0.6), fused overlapping detections, removed motion-only recovered
+tracks, required local neural corroboration for motion candidates, preserved raw
+confidence, and stopped interpolation across different track identities or
+unknown camera motion.
+
+On the supplied night video, source 300–308 seconds, broadcast profile, 40 samples
+at effective 5 fps: eight retrospectively labelled visible-ball frames at
+301.8, 302.0, 302.2, 302.8, 303.0, 303.2, 304.8 and 305.0 seconds matched within
+3 pixels in 8/8 cases with fusion versus 5/8 with `VISION_AUX_BALL=0`. The three
+baseline failures were wrong locations, not missing output. All eight final
+positions were observed, not interpolated. These adjacent frames were inspected
+AFTER inference; this is a debugging result, not a held-out accuracy estimate.
+Occluded/unclear 305.2 was excluded. More matches and negative frames are needed.
+
+The final run reported 25/40 observed ball positions, three inferred positions,
+10% stable ball/player proximity and zero event candidates. Raw coverage is NOT
+accuracy. CPU wall time was 50.184s including setup; the ablation was 46.609s.
+These are single runs with variable machine load, not evidence of acceleration.
+No production GPU timing or full-match event accuracy is claimed.
+
+Reproduce with `backend/.venv312/bin/python backend/scripts/benchmark_vision.py`
+using the supplied file, `--profile broadcast --start 300 --seconds 8 --fps 6` and
+an `--output` path; repeat with `VISION_AUX_BALL=0`. Then run
+`backend/scripts/evaluate_ball_tracks.py` with
+`backend/tests/fixtures/night-football-ball-centres.json` and both output paths.
+The evaluator rejects missing/misaligned timestamps and reports wrong locations
+separately from missing detections.
+
+Validation: 103 backend tests, 14 frontend unit tests, 14 browser tests and a
+production frontend build passed. Remaining priorities are representative
+held-out labels, reducing model runtime on the deployed GPU, and validating
+identity and event accuracy independently of ball visibility.
