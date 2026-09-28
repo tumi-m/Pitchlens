@@ -457,7 +457,8 @@ def run_video(
             # resolves candidates instead of rejecting them by background colour.
             ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
             previous_ball = ball
-            matrices.append(None if cut or not motion_ok else matrix)
+            camera = None if cut or not motion_ok else matrix
+            matrices.append(camera)
             frames.append(
                 {
                     "t": round(t, 3),
@@ -465,6 +466,12 @@ def run_video(
                     "players": players,
                     "ball": ball,
                     "ballCandidates": candidates,
+                    # Affine mapping the previous sampled frame into this one (null at
+                    # cuts or when motion could not be estimated). Pitch calibration
+                    # follows a panning camera through these.
+                    "camera": None
+                    if camera is None
+                    else [round(float(v), 5) for v in np.asarray(camera).reshape(-1)],
                 }
             )
             # Report on wall time, not frame count: a slow CPU host can take
