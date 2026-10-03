@@ -1632,3 +1632,31 @@ def test_established_kit_never_takes_the_other_teams_player():
     )
     a = [p for p in out if p["team"] == 0]
     assert a and all(p["team"] == 0 for p in out if p["id"] == a[0]["id"])
+
+
+def test_upload_reservation_survives_lost_reply_without_duplicate_job(hosted):
+    server, client, _ = hosted
+    owner, request_id = 'c' * 32, 'd' * 32
+    query = f'/jobs?size=100&owner={owner}&requestId={request_id}'
+    headers = {'Content-Type': 'video/mp4', 'x-pitchlens-owner': owner}
+    first = client.post(query, headers=headers)
+    assert first.status_code == 200
+    job = first.json()['id']
+    assert client.put(f'/jobs/{job}/video?offset=0', content=b'first', headers=headers).status_code == 200
+    retry = client.post(query, headers=headers)
+    assert retry.status_code == 200
+    assert retry.json()['id'] == job and retry.json()['receivedBytes'] == 5
+    assert len(list(server.ROOT.glob('*/status.json'))) == 1
+    assert client.post(query.replace('size=100', 'size=200'), headers=headers).status_code == 409
+    assert client.post(query.replace(owner, 'e' * 32), headers={'Content-Type': 'video/mp4'}).status_code == 409
+    assert client.post(f'/jobs/{job}/cancel', headers=headers).status_code == 200
+    assert client.post(query, headers=headers).status_code == 409
+    assert client.post(query.replace(request_id, 'f' * 32), headers=headers).status_code == 200
+
+
+def test_upload_reservation_id_requires_an_owner_and_chunk_size(hosted):
+    _, client, _ = hosted
+    headers = {'Content-Type': 'video/mp4'}
+    for query in ['size=100&requestId=bad', 'size=100&requestId=' + 'd' * 32,
+                  'owner=' + 'c' * 32 + '&requestId=' + 'd' * 32]:
+        assert client.post('/jobs?' + query, headers=headers).status_code == 400

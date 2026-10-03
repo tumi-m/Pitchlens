@@ -28,6 +28,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     );
   const [title, setTitle] = useState("");
   const [health, setHealth] = useState<VisionHealth | null>(null);
+  const [healthAttempt, setHealthAttempt] = useState(0);
+  const [checkingServer, setCheckingServer] = useState(false);
+  const defaultsApplied = useRef(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [percent, setPercent] = useState(0);
@@ -76,22 +79,39 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const upload = useRef<AbortController | null>(null);
   useEffect(() => {
     setCode(visionAccessCode());
-    // Read the body even on 503: it says whether the worker is unset, down or local.
-    fetch("/api/vision/health", { cache: "no-store" })
-      .then((r) => r.json().catch(() => ({})))
-      .then((x: VisionHealth) => {
-        setHealth({ ...x, available: x.available === true });
-        setDiagnostic(x.diagnostics === true);
-        // Football-trained detector (players, keepers, referees + tiled ball
-        // model) beats the general people detector whenever it is installed.
-        if (x.profiles?.includes("broadcast")) setProfile("broadcast");
-        // A GPU makes denser sampling affordable: more frames catch more of the ball.
-        if (x.gpu) setFps("6");
-        setNeedsCode(!!x.accessRequired && !visionAccessCode());
-      })
-      .catch(() => setHealth({ available: false }));
     return () => upload.current?.abort();
   }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    let stopped = false;
+    const deadline = setTimeout(() => controller.abort(), 15000);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setCheckingServer(true);
+    const retry = () => {
+      if (healthAttempt < 3) timer = setTimeout(() => setHealthAttempt((n) => n + 1), 4000);
+    };
+    // Read the body even on 503: it says whether the worker is unset, down or local.
+    fetch("/api/vision/health", { cache: "no-store", signal: controller.signal })
+      .then((r) => r.json().catch(() => ({})))
+      .then((x: VisionHealth) => {
+        if (stopped) return;
+        setHealth({ ...x, available: x.available === true });
+        if (!x.available && x.configured !== false) retry();
+        if (x.available && !defaultsApplied.current) {
+          defaultsApplied.current = true;
+          setDiagnostic(x.diagnostics === true);
+          // Initial choices only: reconnecting must preserve the user's options.
+          if (x.profiles?.includes("broadcast")) setProfile("broadcast");
+          if (x.gpu) setFps("6");
+        }
+        setNeedsCode(!!x.accessRequired && !visionAccessCode());
+      })
+      .catch(() => {
+        if (!stopped) { setHealth({ available: false }); retry(); }
+      })
+      .finally(() => { clearTimeout(deadline); if (!stopped) setCheckingServer(false); });
+    return () => { stopped = true; controller.abort(); clearTimeout(timer); clearTimeout(deadline); };
+  }, [healthAttempt]);
   const available = health?.available === true;
   const hosted = health?.hosted === true;
   // Local setup instructions only make sense to someone running the site themselves.
@@ -214,7 +234,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   </code>
                   <p>
                     Run from the backend folder after following docs/VISION.md.
-                    Then reload this page.
+                    Then choose Retry connection below.
                   </p>
                 </>
               ) : health.configured === false ? (
@@ -233,8 +253,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                     The analysis server is not responding.
                   </p>
                   <p>
-                    It may be starting up or redeploying. Reload this page in a
-                    minute, or use manual review.
+                    It may be starting up or redeploying. Your selected file stays here
+                    while you reconnect.
                   </p>
                 </>
               ) : (
@@ -246,6 +266,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   <p>Manual review works meanwhile.</p>
                 </>
               )}
+              <button type="button" className="pitch-button-secondary" disabled={checkingServer}
+                onClick={() => setHealthAttempt((n) => n + 1)}>
+                {checkingServer ? "Checking connection…" : "Retry connection"}
+              </button>
             </div>
           )}
           <div

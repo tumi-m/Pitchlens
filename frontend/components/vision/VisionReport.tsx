@@ -290,6 +290,19 @@ export function VisionReport({ jobId }: { jobId: string }) {
           )}
           {result && (
             <>
+              {result.metrics.ballFrames === 0 && (
+                <section role="status" className="glass-card border-amber-400/40 p-5 space-y-2">
+                  <h2 className="font-semibold text-amber-200">Ball tracking unavailable for this section</h2>
+                  <p className="text-sm text-pitch-muted">
+                    No ball track was retained. Automatic possession,
+                    passes and shots cannot be established from these detections. Inspect the
+                    overlays before relying on the report or processing more footage.
+                  </p>
+                  <button className="pitch-button-secondary text-sm" onClick={() => seek(result.analysedStart ?? 0)}>
+                    Inspect detections
+                  </button>
+                </section>
+              )}
               {analysis ? (
                 <MatchReport
                   analysis={analysis}

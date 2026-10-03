@@ -224,3 +224,52 @@ test("undecodable footage warns, skips the short test and still allows the uploa
   expect(calls.created).toBe(1);
   expect(calls.diagnostic).not.toBe("true");
 });
+
+test("worker recovery keeps the selected file and enables upload without reloading", async ({ page }) => {
+  let checks = 0;
+  await page.route("**/api/vision/health", (route) => {
+    checks++;
+    return route.fulfill({ status: checks === 1 ? 503 : 200, json: checks === 1
+      ? { available: false, hosted: true, configured: false, detail: "Worker awaiting setup" }
+      : { available: true, hosted: true, diagnostics: true, profiles: ["general"] } });
+  });
+  await page.goto('/upload');
+  await page.getByLabel('Video for computer vision').setInputFiles(FIXTURE);
+  await expect(page.getByRole('heading', { name: 'Video checked on your device' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry connection' }).click();
+  await expect(page.getByRole('button', { name: 'Analyse video automatically', exact: true })).toBeEnabled();
+  await expect(page.getByLabel('Analysis title')).toHaveValue('review');
+  await expect(page.getByRole('heading', { name: 'Video checked on your device' })).toBeVisible();
+});
+
+test("transient reservation failure retries the same upload request", async ({ page }) => {
+  await page.route('**/api/vision/health', (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  const calls = await mockChunkedWorker(page);
+  const ids: string[] = [];
+  await page.route(/\/api\/vision\/jobs\?/, async (route) => {
+    ids.push(new URL(route.request().url()).searchParams.get('requestId') || '');
+    if (ids.length === 1) return route.fulfill({ status: 503, json: { detail: 'Worker starting' } });
+    return route.fallback();
+  });
+  await page.goto('/upload');
+  await page.getByLabel('Video for computer vision').setInputFiles(FIXTURE);
+  await page.getByRole('button', { name: 'Analyse video automatically', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Detecting players', exact: true })).toBeVisible();
+  expect(ids).toHaveLength(2);
+  expect(ids[0]).toMatch(/^[a-f0-9-]{36}$/);
+  expect(ids[1]).toBe(ids[0]);
+  expect(calls.created).toBe(1);
+  expect(calls.started).toBe(1);
+});
+
+test("worker startup is retried automatically", async ({ page }) => {
+  let attempts = 0;
+  await page.route('**/api/vision/health', (route) => route.fulfill({ json: ++attempts === 1
+    ? { available: false, hosted: true }
+    : { available: true, hosted: true } }));
+  await page.goto('/upload');
+  const reconnect = page.getByRole('button', { name: 'Retry connection' });
+  await expect(reconnect).toBeVisible();
+  await expect(reconnect).toHaveCount(0, { timeout: 10000 });
+  expect(attempts).toBe(2);
+});

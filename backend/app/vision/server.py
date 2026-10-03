@@ -137,7 +137,7 @@ def load_status(directory):
 
 def public(data):
     """Owner keys are listing capabilities; never echo them back."""
-    return {k: v for k, v in data.items() if k != "owner"}
+    return {k: v for k, v in data.items() if k not in ("owner", "uploadRequestId", "uploadRequestDigest")}
 
 
 def work(directory, status, event):
@@ -453,10 +453,33 @@ async def create(request: Request):
             raise HTTPException(400, "Invalid video size") from exc
         if not 0 < expected <= MAX_BYTES:
             raise HTTPException(413, "Maximum video size is 500 MB")
+    request_id = request.query_params.get("requestId")
+    if request_id is not None and (
+        not re.fullmatch(r"[a-f0-9-]{32,36}", request_id) or not owner or expected is None
+    ):
+        raise HTTPException(400, "A resumable upload needs a valid request ID, owner and video size")
+    title = request.query_params.get("title", "Football match")[:200]
+    digest = hashlib.sha256(json.dumps(
+        [expected, title, profile, sample_fps, diagnostic, start_seconds, ball_search]
+    ).encode()).hexdigest()
     await asyncio.to_thread(delete_expired)
     job_id = uuid.uuid4().hex
     with lock:
         release_stale_upload()
+        if request_id:
+            # The first response may have been lost after reserving the worker.
+            # Persisted IDs also prevent a restart from silently creating a second job.
+            for path in ROOT.glob("*/status.json"):
+                previous = _read_json(path, {})
+                if not isinstance(previous, dict):
+                    continue
+                if previous.get("owner") != owner or previous.get("uploadRequestId") != request_id:
+                    continue
+                if previous.get("uploadRequestDigest") != digest:
+                    raise HTTPException(409, "Upload request ID already used for different options")
+                if previous.get("status") == "uploading" and previous.get("id") == active:
+                    return public(previous)
+                raise HTTPException(409, "The previous upload stopped. Start the upload again.")
         if active is not None:
             raise HTTPException(
                 409, "Another video is being analysed. Wait for it to finish or cancel it."
@@ -464,7 +487,6 @@ async def create(request: Request):
         active = job_id
     upload_activity[job_id] = upload_started[job_id] = time.monotonic()
     directory = ROOT / job_id
-    title = request.query_params.get("title", "Football match")[:200]
     status = {
         "id": job_id,
         "title": title,
@@ -480,6 +502,8 @@ async def create(request: Request):
     }
     if owner:
         status["owner"] = owner
+    if request_id:
+        status.update(uploadRequestId=request_id, uploadRequestDigest=digest)
     if expected is not None:
         status.update(expectedBytes=expected, receivedBytes=0)
     try:

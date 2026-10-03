@@ -191,15 +191,16 @@ export async function visionJson<T>(
 export const UPLOAD_CHUNK = 4 * 1024 * 1024;
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(new DOMException("Upload cancelled.", "AbortError"));
-      },
-      { once: true },
-    );
+    const aborted = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Upload cancelled.", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (signal?.aborted) aborted();
   });
 
 /** Network drops shorter than this resume where they left off. It stays under
@@ -234,14 +235,25 @@ export async function uploadToVision(
     diagnostic: String(options.diagnostic ?? false),
     start: String(options.start ?? 0),
     search: options.search ?? "exhaustive",
+    requestId: crypto.randomUUID(),
   });
   signal?.throwIfAborted();
   // Never abort the reservation mid-flight: the worker would stay reserved
   // under an id this browser never learns. Cancellation is checked just after.
-  const job = await visionJson<VisionJob>(`jobs?${query}`, {
-    method: "POST",
-    headers: { "Content-Type": "video/mp4" },
-  });
+  let job: VisionJob;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      job = await visionJson<VisionJob>(`jobs?${query}`, {
+        method: "POST",
+        headers: { "Content-Type": "video/mp4" },
+      });
+      break;
+    } catch (e) {
+      if (signal?.aborted || !transient(e) || attempt >= 4) throw e;
+      // Reuse the request ID: a lost reply must not strand a reserved worker.
+      await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
+    }
+  }
   let starting = false;
   try {
     signal?.throwIfAborted();

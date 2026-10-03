@@ -1,6 +1,6 @@
 # Status
 
-Read this first after any break. Updated 2026-09-28.
+Read this first after any break. Updated 2026-10-03.
 
 ## Where things stand
 
@@ -33,12 +33,12 @@ A match now produces a Sofascore-style report:
 
 ## Current task
 
-Commercial hardening through `e117017` is on main. CI passes; production health
-reports private-job enforcement and idempotent review, and anonymous access to a
-private report returns 401. Paystack/ZAR sandbox preparation is implemented
-(see PAYSTACK-SETUP.md); merchant integration still needs a real test transaction.
-Next product validation: run the first labelled target-venue match through pitch
-setup and review, measure accuracy, turnaround time and reviewer effort.
+**Core features first, per owner instruction.** Pause secondary commercial work.
+Fix upload/recovery, run real detection on the supplied footage, and verify the
+report and video playback. Read [CORE-WORKFLOW.md](../CORE-WORKFLOW.md) for the
+acceptance order and the 3 October real-video results. That check completed the
+upload/inference/report path, but retained no ball track in its 20-second section;
+automatic ball analytics remain a core unresolved gap.
 
 ## Blockers (owner)
 

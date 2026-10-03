@@ -337,3 +337,17 @@ test("deleting a finished analysis confirms the scope and removes the dashboard 
   await expect(page.getByText("Private match", { exact: true })).toHaveCount(0);
   expect(deleted).toBe(true);
 });
+
+test("completed player detection does not imply usable ball analytics", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = result();
+  data.metrics.ballFrames = 0;
+  data.metrics.possessionCoverage = 0;
+  data.metrics.teamSeconds = [0, 0];
+  data.metrics.unknownSeconds = 4;
+  const withoutBall = { ...data, frames: data.frames.map((frame) => ({ ...frame, ball: null })) };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (route) => route.fulfill({ json: withoutBall }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole('heading', { name: 'Ball tracking unavailable for this section' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Inspect detections' })).toBeVisible();
+});
