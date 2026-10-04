@@ -732,10 +732,15 @@ def model_file(name: str):
     """Lets the GPU worker copy installed weights it could not download itself."""
     from app.vision.profiles import model_paths
 
+    from app.vision.profiles import CUSTOM_BALL, models_dir
+
     for profile in ("general", "broadcast"):
         for path in model_paths(profile):
             if path.name == name and path.is_file():
                 return FileResponse(path, media_type="application/octet-stream")
+    # Fine-tuned ball weights (a GPU may still be finishing a job started before a switch).
+    if CUSTOM_BALL.fullmatch(name) and (models_dir() / name).is_file():
+        return FileResponse(models_dir() / name, media_type="application/octet-stream")
     raise HTTPException(404, "Model not installed")
 
 
@@ -1072,6 +1077,8 @@ def _clean_decision(d, index):
     if not isinstance(event, str) or not re.fullmatch(r"(ev|added|kept-ev|kept-added)-[a-z0-9-]{1,60}", event):
         raise HTTPException(400, "Unknown event")
     out["eventId"] = event
+    if d.get("sample") is True:
+        out["sample"] = True  # decided in the random-sample view (unbiased estimates)
     # The moment the reviewer was looking at (their list may be older than ours).
     seen = d.get("event")
     if isinstance(seen, dict):
@@ -1171,13 +1178,47 @@ def _video_path(directory):
     return path if path.is_file() and not expired(data) else None
 
 
-def _ball_labels_response(job_id, directory, result):
+label_lock = threading.Lock()  # balllabels.json writes; never held during analysis
+preparing_frames = set()  # job ids whose label frames are being extracted
+
+
+def _prepare_label_frames(job_id, directory, result, picks):
+    """Extract the label frames in one background pass (exact engine numbering)."""
+    from app.vision import balllabels
+
+    video_path = _video_path(directory)
+    if video_path is None:
+        return False
+    cache = balllabels.frame_cache(directory)
+    if all((cache / f"{i}.jpg").is_file() for i in picks):
+        return True
+    with label_lock:
+        if job_id in preparing_frames:
+            return False
+        preparing_frames.add(job_id)
+
+    def run():
+        try:
+            balllabels.prepare_frames(directory, result, picks, video_path)
+        except Exception:  # the next listing retries; frames already written stay
+            pass
+        finally:
+            with label_lock:
+                preparing_frames.discard(job_id)
+
+    threading.Thread(target=run, daemon=True).start()
+    return False
+
+
+def _ball_labels_response(job_id, directory, result, prepare=True):
     from app.vision import balllabels
 
     store = balllabels.load(directory / "balllabels.json")
     picks = balllabels.sample_frames(result, seed=_label_seed(job_id))
     frames = result.get("frames") or []
+    ready = _prepare_label_frames(job_id, directory, result, picks) if prepare else True
     return {
+        "framesReady": ready,
         "frames": [{"index": i, "t": frames[i]["t"], "guess": balllabels.guess(frames[i])} for i in picks],
         "labels": store.get("labels", {}),
         "metrics": balllabels.metrics(result, store),
@@ -1208,7 +1249,10 @@ async def add_ball_label(job_id: str, request: Request):
         raise HTTPException(400, "Unknown frame")
 
     def save():
-        with post_lock:
+        with label_lock:
+            # The match may have been deleted while this request waited.
+            if not (directory / "status.json").is_file():
+                raise HTTPException(404, "Job not found")
             store = balllabels.load(directory / "balllabels.json")
             try:
                 balllabels.apply_label(store, label, round(time.time(), 3))
@@ -1217,32 +1261,23 @@ async def add_ball_label(job_id: str, request: Request):
             _write_json(directory / "balllabels.json", store)
 
     await asyncio.to_thread(save)
-    return await asyncio.to_thread(_ball_labels_response, job_id, directory, result)
+    return await asyncio.to_thread(_ball_labels_response, job_id, directory, result, False)
 
 
 @app.get("/jobs/{job_id}/frames/{index}")
 def frame_image(job_id: str, index: int):
-    """One analysed frame as JPEG at the video's own resolution, for labelling."""
-    import cv2
+    """One label frame as JPEG at the video's own resolution (prepared by the listing)."""
+    from fastapi.responses import Response
 
     from app.vision import balllabels
 
-    directory, path = _finished_result(job_id)
-    video_path = _video_path(directory)
-    if video_path is None:
+    directory, _ = _finished_result(job_id)
+    path = balllabels.frame_cache(directory) / f"{index}.jpg"
+    if index >= 0 and path.is_file():
+        return Response(path.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    if _video_path(directory) is None:
         raise HTTPException(404, "Video is unavailable")
-    result = json.loads(path.read_text())
-    if not 0 <= index < len(result.get("frames") or []):
-        raise HTTPException(404, "Unknown frame")
-    image = balllabels.read_frame(video_path, balllabels.source_frame(result, index))
-    if image is None:
-        raise HTTPException(404, "That frame could not be decoded")
-    ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    if not ok:
-        raise HTTPException(500, "That frame could not be encoded")
-    from fastapi.responses import Response
-
-    return Response(jpeg.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    raise HTTPException(409, "This frame is still being prepared")
 
 
 training = {"state": "idle"}  # one ball-model training at a time, in this process
@@ -1280,7 +1315,12 @@ async def train_ball_model(request: Request):
     owner = body.get("owner")
     if owner is not None and (not isinstance(owner, str) or not OWNER.fullmatch(owner)):
         raise HTTPException(400, "Invalid owner")
-    # From the website: only the requesting browser's own labelled matches.
+    # Switching the ball model changes every later analysis on this worker, and a
+    # run costs GPU time: an operator action. A single-owner deployment can allow
+    # its website to start it (VISION_SITE_TRAINING=1), on that owner's matches.
+    from_site = require_owner(request) or bool(request.headers.get("x-pitchlens-owner"))
+    if from_site and os.getenv("VISION_SITE_TRAINING", "0") != "1":
+        raise HTTPException(403, "Training is an operator action on this server (see docs/BALL-TRAINING.md).")
     owner = _owner(request) or owner
     base = model_paths("broadcast")[1]
     if not base.is_file():
@@ -1292,7 +1332,7 @@ async def train_ball_model(request: Request):
         training.update(state="running", stage="Starting", startedAt=round(time.time(), 3))
 
     def remote(dataset_zip, base_bytes, n):
-        from app.vision.modal_app import app as modal_app, train_ball
+        from app.vision.modal_train import app as modal_app, train_ball
 
         with modal_app.run():
             return train_ball.remote(dataset_zip, base_bytes, n)
@@ -1384,7 +1424,7 @@ def delete_job(job_id: str):
     with calibrating_lock, lock:
         if job_id == active or job_id in calibrating:
             raise HTTPException(409, "Cancel processing and wait for it to stop before deleting")
-        with post_lock:
+        with post_lock, label_lock:
             shutil.rmtree(directory)
             for key in list(_prepared):
                 if key[0] == job_id:

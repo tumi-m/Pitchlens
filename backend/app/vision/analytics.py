@@ -1098,6 +1098,10 @@ def apply_review(events, review):
     if not review:
         return events, {}
     by_id = {e["id"]: dict(e) for e in events}
+    for e in by_id.values():
+        # What the automatic detection said before any decision: report estimates
+        # judge each check against it (see summarise).
+        e.setdefault("original", {k: e.get(k) for k in ("type", "team", "outcome", "onTarget")})
     current = list(by_id.values())
     added = {}
     kept = {}  # decision event id -> reviewer moment kept from a vanished event
@@ -1187,6 +1191,8 @@ def apply_review(events, review):
                 kept[target["id"]] = target  # later decisions address it by its public id
             else:
                 continue
+        if d.get("sample") and action in ("accept", "reject", "team", "type", "outcome"):
+            target["sampled"] = True  # checked as part of a random sample
         if action == "accept":
             target["status"] = "confirmed"
         elif action == "reject":
@@ -1263,22 +1269,12 @@ def summarise(projected, states, spells, events, template, directions, player_of
             unknown += dt
     live = [e for e in events if e["status"] != "rejected"]
 
-    # How often the automatic detections of each type were right, from the
-    # moments the reviewer checked. With enough checks, the unchecked ones are
-    # estimated at that rate instead of being shown as nothing.
-    checked = {}
-    for e in events:
-        if e.get("source") == "reviewer" or e["status"] == "proposed":
-            continue
-        ok, n = checked.get(e["type"], (0, 0))
-        checked[e["type"]] = (ok + (e["status"] == "confirmed"), n + 1)
-
     def count(kind, team, predicate=None):
         items = [e for e in live if e["type"] == kind and e.get("team") == team and (predicate is None or predicate(e))]
         confirmed = sum(1 for e in items if e["status"] == "confirmed")
         pending = sum(1 for e in items if e["status"] == "proposed")
         out = {"value": len(items), "confirmed": confirmed, "pending": pending}
-        ok, n = checked.get(kind, (0, 0))
+        ok, n = checked_rate(kind, predicate)
         out["checked"] = n
         if pending and n >= PARAMS["minCheckedForEstimate"]:
             lo, hi = wilson(ok, n)
@@ -1288,6 +1284,34 @@ def summarise(projected, states, spells, events, template, directions, player_of
         elif not pending:
             out["estimate"] = confirmed
         return out
+
+    def checked_rate(kind, predicate):
+        """How often automatic detections that read as this statistic were right.
+
+        A check counts when the reviewer judged an automatic event whose original
+        reading matched (type, and the predicate such as 'complete' or 'on
+        target'); it was right if the reviewer kept that reading (same type, team
+        and predicate). Passes are reviewed in bulk, so only passes checked in the
+        random-sample view count (an unbiased rate); shots and turnovers are
+        reviewed one by one, so every check counts. Teams are pooled.
+        """
+        ok = n = 0
+        for e in events:
+            if e.get("source") == "reviewer" or e["status"] == "proposed":
+                continue
+            original = e.get("original") or e
+            if original.get("type") != kind or (predicate is not None and not predicate(original)):
+                continue
+            if kind == "pass" and not e.get("sampled"):
+                continue
+            n += 1
+            ok += (
+                e["status"] == "confirmed"
+                and e["type"] == kind
+                and e.get("team") == original.get("team")
+                and (predicate is None or predicate(e))
+            )
+        return ok, n
 
     total_possession = sum(possession_seconds)
     coverage = total_possession / in_play_seconds if in_play_seconds else 0.0

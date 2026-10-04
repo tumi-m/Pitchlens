@@ -217,6 +217,8 @@ export type AnalysisEvent = {
   ballSeen?: number;
   needsReview?: boolean;
   source?: string;
+  /** Checked in the random-sample view (counts toward pass estimates). */
+  sampled?: boolean;
   note?: string;
   evidence?: string[];
   restartAt?: number;
@@ -320,9 +322,9 @@ export type CalibrationRequest = {
 export type SeenEvent = { type: string; t: number; team: number | null; outcome?: string };
 
 export type ReviewDecision =
-  | { action: "accept" | "reject" | "reset"; eventId: string; event?: SeenEvent }
-  | { action: "team"; eventId: string; value: 0 | 1; event?: SeenEvent }
-  | { action: "type" | "outcome"; eventId: string; value: string; event?: SeenEvent }
+  | { action: "accept" | "reject" | "reset"; eventId: string; event?: SeenEvent; sample?: boolean }
+  | { action: "team"; eventId: string; value: 0 | 1; event?: SeenEvent; sample?: boolean }
+  | { action: "type" | "outcome"; eventId: string; value: string; event?: SeenEvent; sample?: boolean }
   | { action: "add"; type: string; t: number; team?: 0 | 1; outcome?: string; x?: number; y?: number }
   | { action: "direction"; value: "left" | "right" }
   | { action: "score"; value: [number, number] };
@@ -395,9 +397,11 @@ export type BallLabelState = {
     precision: Rate;
     falseDetections: Rate;
     inferredAccuracy: Rate;
-    medianErrorPixels: number | null;
+    medianHitErrorPixels: number | null;
   };
   videoAvailable: boolean;
+  /** False while the worker is still extracting the label frames from the video. */
+  framesReady: boolean;
   size: [number, number];
 };
 
@@ -413,7 +417,7 @@ export type BallModelRun = {
   weights: string;
   matches: number;
   split: string;
-  counts: { train: { positive: number; negative: number }; valFrames: number };
+  counts: { train: { positive: number; negative: number }; testFrames: number };
   baseline: { recall: number | null; precision: number | null; frames: number };
   candidate: { recall: number | null; precision: number | null; frames: number };
   kept: boolean;

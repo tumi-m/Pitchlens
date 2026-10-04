@@ -36,11 +36,9 @@ held out for checking.
 
 ## 2. Train (about $1 of GPU, 15-30 minutes)
 
-In the app: **Label the ball → Train on my labels** (needs 30+ labelled
-frames; uses only the matches uploaded from your browser, and the site's
-access code). With Modal configured on the worker it runs on a Modal GPU
-(`VISION_MODAL_TRAIN_GPU`, default L4); otherwise on the worker itself (slow
-on CPU). The same from a terminal, over every labelled match on the worker:
+Switching the ball model changes every later analysis on the worker and a
+run costs GPU time, so training is an operator action. Run it from a terminal
+(it uses every labelled match on the worker):
 
 ```bash
 curl -X POST "$VISION_SERVICE_URL/ball-model/train" \
@@ -50,14 +48,26 @@ curl -X POST "$VISION_SERVICE_URL/ball-model/train" \
 curl "$VISION_SERVICE_URL/ball-model" -H "Authorization: Bearer $VISION_SERVICE_TOKEN"
 ```
 
+On a deployment with a single owner, set `VISION_SITE_TRAINING=1` on the
+worker to enable **Label the ball → Train on my labels** in the app (needs
+30+ labelled frames; uses only the matches uploaded from that browser, and
+the site's access code). Leave it off when other people use the site.
+
+With Modal configured on the worker, training runs on a Modal GPU in its own
+app, so it never blocks an analysis (`VISION_MODAL_TRAIN_GPU`, default L4);
+otherwise on the worker itself (slow on CPU).
+
 What happens:
 
 1. Every labelled frame is cut into exactly the tiles the detector sees, with
    a box on the ball; tiles without the ball teach it what is *not* a ball.
-2. Matches are split for training and checking **by match** (with only one
-   labelled match: the last 30% of its frames, reported as a weaker check).
+2. Matches are split for training and testing **by match**: the smaller
+   matches form a test set of at least 30 frames with a visible ball, the
+   rest train. With one usable match, the last 30% of its frames is the test
+   set, reported as a weaker check. A slice of the training frames picks the
+   best epoch; the test frames are never seen during training.
 3. The current ball model is fine-tuned on the GPU.
-4. Old and new models are both scored on the held-out frames. The new one is
+4. Old and new models are both scored on the test frames. The new one is
    switched on **only** if it finds at least 3 points more balls without
    losing more than 2 points of precision. Every run, kept or not, is recorded
    in `.vision/models/ball-model.json` with both scores.
@@ -67,8 +77,14 @@ worker volume, and copied to the Modal GPU (hash-checked) for later analyses.
 Re-run an analysis from the saved footage to apply it to an older match.
 
 To go back to the stock model, set `"active": null` in
-`.vision/models/ball-model.json`, or set `VISION_BALL_WEIGHTS` to a weights
-file.
+`.vision/models/ball-model.json`. `VISION_BALL_WEIGHTS` can point at another
+weights file, but only hash-named fine-tuned files (`ball-<hash>.pt`) are
+sent to the Modal GPU; any other override applies to CPU runs on the worker.
+
+Label frames are read from the video in one pass, numbered exactly as the
+analysis numbered them (seeking frame by frame lands a frame late on trimmed
+phone video). The first time you open the labeller this takes a minute or
+two. Training-set copies of frames are deleted after each run.
 
 ## 3. Also free: upload the original recording
 

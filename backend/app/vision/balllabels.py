@@ -24,9 +24,10 @@ SCHEMA = 1
 MAX_FRAMES = 400
 
 
-def ball_tolerance(height):
-    """Pixels within which a detection counts as the labelled ball (3 px at 360p)."""
-    return 3.0 * max(1.0, height / 360.0)
+def ball_tolerance(width, height):
+    """Pixels within which a detection counts as the labelled ball (3 px at 360p,
+    scaled by the short side so portrait video is not judged more loosely)."""
+    return 3.0 * max(1.0, min(width or height, height or width) / 360.0)
 
 
 def sample_frames(result, count=150, seed=0):
@@ -69,14 +70,76 @@ def source_frame(result, index):
 
 
 def read_frame(video_path, number):
-    """Decode one source frame (BGR) by its number, or None."""
+    """Decode one source frame (BGR) by its number, or None. Slow for late frames;
+    the labelling flow uses extract_frames, which reads the video in one pass."""
+    out = extract_frames(video_path, {number: None}, start=0)
+    return out.get(number)
+
+
+def extract_frames(video_path, wanted, start=None, write=None):
+    """Decode the wanted source frames in one sequential pass, numbered exactly as
+    the engine numbers them: seek once to the analysis start, then count decoded
+    frames. (Seeking to each frame number lands one frame late on trimmed,
+    variable-frame-rate phone video.)
+
+    wanted: {source frame number: key}. With `write(key, image)`, frames are
+    handed over as they are decoded and not kept; otherwise {number: image}.
+    """
+    if not wanted:
+        return {}
     cap = cv2.VideoCapture(str(video_path))
+    out = {}
     try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, number)
-        ok, image = cap.read()
-        return image if ok else None
+        n = 0
+        first = min(wanted)
+        if start and 0 < start <= first:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            n = start
+        last = max(wanted)
+        while n <= last:
+            if n in wanted:
+                ok, image = cap.read()
+                if not ok:
+                    break
+                if write:
+                    write(wanted[n], image)
+                else:
+                    out[n] = image
+            elif not cap.grab():
+                break
+            n += 1
     finally:
         cap.release()
+    return out
+
+
+def analysis_start(result):
+    """Source frame the engine seeked to before counting (its first sampled frame)."""
+    frames = result.get("frames") or []
+    number = frames[0].get("frame") if frames else None
+    return number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else 0
+
+
+def frame_cache(directory):
+    return directory / "labelframes"
+
+
+def prepare_frames(directory, result, indices, video_path):
+    """Write the label frames as JPEGs in one pass (skips those already written)."""
+    cache = frame_cache(directory)
+    cache.mkdir(exist_ok=True)
+    wanted = {}
+    for i in indices:
+        if not (cache / f"{i}.jpg").is_file():
+            wanted.setdefault(source_frame(result, i), i)
+
+    def write(i, image):
+        temporary = cache / f"{i}.tmp.jpg"
+        cv2.imwrite(str(temporary), image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        temporary.replace(cache / f"{i}.jpg")
+
+    extract_frames(video_path, wanted, start=analysis_start(result), write=write)
+    return cache
 
 
 def clean_label(body, size):
@@ -135,8 +198,8 @@ def metrics(result, store):
       were the ball. Inferred (gap-filled) positions are scored separately.
     """
     frames = result.get("frames") or []
-    height = float((result.get("video") or {}).get("height") or 360)
-    tol = ball_tolerance(height)
+    video = result.get("video") or {}
+    tol = ball_tolerance(float(video.get("width") or 640), float(video.get("height") or 360))
     hit = visible = absent = false_detections = detections = correct = 0
     inferred_hit = inferred_n = 0
     errors = []
@@ -171,7 +234,8 @@ def metrics(result, store):
         "precision": _rate(correct, detections),
         "falseDetections": _rate(false_detections, absent),
         "inferredAccuracy": _rate(inferred_hit, inferred_n),
-        "medianErrorPixels": round(float(np.median(errors)), 2) if errors else None,
+        # Over correct detections only: how precisely a found ball is placed.
+        "medianHitErrorPixels": round(float(np.median(errors)), 2) if errors else None,
     }
 
 

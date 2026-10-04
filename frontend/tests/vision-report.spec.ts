@@ -440,9 +440,10 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
       labelled: 0, visible: 0, tolerancePixels: 3,
       recall: { value: null, n: 0, interval95: null }, precision: { value: null, n: 0, interval95: null },
       falseDetections: { value: null, n: 0, interval95: null }, inferredAccuracy: { value: null, n: 0, interval95: null },
-      medianErrorPixels: null,
+      medianHitErrorPixels: null,
     },
     videoAvailable: true,
+    framesReady: true,
     size: [640, 360],
   };
   await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), async (r) => {
@@ -508,7 +509,7 @@ test("training on the labels reports old and new ball recall and whether it was 
   const labels = Object.fromEntries(frames.map((f) => [String(f.index), { visible: false }]));
   const empty = { value: null, n: 0, interval95: null };
   await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) =>
-    r.fulfill({ json: { frames, labels, metrics: { labelled: 40, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianErrorPixels: null }, videoAvailable: true, size: [640, 360] } }),
+    r.fulfill({ json: { frames, labels, metrics: { labelled: 40, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: true, size: [640, 360] } }),
   );
   await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
   const model = { active: null as string | null, runs: [] as unknown[], training: { state: "idle" } as Record<string, unknown> };
@@ -530,4 +531,36 @@ test("training on the labels reports old and new ball recall and whether it was 
   const result = page.getByTestId("ball-training-result");
   await expect(result).toContainText("41% → 67%");
   await expect(result).toContainText("Switched on");
+});
+
+test("passes checked in the random-sample view are marked as sampled", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.events = Array.from({ length: 12 }, (_, i) => ({ id: `ev-${i}`, type: "pass", t: i, team: i % 2, confidence: 0.6, status: "proposed", outcome: "complete" })) as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: /Enter the score and review|Review/ }).first().click();
+  await page.getByRole("tab", { name: "Check passes" }).click();
+  await expect(page.getByTestId("sample-progress")).toContainText("0 of 10 checked");
+  await page.keyboard.press("a");
+  await expect.poll(() => state.reviews.length).toBe(1);
+  const decision = (state.reviews[0] as { decisions: { action: string; sample?: boolean }[] }).decisions[0];
+  expect(decision.action).toBe("accept");
+  expect(decision.sample).toBe(true);
+});
+
+test("the labeller waits while the worker prepares the frames", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const empty = { value: null, n: 0, interval95: null };
+  let calls = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) => {
+    calls++;
+    return r.fulfill({ json: { frames: [{ index: 3, t: 0.6, guess: null }], labels: {}, metrics: { labelled: 0, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: calls > 1, size: [640, 360] } });
+  });
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: { active: null, runs: [], training: { state: "idle" } } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  await expect(page.getByTestId("ball-frames-preparing")).toBeVisible();
+  await expect(page.getByText("Frame 1 of 1")).toBeVisible({ timeout: 8000 });
 });

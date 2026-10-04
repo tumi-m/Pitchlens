@@ -87,12 +87,26 @@ def test_worker_serves_frames_and_records_labels(tmp_path, monkeypatch):
 
     listing = client.get(f"/jobs/{job_id}/ball-labels").json()
     assert listing["videoAvailable"] and listing["frames"] and listing["metrics"]["labelled"] == 0
-    # The frame image is the analysed frame itself (sampled frame 7 = source frame 14).
+    # Frames are prepared in one background pass; the image is the analysed frame
+    # itself (sampled frame 7 = source frame 14).
+    import time
+
+    pick = listing["frames"][0]["index"]
+    for _ in range(200):
+        if client.get(f"/jobs/{job_id}/ball-labels").json()["framesReady"]:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("label frames were never prepared")
+    assert client.get(f"/jobs/{job_id}/frames/{pick}").status_code == 200
+    (directory / "labelframes" / "7.jpg").write_bytes(
+        cv2.imencode(".jpg", balllabels.extract_frames(directory / "video", {14: 14})[14])[1].tobytes()
+    )
     image = client.get(f"/jobs/{job_id}/frames/7")
     assert image.status_code == 200 and image.headers["content-type"] == "image/jpeg"
     pixels = cv2.imdecode(np.frombuffer(image.content, np.uint8), cv2.IMREAD_GRAYSCALE)
     assert abs(int(np.median(pixels)) - 28) <= 3
-    assert client.get(f"/jobs/{job_id}/frames/99").status_code == 404
+    assert client.get(f"/jobs/{job_id}/frames/99").status_code == 409  # not a prepared frame
 
     assert client.post(f"/jobs/{job_id}/ball-labels", json={"index": 1, "x": 11.0, "y": 20.0}).status_code == 200
     out = client.post(f"/jobs/{job_id}/ball-labels", json={"index": 5, "visible": False}).json()
@@ -106,7 +120,7 @@ def test_worker_serves_frames_and_records_labels(tmp_path, monkeypatch):
     # Without the footage, labelling is not offered and frames are unavailable.
     (directory / "video").unlink()
     assert client.get(f"/jobs/{job_id}/ball-labels").json()["videoAvailable"] is False
-    assert client.get(f"/jobs/{job_id}/frames/7").status_code == 404
+    assert client.get(f"/jobs/{job_id}/frames/99").status_code == 404
 
 
 def _labelled_job(root, name, n=40, size=(640, 360)):
@@ -139,7 +153,12 @@ def test_training_set_uses_the_detector_tiles_and_splits_by_match(tmp_path):
     train, val, how = balltrain.split(jobs)
     assert how == "by-match" and len(train) == 2 and len(val) == 1
     counts = balltrain.build_dataset(train, val, tmp_path / "ds")
-    assert counts["valFrames"] == 40 and counts["train"]["positive"] >= 64
+    assert counts["testFrames"] == 40 and counts["train"]["positive"] >= 40 and counts["val"]["positive"] >= 5
+    # Negatives are kept at about one per positive (at least a few).
+    assert counts["train"]["negative"] <= counts["train"]["positive"] + 1
+    # The test match never appears in the training or epoch-choice tiles.
+    test_stem = val[0][0].name[:8]
+    assert not any(p.name.startswith(test_stem) for p in (tmp_path / "ds" / "images").rglob("*.jpg"))
     # Every positive label sits on the ball inside its tile, at the tile's own scale.
     for txt in (tmp_path / "ds" / "labels" / "train").glob("*.txt"):
         line = txt.read_text().split()
@@ -211,7 +230,30 @@ def test_training_endpoint_validates_and_needs_a_tiled_ball_model(tmp_path, monk
     assert client.post("/ball-model/train", json={"epochs": 0}).status_code == 400
     assert client.post("/ball-model/train", json={"epochs": True}).status_code == 400
     # From the hosted site an owner key is required (only that browser's matches train).
+    assert client.post("/ball-model/train", json={}, headers={"x-pitchlens-require-owner": "1"}).status_code == 403
+    monkeypatch.setenv("VISION_SITE_TRAINING", "1")
     assert client.post("/ball-model/train", json={}, headers={"x-pitchlens-require-owner": "1"}).status_code == 400
+    monkeypatch.delenv("VISION_SITE_TRAINING")
     monkeypatch.setattr("app.vision.profiles.model_paths", lambda profile="general": (tmp_path / "p.pt", tmp_path / "missing.pt"))
     assert client.post("/ball-model/train", json={}).status_code == 409
     assert client.get("/ball-model", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_label_frames_match_the_engine_numbering_on_trimmed_variable_frame_rate_video():
+    """Seeking to a frame number lands one frame late on this clip (an edit list
+    over variable-frame-rate video); one sequential pass does not."""
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "trimmed-vfr.mp4"
+    cap = cv2.VideoCapture(str(path))
+    sequential = []
+    while True:
+        ok, image = cap.read()
+        if not ok:
+            break
+        sequential.append(image)
+    cap.release()
+    wanted = {n: n for n in range(0, len(sequential), 4)}
+    got = balllabels.extract_frames(path, wanted)
+    assert sorted(got) == sorted(wanted)
+    assert all(np.array_equal(got[n], sequential[n]) for n in wanted)

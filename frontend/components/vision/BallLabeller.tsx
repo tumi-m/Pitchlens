@@ -28,18 +28,36 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   const [zoom, setZoom] = useState<{ x: number; y: number } | null>(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  // Which frame image has finished loading (the zoom draws only from that one).
+  const [loadedSrc, setLoadedSrc] = useState("");
   const image = useRef<HTMLImageElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
+  const positionRef = useRef(0);
+  positionRef.current = position;
 
   useEffect(() => {
-    fetchBallLabels(jobId)
-      .then((data) => {
-        setState(data);
-        const first = data.frames.findIndex((f) => !(String(f.index) in data.labels));
-        setPosition(first >= 0 ? first : 0);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "Labels could not be loaded"));
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let first = true;
+    const load = () =>
+      fetchBallLabels(jobId)
+        .then((data) => {
+          if (stop) return;
+          setState(data);
+          if (first) {
+            first = false;
+            const start = data.frames.findIndex((f) => !(String(f.index) in data.labels));
+            setPosition(start >= 0 ? start : 0);
+          }
+          // The worker extracts the frames from the video in one pass first.
+          if (data.videoAvailable && !data.framesReady) timer = setTimeout(load, 3000);
+        })
+        .catch((e) => !stop && setError(e instanceof Error ? e.message : "Labels could not be loaded"));
+    load();
+    return () => {
+      stop = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [jobId]);
 
   const frame = state?.frames[position];
@@ -48,38 +66,40 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   const height = state?.size?.[1] || 360;
   const size = useMemo(() => [width, height] as const, [width, height]);
   const done = state ? state.frames.filter((f) => String(f.index) in state.labels).length : 0;
-
-  const advance = useCallback(
-    (next: BallLabelState) => {
-      // Next unlabelled frame after this one (wrapping), else stay.
-      const n = next.frames.length;
-      for (let step = 1; step <= n; step++) {
-        const i = (position + step) % n;
-        if (!(String(next.frames[i].index) in next.labels)) return setPosition(i);
-      }
-      setPosition(Math.min(n - 1, position + 1));
-    },
-    [position],
-  );
+  const src = frame ? frameImageUrl(jobId, frame.index) : "";
+  const loaded = !!src && loadedSrc.endsWith(src);
 
   const save = useCallback(
     async (body: { index: number; x: number; y: number } | { index: number; visible: false }) => {
-      if (saving) return;
+      if (saving || !state) return;
+      const from = state.frames.findIndex((f) => f.index === body.index);
       setSaving(true);
       setError("");
       try {
         const next = await sendBallLabel(jobId, body);
-        setState(next);
-        setZoom(null);
-        setLoaded(false);
-        advance(next);
+        setState((prev) => (prev ? { ...next, framesReady: prev.framesReady || next.framesReady } : next));
+        // Move on from the frame that was labelled, and only if the reviewer is
+        // still on it (they may have stepped elsewhere while it saved).
+        const n = next.frames.length;
+        let target = Math.min(n - 1, from + 1);
+        for (let step = 1; step <= n; step++) {
+          const i = (from + step) % n;
+          if (!(String(next.frames[i].index) in next.labels)) {
+            target = i;
+            break;
+          }
+        }
+        if (positionRef.current === from) {
+          setZoom(null);
+          setPosition(target);
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : "The label could not be saved");
       } finally {
         setSaving(false);
       }
     },
-    [jobId, saving, advance],
+    [jobId, saving, state],
   );
 
   const accept = useCallback(() => {
@@ -90,7 +110,6 @@ export function BallLabeller({ jobId }: { jobId: string }) {
     (step: number) => {
       if (!state) return;
       setZoom(null);
-      setLoaded(false);
       setPosition((p) => Math.min(state.frames.length - 1, Math.max(0, p + step)));
     },
     [state],
@@ -98,9 +117,10 @@ export function BallLabeller({ jobId }: { jobId: string }) {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || e.defaultPrevented) return;
       const target = e.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      if (target && (["INPUT", "TEXTAREA", "SELECT", "VIDEO"].includes(target.tagName) || target.isContentEditable)) return;
+      if (target?.tagName === "BUTTON" && (e.key === " " || e.key === "Enter")) return;
       if (e.key === "Enter" || e.key === "y") accept();
       else if (e.key === "n") absent();
       else if (e.key === "s" || e.key === "ArrowRight") move(1);
@@ -117,7 +137,7 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   useEffect(() => {
     const img = image.current;
     const out = canvas.current;
-    if (!zoom || !img || !out || !loaded) return;
+    if (!zoom || !img || !out || !loaded || !img.complete || !img.naturalWidth) return;
     const w = size[0] / ZOOM;
     const h = size[1] / ZOOM;
     const x0 = Math.min(Math.max(0, zoom.x - w / 2), size[0] - w);
@@ -144,6 +164,7 @@ export function BallLabeller({ jobId }: { jobId: string }) {
     const x0 = Number(el.dataset.x0);
     const y0 = Number(el.dataset.y0);
     const w = Number(el.dataset.w);
+    if (![x0, y0, w].every(Number.isFinite) || !box.width) return;  // not drawn yet
     const scale = w / box.width;
     const x = x0 + (e.clientX - box.left) * scale;
     const y = y0 + (e.clientY - box.top) * scale;
@@ -154,6 +175,12 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   if (!state) return <p className="text-sm text-pitch-muted">Loading frames…</p>;
   if (!state.videoAvailable)
     return <p className="text-sm text-pitch-muted">The footage of this match is no longer stored, so its frames cannot be labelled.</p>;
+  if (!state.framesReady)
+    return (
+      <p className="text-sm text-pitch-muted" data-testid="ball-frames-preparing">
+        Preparing {state.frames.length} frames from your video. This reads the whole match once and takes a minute or two.
+      </p>
+    );
   const m = state.metrics;
   const circle = (x: number, y: number, colour: string) => (
     <span
@@ -198,10 +225,11 @@ export function BallLabeller({ jobId }: { jobId: string }) {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               ref={image}
-              src={frameImageUrl(jobId, frame.index)}
+              key={src}
+              src={src}
               alt={`Analysed frame at ${clockTime(frame.t)}`}
               className="w-full h-auto cursor-crosshair select-none"
-              onLoad={() => setLoaded(true)}
+              onLoad={(e) => setLoadedSrc(e.currentTarget.src)}
               onClick={frameClick}
               draggable={false}
             />

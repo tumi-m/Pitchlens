@@ -21,10 +21,12 @@ def modal_enabled():
 
 def active_ball_name():
     """File name of the fine-tuned ball model in use ("" for the stock weights)."""
-    from app.vision.profiles import active_ball_weights
+    from app.vision.profiles import CUSTOM_BALL, active_ball_weights
 
     path = active_ball_weights()
-    return path.name if path else ""
+    # Only hash-named fine-tuned weights can be verified on the GPU; any other
+    # VISION_BALL_WEIGHTS override applies to CPU runs on this worker only.
+    return path.name if path and CUSTOM_BALL.fullmatch(path.name) else ""
 
 
 def public_base():

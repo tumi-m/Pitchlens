@@ -230,6 +230,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
     calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
   const openReview = () => {
+    // One panel with keyboard shortcuts at a time (both use Enter and arrows).
+    setLabelling(false);
     setReviewOpen(true);
     setTimeout(() => reviewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
   };
@@ -636,7 +638,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         ball was found, and the answers train a better ball finder for footage like yours.
                       </p>
                     </div>
-                    <button className="pitch-button-secondary" onClick={() => setLabelling((v) => !v)}>
+                    <button className="pitch-button-secondary" onClick={() => {
+                        setReviewOpen(false);
+                        setLabelling((v) => !v);
+                      }}>
                       {labelling ? "Close" : "Label the ball"}
                     </button>
                   </div>

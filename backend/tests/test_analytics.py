@@ -752,23 +752,30 @@ def test_possession_bounds_include_unseen_play_not_detector_accuracy():
 def test_checked_sample_estimates_the_unchecked_detections():
     from app.vision import analytics as an
 
-    events = [{"id": f"ev-{i}", "type": "pass", "t": float(i), "team": i % 2, "confidence": 0.6, "status": "proposed"} for i in range(100)]
-    # The reviewer checked 20: 15 right, 5 wrong.
-    for e in events[:15]:
-        e["status"] = "confirmed"
-    for e in events[15:20]:
-        e["status"] = "rejected"
+    def passes():
+        return [{"id": f"ev-{i}", "type": "pass", "t": float(i), "team": i % 2, "confidence": 0.6, "status": "proposed", "outcome": "complete"} for i in range(100)]
+
     seen = ([{"t": 0.0, "calibrated": False, "players": [], "ball": None}], [{"state": "control", "team": 0}])
-    stats = an.summarise(*seen, [], events, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
-    team0 = stats["teams"][0]["passes"]
-    # Team 0: 8 confirmed of its 10 checked... and 40 unchecked, estimated at 75%.
+
+    def stats_for(review):
+        events, _ = an.apply_review(passes(), review)
+        return an.summarise(*seen, [], events, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
+
+    # The reviewer checked 20 in the random-sample view: 15 right, 5 wrong.
+    review = {"decisions": [{"action": "accept" if i < 15 else "reject", "eventId": f"ev-{i}", "sample": True} for i in range(20)]}
+    team0 = stats_for(review)["teams"][0]["passes"]
+    # Team 0: 8 confirmed of its 10 checked, and 40 unchecked, estimated at 75%.
     assert team0["confirmed"] == 8 and team0["pending"] == 40 and team0["checked"] == 20
     assert team0["estimate"] == 8 + 30
     lo, hi = team0["estimateRange"]
     assert lo < team0["estimate"] < hi and lo >= 8 and hi <= 48
-    # Too few checks: no estimate.
-    few = [dict(e, status="proposed") for e in events]
-    for e in few[:5]:
-        e["status"] = "confirmed"
-    stats = an.summarise(*seen, [], few, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
-    assert "estimate" not in stats["teams"][0]["passes"]
+    # The same decisions made outside the random sample do not estimate passes.
+    unsampled = {"decisions": [{k: v for k, v in d.items() if k != "sample"} for d in review["decisions"]]}
+    assert "estimate" not in stats_for(unsampled)["teams"][0]["passes"]
+    # A check is judged against what the detection originally said: a 'complete'
+    # pass re-labelled 'intercepted' is a miss for completed passes, a hit for passes.
+    relabel = {"decisions": [{"action": "outcome", "eventId": f"ev-{i}", "value": "intercepted", "sample": True} for i in range(10)]}
+    stats = stats_for(relabel)["teams"][0]
+    assert stats["passesComplete"]["checked"] == 10 and stats["passesComplete"]["checkedCorrect"] == 0
+    assert stats["passesComplete"]["estimate"] == 0
+    assert stats["passes"]["checkedCorrect"] == 10

@@ -1,14 +1,17 @@
 """Fine-tune the ball detector on the reviewer's own labels, and only keep it if it is better.
 
-1. build_dataset: every labelled frame of every match is cut into the same
-   overlapping tiles the detector sees at inference (ball.tile_frame), with a
-   YOLO box around each labelled ball. Tiles without the ball are negatives:
-   they teach the model what boots, socks, lights and line crossings look like.
-   Matches are split into training and validation by match, never by
-   neighbouring frames (with a single match, by time: the last 30%).
-2. train: Ultralytics fine-tuning from the current ball weights.
-3. score_detector: frame-level ball recall/precision on the validation labels,
-   for the current and the new weights. The new weights are kept only when they
+1. split: labelled matches are divided by match into a training part and a
+   test part (the test part needs about 30 frames with a visible ball). With
+   one usable match, by time: the last 30% is the test part.
+2. build_dataset: every training frame is cut into the same overlapping tiles
+   the detector sees at inference (ball.tile_frame), with a YOLO box around
+   the labelled ball; empty tiles (boots, socks, lights, line crossings) are
+   kept as negatives at a fixed ratio. A slice of the training frames is
+   Ultralytics' own validation set for choosing the best epoch; the test
+   frames are never shown to training at all.
+3. train: Ultralytics fine-tuning from the current ball weights.
+4. score_detector: frame-level ball recall/precision on the test frames, for
+   the current and the new weights. The new weights are kept only when they
    find more balls without more false ones (see `better`).
 """
 
@@ -25,14 +28,27 @@ from app.vision import balllabels
 from app.vision.ball import tile_frame
 from app.vision.faint import ball_size_prior
 
+MIN_TEST_VISIBLE = 30
+MIN_TRAIN_VISIBLE = 20
+MIN_MATCH_LABELS = 10
 
-def labelled_jobs(root):
+
+def _usable(directory):
+    """The footage is still stored (deleted after the retention period)."""
+    try:
+        status = json.loads((directory / "status.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return (directory / "video").is_file() and not status.get("videoDeleted")
+
+
+def labelled_jobs(root, usable=_usable):
     """Match folders with ball labels, a finished result and the footage."""
     out = []
     for directory in sorted(Path(root).iterdir()):
-        if not (directory / "balllabels.json").is_file() or not (directory / "result.json").is_file():
+        if not directory.is_dir() or not (directory / "balllabels.json").is_file() or not (directory / "result.json").is_file():
             continue
-        if not (directory / "video").is_file():
+        if not usable(directory):
             continue
         if balllabels.load(directory / "balllabels.json").get("labels"):
             out.append(directory)
@@ -51,17 +67,41 @@ def _frames_of(directory):
     return result, items
 
 
-def split(jobs, val_fraction=0.3):
-    """[(directory, indices or None)] for training and validation: by match when possible."""
-    if len(jobs) >= 2:
-        k = max(1, round(len(jobs) * val_fraction))
-        return [(d, None) for d in jobs[:-k]], [(d, None) for d in jobs[-k:]], "by-match"
-    if not jobs:
-        return [], [], "none"
-    _, items = _frames_of(jobs[0])
-    cut = int(len(items) * (1 - val_fraction))
+def _visible(items):
+    return sum(1 for _, label in items if label.get("visible"))
+
+
+def _time_split(directory, items, fraction):
     indices = [i for i, _ in items]
-    return [(jobs[0], set(indices[:cut]))], [(jobs[0], set(indices[cut:]))], "by-time-within-one-match"
+    cut = int(len(indices) * (1 - fraction))
+    return (directory, set(indices[:cut])), (directory, set(indices[cut:]))
+
+
+def split(jobs, test_fraction=0.3):
+    """(train, test, how): lists of (directory, indices or None).
+
+    By match when the smaller matches can supply enough visible-ball test
+    frames while the largest stays for training; otherwise by time inside the
+    largest match (a weaker check, reported as such).
+    """
+    ranked = sorted(((_visible(_frames_of(d)[1]), len(_frames_of(d)[1]), d) for d in jobs), key=lambda x: (x[0], x[1]))
+    ranked = [r for r in ranked if r[1] >= MIN_MATCH_LABELS]
+    if not ranked:
+        return [], [], "none"
+    if len(ranked) >= 2:
+        test, seen = [], 0
+        for visible, _, directory in ranked[:-1]:
+            if seen >= MIN_TEST_VISIBLE:
+                break
+            test.append(directory)
+            seen += visible
+        train = [d for _, _, d in ranked if d not in test]
+        train_visible = sum(v for v, _, d in ranked if d in train)
+        if seen >= MIN_TEST_VISIBLE and train_visible >= MIN_TRAIN_VISIBLE:
+            return [(d, None) for d in train], [(d, None) for d in test], "by-match"
+    largest = ranked[-1][2]
+    train, test = _time_split(largest, _frames_of(largest)[1], test_fraction)
+    return [train], [test], "by-time-within-one-match"
 
 
 def _box(label, scale, x0, y0, diameter, tile_w, tile_h):
@@ -72,44 +112,70 @@ def _box(label, scale, x0, y0, diameter, tile_w, tile_h):
     return (cx / tile_w, cy / tile_h, min(1.0, d / tile_w), min(1.0, d / tile_h))
 
 
-def build_dataset(train, val, out, negatives_per_positive=1.0, seed=0):
-    """Write a YOLO dataset to `out`; returns counts. Validation frames are also kept whole."""
+def _load_frames(directory, result, indices):
+    """Label frames decoded exactly as the engine numbered them (shared cache with the labelling screen)."""
+    cache = balllabels.prepare_frames(directory, result, indices, directory / "video")
+    return {i: cv2.imread(str(cache / f"{i}.jpg")) for i in indices if (cache / f"{i}.jpg").is_file()}
+
+
+def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.15, seed=0):
+    """Write a YOLO dataset to `out`; returns counts. Test frames are only kept whole, for scoring."""
     out = Path(out)
     if out.exists():
         shutil.rmtree(out)
     rng = random.Random(seed)
-    counts = {"train": {"positive": 0, "negative": 0}, "val": {"positive": 0, "negative": 0}, "valFrames": 0}
-    whole = []
-    for part, members in (("train", train), ("val", val)):
+    counts = {"train": {"positive": 0, "negative": 0}, "val": {"positive": 0, "negative": 0}, "testFrames": 0}
+    for part in ("train", "val"):
         (out / "images" / part).mkdir(parents=True)
         (out / "labels" / part).mkdir(parents=True)
-        for directory, indices in members:
-            result, items = _frames_of(directory)
-            height = float((result.get("video") or {}).get("height") or 360)
-            for i, label in items:
-                if indices is not None and i not in indices:
-                    continue
-                frame = balllabels.read_frame(directory / "video", balllabels.source_frame(result, i))
-                if frame is None:
-                    continue
-                diameter = ball_size_prior(result["frames"][i].get("players") or [], height)
-                stem = f"{directory.name[:8]}-{i}"
-                if part == "val":
-                    path = out / "val_frames" / f"{stem}.jpg"
-                    path.parent.mkdir(exist_ok=True)
-                    cv2.imwrite(str(path), frame)
-                    whole.append({"image": path.name, "label": label, "height": height})
-                for t, (x0, y0, scale, crop) in enumerate(tile_frame(frame)):
-                    th, tw = crop.shape[:2]
-                    box = _box(label, scale, x0, y0, diameter, tw, th) if label.get("visible") else None
-                    if box is None and rng.random() > negatives_per_positive * 0.5:
-                        continue  # keep a share of the empty tiles
-                    name = f"{stem}-{t}"
-                    cv2.imwrite(str(out / "images" / part / f"{name}.jpg"), crop)
-                    (out / "labels" / part / f"{name}.txt").write_text("" if box is None else "0 %.6f %.6f %.6f %.6f\n" % box)
-                    counts[part]["positive" if box else "negative"] += 1
-    (out / "val_frames.json").write_text(json.dumps(whole))
-    counts["valFrames"] = len(whole)
+    empties = {"train": [], "val": []}
+
+    def write(part, name, crop, box):
+        cv2.imwrite(str(out / "images" / part / f"{name}.jpg"), crop)
+        (out / "labels" / part / f"{name}.txt").write_text("" if box is None else "0 %.6f %.6f %.6f %.6f\n" % box)
+        counts[part]["positive" if box else "negative"] += 1
+
+    for directory, indices in train:
+        result, items = _frames_of(directory)
+        items = [(i, l) for i, l in items if indices is None or i in indices]
+        cut = int(len(items) * (1 - val_fraction))  # the latest frames choose the epoch
+        height = float((result.get("video") or {}).get("height") or 360)
+        frames = _load_frames(directory, result, [i for i, _ in items])
+        for k, (i, label) in enumerate(items):
+            frame = frames.get(i)
+            if frame is None:
+                continue
+            part = "train" if k < cut else "val"
+            diameter = ball_size_prior(result["frames"][i].get("players") or [], height)
+            for t, (x0, y0, scale, crop) in enumerate(tile_frame(frame)):
+                th, tw = crop.shape[:2]
+                box = _box(label, scale, x0, y0, diameter, tw, th) if label.get("visible") else None
+                name = f"{directory.name[:8]}-{i}-{t}"
+                if box is None:
+                    empties[part].append((name, crop))
+                else:
+                    write(part, name, crop, box)
+    # Negatives at a fixed ratio to the positives (at least a few per part).
+    for part, pool in empties.items():
+        keep = min(len(pool), max(5, int(round(counts[part]["positive"] * negatives_per_positive))))
+        for name, crop in rng.sample(pool, keep):
+            write(part, name, crop, None)
+
+    whole = []
+    (out / "test_frames").mkdir()
+    for directory, indices in test:
+        result, items = _frames_of(directory)
+        items = [(i, l) for i, l in items if indices is None or i in indices]
+        video = result.get("video") or {}
+        frames = _load_frames(directory, result, [i for i, _ in items])
+        for i, label in items:
+            if i not in frames or frames[i] is None:
+                continue
+            name = f"{directory.name[:8]}-{i}.jpg"
+            cv2.imwrite(str(out / "test_frames" / name), frames[i])
+            whole.append({"image": name, "label": label, "width": video.get("width"), "height": video.get("height")})
+    (out / "test_frames.json").write_text(json.dumps(whole))
+    counts["testFrames"] = len(whole)
     (out / "data.yaml").write_text(
         f"path: {out.resolve()}\ntrain: images/train\nval: images/val\nnames:\n  0: ball\n"
     )
@@ -117,19 +183,19 @@ def build_dataset(train, val, out, negatives_per_positive=1.0, seed=0):
 
 
 def score_detector(detector, dataset):
-    """Frame-level ball recall/precision of a detector on the dataset's whole validation frames.
+    """Frame-level ball recall/precision of a detector on the dataset's held-out test frames.
 
     The top-scoring detection of each frame counts (the tracker sees more, so
     this is a conservative proxy for what the engine will retain).
     """
     dataset = Path(dataset)
-    frames = json.loads((dataset / "val_frames.json").read_text())
+    frames = json.loads((dataset / "test_frames.json").read_text())
     hit = visible = absent = false = detections = 0
     for item in frames:
-        image = cv2.imread(str(dataset / "val_frames" / item["image"]))
+        image = cv2.imread(str(dataset / "test_frames" / item["image"]))
         found = detector.detect_batch([image], threshold=0.15)[0]
         best = max(found, key=lambda b: b["confidence"]) if found else None
-        tol = balllabels.ball_tolerance(item["height"])
+        tol = balllabels.ball_tolerance(float(item.get("width") or 640), float(item.get("height") or 360))
         label = item["label"]
         if best:
             detections += 1
@@ -223,7 +289,7 @@ def registry(models):
         return {"active": None, "runs": []}
 
 
-def run_training(root, models, base_weights, epochs=60, owner=None, remote=None, device="cpu", now=0.0, progress=None):
+def run_training(root, models, base_weights, epochs=60, owner=None, remote=None, device="cpu", now=0.0, progress=None, usable=_usable):
     """Build the dataset from every labelled match, fine-tune, validate, keep if better.
 
     `remote(dataset_zip, base_bytes, epochs)` runs training on a GPU (Modal) and
@@ -234,7 +300,7 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
     from app.vision.ball import TiledBallDetector
 
     say = progress or (lambda message: None)
-    jobs = labelled_jobs(root)
+    jobs = labelled_jobs(root, usable)
     if owner:
         jobs = [d for d in jobs if json.loads((d / "status.json").read_text()).get("owner") == owner]
     train_set, val_set, how = split(jobs)
@@ -245,21 +311,27 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
     dataset = work / "dataset"
     say("Building the training set from your labels")
     counts = build_dataset(train_set, val_set, dataset)
-    if counts["train"]["positive"] < 20 or counts["valFrames"] < 10:
+    if counts["train"]["positive"] < 20 or counts["testFrames"] < 10:
+        shutil.rmtree(dataset, ignore_errors=True)
         raise ValueError(
             f"Too few labels to train ({counts['train']['positive']} balls to learn from, "
-            f"{counts['valFrames']} frames to check against). Label more frames."
+            f"{counts['testFrames']} frames to check against). Label more frames."
         )
-    if remote:
-        say("Training on the GPU")
-        out = remote(_zip(dataset), Path(base_weights).read_bytes(), epochs)
-        weights_bytes, baseline, candidate = out["weights"], out["baseline"], out["candidate"]
-    else:
-        say("Training on this machine")
-        best = train(dataset, base_weights, work / "runs", epochs=epochs, device=device)
-        weights_bytes = best.read_bytes()
-        baseline = score_detector(TiledBallDetector(base_weights, device), dataset)
-        candidate = score_detector(TiledBallDetector(best, device), dataset)
+    try:
+        if remote:
+            say("Training on the GPU")
+            out = remote(_zip(dataset), Path(base_weights).read_bytes(), epochs)
+            weights_bytes, baseline, candidate = out["weights"], out["baseline"], out["candidate"]
+        else:
+            say("Training on this machine")
+            best = train(dataset, base_weights, work / "runs", epochs=epochs, device=device)
+            weights_bytes = best.read_bytes()
+            baseline = score_detector(TiledBallDetector(base_weights, device), dataset)
+            candidate = score_detector(TiledBallDetector(best, device), dataset)
+    finally:
+        # Frame copies of customers' footage do not outlive the run.
+        shutil.rmtree(dataset, ignore_errors=True)
+        shutil.rmtree(work / "runs", ignore_errors=True)
     name = f"ball-{hashlib.sha256(weights_bytes).hexdigest()[:16]}.pt"
     Path(models).mkdir(parents=True, exist_ok=True)
     (Path(models) / name).write_bytes(weights_bytes)
@@ -271,6 +343,7 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
             "weights": name,
             "base": Path(base_weights).name,
             "matches": len(jobs),
+            "owner": owner,
             "split": how,
             "counts": counts,
             "baseline": baseline,
