@@ -189,6 +189,20 @@ export async function visionJson<T>(
 
 /** Stays under Vercel's 4.5 MB function request limit, with room for headers. */
 export const UPLOAD_CHUNK = 4 * 1024 * 1024;
+
+/** A lost reply must navigate to the same run, not launch paid inference twice. */
+export async function rerunSavedVision(id: string, mode: "section" | "full", start: number, requestId: string) {
+  const query = new URLSearchParams({ mode, start: String(start), requestId });
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await visionJson<VisionJob>(`jobs/${id}/rerun?${query}`, { method: "POST" });
+    } catch (e) {
+      if (!transient(e) || attempt >= 3) throw e;
+      await sleep(1000 * 2 ** attempt);
+    }
+  }
+}
+
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     const aborted = () => {

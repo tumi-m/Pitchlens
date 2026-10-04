@@ -175,7 +175,7 @@ export function MatchReport({
           </div>
         </div>
         <p className="relative border-t border-white/10 px-5 py-2.5 text-xs text-pitch-muted flex flex-wrap gap-x-4 gap-y-1 justify-center">
-          <span>Ball state known {cov.ballStatePercent}% of the time</span>
+          <span title="Retained detector and inferred positions; this is coverage, not verified accuracy.">Ball position coverage {cov.ballStatePercent}%</span>
           <span>Possession followed {cov.possessionPercent}% of play</span>
           {cov.deadBallSeconds > 0 && <span>Ball out of play {clockTime(cov.deadBallSeconds)}</span>}
           <span>Pitch mapped {cov.calibratedPercent}%</span>

@@ -137,7 +137,9 @@ def load_status(directory):
 
 def public(data):
     """Owner keys are listing capabilities; never echo them back."""
-    return {k: v for k, v in data.items() if k not in ("owner", "uploadRequestId", "uploadRequestDigest")}
+    return {k: v for k, v in data.items() if k not in (
+        "owner", "uploadRequestId", "uploadRequestDigest", "rerunRequestId", "rerunDigest"
+    )}
 
 
 def work(directory, status, event):
@@ -356,11 +358,12 @@ def health():
         "maxBytes": MAX_BYTES,
         "maxChunk": MAX_CHUNK,
         "retentionHours": RETENTION_HOURS or None,
-        "gpu": gpu.modal_enabled(),
+        "gpu": gpu.modal_enabled() or os.getenv("VISION_DEVICE", "").startswith(("cuda", "mps")),
         # Pitch calibration, event detection and reviewer decisions.
         "analytics": True,
         "privateJobs": True,
         "reviewIdempotency": True,
+        "savedVideoReruns": True,
     }
 
 
@@ -1256,4 +1259,77 @@ def retry_job(job_id: str):
         active = job_id
         cancellations[job_id] = event
         pool.submit(work, directory, status, event)
+        return public(status)
+
+
+@app.post("/jobs/{job_id}/rerun")
+def rerun_job(job_id: str, request: Request):
+    """Start a fresh report from private saved footage; preserve the original report."""
+    global active
+    mode = request.query_params.get("mode", "section")
+    request_id = request.query_params.get("requestId", "")
+    if mode not in ("section", "full") or not re.fullmatch(r"[a-f0-9-]{32,36}", request_id):
+        raise HTTPException(400, "Choose a section or full match and a valid request ID")
+    try:
+        start = int(request.query_params.get("start", "0"))
+    except ValueError as exc:
+        raise HTTPException(400, "Test start must be a whole number of seconds") from exc
+    digest = f"{mode}:{start}"
+    with lock:
+        source = folder(job_id)
+        previous = load_status(source)
+        # Owner authorization runs before this endpoint, including retry replies.
+        for path in ROOT.glob("*/status.json"):
+            existing = _read_json(path, {})
+            if not isinstance(existing, dict):
+                continue
+            if existing.get("sourceJobId") == job_id and existing.get("rerunRequestId") == request_id:
+                if existing.get("rerunDigest") != digest:
+                    raise HTTPException(409, "Rerun request ID already used for different options")
+                return public(load_status(path.parent))
+        if previous["status"] not in ("completed", "failed", "interrupted", "cancelled"):
+            raise HTTPException(409, "Wait for this analysis to finish before starting another")
+        metadata = previous.get("video")
+        if not metadata or not (source / "video").is_file() or expired(previous):
+            raise HTTPException(409, "Saved footage is no longer available. Upload the video again.")
+        if not 0 <= start < metadata["duration"] or (mode == "full" and start != 0):
+            raise HTTPException(400, "Test start must be inside the video; full matches start at zero")
+        if previous.get("profile", "general") not in available_profiles():
+            raise HTTPException(503, "The selected vision models are not installed")
+        release_stale_upload()
+        if active is not None:
+            raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
+        new_id = uuid.uuid4().hex
+        directory = ROOT / new_id
+        status = {
+            "id": new_id, "sourceJobId": job_id, "title": previous["title"],
+            "createdAt": time.time(), "status": "processing", "stage": "Opening saved footage",
+            "progress": 0, "video": metadata, "fileSize": (source / "video").stat().st_size,
+            "profile": previous.get("profile", "general"), "sampleFps": previous.get("sampleFps", 3),
+            "ballSearch": previous.get("ballSearch", "exhaustive"),
+            "maxSeconds": 20 if mode == "section" else None, "startSeconds": start,
+            "rerunRequestId": request_id, "rerunDigest": digest,
+        }
+        if previous.get("owner"):
+            status["owner"] = previous["owner"]
+        try:
+            directory.mkdir()
+            # Both jobs are read-only consumers; deleting either link preserves
+            # the other. This avoids another upload and another 500 MB disk copy.
+            try:
+                os.link(source / "video", directory / "video")
+            except OSError:
+                check_space(status["fileSize"])
+                shutil.copyfile(source / "video", directory / "video")
+            write_status(directory, status)
+            active = new_id
+            event = threading.Event()
+            cancellations[new_id] = event
+            pool.submit(work, directory, status, event)
+        except BaseException:
+            if active == new_id:
+                active = None
+            cancellations.pop(new_id, None)
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
         return public(status)

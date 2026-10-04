@@ -66,13 +66,17 @@ test('owner query cannot override the caller capability and GPU grants are not f
   assert.equal(response.headers.get('set-cookie'), null);
 });
 
-test('delete and retry require same-origin access authorization', async () => {
+test('delete, retry and saved-video reruns require same-origin access authorization', async () => {
   const s = setup();
   assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER }), s.route())).status, 401);
   assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, access: 'fixture-access', origin: 'https://attacker.example' }), s.route())).status, 403);
   assert.equal(s.calls.length, 0);
   assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, access: 'fixture-access' }), s.route())).status, 200);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('retry'))).status, 200);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('rerun'))).status, 401);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access', origin: 'https://attacker.example' }), s.route('rerun'))).status, 403);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access', query: '?mode=full&start=0&requestId=abc' }), s.route('rerun'))).status, 200);
+  assert.equal(new URL(s.calls.at(-1).url).searchParams.get('mode'), 'full');
 });
 
 test('billing requires owner and write authorization; browser proxy never accepts webhooks', async () => {

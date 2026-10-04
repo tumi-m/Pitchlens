@@ -154,6 +154,64 @@ test("an uncalibrated match shows possession and passes, and withholds shots ins
   await expect(page.getByText("75%").first()).toBeVisible();
 });
 
+test("high ball coverage without control is not presented as verified ball accuracy", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.stats.coverage.controlPercent = 0;
+  data.stats.coverage.ballStatePercent = 90;
+  data.stats.coverage.possessionPercent = 0;
+  data.stats.coverage.possessionShown = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), r => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Ball detections did not establish possession")).toBeVisible();
+  await expect(page.getByText("Ball position coverage 90%")).toBeVisible();
+  await expect(page.getByText(/Ball state known/)).toHaveCount(0);
+});
+
+test("saved footage can start a new section without uploading the file again", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const next = "d".repeat(32);
+  const requests: URL[] = [];
+  const uploads: string[] = [];
+  page.on("request", r => { if (r.method() === "PUT") uploads.push(r.url()); });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/rerun\\?`), r => {
+    expect(r.request().method()).toBe("POST");
+    requests.push(new URL(r.request().url()));
+    return r.fulfill({ json: { id: next, status: "processing" } });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${next}$`), r => r.fulfill({ json: { id: next, status: "processing", progress: 5, stage: "Detecting players", title: "Friday 5s" } }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByLabel("Saved video test start").fill("2");
+  await page.getByRole("button", { name: "Test 20 seconds" }).click();
+  await expect(page).toHaveURL(`/vision/${next}`);
+  expect(requests).toHaveLength(1);
+  expect(requests[0].searchParams.get("start")).toBe("2");
+  expect(requests[0].searchParams.get("mode")).toBe("section");
+  expect(requests[0].searchParams.get("requestId")).toMatch(/^[a-f0-9-]{36}$/);
+  expect(uploads).toEqual([]);
+});
+
+test("full-match reruns start at zero and retry with the same reservation ID", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const next = "e".repeat(32);
+  const requests: URL[] = [];
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/rerun\\?`), r => {
+    requests.push(new URL(r.request().url()));
+    return requests.length === 1
+      ? r.fulfill({ status: 503, json: { detail: "Worker restarting" } })
+      : r.fulfill({ json: { id: next, status: "processing" } });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${next}$`), r => r.fulfill({ json: { id: next, status: "processing", progress: 5, stage: "Detecting players", title: "Friday 5s" } }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByLabel("Saved video test start").fill("2");
+  await page.getByRole("button", { name: "Analyse full match" }).click();
+  await expect(page).toHaveURL(`/vision/${next}`);
+  expect(requests).toHaveLength(2);
+  expect(requests[0].searchParams.get("start")).toBe("0");
+  expect(requests[0].searchParams.get("mode")).toBe("full");
+  expect(requests[1].searchParams.get("requestId")).toBe(requests[0].searchParams.get("requestId"));
+});
+
 test("pitch setup: landmarks are clicked on the video, the fit is checked, then applied to the match", async ({ page }) => {
   const state = await mockReport(page, { calibrated: false });
   await page.goto(`/vision/${ID}`);

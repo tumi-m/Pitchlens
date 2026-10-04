@@ -27,6 +27,10 @@ os.environ["VISION_SERVICE_TOKEN"] = token
 os.environ.setdefault("YOLO_CONFIG_DIR", str(root / ".ultralytics"))
 Path(os.environ["YOLO_CONFIG_DIR"]).mkdir(exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(config / "matplotlib"))
+from app.vision.runtime import inference_device  # noqa: E402
+
+os.environ["VISION_DEVICE"] = inference_device()
+print(f"Local inference device: {os.environ['VISION_DEVICE']}", flush=True)
 print(
     "Local worker: http://127.0.0.1:8100. Restart Next.js to load its local proxy configuration.",
     flush=True,

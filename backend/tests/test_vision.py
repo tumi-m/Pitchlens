@@ -1660,3 +1660,123 @@ def test_upload_reservation_id_requires_an_owner_and_chunk_size(hosted):
     for query in ['size=100&requestId=bad', 'size=100&requestId=' + 'd' * 32,
                   'owner=' + 'c' * 32 + '&requestId=' + 'd' * 32]:
         assert client.post('/jobs?' + query, headers=headers).status_code == 400
+
+
+def test_stationary_sky_distractor_is_removed_before_selecting_moving_ball():
+    from app.vision.faint import reject_static_candidates, strong_candidates
+    from app.vision.ball_tracking import BallTracker
+
+    drift = np.array([[1., 0, .4], [0, 1., 0]])
+    frames = [{"t": i / 5, "scene": 0, "players": [], "ballCandidates": [
+        {"x": 77., "y": 52., "confidence": .8, "outsidePitch": True},
+        {"x": 140. + 5 * i, "y": 180., "confidence": .4},
+    ]} for i in range(25)]
+    # A missed camera estimate must not protect a fixed image speck.
+    matrices = [drift if i not in (0, 4) else None for i in range(25)]
+    assert reject_static_candidates(frames, matrices, 734, 5) == 25
+    tracker = BallTracker()
+    for i, frame in enumerate(frames):
+        assert len(frame["ballCandidates"]) == 1
+        ball = tracker.update(strong_candidates(frame["ballCandidates"]), frame['t'], drift, (360, 640))
+        if i:
+            assert ball is not None and ball["x"] == 140 + 5 * i
+
+
+def test_static_filter_preserves_dead_balls_unknown_kit_keepers_and_airborne_motion():
+    from app.vision.faint import reject_static_candidates
+    identity = np.eye(2, 3)
+    for variant in ('confident-on-pitch', 'attended', 'moving', 'cut'):
+        frames = []
+        for i in range(25):
+            candidate = {'x': 77. + (i * 4 if variant == 'moving' else 0), 'y': 52.,
+                         'confidence': .8, 'outsidePitch': variant != 'confident-on-pitch'}
+            players = [{'team': -1, 'role': 'goalkeeper', 'box': [70, 20, 85, 54]}] if variant == 'attended' else []
+            frames.append({'t': i / 5, 'scene': int(i >= 12) if variant == 'cut' else 0,
+                           'players': players, 'ballCandidates': [candidate]})
+        assert reject_static_candidates(frames, [identity] * 25, 734, 5) == 0, variant
+
+
+def test_static_filter_rejects_camera_fixed_weak_object_despite_single_confidence_spike():
+    from app.vision.faint import reject_static_candidates
+    pan = np.array([[1., 0, 5.], [0, 1., 0]])
+    frames = [{'t': i / 5, 'scene': 0, 'players': [], 'ballCandidates': [
+        {'x': 50 + 5 * i, 'y': 70, 'confidence': .7 if i == 4 else .15}
+    ]} for i in range(25)]
+    assert reject_static_candidates(frames, [pan] * 25, 734, 5) == 25
+
+
+def test_auto_device_uses_available_acceleration_but_respects_override(monkeypatch):
+    from types import SimpleNamespace
+    from app.vision.runtime import inference_device
+    fake = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False),
+                           backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: True)))
+    monkeypatch.delenv('VISION_DEVICE', raising=False)
+    assert inference_device(fake) == 'mps'
+    fake.cuda.is_available = lambda: True
+    assert inference_device(fake) == 'cuda'
+    monkeypatch.setenv('VISION_DEVICE', 'cpu')
+    assert inference_device(fake) == 'cpu'
+    monkeypatch.setenv('VISION_DEVICE', 'auto')
+    fake.cuda.is_available = lambda: False
+    fake.backends.mps.is_available = lambda: False
+    assert inference_device(fake) == 'cpu'
+
+
+def test_saved_video_rerun_is_private_idempotent_and_preserves_the_report(hosted, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    server, client, _ = hosted
+    owner, job = 'c' * 32, 'a' * 32
+    source = server.ROOT / job
+    source.mkdir()
+    (source / 'video').write_bytes(b'complete saved video')
+    (source / 'result.json').write_text('{"old":true}')
+    (source / 'review.json').write_text('{"keep":true}')
+    server.write_status(source, {'id': job, 'owner': owner, 'title': 'Saved match',
+        'status': 'completed', 'createdAt': 0, 'profile': 'general', 'sampleFps': 6,
+        'video': {'duration': 600}, 'maxSeconds': 20, 'startSeconds': 0})
+    queued = []
+    monkeypatch.setattr(server, 'pool', SimpleNamespace(submit=lambda *args: queued.append(args)))
+    headers = {'x-pitchlens-owner': owner}
+    query = f'/jobs/{job}/rerun?mode=section&start=300&requestId=' + 'd' * 32
+    assert client.post(query).status_code == 404
+    response = client.post(query, headers=headers)
+    assert response.status_code == 200
+    new = response.json()['id']
+    assert new != job and response.json()['startSeconds'] == 300 and response.json()['maxSeconds'] == 20
+    assert 'owner' not in response.json() and 'rerunRequestId' not in response.json()
+    assert (server.ROOT / new / 'video').read_bytes() == b'complete saved video'
+    assert json.loads((server.ROOT / new / 'status.json').read_text())['owner'] == owner
+    assert client.post(query, headers=headers).json()['id'] == new
+    assert len(queued) == 1
+    assert client.post(query.replace('start=300', 'start=400'), headers=headers).status_code == 409
+    assert (source / 'result.json').read_text() == '{"old":true}'
+    assert (source / 'review.json').read_text() == '{"keep":true}'
+    source.joinpath('video').unlink()
+    assert (server.ROOT / new / 'video').read_bytes() == b'complete saved video'
+
+
+def test_full_rerun_validates_saved_footage_and_releases_failed_reservations(hosted, monkeypatch):
+    from types import SimpleNamespace
+    server, client, _ = hosted
+    owner, job = 'c' * 32, 'a' * 32
+    source = server.ROOT / job
+    source.mkdir()
+    saved = {'id': job, 'owner': owner, 'title': 'Match', 'status': 'completed',
+             'createdAt': 0, 'profile': 'general', 'video': {'duration': 60}}
+    server.write_status(source, saved)
+    headers = {'x-pitchlens-owner': owner}
+    query = f'/jobs/{job}/rerun?mode=full&requestId=' + 'e' * 32
+    assert client.post(query, headers=headers).status_code == 409
+    (source / 'video').write_bytes(b'complete')
+    assert client.post(query + '&start=1', headers=headers).status_code == 400
+    assert client.post(query.replace('mode=full', 'mode=section') + '&start=60', headers=headers).status_code == 400
+    def fail(*args): raise RuntimeError('queue stopped')
+    monkeypatch.setattr(server, 'pool', SimpleNamespace(submit=fail))
+    assert client.post(query, headers=headers).status_code == 500
+    assert server.active is None and list(server.ROOT.glob('*/status.json')) == [source / 'status.json']
+    assert not server.cancellations
+    monkeypatch.setattr(server, 'pool', SimpleNamespace(submit=lambda *args: None))
+    response = client.post(query, headers=headers)
+    assert response.status_code == 200 and response.json()['maxSeconds'] is None
+    assert response.json()['startSeconds'] == 0

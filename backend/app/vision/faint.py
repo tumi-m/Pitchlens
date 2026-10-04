@@ -292,15 +292,94 @@ def confirm_chains(
 
 
 def _attended(frame, ball):
-    """A team player stands over the ball (a set piece), so it is no marking."""
+    """A player stands over the ball, including keepers and uncertain kit labels."""
     for p in frame.get("players", []):
-        if p.get("team") not in (0, 1):
+        if p.get("role") not in (None, "person", "player", "goalkeeper"):
             continue
         x1, y1, x2, y2 = p["box"]
         scale = max(y2 - y1, 1)
         if min(math.hypot(ball["x"] - x, ball["y"] - y2) for x in (x1, (x1 + x2) / 2, x2)) <= scale:
             return True
     return False
+
+
+def reject_static_candidates(frames, matrices, diagonal, sample_fps):
+    """Remove persistent unattended distractors before choosing a ball path.
+
+    Test both camera-compensated and image-fixed positions. Optical-flow drift
+    previously protected fixed bright specks/overlays from static rejection.
+    Short, sparse or attended hypotheses are preserved. This removes neural
+    observations, never manufactures a replacement ball or a missing position.
+    """
+    active, rejected = [], set()
+    tolerance = diagonal * 0.004
+
+    def finish(run):
+        keys = run["keys"]
+        first, last = keys[0][0], keys[-1][0]
+        span = frames[last]["t"] - frames[first]["t"] + 1 / sample_fps
+        candidates = [frames[i]["ballCandidates"][j] for i, j in keys]
+        # One score spike must not protect an otherwise weak, stationary logo.
+        weak = np.median([c["confidence"] for c in candidates]) < 0.3
+        outside = sum(c.get("outsidePitch", False) for c in candidates) >= 0.6 * len(candidates)
+        minimum = 3.0 if weak or outside else 20.0
+        if span + 1e-6 < minimum or len(keys) / (span * sample_fps) < 0.6:
+            return
+        attended = sum(_attended(frames[i], frames[i]["ballCandidates"][j]) for i, j in keys)
+        if attended * 2 < len(keys):
+            rejected.update(keys)
+
+    for i, frame in enumerate(frames):
+        matrix = matrices[i]
+        same_scene = i > 0 and frame["scene"] == frames[i - 1]["scene"]
+        motion_known = matrix is not None and np.isfinite(matrix).all()
+        retained = []
+        for run in active:
+            last_seen = frames[run["keys"][-1][0]]["t"]
+            if not same_scene or frame["t"] - last_seen > 0.5 + 1 / sample_fps:
+                finish(run)
+            else:
+                if motion_known:
+                    run["anchor"] = _warp_point(run["anchor"], matrix)
+                else:
+                    run["cameraStatic"] = False
+                retained.append(run)
+        active = retained
+        choices = []
+        for k, run in enumerate(active):
+            for j, candidate in enumerate(frame.get("ballCandidates", [])):
+                if candidate.get("source") == "motion":
+                    continue
+                xy = np.array([candidate["x"], candidate["y"]])
+                camera_error = np.linalg.norm(run["anchor"] - xy) if run["cameraStatic"] else math.inf
+                screen_error = np.linalg.norm(run["screen"] - xy) if run["screenStatic"] else math.inf
+                distance = min(camera_error, screen_error)
+                if distance <= tolerance:
+                    choices.append((distance, k, j, camera_error, screen_error))
+        used_runs, used_candidates = set(), set()
+        for _, k, j, camera_error, screen_error in sorted(choices):
+            if k in used_runs or j in used_candidates:
+                continue
+            run = active[k]
+            run["keys"].append((i, j))
+            run["cameraStatic"] &= camera_error <= tolerance
+            run["screenStatic"] &= screen_error <= tolerance
+            used_runs.add(k)
+            used_candidates.add(j)
+        for j, candidate in enumerate(frame.get("ballCandidates", [])):
+            if candidate.get("source") != "motion" and j not in used_candidates:
+                xy = np.array([candidate["x"], candidate["y"]])
+                active.append({
+                    "anchor": xy, "screen": xy, "keys": [(i, j)],
+                    "cameraStatic": True, "screenStatic": True,
+                })
+    for run in active:
+        finish(run)
+    for i, frame in enumerate(frames):
+        frame["ballCandidates"] = [
+            c for j, c in enumerate(frame.get("ballCandidates", [])) if (i, j) not in rejected
+        ]
+    return len(rejected)
 
 
 def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confident_seconds=20.0):

@@ -8,6 +8,7 @@ import {
   visionJson,
   VisionError,
   clockTime,
+  rerunSavedVision,
 } from "@/lib/review/vision";
 import { MatchCentre } from "@/components/vision/MatchCentre";
 import { AnalysisWait } from "@/components/vision/AnalysisWait";
@@ -30,6 +31,9 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [result, setResult] = useState<VisionResult | null>(null);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [rerunning, setRerunning] = useState(false);
+  const [testStart, setTestStart] = useState(0);
+  const rerunRequest = useRef<{ key: string; id: string } | null>(null);
   const [time, setTime] = useState(0);
   const [overlay, setOverlay] = useState(true);
   const [names, setNames] = useState(["Kit A", "Kit B"]);
@@ -68,6 +72,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
           if (stopped) return;
           setResult(data);
           setTime(data.analysedStart ?? 0);
+          setTestStart(Math.floor(data.analysedStart ?? 0));
           loaded = true;
         }
       } catch (e) {
@@ -101,6 +106,20 @@ export function VisionReport({ jobId }: { jobId: string }) {
       clearTimeout(timer);
     };
   }, [jobId]);
+  async function rerun(mode: "section" | "full") {
+    const start = mode === "full" ? 0 : testStart;
+    const key = `${jobId}:${mode}:${start}`;
+    if (rerunRequest.current?.key !== key) rerunRequest.current = { key, id: crypto.randomUUID() };
+    setRerunning(true);
+    setError("");
+    try {
+      const next = await rerunSavedVision(jobId, mode, start, rerunRequest.current.id);
+      window.location.assign(`/vision/${next.id}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to analyse saved footage");
+      setRerunning(false);
+    }
+  }
   const loadAnalytics = useCallback(async () => {
     try {
       const [a, c] = await Promise.all([fetchAnalysis(jobId), fetchCalibration(jobId)]);
@@ -261,6 +280,26 @@ export function VisionReport({ jobId }: { jobId: string }) {
             <p>{(result.performance.totalSeconds / result.analysedDuration).toFixed(1)} seconds processing per second of footage. Full matches may take a different amount of time.</p>
             {result.analysedDuration < result.video.duration - .5 && <p className="text-amber-200">Diagnostic section: {clockTime(result.analysedStart ?? 0)}–{clockTime((result.analysedStart ?? 0) + result.analysedDuration)}. These results do not describe the full match.</p>}
           </div>}
+          {result && !job?.videoDeleted && (
+            <section className="glass-card p-4 space-y-3" aria-label="Analyse saved footage">
+              <p className="text-sm text-pitch-muted">Test a section with visible play or analyse the full match. Your saved video is reused; this report stays available.</p>
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="text-sm">Test start (seconds)
+                  <input aria-label="Saved video test start" type="number" min="0"
+                    max={Math.max(0, Math.ceil(result.video.duration) - 1)} step="1"
+                    value={testStart} disabled={rerunning} className="pitch-input ml-2 w-24"
+                    onChange={(e) => setTestStart(Math.max(0, Math.min(Math.ceil(result.video.duration) - 1, Math.floor(Number(e.target.value) || 0))))} />
+                </label>
+                <button className="pitch-button-secondary text-sm" disabled={rerunning}
+                  onClick={() => setTestStart(Math.max(0, Math.min(Math.ceil(result.video.duration) - 1, Math.floor(time))))}>
+                  Use playback position
+                </button>
+                <button className="pitch-button-secondary text-sm" disabled={rerunning} onClick={() => rerun("section")}>Test 20 seconds</button>
+                <button className="pitch-button-primary text-sm" disabled={rerunning} onClick={() => rerun("full")}>Analyse full match</button>
+                {rerunning && <span role="status" className="text-sm">Starting from saved footage…</span>}
+              </div>
+            </section>
+          )}
           {error && (
             <p role="alert" className="text-red-300 glass-card p-4">
               {error}
@@ -301,6 +340,13 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   <button className="pitch-button-secondary text-sm" onClick={() => seek(result.analysedStart ?? 0)}>
                     Inspect detections
                   </button>
+                </section>
+              )}
+              {result.metrics.ballFrames > 0 && analysis?.stats.coverage.controlPercent === 0 && (
+                <section role="status" className="glass-card border-amber-400/40 p-5 space-y-2">
+                  <h2 className="font-semibold text-amber-200">Ball detections did not establish possession</h2>
+                  <p className="text-sm text-pitch-muted">A high detection count can include background objects. No reliable player control was established in this section. Inspect the ball overlay and test another section with visible play before running the full match.</p>
+                  <button className="pitch-button-secondary text-sm" onClick={() => seek(result.analysedStart ?? 0)}>Inspect detections</button>
                 </section>
               )}
               {analysis ? (

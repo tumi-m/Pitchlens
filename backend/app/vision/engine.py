@@ -24,10 +24,12 @@ from app.vision.faint import (
     ball_size_prior,
     difference_candidates,
     recover_ball,
+    reject_static_candidates,
     strong_candidates,
 )
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
+from app.vision.runtime import inference_device
 from app.vision.tracking import ByteTracker, MotionTracker, camera_motion
 
 
@@ -250,7 +252,7 @@ def run_video(
     first_frame = math.ceil(start_seconds * meta["fps"])
     start_seconds = first_frame / meta["fps"]
     duration = min(duration, meta["duration"] - start_seconds)
-    device = os.getenv("VISION_DEVICE", "cpu")
+    device = inference_device(torch)
     model = YOLO(str(model_path))
     if not ball_path.is_file():
         raise ValueError(
@@ -294,11 +296,9 @@ def run_video(
             for r in results
         ]
 
-    def detect(frame):
-        return detect_batch([frame])[0]
-
     # Batches amortise model overhead; a GPU processes 8 frames almost as fast as one.
-    batch_size = max(1, int(os.getenv("VISION_BATCH", "8" if device.startswith("cuda") else "2")))
+    default_batch = "8" if device.startswith("cuda") else "4" if device == "mps" else "2"
+    batch_size = max(1, int(os.getenv("VISION_BATCH", default_batch)))
     # Adaptive search keys each frame's ball search on the previous frame's ball,
     # so ball inference runs frame by frame in that mode.
     adaptive = isinstance(ball_detector, TiledBallDetector) and ball_search == "adaptive"
@@ -323,25 +323,31 @@ def run_video(
     )
     try:
         # Spread the fit over the video so pre-match lineups do not determine every kit.
-        for index, frame_index in enumerate(calibration_indices):
+        for start in range(0, len(calibration_indices), batch_size):
             if cancelled():
                 raise InterruptedError("Analysis cancelled")
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            boxes, scores, classes = detect(frame)
-            calibration[frame_index] = (boxes, scores, classes)
-            mask = field_mask(frame)
-            pitch = pitch_colour(frame, mask)
-            for box, c in zip(boxes, classes):
-                if names[c].lower() in ("person", "player") and inside_field(mask, box):
-                    f = jersey(frame, box, pitch)
-                    if f is not None:
-                        features.append(f)
+            samples = []
+            for frame_index in calibration_indices[start : start + batch_size]:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = cap.read()
+                if ok:
+                    samples.append((frame_index, frame))
+            if samples:
+                for (frame_index, frame), (boxes, scores, classes) in zip(
+                    samples, detect_batch([frame for _, frame in samples])
+                ):
+                    calibration[frame_index] = (boxes, scores, classes)
+                    mask = field_mask(frame)
+                    pitch = pitch_colour(frame, mask)
+                    for box, c in zip(boxes, classes):
+                        if names[c].lower() in ("person", "player") and inside_field(mask, box):
+                            f = jersey(frame, box, pitch)
+                            if f is not None:
+                                features.append(f)
+            done = min(start + batch_size, len(calibration_indices))
             progress(
-                stage=f"Learning kit colours · sample {index + 1}/{len(calibration_indices)}",
-                progress=round(1 + (index + 1) / len(calibration_indices) * 4, 1),
+                stage=f"Learning kit colours · sample {done}/{len(calibration_indices)}",
+                progress=round(1 + done / len(calibration_indices) * 4, 1),
             )
     finally:
         cap.release()
@@ -448,6 +454,16 @@ def run_video(
             raw_candidates = fuse_ball_candidates(
                 raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
             )
+            if mask.any():
+                # Airborne balls remain candidates. Only prolonged stillness
+                # outside this generous field margin identifies a distractor.
+                margin = max(3, int(frame.shape[0] * 0.08))
+                region = cv2.dilate(mask, np.ones((margin, margin), np.uint8))
+                for candidate in raw_candidates:
+                    x, y = int(candidate["x"]), int(candidate["y"])
+                    candidate["outsidePitch"] = not (
+                        0 <= y < region.shape[0] and 0 <= x < region.shape[1] and bool(region[y, x])
+                    )
             detector = sorted(raw_candidates, key=lambda c: -c["confidence"])
             motion = []
             if motion_ok and not cut:
@@ -557,6 +573,18 @@ def run_video(
     progress(stage="Confirming faint ball tracks across frames", progress=94)
     tick = time.monotonic()
     diagonal = math.hypot(meta["width"], meta["height"])
+    rejected = reject_static_candidates(frames, matrices, diagonal, effective_fps)
+    if rejected:
+        # A removed distractor may have beaten the real ball online. Reassociate
+        # the remaining observed candidates before trying to bridge any gaps.
+        ball_tracker = BallTracker()
+        for i, f in enumerate(frames):
+            matrix = matrices[i] if matrices[i] is not None else np.eye(2, 3)
+            f["ball"] = ball_tracker.update(
+                strong_candidates(f["ballCandidates"]), f["t"], matrix,
+                (meta["height"], meta["width"]),
+                cut=i > 0 and f["scene"] != frames[i - 1]["scene"],
+            )
     # VISION_FAINT=0 disables track-before-detect recovery (for comparisons).
     faint = (
         recover_ball(frames, matrices, diagonal, effective_fps)
@@ -564,6 +592,7 @@ def run_video(
         else {"recovered": 0, "inferred": 0, "disabled": True}
     )
     timings["ballRecoverySeconds"] = time.monotonic() - tick
+    faint["rejectedStaticCandidates"] = rejected
     # Working data for the confirmation pass: ~12 dicts per frame, tens of MB
     # on a full match. Kept only when asked (tuning, benchmarks).
     if os.getenv("VISION_KEEP_CANDIDATES", "0") != "1":
@@ -577,7 +606,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.3",
+        "pipelineVersion": "local-vision-2.4",
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},
