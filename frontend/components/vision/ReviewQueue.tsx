@@ -5,6 +5,13 @@ import type { Analysis, AnalysisEvent, ReviewDecision } from "@/lib/review/analy
 import { describeEvent, sendReview } from "@/lib/review/analysis";
 import { clockTime } from "@/lib/review/vision";
 
+/** Stable pseudo-random rank from an event id (same order on every visit). */
+function shuffleKey(id: string) {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
 const PRIORITY: Record<string, number> = { "goal-candidate": 0, shot: 1, interception: 2, tackle: 3, pass: 4, out: 5 };
 
 export function ReviewQueue({
@@ -25,7 +32,7 @@ export function ReviewQueue({
   onWatch: (t: number, until: number) => void;
   onAnalysis: (analysis: Analysis) => void;
 }) {
-  const [filter, setFilter] = useState<"key" | "all" | "pending">("key");
+  const [filter, setFilter] = useState<"key" | "sample" | "pending" | "all">("key");
   // The selection follows the event, not a position: decisions change the list.
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [team, setTeam] = useState<0 | 1>(0);
@@ -33,6 +40,11 @@ export function ReviewQueue({
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const items = useMemo(() => {
+    if (filter === "sample") {
+      // Unchecked passes in a fixed random order: checking the first ten gives an
+      // unbiased hit rate for estimating the rest (no need to review them all).
+      return analysis.events.filter((e) => e.type === "pass" && e.status === "proposed").sort((a, b) => shuffleKey(a.id) - shuffleKey(b.id));
+    }
     const list = analysis.events.filter((e) => {
       if (filter === "key") return e.type !== "pass" && e.type !== "out";
       if (filter === "pending") return e.status === "proposed";
@@ -66,7 +78,7 @@ export function ReviewQueue({
         onAnalysis(out.analysis);
         // Under "Not reviewed" the decided moment leaves the list: the next one
         // takes its place, so stay on the same position rather than skipping.
-        if (advance) setSelectedId(filter === "pending" ? nextId : nextId ?? current?.id ?? null);
+        if (advance) setSelectedId(filter === "pending" || filter === "sample" ? nextId : nextId ?? current?.id ?? null);
       } catch (e) {
         setError(e instanceof Error ? e.message : "The decision could not be saved");
       } finally {
@@ -202,6 +214,7 @@ export function ReviewQueue({
         {(
           [
             ["key", "Shots & key moments"],
+            ["sample", "Check passes"],
             ["pending", "Not reviewed"],
             ["all", "Everything"],
           ] as const
@@ -211,6 +224,16 @@ export function ReviewQueue({
           </button>
         ))}
       </div>
+      {filter === "sample" && (
+        <p className="text-xs text-pitch-muted" data-testid="sample-progress">
+          {(() => {
+            const checked = analysis.events.filter((e) => e.type === "pass" && e.status !== "proposed" && e.source !== "reviewer").length;
+            return checked >= 10
+              ? `${checked} passes checked: the report now estimates pass counts from them. More checks narrow the range.`
+              : `Random passes, one after another. ${checked} of 10 checked before the report can estimate pass counts.`;
+          })()}
+        </p>
+      )}
       {current ? (
         <div className="rounded-xl border border-white/10 p-4 space-y-3">
           <div className="flex items-center justify-between gap-3">

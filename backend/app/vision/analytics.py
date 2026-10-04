@@ -61,6 +61,7 @@ PARAMS = {
     "tackleMaxTravel": 2.0,  # m: shorter opponent gains are tackles, not interceptions
     "tackleMaxGap": 0.8,  # s
     "minPassesForAccuracy": 20,  # attempts per team before an accuracy % is shown
+    "minCheckedForEstimate": 10,  # reviewed detections of a type before unchecked ones are estimated
     # Shots.
     "minShotSpeed": 8.0,  # m/s; 6-8 m/s kept as low-confidence candidates
     "lowShotSpeed": 6.0,
@@ -1071,6 +1072,15 @@ ON_TARGET = {"on-target", "saved", "goal-candidate", "goal"}
 REANCHOR_SECONDS = 1.0
 
 
+def wilson(successes, n, z=1.96):
+    """95% Wilson interval for a proportion (honest on small samples)."""
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
 def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < 1e12 and math.isfinite(value)
 
@@ -1253,13 +1263,31 @@ def summarise(projected, states, spells, events, template, directions, player_of
             unknown += dt
     live = [e for e in events if e["status"] != "rejected"]
 
+    # How often the automatic detections of each type were right, from the
+    # moments the reviewer checked. With enough checks, the unchecked ones are
+    # estimated at that rate instead of being shown as nothing.
+    checked = {}
+    for e in events:
+        if e.get("source") == "reviewer" or e["status"] == "proposed":
+            continue
+        ok, n = checked.get(e["type"], (0, 0))
+        checked[e["type"]] = (ok + (e["status"] == "confirmed"), n + 1)
+
     def count(kind, team, predicate=None):
         items = [e for e in live if e["type"] == kind and e.get("team") == team and (predicate is None or predicate(e))]
-        return {
-            "value": len(items),
-            "confirmed": sum(1 for e in items if e["status"] == "confirmed"),
-            "pending": sum(1 for e in items if e["status"] == "proposed"),
-        }
+        confirmed = sum(1 for e in items if e["status"] == "confirmed")
+        pending = sum(1 for e in items if e["status"] == "proposed")
+        out = {"value": len(items), "confirmed": confirmed, "pending": pending}
+        ok, n = checked.get(kind, (0, 0))
+        out["checked"] = n
+        if pending and n >= PARAMS["minCheckedForEstimate"]:
+            lo, hi = wilson(ok, n)
+            out["estimate"] = round(confirmed + pending * ok / n)
+            out["estimateRange"] = [math.floor(confirmed + pending * lo), math.ceil(confirmed + pending * hi)]
+            out["checkedCorrect"] = ok
+        elif not pending:
+            out["estimate"] = confirmed
+        return out
 
     total_possession = sum(possession_seconds)
     coverage = total_possession / in_play_seconds if in_play_seconds else 0.0
@@ -1491,6 +1519,10 @@ def finish(base, review=None, include_positions=True):
             "confirmed": sum(1 for e in events if e["status"] == "confirmed"),
             "rejected": sum(1 for e in events if e["status"] == "rejected"),
             "pending": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True)),
+            # Shots, possible goals and turnovers deserve a look each; passes are
+            # better estimated from a random sample than reviewed one by one.
+            "pendingKey": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True) and e["type"] not in ("pass", "out")),
+            "pendingByType": dict(Counter(e["type"] for e in events if e["status"] == "proposed" and e.get("needsReview", True))),
         },
         "positions": base["positions"] if include_positions else None,
     }

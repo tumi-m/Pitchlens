@@ -409,3 +409,19 @@ test("completed player detection does not imply usable ball analytics", async ({
   await expect(page.getByRole('heading', { name: 'Ball tracking unavailable for this section' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Inspect detections' })).toBeVisible();
 });
+
+test("checked passes turn unchecked detections into an estimate with a range", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.stats.teams[0].passes = { value: 48, confirmed: 8, pending: 40, checked: 20, checkedCorrect: 15, estimate: 38, estimateRange: [29, 44] };
+  data.stats.teams[1].passes = { value: 30, confirmed: 2, pending: 28, checked: 20 } as never;
+  data.review = { ...data.review, pending: 70, pendingKey: 2, pendingByType: { pass: 68, shot: 2 } } as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const passes = page.locator('[data-stat="Passes"]');
+  await expect(passes).toContainText("≈38");
+  await expect(passes).toContainText("29–44");
+  await expect(page.getByText("2 key moments to check", { exact: false })).toBeVisible();
+  await expect(page.getByText("68 passes found", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pitch not set up · set it up" })).toBeVisible();
+});

@@ -161,7 +161,17 @@ export function pitchToImage(H: Mat3, k1: number, size: [number, number], points
 
 // ---------------------------------------------------------------- types
 
-export type CountStat = { value: number; confirmed: number; pending: number };
+export type CountStat = {
+  value: number;
+  confirmed: number;
+  pending: number;
+  /** Automatic detections of this type the reviewer has checked (all teams). */
+  checked?: number;
+  checkedCorrect?: number;
+  /** Confirmed plus unchecked detections at the checked hit rate (with enough checks). */
+  estimate?: number;
+  estimateRange?: [number, number];
+};
 
 export type TeamStats = {
   controlSeconds: number;
@@ -247,7 +257,15 @@ export type Analysis = {
   kickoffs?: { t: number; team: number }[];
   /** Final score typed by the reviewer: the authority for the scoreline. */
   enteredScore?: [number, number] | null;
-  review: { decisions: number; confirmed: number; rejected: number; pending: number };
+  review: {
+    decisions: number;
+    confirmed: number;
+    rejected: number;
+    pending: number;
+    /** Unreviewed shots, possible goals and turnovers (passes are estimated from a sample). */
+    pendingKey?: number;
+    pendingByType?: Record<string, number>;
+  };
   /** [t, [[player, team, x, y]...] | null, [bx, by, inferred] | null] per sampled frame. */
   positions: [number, [number, number, number, number][] | null, [number, number, number] | null][] | null;
 };

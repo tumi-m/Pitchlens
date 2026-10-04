@@ -747,3 +747,28 @@ def test_possession_bounds_include_unseen_play_not_detector_accuracy():
         frame["ball"] = None
     empty = analytics.analyse(result_for(frames), calibration_for(frames))
     assert empty["stats"]["coverage"]["possessionMissingBounds"] is None
+
+
+def test_checked_sample_estimates_the_unchecked_detections():
+    from app.vision import analytics as an
+
+    events = [{"id": f"ev-{i}", "type": "pass", "t": float(i), "team": i % 2, "confidence": 0.6, "status": "proposed"} for i in range(100)]
+    # The reviewer checked 20: 15 right, 5 wrong.
+    for e in events[:15]:
+        e["status"] = "confirmed"
+    for e in events[15:20]:
+        e["status"] = "rejected"
+    seen = ([{"t": 0.0, "calibrated": False, "players": [], "ball": None}], [{"state": "control", "team": 0}])
+    stats = an.summarise(*seen, [], events, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
+    team0 = stats["teams"][0]["passes"]
+    # Team 0: 8 confirmed of its 10 checked... and 40 unchecked, estimated at 75%.
+    assert team0["confirmed"] == 8 and team0["pending"] == 40 and team0["checked"] == 20
+    assert team0["estimate"] == 8 + 30
+    lo, hi = team0["estimateRange"]
+    assert lo < team0["estimate"] < hi and lo >= 8 and hi <= 48
+    # Too few checks: no estimate.
+    few = [dict(e, status="proposed") for e in events]
+    for e in few[:5]:
+        e["status"] = "confirmed"
+    stats = an.summarise(*seen, [], few, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
+    assert "estimate" not in stats["teams"][0]["passes"]
