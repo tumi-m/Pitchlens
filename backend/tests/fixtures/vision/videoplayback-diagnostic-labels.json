@@ -1,0 +1,85 @@
+{
+  "note": "Retrospective debugging labels on supplied 640x360 video, not held-out evaluation. Three added centres at 301.4, 301.6 and 305.6 were inspected on native-pixel crops; 302.6 and 305.2 are occluded and excluded. Never use this small selected set as a full-match accuracy claim.",
+  "tolerancePixels": 3,
+  "labels": [
+    {
+      "t": 301.4,
+      "x": 430.0,
+      "y": 169.0
+    },
+    {
+      "t": 301.6,
+      "x": 463.0,
+      "y": 169.0
+    },
+    {
+      "t": 301.8,
+      "x": 493,
+      "y": 170
+    },
+    {
+      "t": 302,
+      "x": 517.5,
+      "y": 171.5
+    },
+    {
+      "t": 302.2,
+      "x": 540,
+      "y": 171
+    },
+    {
+      "t": 302.8,
+      "x": 565,
+      "y": 173
+    },
+    {
+      "t": 303,
+      "x": 563.25,
+      "y": 173
+    },
+    {
+      "t": 303.2,
+      "x": 560,
+      "y": 173
+    },
+    {
+      "t": 304.8,
+      "x": 545,
+      "y": 172
+    },
+    {
+      "t": 305,
+      "x": 544.25,
+      "y": 172
+    },
+    {
+      "t": 305.6,
+      "x": 509.5,
+      "y": 162.0
+    }
+  ],
+  "videoSha256": "9f1189f289ff92fa066240c48390996c6cefcedb6016a2c9d8f82b6aabfa02cb",
+  "sourceVideo": "videoplayback.mp4",
+  "negativeRegions": [
+    {
+      "t": 301.4,
+      "box": [
+        293,
+        160,
+        303,
+        169
+      ],
+      "reason": "Pitch object; actual ball is at 430,169."
+    },
+    {
+      "t": 301.6,
+      "box": [
+        293,
+        160,
+        303,
+        169
+      ],
+      "reason": "Pitch object; actual ball is at 463,169."
+    }
+  ]
+}

@@ -31,6 +31,7 @@ from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
 from app.vision.runtime import inference_device
 from app.vision.tracking import ByteTracker, MotionTracker, camera_motion
+from app.vision.trajectory import recover_near_anchors
 
 
 def file_sha256(path):
@@ -106,6 +107,36 @@ def vote_teams(frames):
             if p["id"] in decided and p.get("role") in (None, "person", "player"):
                 p["team"] = decided[p["id"]]
     return frames
+
+
+def stabilise_roles(frames):
+    """Resolve noisy role classifications using evidence within one short-term ID.
+
+    A single false 'referee' frame must not remove a known player's kit and
+    break a control spell. Ambiguous and short tracks remain as detected. Keep
+    the original role for inspection; this is a temporal estimate, not identity.
+    """
+    votes, observations = {}, {}
+    for f in frames:
+        for p in f["players"]:
+            key = (f.get("scene", 0), p["id"])
+            role = p.get("detectedRole") or p.get("role") or "player"
+            observations.setdefault(key, []).append(p)
+            votes.setdefault(key, Counter())[role] += p.get("confidence", 1.0)
+    corrected = 0
+    for key, counts in votes.items():
+        role, weight = counts.most_common(1)[0]
+        members = observations[key]
+        if len(members) < 6 or weight < 0.75 * sum(counts.values()):
+            continue
+        for p in members:
+            if p.get("role", "player") != role:
+                p.setdefault("detectedRole", p.get("role", "player"))
+                p["role"] = role
+                corrected += 1
+            if role not in ("player", "person"):
+                p["team"] = -1
+    return corrected
 
 
 def field_mask(frame):
@@ -420,18 +451,22 @@ def run_video(
             if cut:
                 scene += 1
             previous_gray = gray
-            observations = [
-                {
-                    "team": assign_team(jersey(frame, box, pitch), centres, use_hue=not role_aware)
-                    if centres is not None and names[c].lower() in ("person", "player")
-                    else -1,
-                    "role": names[c].lower(),
+            observations = []
+            for box, score, c in zip(boxes, scores, classes):
+                if c not in people or not inside_field(mask, box):
+                    continue
+                feature = jersey(frame, box, pitch)
+                role = names[c].lower()
+                observations.append({
+                    "team": assign_team(feature, centres, use_hue=not role_aware)
+                    if centres is not None and role in ("person", "player") else -1,
+                    "role": role,
                     "box": [round(float(x), 1) for x in box],
                     "confidence": round(float(score), 3),
-                }
-                for box, score, c in zip(boxes, scores, classes)
-                if c in people and inside_field(mask, box)
-            ]
+                    # Also retain colour for non-player labels: those labels
+                    # fluctuate, but the physical kit does not change each frame.
+                    "kitFeature": [round(float(x), 1) for x in feature] if feature is not None else None,
+                })
             players = tracker.update(observations, t, matrix, cut=cut)
             # Masking uses every on-pitch detection: the tracker only lists a new
             # player once confirmed (on the next frame), and an unmasked limb would
@@ -585,7 +620,11 @@ def run_video(
                 (meta["height"], meta["width"]),
                 cut=i > 0 and f["scene"] != frames[i - 1]["scene"],
             )
-    # VISION_FAINT=0 disables track-before-detect recovery (for comparisons).
+    trajectory_recovered = (
+        recover_near_anchors(frames, matrices, diagonal, effective_fps)
+        if os.getenv("VISION_TRAJECTORY", "1") != "0" else 0
+    )
+    # These two recovery passes can be disabled separately for comparisons.
     faint = (
         recover_ball(frames, matrices, diagonal, effective_fps)
         if os.getenv("VISION_FAINT", "1") != "0"
@@ -593,6 +632,7 @@ def run_video(
     )
     timings["ballRecoverySeconds"] = time.monotonic() - tick
     faint["rejectedStaticCandidates"] = rejected
+    faint["trajectoryRecovered"] = trajectory_recovered
     # Working data for the confirmation pass: ~12 dicts per frame, tens of MB
     # on a full match. Kept only when asked (tuning, benchmarks).
     if os.getenv("VISION_KEEP_CANDIDATES", "0") != "1":
@@ -602,11 +642,13 @@ def run_video(
     analysed_duration = min(
         duration, max((frame_num - first_frame) / meta["fps"], last_t - start_seconds)
     )
+    corrected_roles = stabilise_roles(frames)
     vote_teams(frames)
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.4",
+        "pipelineVersion": "local-vision-2.5",
+        "playerTracking": {"appearance": isinstance(tracker, ByteTracker), "roleCorrections": corrected_roles},
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},

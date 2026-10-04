@@ -1722,6 +1722,43 @@ def test_auto_device_uses_available_acceleration_but_respects_override(monkeypat
     assert inference_device(fake) == 'cpu'
 
 
+def test_role_consensus_repairs_player_misclassification_but_preserves_referees_and_ambiguity():
+    from app.vision.engine import stabilise_roles, vote_teams
+    frames = []
+    for i in range(10):
+        frames.append({'scene': 0, 'players': [
+            {'id': 1, 'role': 'referee' if i == 4 else 'player', 'team': -1 if i == 4 else 0, 'confidence': .9},
+            {'id': 2, 'role': 'player' if i == 4 else 'referee', 'team': 0 if i == 4 else -1, 'confidence': .9},
+            {'id': 3, 'role': 'player' if i % 2 else 'goalkeeper', 'team': 1 if i % 2 else -1, 'confidence': .9},
+        ]})
+    assert stabilise_roles(frames) == 2
+    vote_teams(frames)
+    assert all(f['players'][0]['team'] == 0 and f['players'][0]['role'] == 'player' for f in frames)
+    assert frames[4]['players'][0]['detectedRole'] == 'referee'
+    assert all(f['players'][1]['team'] == -1 and f['players'][1]['role'] == 'referee' for f in frames)
+    assert len(set(f['players'][2]['role'] for f in frames)) == 2
+    assert stabilise_roles(frames) == 0  # repeated processing is stable
+
+
+def test_appearance_stops_unknown_role_from_stealing_an_opposing_player_id():
+    from app.vision.tracking import ByteTracker
+    tracker = ByteTracker()
+    matrix = np.eye(2, 3)
+    red = {'box': [50, 20, 70, 70], 'team': 0, 'confidence': .9, 'kitFeature': [130, 180, 150]}
+    for i in range(4):
+        tracked = tracker.update([red], i / 5, matrix)
+    original = tracked[0]['id']
+    # The detector calls a white-shirt opponent a referee at the same position.
+    # Geometry and team=-1 alone used to attach them to the established red ID.
+    white = {**red, 'team': -1, 'role': 'referee', 'kitFeature': [200, 120, 130]}
+    assert tracker.update([white], .8, matrix) == []
+    other = tracker.update([white], 1., matrix)
+    assert other[0]['id'] != original
+    # A shadow changes brightness, not the kit's chromaticity.
+    shadow = {**red, 'kitFeature': [70, 179, 151]}
+    assert tracker.update([shadow], 1.2, matrix)[0]['id'] == original
+
+
 def test_saved_video_rerun_is_private_idempotent_and_preserves_the_report(hosted, monkeypatch):
     import json
     from types import SimpleNamespace

@@ -121,3 +121,54 @@ Remaining detection work: label representative visible balls and hard negatives
 on separate training and evaluation sections, improve ball recall without
 restoring these distractors, and validate end-to-end events on held-out matches.
 The current system must not be described as solved or commercially validated.
+
+## Full-match export and pipeline 2.5
+
+The next supplied export, `pitchlens-vision (6).json`, contains the full 37:34
+video, not a diagnostic. CUDA processing took 840.1 seconds, with 2,847 observed
+ball frames out of 11,272 (25.3%) and 2,125 player track fragments. Its legacy
+raw `metrics.possessionCoverage` is 5.5%. The separate report analytics algorithm
+produces 10.2% control coverage and 48.4% estimated possession coverage, still
+below its display threshold, with 290 unconfirmed event candidates. These
+different measures must not be compared as if they were detection accuracy.
+
+Two further failures were reproduced:
+
+- Role classifications fluctuate within tracked people. Treating each referee
+  or goalkeeper classification as definitive dropped a known player's team
+  assignment. A colour-aware association cost now helps prevent an unknown
+  role from stealing an opposing kit's ID. A confidence-weighted role consensus
+  needs six observations and a 75% majority before correcting a role; the
+  original is retained in `detectedRole`. Ambiguous tracks stay unresolved.
+  This is short-term tracking, not reliable full-match player identification.
+- At 05:01.4 and 05:01.6 the tracker selected a pitch object while the visible
+  ball moved across the frame. Nearby strong detections now resolve existing
+  weak candidates backwards and forwards over at most 0.6 seconds. Motion
+  candidates need bracketing neural observations. This pass never inserts a
+  position without a candidate, never overwrites a strong observation, and
+  stops at cuts or missing camera motion. It adds no model inference calls.
+
+Real re-inference of 05:00–05:20 matches 10 of the 11 diagnostic centres within
+three pixels, up from 8 in the user's export; both labelled pitch-object errors
+are gone. The remaining ball at 05:05.6 is still missed. All eight earlier
+positive labels remain matched. A separate 10:00–10:20 run adds five temporal
+promotions; native-pixel crops of those five were visually inspected and show
+the ball. This is a small diagnostic check, **not held-out match accuracy**.
+The two final CPU runs executed concurrently and took about 245–247 seconds
+each; those timings are not a serial CPU or hosted GPU performance benchmark.
+One intermediate GPU run completed, but automatic approval-review quota blocked
+the later GPU comparison. Final integrated checks therefore used CPU.
+
+128-, 192- and 256-pixel crop searches with the existing ball and player models
+were also tried. They did not consistently recover the three inspected misses
+and introduced background candidates. No additional crop-inference pass or
+lower detector threshold was adopted.
+
+The versioned diagnostic labels live in
+`backend/tests/fixtures/vision/videoplayback-diagnostic-labels.json`.
+`backend/scripts/evaluate_ball_tracks.py` separately reports matched observed
+positions, inferred positions, candidate availability and hits in labelled
+background regions. Keep these debugging labels out of training and do not
+describe their hit rate as a general accuracy score. A larger independent set
+of visible balls, occlusions and hard negatives is still required before model
+fine-tuning or a full-match quality claim.

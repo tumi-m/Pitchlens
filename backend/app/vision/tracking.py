@@ -202,6 +202,8 @@ class _Track:
     born: float = 0.0
     # Observations seen before confirmation: (that frame's output list, observation).
     pending: list = field(default_factory=list)
+    appearance: np.ndarray | None = None
+    appearance_hits: int = 0
 
     @property
     def team(self):
@@ -236,6 +238,19 @@ class ByteTracker:
         if distance > gate:
             return None
         cost = 0.65 * distance / gate + 0.35 * (1 - overlap(predicted, np.array(obs["box"])))
+        feature = obs.get("kitFeature")
+        if feature is not None and track.appearance is not None:
+            delta = np.asarray(feature, float) - track.appearance
+            colour_distance = float(np.linalg.norm(delta))
+            # A referee/keeper misclassification has team=-1, so the team gate
+            # alone lets an established ID jump to the opposing kit. Use the
+            # actual jersey pixels too. A brightness change alone is not a veto.
+            if track.appearance_hits >= 3 and colour_distance > 55 and np.linalg.norm(delta[1:]) > 35:
+                return None
+            # Illumination changes are common under floodlights; chromaticity
+            # distinguishes the kits more reliably than raw brightness.
+            appearance_cost = float(np.linalg.norm(delta * [0.35, 1.0, 1.0]))
+            cost += 0.2 * min(1.0, appearance_cost / 55)
         team = track.team
         if team >= 0 and obs["team"] >= 0 and team != obs["team"]:
             a, b = track.team_votes
@@ -293,6 +308,10 @@ class ByteTracker:
             tr.kf.update(obs["box"])
             tr.seen = t
             tr.hits += 1
+            if obs.get("kitFeature") is not None:
+                feature = np.asarray(obs["kitFeature"], float)
+                tr.appearance = feature if tr.appearance is None else 0.9 * tr.appearance + 0.1 * feature
+                tr.appearance_hits += 1
             if obs["team"] in (0, 1):
                 tr.team_votes[obs["team"]] += 1
             if not tr.confirmed and tr.hits >= self.CONFIRM_HITS:
@@ -323,6 +342,9 @@ class ByteTracker:
             if obs["team"] in (0, 1):
                 votes[obs["team"]] += 1
             track = _Track(self.next_id, _Kalman(obs["box"]), votes, t, born=t)
+            if obs.get("kitFeature") is not None:
+                track.appearance = np.asarray(obs["kitFeature"], float)
+                track.appearance_hits = 1
             track.pending.append((frame_list, obs))
             self.tracks.append(track)
             self.next_id += 1
