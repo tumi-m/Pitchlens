@@ -107,8 +107,10 @@ measured run on 02:00–02:20 fell from 131.8 seconds on CPU to 37.6 seconds on
 MPS with batching. This is a hardware-and-pipeline comparison, not an isolated
 algorithm speedup or a hosted CUDA performance claim. Player model calls on
 the MPS run fell from 74 to 31. An intermediate 05:00–05:20 run preserved all
-eight retrospective visible-ball labels within three pixels; eight examples
-are insufficient to establish general recall or precision.
+eight retrospective visible-ball labels within three pixels. A final CPU rerun
+of 05:00–05:20, including the off-pitch rejection, also preserved all eight
+labels (128.5 seconds, 39 observed plus three inferred ball positions). Eight
+examples are insufficient to establish general recall or precision.
 
 Also evaluated the official [WASB multi-frame soccer detector](https://github.com/nttcom/WASB-SBDT)
 outside the repository. Neither the tested whole-frame nor tiled samples

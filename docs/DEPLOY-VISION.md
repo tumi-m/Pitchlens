@@ -158,7 +158,8 @@ Modal → Settings → Usage & billing.
 
 ### Engine tuning variables
 
-- `VISION_BATCH`: frames per model call (default 8 on GPU, 2 on CPU).
+- `VISION_DEVICE`: `auto` selects CUDA, Apple MPS, then CPU; an explicit device overrides selection. Modal sets `cuda`.
+- `VISION_BATCH`: frames per player-model call, including kit-colour sampling (default 8 on CUDA, 4 on MPS, 2 on CPU).
 - `VISION_FAINT=0`: turn off track-before-detect ball recovery (default on).
 - `VISION_THREADS`: CPU threads for inference.
 - `VISION_TRACKER=legacy`: previous player tracker (default is the
