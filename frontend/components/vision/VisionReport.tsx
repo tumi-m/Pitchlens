@@ -15,6 +15,7 @@ import { AnalysisWait } from "@/components/vision/AnalysisWait";
 import { matchStats } from "@/lib/review/visionStats";
 import { MatchReport } from "@/components/vision/MatchReport";
 import { ReviewQueue } from "@/components/vision/ReviewQueue";
+import { BallLabeller } from "@/components/vision/BallLabeller";
 import { PitchCalibration, CalibrationOverlay } from "@/components/vision/PitchCalibration";
 import { MiniPitch } from "@/components/vision/PitchGraphics";
 import {
@@ -47,6 +48,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [calClick, setCalClick] = useState<{ x: number; y: number; n: number; moved?: boolean } | null>(null);
   const [showLines, setShowLines] = useState(true);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [labelling, setLabelling] = useState(false);
   const clipEnd = useRef<number | null>(null);
   const reviewRef = useRef<HTMLDivElement>(null);
   const calibrationRef = useRef<HTMLDivElement>(null);
@@ -623,6 +625,23 @@ export function VisionReport({ jobId }: { jobId: string }) {
                     </section>
                   )}
                 </div>
+              )}
+              {analysis && !job?.videoDeleted && (
+                <section className="glass-card p-5 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-xl font-semibold">Ball accuracy and training</h2>
+                      <p className="text-sm text-pitch-muted max-w-2xl">
+                        Show Pitchlens where the ball is on frames from across this match. It measures how often the
+                        ball was found, and the answers train a better ball finder for footage like yours.
+                      </p>
+                    </div>
+                    <button className="pitch-button-secondary" onClick={() => setLabelling((v) => !v)}>
+                      {labelling ? "Close" : "Label the ball"}
+                    </button>
+                  </div>
+                  {labelling && <BallLabeller jobId={jobId} />}
+                </section>
               )}
               {!analysis && (
               <section className="glass-card p-5 space-y-4">

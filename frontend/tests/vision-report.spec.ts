@@ -413,7 +413,7 @@ test("completed player detection does not imply usable ball analytics", async ({
 test("checked passes turn unchecked detections into an estimate with a range", async ({ page }) => {
   await mockReport(page, { calibrated: false });
   const data = analysis(false);
-  data.stats.teams[0].passes = { value: 48, confirmed: 8, pending: 40, checked: 20, checkedCorrect: 15, estimate: 38, estimateRange: [29, 44] };
+  data.stats.teams[0].passes = { value: 48, confirmed: 8, pending: 40, checked: 20, checkedCorrect: 15, estimate: 38, estimateRange: [29, 44] } as never;
   data.stats.teams[1].passes = { value: 30, confirmed: 2, pending: 28, checked: 20 } as never;
   data.review = { ...data.review, pending: 70, pendingKey: 2, pendingByType: { pass: 68, shot: 2 } } as never;
   await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
@@ -424,4 +424,64 @@ test("checked passes turn unchecked detections into an estimate with a range", a
   await expect(page.getByText("2 key moments to check", { exact: false })).toBeVisible();
   await expect(page.getByText("68 passes found", { exact: false })).toBeVisible();
   await expect(page.getByRole("button", { name: "Pitch not set up · set it up" })).toBeVisible();
+});
+
+test("the ball can be labelled on frames: accept the guess, click it exactly, or mark it not visible", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const posts: Record<string, unknown>[] = [];
+  const state = {
+    frames: [
+      { index: 2, t: 0.4, guess: { x: 320, y: 180, confidence: 0.6 } },
+      { index: 9, t: 1.8, guess: null },
+      { index: 15, t: 3.0, guess: null },
+    ],
+    labels: {} as Record<string, unknown>,
+    metrics: {
+      labelled: 0, visible: 0, tolerancePixels: 3,
+      recall: { value: null, n: 0, interval95: null }, precision: { value: null, n: 0, interval95: null },
+      falseDetections: { value: null, n: 0, interval95: null }, inferredAccuracy: { value: null, n: 0, interval95: null },
+      medianErrorPixels: null,
+    },
+    videoAvailable: true,
+    size: [640, 360],
+  };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), async (r) => {
+    if (r.request().method() === "POST") {
+      const body = r.request().postDataJSON();
+      posts.push(body);
+      state.labels[String(body.index)] = body.visible === false ? { visible: false } : { visible: true, x: body.x, y: body.y };
+      if (posts.length === 1) state.metrics = { ...state.metrics, labelled: 1, visible: 1, recall: { value: 1, n: 1, interval95: [0.21, 1] } };
+    }
+    return r.fulfill({ json: state });
+  });
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC",
+    "base64",
+  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ body: png, headers: { "content-type": "image/png" } }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  await expect(page.getByTestId("ball-labeller")).toBeVisible();
+  await expect(page.getByText("Frame 1 of 3")).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => posts.length).toBe(1);
+  expect(posts[0]).toEqual({ index: 2, x: 320, y: 180 });
+  await expect(page.getByTestId("ball-recall")).toHaveText("100%");
+  await expect(page.getByText("Frame 2 of 3")).toBeVisible();
+  // First click zooms, the second places the ball exactly.
+  const frame = page.getByAltText(/Analysed frame/);
+  const box = (await frame.boundingBox())!;
+  await frame.click({ position: { x: box.width / 4, y: box.height / 2 } });
+  const zoom = page.getByTestId("ball-zoom");
+  await expect(zoom).toBeVisible();
+  const zbox = (await zoom.boundingBox())!;
+  await zoom.click({ position: { x: zbox.width / 2, y: zbox.height / 2 } });
+  await expect.poll(() => posts.length).toBe(2);
+  const placed = posts[1] as { index: number; x: number; y: number };
+  expect(placed.index).toBe(9);
+  expect(Math.abs(placed.x - 160)).toBeLessThan(2);
+  expect(Math.abs(placed.y - 180)).toBeLessThan(2);
+  await page.keyboard.press("n");
+  await expect.poll(() => posts.length).toBe(3);
+  expect(posts[2]).toEqual({ index: 15, visible: false });
 });

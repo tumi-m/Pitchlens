@@ -16,7 +16,7 @@ const MIN_CHECKED = 10;
 
 function count(c: CountStat | null | undefined): Value {
   if (!c) return { value: null };
-  if (!c.pending) return { value: c.confirmed > 0 ? c.confirmed : null, note: c.confirmed ? "all confirmed" : c.value ? undefined : "none found" };
+  if (!c.pending) return { value: c.confirmed > 0 ? c.confirmed : null, note: c.confirmed ? "confirmed in reviewed clips" : "none confirmed" };
   if (c.estimate !== undefined && c.estimateRange) {
     // Unchecked detections counted at the rate the reviewer found them right.
     return { value: c.estimate, approx: true, note: `${c.estimateRange[0]}–${c.estimateRange[1]} · ${c.confirmed} confirmed` };

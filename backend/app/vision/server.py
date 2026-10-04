@@ -1156,6 +1156,166 @@ async def add_review(job_id: str, request: Request):
     return {"decisions": total, "added": added, "analysis": data}
 
 
+# ------------------------------------------------------------------ ball labels
+# Ground truth for the ball from the reviewer: measured accuracy per match and
+# training data for the ball detector (app/vision/balllabels.py).
+
+
+def _label_seed(job_id):
+    return int(job_id[:8], 16)
+
+
+def _video_path(directory):
+    path = directory / "video"
+    data = _read_json(directory / "status.json", {})
+    return path if path.is_file() and not expired(data) else None
+
+
+def _ball_labels_response(job_id, directory, result):
+    from app.vision import balllabels
+
+    store = balllabels.load(directory / "balllabels.json")
+    picks = balllabels.sample_frames(result, seed=_label_seed(job_id))
+    frames = result.get("frames") or []
+    return {
+        "frames": [{"index": i, "t": frames[i]["t"], "guess": balllabels.guess(frames[i])} for i in picks],
+        "labels": store.get("labels", {}),
+        "metrics": balllabels.metrics(result, store),
+        "videoAvailable": _video_path(directory) is not None,
+        "size": [(result.get("video") or {}).get("width"), (result.get("video") or {}).get("height")],
+    }
+
+
+@app.get("/jobs/{job_id}/ball-labels")
+def ball_labels(job_id: str):
+    directory, path = _finished_result(job_id)
+    return _ball_labels_response(job_id, directory, json.loads(path.read_text()))
+
+
+@app.post("/jobs/{job_id}/ball-labels")
+async def add_ball_label(job_id: str, request: Request):
+    from app.vision import balllabels
+
+    directory, path = _finished_result(job_id)
+    body = await _json_body(request)
+    result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    size = ((result.get("video") or {}).get("width") or 0, (result.get("video") or {}).get("height") or 0)
+    try:
+        label = balllabels.clean_label(body, size)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if label["index"] >= len(result.get("frames") or []):
+        raise HTTPException(400, "Unknown frame")
+
+    def save():
+        with post_lock:
+            store = balllabels.load(directory / "balllabels.json")
+            try:
+                balllabels.apply_label(store, label, round(time.time(), 3))
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            _write_json(directory / "balllabels.json", store)
+
+    await asyncio.to_thread(save)
+    return await asyncio.to_thread(_ball_labels_response, job_id, directory, result)
+
+
+@app.get("/jobs/{job_id}/frames/{index}")
+def frame_image(job_id: str, index: int):
+    """One analysed frame as JPEG at the video's own resolution, for labelling."""
+    import cv2
+
+    from app.vision import balllabels
+
+    directory, path = _finished_result(job_id)
+    video_path = _video_path(directory)
+    if video_path is None:
+        raise HTTPException(404, "Video is unavailable")
+    result = json.loads(path.read_text())
+    if not 0 <= index < len(result.get("frames") or []):
+        raise HTTPException(404, "Unknown frame")
+    image = balllabels.read_frame(video_path, balllabels.source_frame(result, index))
+    if image is None:
+        raise HTTPException(404, "That frame could not be decoded")
+    ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise HTTPException(500, "That frame could not be encoded")
+    from fastapi.responses import Response
+
+    return Response(jpeg.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+training = {"state": "idle"}  # one ball-model training at a time, in this process
+training_lock = threading.Lock()
+
+
+def _models_dir():
+    from app.vision.profiles import models_dir
+
+    return models_dir()
+
+
+@app.get("/ball-model")
+def ball_model():
+    """Fine-tuned ball models: which one is active and how each run validated.
+
+    Service-token only (the website proxy does not route it): an operator action.
+    """
+    from app.vision import balltrain
+
+    return {**balltrain.registry(_models_dir()), "training": dict(training)}
+
+
+@app.post("/ball-model/train")
+async def train_ball_model(request: Request):
+    """Fine-tune the ball detector on every labelled match (Modal GPU when configured)."""
+    from app.vision import balltrain
+    from app.vision.profiles import model_paths
+    from app.vision.runtime import inference_device
+
+    body = await _json_body(request) if request.headers.get("content-length") not in (None, "0") else {}
+    epochs = body.get("epochs", 60)
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or not 1 <= epochs <= 300:
+        raise HTTPException(400, "Epochs must be a whole number from 1 to 300")
+    owner = body.get("owner")
+    if owner is not None and (not isinstance(owner, str) or not OWNER.fullmatch(owner)):
+        raise HTTPException(400, "Invalid owner")
+    base = model_paths("broadcast")[1]
+    if not base.is_file():
+        raise HTTPException(409, "No tiled ball model is installed to start from")
+    with training_lock:
+        if training.get("state") == "running":
+            raise HTTPException(409, "A training run is already in progress")
+        training.clear()
+        training.update(state="running", stage="Starting", startedAt=round(time.time(), 3))
+
+    def remote(dataset_zip, base_bytes, n):
+        from app.vision.modal_app import app as modal_app, train_ball
+
+        with modal_app.run():
+            return train_ball.remote(dataset_zip, base_bytes, n)
+
+    def run():
+        try:
+            run = balltrain.run_training(
+                ROOT,
+                _models_dir(),
+                base,
+                epochs=epochs,
+                owner=owner,
+                remote=remote if gpu.modal_enabled() else None,
+                device=inference_device(),
+                now=round(time.time(), 3),
+                progress=lambda message: training.update(stage=message),
+            )
+            training.update(state="done", stage="Finished", run=run)
+        except Exception as exc:  # reported to the operator; nothing is switched
+            training.update(state="failed", stage=str(exc))
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"started": True}
+
+
 # ------------------------------------------------------------------ venues
 
 VENUES = "venues"

@@ -381,3 +381,29 @@ export function describeEvent(e: AnalysisEvent): string {
   if (e.type === "shot") return `${base} · ${(e.outcome || "").replace("-", " ")}`;
   return base;
 }
+
+export type Rate = { value: number | null; n: number; interval95: [number, number] | null };
+
+export type BallLabelState = {
+  frames: { index: number; t: number; guess: { x: number; y: number; confidence?: number } | null }[];
+  labels: Record<string, { visible: true; x: number; y: number } | { visible: false }>;
+  metrics: {
+    labelled: number;
+    visible: number;
+    tolerancePixels: number;
+    recall: Rate;
+    precision: Rate;
+    falseDetections: Rate;
+    inferredAccuracy: Rate;
+    medianErrorPixels: number | null;
+  };
+  videoAvailable: boolean;
+  size: [number, number];
+};
+
+export const fetchBallLabels = (jobId: string) => visionJson<BallLabelState>(`jobs/${jobId}/ball-labels`);
+
+export const sendBallLabel = (jobId: string, label: { index: number; x: number; y: number } | { index: number; visible: false }) =>
+  post<BallLabelState>(`jobs/${jobId}/ball-labels`, label);
+
+export const frameImageUrl = (jobId: string, index: number) => `/api/vision/jobs/${jobId}/frames/${index}`;
