@@ -195,3 +195,23 @@ def test_profiles_use_the_validated_ball_model(tmp_path, monkeypatch):
     # A tampered registry cannot point outside the models folder.
     (tmp_path / "models" / "ball-model.json").write_text(json.dumps({"active": "../../etc/passwd"}))
     assert profiles.active_ball_weights() is None
+
+
+def test_training_endpoint_validates_and_needs_a_tiled_ball_model(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "test-token")
+    monkeypatch.setenv("VISION_DATA_DIR", str(tmp_path))
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers["Authorization"] = "Bearer test-token"
+    assert client.get("/ball-model").json()["active"] is None
+    assert client.post("/ball-model/train", json={"epochs": 0}).status_code == 400
+    assert client.post("/ball-model/train", json={"epochs": True}).status_code == 400
+    # From the hosted site an owner key is required (only that browser's matches train).
+    assert client.post("/ball-model/train", json={}, headers={"x-pitchlens-require-owner": "1"}).status_code == 400
+    monkeypatch.setattr("app.vision.profiles.model_paths", lambda profile="general": (tmp_path / "p.pt", tmp_path / "missing.pt"))
+    assert client.post("/ball-model/train", json={}).status_code == 409
+    assert client.get("/ball-model", headers={"Authorization": "Bearer wrong"}).status_code == 401

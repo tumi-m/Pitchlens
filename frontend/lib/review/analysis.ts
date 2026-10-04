@@ -407,3 +407,23 @@ export const sendBallLabel = (jobId: string, label: { index: number; x: number; 
   post<BallLabelState>(`jobs/${jobId}/ball-labels`, label);
 
 export const frameImageUrl = (jobId: string, index: number) => `/api/vision/jobs/${jobId}/frames/${index}`;
+
+export type BallModelRun = {
+  at: number;
+  weights: string;
+  matches: number;
+  split: string;
+  counts: { train: { positive: number; negative: number }; valFrames: number };
+  baseline: { recall: number | null; precision: number | null; frames: number };
+  candidate: { recall: number | null; precision: number | null; frames: number };
+  kept: boolean;
+};
+
+export type BallModelState = {
+  active: string | null;
+  runs: BallModelRun[];
+  training: { state: "idle" | "running" | "done" | "failed"; stage?: string; run?: BallModelRun };
+};
+
+export const fetchBallModel = () => visionJson<BallModelState>("ball-model");
+export const trainBallModel = (epochs = 60) => post<{ started: boolean }>("ball-model/train", { epochs });

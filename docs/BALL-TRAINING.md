@@ -36,9 +36,11 @@ held out for checking.
 
 ## 2. Train (about $1 of GPU, 15-30 minutes)
 
-Training uses every labelled match on the worker. With Modal configured on the
-worker it runs on a Modal GPU (`VISION_MODAL_TRAIN_GPU`, default L4);
-otherwise on the worker itself (slow on CPU).
+In the app: **Label the ball → Train on my labels** (needs 30+ labelled
+frames; uses only the matches uploaded from your browser, and the site's
+access code). With Modal configured on the worker it runs on a Modal GPU
+(`VISION_MODAL_TRAIN_GPU`, default L4); otherwise on the worker itself (slow
+on CPU). The same from a terminal, over every labelled match on the worker:
 
 ```bash
 curl -X POST "$VISION_SERVICE_URL/ball-model/train" \

@@ -450,7 +450,7 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
       const body = r.request().postDataJSON();
       posts.push(body);
       state.labels[String(body.index)] = body.visible === false ? { visible: false } : { visible: true, x: body.x, y: body.y };
-      if (posts.length === 1) state.metrics = { ...state.metrics, labelled: 1, visible: 1, recall: { value: 1, n: 1, interval95: [0.21, 1] } };
+      if (posts.length === 1) state.metrics = { ...state.metrics, labelled: 1, visible: 1, recall: { value: 1, n: 1, interval95: [0.21, 1] } } as never;
     }
     return r.fulfill({ json: state });
   });
@@ -459,8 +459,24 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
     "base64",
   );
   await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ body: png, headers: { "content-type": "image/png" } }));
+  const trainings: unknown[] = [];
+  const model = {
+    active: null as string | null,
+    runs: [] as unknown[],
+    training: { state: "idle" } as Record<string, unknown>,
+  };
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: model }));
+  await page.route(/\/api\/vision\/ball-model\/train$/, (r) => {
+    trainings.push(r.request().postDataJSON());
+    model.training = { state: "done", stage: "Finished" };
+    model.runs = [{ at: 1, weights: "ball-0123456789abcdef.pt", matches: 2, split: "by-match", counts: { train: { positive: 90, negative: 80 }, valFrames: 150 },
+      baseline: { recall: 0.41, precision: 0.8, frames: 150 }, candidate: { recall: 0.67, precision: 0.84, frames: 150 }, kept: true }];
+    return r.fulfill({ json: { started: true } });
+  });
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: "Label the ball" }).click();
+  // Training needs labels first.
+  await expect(page.getByRole("button", { name: "Train on my labels" })).toBeDisabled();
   await expect(page.getByTestId("ball-labeller")).toBeVisible();
   await expect(page.getByText("Frame 1 of 3")).toBeVisible();
   await page.keyboard.press("Enter");
@@ -484,4 +500,34 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
   await page.keyboard.press("n");
   await expect.poll(() => posts.length).toBe(3);
   expect(posts[2]).toEqual({ index: 15, visible: false });
+});
+
+test("training on the labels reports old and new ball recall and whether it was switched on", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const frames = Array.from({ length: 40 }, (_, i) => ({ index: i, t: i, guess: null }));
+  const labels = Object.fromEntries(frames.map((f) => [String(f.index), { visible: false }]));
+  const empty = { value: null, n: 0, interval95: null };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) =>
+    r.fulfill({ json: { frames, labels, metrics: { labelled: 40, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianErrorPixels: null }, videoAvailable: true, size: [640, 360] } }),
+  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
+  const model = { active: null as string | null, runs: [] as unknown[], training: { state: "idle" } as Record<string, unknown> };
+  const started: unknown[] = [];
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: model }));
+  await page.route(/\/api\/vision\/ball-model\/train$/, (r) => {
+    started.push(r.request().postDataJSON());
+    model.training = { state: "done", stage: "Finished" };
+    model.active = "ball-0123456789abcdef.pt";
+    model.runs = [{ at: 1, weights: "ball-0123456789abcdef.pt", matches: 2, split: "by-match", counts: { train: { positive: 90, negative: 80 }, valFrames: 150 },
+      baseline: { recall: 0.41, precision: 0.8, frames: 150 }, candidate: { recall: 0.67, precision: 0.84, frames: 150 }, kept: true }];
+    return r.fulfill({ json: { started: true } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  await page.getByRole("button", { name: "Train on my labels" }).click();
+  await expect.poll(() => started.length).toBe(1);
+  expect(started[0]).toEqual({ epochs: 60 });
+  const result = page.getByTestId("ball-training-result");
+  await expect(result).toContainText("41% → 67%");
+  await expect(result).toContainText("Switched on");
 });

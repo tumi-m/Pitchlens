@@ -1,8 +1,8 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, EyeOff, SkipForward, ChevronLeft, ZoomIn } from "lucide-react";
-import type { BallLabelState, Rate } from "@/lib/review/analysis";
-import { fetchBallLabels, frameImageUrl, sendBallLabel } from "@/lib/review/analysis";
+import type { BallLabelState, BallModelState, Rate } from "@/lib/review/analysis";
+import { fetchBallLabels, fetchBallModel, frameImageUrl, sendBallLabel, trainBallModel } from "@/lib/review/analysis";
 import { clockTime } from "@/lib/review/vision";
 
 const ZOOM = 5; // magnification of the precise-click view
@@ -234,6 +234,67 @@ export function BallLabeller({ jobId }: { jobId: string }) {
           {error && <p className="text-sm text-red-300">{error}</p>}
         </div>
       )}
+      <BallTraining labelled={done} />
+    </div>
+  );
+}
+
+const pctOf = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v * 100)}%`);
+
+/** Fine-tune the ball finder on every match labelled from this browser (GPU, about $1). */
+export function BallTraining({ labelled }: { labelled: number }) {
+  const [model, setModel] = useState<BallModelState | null>(null);
+  const [error, setError] = useState("");
+  const running = model?.training.state === "running";
+
+  const refresh = useCallback(() => {
+    fetchBallModel()
+      .then(setModel)
+      .catch((e) => setError(e instanceof Error ? e.message : "Training status unavailable"));
+  }, []);
+  useEffect(refresh, [refresh]);
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(refresh, 5000);
+    return () => clearInterval(timer);
+  }, [running, refresh]);
+
+  async function start() {
+    setError("");
+    try {
+      await trainBallModel();
+      refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Training could not start");
+    }
+  }
+
+  const last = model?.training.run ?? model?.runs[model.runs.length - 1];
+  return (
+    <div className="rounded-lg border border-white/10 p-4 space-y-2 text-sm" data-testid="ball-training">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="font-semibold">Train a better ball finder</p>
+          <p className="text-pitch-muted text-xs max-w-xl">
+            Uses the frames you labelled in every match from this browser. Some matches are held back to check the
+            result; the new finder is switched on only if it finds more balls there without more false ones.
+            Label at least two matches first ({labelled} frames labelled here).
+          </p>
+        </div>
+        <button className="pitch-button-primary" onClick={start} disabled={running || labelled < 30}>
+          {running ? "Training…" : "Train on my labels"}
+        </button>
+      </div>
+      {running && <p className="text-pitch-muted">{model?.training.stage}</p>}
+      {model?.training.state === "failed" && <p className="text-amber-200">{model.training.stage}</p>}
+      {last && (
+        <p className="text-pitch-muted" data-testid="ball-training-result">
+          Last run: ball found {pctOf(last.baseline.recall)} → {pctOf(last.candidate.recall)} of visible balls on{" "}
+          {last.candidate.frames} held-back frames ({last.split === "by-match" ? "other matches" : "later in the same match"}).{" "}
+          {last.kept ? "Switched on for new analyses." : "Not better, so the current finder stays."}
+        </p>
+      )}
+      {error && <p className="text-red-300">{error}</p>}
     </div>
   );
 }

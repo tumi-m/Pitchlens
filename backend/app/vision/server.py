@@ -1280,6 +1280,8 @@ async def train_ball_model(request: Request):
     owner = body.get("owner")
     if owner is not None and (not isinstance(owner, str) or not OWNER.fullmatch(owner)):
         raise HTTPException(400, "Invalid owner")
+    # From the website: only the requesting browser's own labelled matches.
+    owner = _owner(request) or owner
     base = model_paths("broadcast")[1]
     if not base.is_file():
         raise HTTPException(409, "No tiled ball model is installed to start from")
