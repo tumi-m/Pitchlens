@@ -1,6 +1,8 @@
 """Explicit model choices: broadcast training does not establish indoor accuracy."""
 
+import json
 import os
+import re
 from pathlib import Path
 
 # Pinned SHA-256 of downloadable weights; a GPU copying weights verifies these.
@@ -14,8 +16,42 @@ KNOWN_SHA256 = {
 }
 
 
+CUSTOM_BALL = re.compile(r"ball-([a-f0-9]{16})\.pt")
+
+
+def expected_digest(name):
+    """Full SHA-256 for downloadable weights, or the hash prefix a fine-tuned ball model is named by."""
+    if name in KNOWN_SHA256:
+        return KNOWN_SHA256[name]
+    match = CUSTOM_BALL.fullmatch(name)
+    return match.group(1) if match else None
+
+
+def models_dir():
+    """Fine-tuned weights live with the match data (a persistent volume), not in the image."""
+    return Path(os.getenv("VISION_DATA_DIR", ".vision")).resolve() / "models"
+
+
+def active_ball_weights():
+    """The fine-tuned ball model in use, if one passed its validation (see balltrain)."""
+    explicit = os.getenv("VISION_BALL_WEIGHTS")
+    if explicit:
+        # Set by the GPU job before it copies the file in (missing until then).
+        return Path(explicit)
+    try:
+        registry = json.loads((models_dir() / "ball-model.json").read_text())
+    except (OSError, ValueError):
+        return None
+    name = registry.get("active")
+    if not isinstance(name, str) or not CUSTOM_BALL.fullmatch(name):
+        return None
+    path = models_dir() / name
+    return path if path.is_file() else None
+
+
 def model_paths(profile="general"):
     root = Path(__file__).resolve().parents[2]
+    custom = active_ball_weights()
 
     def resolve(value):
         path = Path(value)
@@ -29,12 +65,12 @@ def model_paths(profile="general"):
     if profile == "small-ball":
         return (
             resolve(os.getenv("VISION_MODEL_PATH", "models/yolo11s.pt")),
-            root / "models/roboflow-football-ball.pt",
+            custom or root / "models/roboflow-football-ball.pt",
         )
     if profile == "broadcast":
         return (
             root / "models/roboflow-football-player.pt",
-            root / "models/roboflow-football-ball.pt",
+            custom or root / "models/roboflow-football-ball.pt",
         )
     raise ValueError("Unknown footage profile")
 

@@ -61,6 +61,7 @@ PARAMS = {
     "tackleMaxTravel": 2.0,  # m: shorter opponent gains are tackles, not interceptions
     "tackleMaxGap": 0.8,  # s
     "minPassesForAccuracy": 20,  # attempts per team before an accuracy % is shown
+    "minCheckedForEstimate": 10,  # reviewed detections of a type before unchecked ones are estimated
     # Shots.
     "minShotSpeed": 8.0,  # m/s; 6-8 m/s kept as low-confidence candidates
     "lowShotSpeed": 6.0,
@@ -1071,6 +1072,15 @@ ON_TARGET = {"on-target", "saved", "goal-candidate", "goal"}
 REANCHOR_SECONDS = 1.0
 
 
+def wilson(successes, n, z=1.96):
+    """95% Wilson interval for a proportion (honest on small samples)."""
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
 def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < 1e12 and math.isfinite(value)
 
@@ -1088,6 +1098,10 @@ def apply_review(events, review):
     if not review:
         return events, {}
     by_id = {e["id"]: dict(e) for e in events}
+    for e in by_id.values():
+        # What the automatic detection said before any decision: report estimates
+        # judge each check against it (see summarise).
+        e.setdefault("original", {k: e.get(k) for k in ("type", "team", "outcome", "onTarget")})
     current = list(by_id.values())
     added = {}
     kept = {}  # decision event id -> reviewer moment kept from a vanished event
@@ -1177,6 +1191,8 @@ def apply_review(events, review):
                 kept[target["id"]] = target  # later decisions address it by its public id
             else:
                 continue
+        if d.get("sample") and action in ("accept", "reject", "team", "type", "outcome"):
+            target["sampled"] = True  # checked as part of a random sample
         if action == "accept":
             target["status"] = "confirmed"
         elif action == "reject":
@@ -1255,11 +1271,47 @@ def summarise(projected, states, spells, events, template, directions, player_of
 
     def count(kind, team, predicate=None):
         items = [e for e in live if e["type"] == kind and e.get("team") == team and (predicate is None or predicate(e))]
-        return {
-            "value": len(items),
-            "confirmed": sum(1 for e in items if e["status"] == "confirmed"),
-            "pending": sum(1 for e in items if e["status"] == "proposed"),
-        }
+        confirmed = sum(1 for e in items if e["status"] == "confirmed")
+        pending = sum(1 for e in items if e["status"] == "proposed")
+        out = {"value": len(items), "confirmed": confirmed, "pending": pending}
+        ok, n = checked_rate(kind, predicate)
+        out["checked"] = n
+        if pending and n >= PARAMS["minCheckedForEstimate"]:
+            lo, hi = wilson(ok, n)
+            out["estimate"] = round(confirmed + pending * ok / n)
+            out["estimateRange"] = [math.floor(confirmed + pending * lo), math.ceil(confirmed + pending * hi)]
+            out["checkedCorrect"] = ok
+        elif not pending:
+            out["estimate"] = confirmed
+        return out
+
+    def checked_rate(kind, predicate):
+        """How often automatic detections that read as this statistic were right.
+
+        A check counts when the reviewer judged an automatic event whose original
+        reading matched (type, and the predicate such as 'complete' or 'on
+        target'); it was right if the reviewer kept that reading (same type, team
+        and predicate). Passes are reviewed in bulk, so only passes checked in the
+        random-sample view count (an unbiased rate); shots and turnovers are
+        reviewed one by one, so every check counts. Teams are pooled.
+        """
+        ok = n = 0
+        for e in events:
+            if e.get("source") == "reviewer" or e["status"] == "proposed":
+                continue
+            original = e.get("original") or e
+            if original.get("type") != kind or (predicate is not None and not predicate(original)):
+                continue
+            if kind == "pass" and not e.get("sampled"):
+                continue
+            n += 1
+            ok += (
+                e["status"] == "confirmed"
+                and e["type"] == kind
+                and e.get("team") == original.get("team")
+                and (predicate is None or predicate(e))
+            )
+        return ok, n
 
     total_possession = sum(possession_seconds)
     coverage = total_possession / in_play_seconds if in_play_seconds else 0.0
@@ -1491,6 +1543,10 @@ def finish(base, review=None, include_positions=True):
             "confirmed": sum(1 for e in events if e["status"] == "confirmed"),
             "rejected": sum(1 for e in events if e["status"] == "rejected"),
             "pending": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True)),
+            # Shots, possible goals and turnovers deserve a look each; passes are
+            # better estimated from a random sample than reviewed one by one.
+            "pendingKey": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True) and e["type"] not in ("pass", "out")),
+            "pendingByType": dict(Counter(e["type"] for e in events if e["status"] == "proposed" and e.get("needsReview", True))),
         },
         "positions": base["positions"] if include_positions else None,
     }

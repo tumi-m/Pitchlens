@@ -161,7 +161,17 @@ export function pitchToImage(H: Mat3, k1: number, size: [number, number], points
 
 // ---------------------------------------------------------------- types
 
-export type CountStat = { value: number; confirmed: number; pending: number };
+export type CountStat = {
+  value: number;
+  confirmed: number;
+  pending: number;
+  /** Automatic detections of this type the reviewer has checked (all teams). */
+  checked?: number;
+  checkedCorrect?: number;
+  /** Confirmed plus unchecked detections at the checked hit rate (with enough checks). */
+  estimate?: number;
+  estimateRange?: [number, number];
+};
 
 export type TeamStats = {
   controlSeconds: number;
@@ -207,6 +217,8 @@ export type AnalysisEvent = {
   ballSeen?: number;
   needsReview?: boolean;
   source?: string;
+  /** Checked in the random-sample view (counts toward pass estimates). */
+  sampled?: boolean;
   note?: string;
   evidence?: string[];
   restartAt?: number;
@@ -247,7 +259,15 @@ export type Analysis = {
   kickoffs?: { t: number; team: number }[];
   /** Final score typed by the reviewer: the authority for the scoreline. */
   enteredScore?: [number, number] | null;
-  review: { decisions: number; confirmed: number; rejected: number; pending: number };
+  review: {
+    decisions: number;
+    confirmed: number;
+    rejected: number;
+    pending: number;
+    /** Unreviewed shots, possible goals and turnovers (passes are estimated from a sample). */
+    pendingKey?: number;
+    pendingByType?: Record<string, number>;
+  };
   /** [t, [[player, team, x, y]...] | null, [bx, by, inferred] | null] per sampled frame. */
   positions: [number, [number, number, number, number][] | null, [number, number, number] | null][] | null;
 };
@@ -302,9 +322,9 @@ export type CalibrationRequest = {
 export type SeenEvent = { type: string; t: number; team: number | null; outcome?: string };
 
 export type ReviewDecision =
-  | { action: "accept" | "reject" | "reset"; eventId: string; event?: SeenEvent }
-  | { action: "team"; eventId: string; value: 0 | 1; event?: SeenEvent }
-  | { action: "type" | "outcome"; eventId: string; value: string; event?: SeenEvent }
+  | { action: "accept" | "reject" | "reset"; eventId: string; event?: SeenEvent; sample?: boolean }
+  | { action: "team"; eventId: string; value: 0 | 1; event?: SeenEvent; sample?: boolean }
+  | { action: "type" | "outcome"; eventId: string; value: string; event?: SeenEvent; sample?: boolean }
   | { action: "add"; type: string; t: number; team?: 0 | 1; outcome?: string; x?: number; y?: number }
   | { action: "direction"; value: "left" | "right" }
   | { action: "score"; value: [number, number] };
@@ -363,3 +383,51 @@ export function describeEvent(e: AnalysisEvent): string {
   if (e.type === "shot") return `${base} · ${(e.outcome || "").replace("-", " ")}`;
   return base;
 }
+
+export type Rate = { value: number | null; n: number; interval95: [number, number] | null };
+
+export type BallLabelState = {
+  frames: { index: number; t: number; guess: { x: number; y: number; confidence?: number } | null }[];
+  labels: Record<string, { visible: true; x: number; y: number } | { visible: false }>;
+  metrics: {
+    labelled: number;
+    visible: number;
+    tolerancePixels: number;
+    recall: Rate;
+    precision: Rate;
+    falseDetections: Rate;
+    inferredAccuracy: Rate;
+    medianHitErrorPixels: number | null;
+  };
+  videoAvailable: boolean;
+  /** False while the worker is still extracting the label frames from the video. */
+  framesReady: boolean;
+  size: [number, number];
+};
+
+export const fetchBallLabels = (jobId: string) => visionJson<BallLabelState>(`jobs/${jobId}/ball-labels`);
+
+export const sendBallLabel = (jobId: string, label: { index: number; x: number; y: number } | { index: number; visible: false }) =>
+  post<BallLabelState>(`jobs/${jobId}/ball-labels`, label);
+
+export const frameImageUrl = (jobId: string, index: number) => `/api/vision/jobs/${jobId}/frames/${index}`;
+
+export type BallModelRun = {
+  at: number;
+  weights: string;
+  matches: number;
+  split: string;
+  counts: { train: { positive: number; negative: number }; testFrames: number };
+  baseline: { recall: number | null; precision: number | null; frames: number };
+  candidate: { recall: number | null; precision: number | null; frames: number };
+  kept: boolean;
+};
+
+export type BallModelState = {
+  active: string | null;
+  runs: BallModelRun[];
+  training: { state: "idle" | "running" | "done" | "failed"; stage?: string; run?: BallModelRun };
+};
+
+export const fetchBallModel = () => visionJson<BallModelState>("ball-model");
+export const trainBallModel = (epochs = 60) => post<{ started: boolean }>("ball-model/train", { epochs });

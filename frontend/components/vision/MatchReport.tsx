@@ -9,14 +9,20 @@ import { AveragePositions, Heatmap, ShotMap } from "@/components/vision/PitchGra
 
 const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p-5";
 
-type Value = { value: number | null; note?: string };
+type Value = { value: number | null; note?: string; approx?: boolean };
+
+/** Minimum checked detections of a type before the rest are estimated (mirrors the worker). */
+const MIN_CHECKED = 10;
 
 function count(c: CountStat | null | undefined): Value {
   if (!c) return { value: null };
-  return {
-    value: c.confirmed > 0 ? c.confirmed : null,
-    note: c.pending ? `${c.confirmed} confirmed · ${c.pending} to review` : c.confirmed ? "confirmed in reviewed clips" : "none confirmed",
-  };
+  if (!c.pending) return { value: c.confirmed > 0 ? c.confirmed : null, note: c.confirmed ? "confirmed in reviewed clips" : "none confirmed" };
+  if (c.estimate !== undefined && c.estimateRange) {
+    // Unchecked detections counted at the rate the reviewer found them right.
+    return { value: c.estimate, approx: true, note: `${c.estimateRange[0]}–${c.estimateRange[1]} · ${c.confirmed} confirmed` };
+  }
+  const need = Math.max(0, MIN_CHECKED - (c.checked ?? 0));
+  return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review${need ? ` · ${need} more checks to estimate` : ""}` };
 }
 
 function Row({
@@ -44,7 +50,7 @@ function Row({
         className="px-2.5 py-0.5 rounded-full text-sm font-bold tabular-nums"
         style={leader === side ? { background: colours[side], color: "#0b0f1a" } : undefined}
       >
-        {v.value === null ? "—" : format(v.value)}
+        {v.value === null ? "—" : `${v.approx ? "≈" : ""}${format(v.value)}`}
       </span>
       {v.note && <span className="text-[10px] text-pitch-muted mt-0.5">{v.note}</span>}
     </span>
@@ -120,9 +126,9 @@ export function MatchReport({
   return (
     <div className="space-y-6">
       <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
-        <strong>Assisted review</strong> · Automatic moments are candidates until you confirm them.
-        Counts below include confirmed events only; missed events still need to be added.
-        Observed control and pitch graphics are estimates, with full-match accuracy not yet validated.
+        <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check about ten random
+        passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
+        detections you checked were right. Moments the system never found are not included; add them in the review.
       </section>
       <motion.section
         initial={{ opacity: 0, y: 14 }}
@@ -166,8 +172,16 @@ export function MatchReport({
                     : "No goal confirmed yet. Add goals you saw in the review."}
             </span>
             <button className="text-xs underline text-pitch-green" onClick={onReview}>
-              {analysis.enteredScore ? "Review moments" : "Enter the score and review moments"} ({analysis.review.pending} waiting)
+              {analysis.enteredScore ? "Review" : "Enter the score and review"}
+              {analysis.review.pendingKey !== undefined
+                ? ` · ${analysis.review.pendingKey} key moment${analysis.review.pendingKey === 1 ? "" : "s"} to check`
+                : ` · ${analysis.review.pending} waiting`}
             </button>
+            {(analysis.review.pendingByType?.pass ?? 0) > 0 && (
+              <span className="text-[11px] text-pitch-muted max-w-[18rem]">
+                {analysis.review.pendingByType?.pass} passes found: check a random sample of ten to estimate the totals, no need to go through them all.
+              </span>
+            )}
           </div>
           <div className="flex flex-col items-center gap-2">
             <span className="w-12 h-12 rounded-full border-4 border-white/20" style={{ background: colours[1] }} />
@@ -178,8 +192,14 @@ export function MatchReport({
           <span title="Retained detector and inferred positions; this is coverage, not verified accuracy.">Ball position coverage {cov.ballStatePercent}%</span>
           <span>Possession followed {cov.possessionPercent}% of play</span>
           {cov.deadBallSeconds > 0 && <span>Ball out of play {clockTime(cov.deadBallSeconds)}</span>}
-          <span>Pitch mapped {cov.calibratedPercent}%</span>
-          <span>{analysis.stats.tracks.players} player tracks</span>
+          {cov.calibratedPercent > 0 ? (
+            <span>Pitch mapped {cov.calibratedPercent}%</span>
+          ) : (
+            <button className="underline text-pitch-green" onClick={onCalibrate}>
+              Pitch not set up · set it up
+            </button>
+          )}
+          <span title="Pieces of player tracks after joining; one player usually appears as several.">{analysis.stats.tracks.players} track segments</span>
         </p>
       </motion.section>
 
@@ -278,7 +298,9 @@ export function MatchReport({
             <Row label="Tackles / balls won" a={count(A.tackles)} b={count(B.tackles)} colours={colours} />
           </Group>
           <p className="text-xs text-pitch-muted mt-4">
-            — means none confirmed or unavailable, not zero events in the match. Counts describe reviewed clips, not complete match totals. Items marked &quot;to review&quot; are excluded from confirmed counts.
+            — means not measured or nothing confirmed yet, not zero. ≈ marks an estimate from the moments you checked:
+            confirmed events plus unchecked detections at the rate you found them right, with a 95% range. Moments the
+            system missed are not counted until you add them.
           </p>
         </section>
 

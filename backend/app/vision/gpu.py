@@ -19,6 +19,16 @@ def modal_enabled():
     )
 
 
+def active_ball_name():
+    """File name of the fine-tuned ball model in use ("" for the stock weights)."""
+    from app.vision.profiles import CUSTOM_BALL, active_ball_weights
+
+    path = active_ball_weights()
+    # Only hash-named fine-tuned weights can be verified on the GPU; any other
+    # VISION_BALL_WEIGHTS override applies to CPU runs on this worker only.
+    return path.name if path and CUSTOM_BALL.fullmatch(path.name) else ""
+
+
 def public_base():
     explicit = os.getenv("VISION_PUBLIC_URL", "").rstrip("/")
     if explicit:
@@ -58,6 +68,7 @@ def run_on_modal(
                 start_seconds,
                 ball_search,
                 video_grant(token, job_id),
+                active_ball_name(),
             )
             for item in stream:
                 if cancelled():

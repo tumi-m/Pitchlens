@@ -31,6 +31,18 @@ A match now produces a Sofascore-style report:
 - Owner's 20 s GPU diagnostic of the night 5-a-side: ball in 91% of frames,
   possession followed for 54% of play (pre-calibration).
 
+## 4 October: what changed (Claude)
+
+- The report no longer shows an empty page until every moment is reviewed:
+  checking about ten random detections of a type turns the rest into an
+  estimate (≈N with a 95% range). The review asks for key moments only.
+- Ball data engine: label the ball on 150 frames per match in the app; the
+  report shows measured ball recall/precision for that match; a Modal GPU job
+  fine-tunes the ball model on all labels and switches it on only if it
+  validates better on held-out matches (docs/BALL-TRAINING.md).
+- Tried and not adopted (EXPERIMENTS E13, E14): automatic pitch calibration by
+  pose search; full-frame-rate ball trajectories without an appearance model.
+
 ## Current task
 
 **Core features first, per owner instruction.** Pause secondary commercial work.

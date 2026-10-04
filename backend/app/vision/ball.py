@@ -86,6 +86,30 @@ class BallDetector:
         return found
 
 
+def tile_frame(frame, tile=480, overlap=48, max_short_side=1080):
+    """Overlapping tiles as the tiled ball detector sees them (training uses the same).
+
+    Returns (x0, y0, scale, crop); crop coordinates map back as (x / scale, y / scale).
+    """
+    short = min(frame.shape[:2])
+    scale = 1.0 if short <= max_short_side else max_short_side / short
+    if scale < 1:
+        frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    h, w = frame.shape[:2]
+    cols = max(1, math.ceil(w / tile))
+    rows = max(1, math.ceil(h / tile))
+    tw, th = math.ceil(w / cols), math.ceil(h / rows)
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            x0 = max(0, c * tw - overlap)
+            y0 = max(0, r * th - overlap)
+            x1 = min(w, (c + 1) * tw + overlap)
+            y1 = min(h, (r + 1) * th + overlap)
+            out.append((x0, y0, scale, frame[y0:y1, x0:x1]))
+    return out
+
+
 class TiledBallDetector:
     """Local YOLO weights trained for tiles, including Roboflow's football example.
 
@@ -119,22 +143,7 @@ class TiledBallDetector:
 
     def tiles(self, frame):
         """(x0, y0, scale, crop): crop coordinates map back as (x / scale, y / scale)."""
-        scale = self.scale_for(frame)
-        if scale < 1:
-            frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        h, w = frame.shape[:2]
-        cols = max(1, math.ceil(w / self.TILE))
-        rows = max(1, math.ceil(h / self.TILE))
-        tw, th = math.ceil(w / cols), math.ceil(h / rows)
-        out = []
-        for r in range(rows):
-            for c in range(cols):
-                x0 = max(0, c * tw - self.OVERLAP)
-                y0 = max(0, r * th - self.OVERLAP)
-                x1 = min(w, (c + 1) * tw + self.OVERLAP)
-                y1 = min(h, (r + 1) * th + self.OVERLAP)
-                out.append((x0, y0, scale, frame[y0:y1, x0:x1]))
-        return out
+        return tile_frame(frame, self.TILE, self.OVERLAP, self.MAX_SHORT_SIDE)
 
     def _predict(self, crops, threshold):
         results = []

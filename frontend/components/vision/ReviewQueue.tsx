@@ -5,6 +5,20 @@ import type { Analysis, AnalysisEvent, ReviewDecision } from "@/lib/review/analy
 import { describeEvent, sendReview } from "@/lib/review/analysis";
 import { clockTime } from "@/lib/review/vision";
 
+/** Stable pseudo-random rank for an event in this match (same order on every visit). */
+function shuffleKey(seed: string, id: string) {
+  const text = `${seed}:${id}`;
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619);
+  // Final avalanche (murmur3 fmix32) so neighbouring ids do not stay in order.
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
 const PRIORITY: Record<string, number> = { "goal-candidate": 0, shot: 1, interception: 2, tackle: 3, pass: 4, out: 5 };
 
 export function ReviewQueue({
@@ -25,7 +39,7 @@ export function ReviewQueue({
   onWatch: (t: number, until: number) => void;
   onAnalysis: (analysis: Analysis) => void;
 }) {
-  const [filter, setFilter] = useState<"key" | "all" | "pending">("key");
+  const [filter, setFilter] = useState<"key" | "sample" | "pending" | "all">("key");
   // The selection follows the event, not a position: decisions change the list.
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [team, setTeam] = useState<0 | 1>(0);
@@ -33,13 +47,18 @@ export function ReviewQueue({
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const items = useMemo(() => {
+    if (filter === "sample") {
+      // Unchecked passes in a fixed random order: checking the first ten gives an
+      // unbiased hit rate for estimating the rest (no need to review them all).
+      return analysis.events.filter((e) => e.type === "pass" && e.status === "proposed").sort((a, b) => shuffleKey(jobId, a.id) - shuffleKey(jobId, b.id));
+    }
     const list = analysis.events.filter((e) => {
       if (filter === "key") return e.type !== "pass" && e.type !== "out";
       if (filter === "pending") return e.status === "proposed";
       return true;
     });
     return list.sort((a, b) => (filter === "key" ? (PRIORITY[a.type] ?? 9) - (PRIORITY[b.type] ?? 9) || a.t - b.t : a.t - b.t));
-  }, [analysis, filter]);
+  }, [analysis, filter, jobId]);
   const found = selectedId === null ? -1 : items.findIndex((e) => e.id === selectedId);
   const index = found >= 0 ? found : 0;
   const current: AnalysisEvent | undefined = items[index];
@@ -62,11 +81,13 @@ export function ReviewQueue({
       // Where to go next, decided on the list the reviewer is looking at.
       const nextId = advance ? items[index + 1]?.id ?? null : current?.id ?? null;
       try {
-        const out = await sendReview(jobId, decisions, analysis.review.decisions);
+        // Decisions in the random-sample view are what pass estimates are based on.
+        const marked = filter === "sample" ? decisions.map((d) => ("eventId" in d ? { ...d, sample: true } : d)) : decisions;
+        const out = await sendReview(jobId, marked, analysis.review.decisions);
         onAnalysis(out.analysis);
         // Under "Not reviewed" the decided moment leaves the list: the next one
         // takes its place, so stay on the same position rather than skipping.
-        if (advance) setSelectedId(filter === "pending" ? nextId : nextId ?? current?.id ?? null);
+        if (advance) setSelectedId(filter === "pending" || filter === "sample" ? nextId : nextId ?? current?.id ?? null);
       } catch (e) {
         setError(e instanceof Error ? e.message : "The decision could not be saved");
       } finally {
@@ -101,7 +122,7 @@ export function ReviewQueue({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // Never hijack browser shortcuts (Ctrl/Cmd+R reload, Cmd+G find, ...).
-      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || e.defaultPrevented) return;
       const target = e.target as HTMLElement;
       if (target && (["INPUT", "SELECT", "TEXTAREA", "VIDEO"].includes(target.tagName) || target.isContentEditable)) return;
       if (target?.tagName === "BUTTON" && (e.key === " " || e.key === "Enter")) return;
@@ -202,6 +223,7 @@ export function ReviewQueue({
         {(
           [
             ["key", "Shots & key moments"],
+            ["sample", "Check passes"],
             ["pending", "Not reviewed"],
             ["all", "Everything"],
           ] as const
@@ -211,6 +233,16 @@ export function ReviewQueue({
           </button>
         ))}
       </div>
+      {filter === "sample" && (
+        <p className="text-xs text-pitch-muted" data-testid="sample-progress">
+          {(() => {
+            const checked = analysis.events.filter((e) => e.type === "pass" && e.status !== "proposed" && e.source !== "reviewer" && e.sampled).length;
+            return checked >= 10
+              ? `${checked} passes checked: the report now estimates pass counts from them. More checks narrow the range.`
+              : `Random passes, one after another. ${checked} of 10 checked before the report can estimate pass counts.`;
+          })()}
+        </p>
+      )}
       {current ? (
         <div className="rounded-xl border border-white/10 p-4 space-y-3">
           <div className="flex items-center justify-between gap-3">

@@ -3,6 +3,31 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E14 · Full-frame-rate ball trajectories at 360p (2026-10-04)
+- Hypothesis: at the full 30 fps a ball moves a few pixels per frame on a
+  smooth path, so difference-image candidates linked by a constant-velocity
+  model would find it without a detector (trajectory-based detection).
+- Data: Tryzub indoor clip, 640x360, frames 1700-1900.
+- Cost: 1.7 s of CPU per 200 frames (about 8 minutes for a 40-minute match).
+- Outcome: 31 smooth trajectories in 200 frames; the inspected ones were legs,
+  boots and a shirt number, not the ball. At 360p the ball is 3-5 px and
+  indistinguishable from a boot by motion alone (also by eye in single frames).
+- Decision: not adopted. The missing ingredient is an appearance model trained
+  on labelled frames from the venue, so the in-app ball labelling and training
+  loop was built instead (docs/BALL-TRAINING.md).
+
+## E13 · Automatic pitch calibration by camera-pose search (2026-10-04)
+- Hypothesis: search a dictionary of ~6,500 camera poses around the pitch,
+  score projected template lines against the painted-line mask, refine with
+  the existing line alignment.
+- Outcome: 0 of 8 synthetic views (known template, clean lines) within 0.5 m;
+  on a real frame with unknown court dimensions the fit chose a far too small
+  pitch. Sparse pose dictionaries do not reach the narrow basin of the
+  chamfer fit, and amateur courts do not have standard dimensions.
+- Decision: not adopted. Clicking landmarks once per venue (reused for every
+  match from a fixed camera) stays the method. A learned keypoint detector or
+  line-correspondence search with metric rectification is the next attempt.
+
 ## E12 · Camera field of view for a side-on halfway camera (2026-09-28)
 - Synthetic 1280×720 camera 30 m from a futsal court, level with halfway,
   facing straight across; 13 visible landmarks with 0.7-2 px click noise,

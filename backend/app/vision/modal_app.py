@@ -72,6 +72,7 @@ def analyse(
     start_seconds=0,
     ball_search="exhaustive",
     video_grant="",
+    ball_weights="",
 ):
     """Generator: yields progress dicts, then {"result_gz": bytes}."""
     import gzip
@@ -81,7 +82,14 @@ def analyse(
     import requests
 
     from app.vision.engine import run_video
-    from app.vision.profiles import model_paths
+    from app.vision.profiles import CUSTOM_BALL, model_paths
+
+    if ball_weights:
+        # The worker's fine-tuned ball model: copied below like any other weights.
+        if not CUSTOM_BALL.fullmatch(ball_weights):
+            yield {"error": "Unknown ball model", "user": False}
+            return
+        os.environ["VISION_BALL_WEIGHTS"] = f"/root/models/{ball_weights}"
 
     missing = [p for p in model_paths(profile) if not p.is_file()]
     if missing:
@@ -145,15 +153,19 @@ def ensure_model(path, base, token):
 
     import requests
 
-    from app.vision.profiles import KNOWN_SHA256
+    from app.vision.profiles import expected_digest
 
     def digest(p):
         with p.open("rb") as stream:
             return hashlib.file_digest(stream, "sha256").hexdigest()
 
-    expected = KNOWN_SHA256.get(path.name)
+    def verified(p):
+        # Fine-tuned ball models are named by their hash prefix.
+        return expected is None or digest(p).startswith(expected)
+
+    expected = expected_digest(path.name)
     cached = Path("/cache") / path.name
-    if not (cached.is_file() and (expected is None or digest(cached) == expected)):
+    if not (cached.is_file() and verified(cached)):
         temporary = cached.with_suffix(".download")
         with requests.get(
             f"{base}/models/{path.name}",
@@ -165,7 +177,7 @@ def ensure_model(path, base, token):
             with temporary.open("wb") as f:
                 for chunk in response.iter_content(8 * 1024 * 1024):
                     f.write(chunk)
-        if expected and digest(temporary) != expected:
+        if not verified(temporary):
             temporary.unlink(missing_ok=True)
             raise RuntimeError(f"checksum mismatch for {path.name}")
         temporary.replace(cached)
@@ -175,3 +187,4 @@ def ensure_model(path, base, token):
             pass
     path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(cached, path)
+
