@@ -149,6 +149,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           title: title.trim(),
           profile,
           fps,
+          search: playerLoadOnly ? "none" : "exhaustive",
         });
         router.push(`/vision/${job.id}`);
         return;
@@ -595,12 +596,12 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </select>
             </label>
           </div>
-          {source === "file" && (
+          {source === "file" || source === "youtube" ? (
             <label className="flex gap-2 text-sm">
               <input type="checkbox" checked={playerLoadOnly} disabled={busy} onChange={(e) => setPlayerLoadOnly(e.target.checked)} />
-              Player load only. Skips the ball model, which on a full recording is about a third of the GPU time, and does not change the running distance.
+              Player load only. Skips the ball model, the motion search and gap filling. That is the cheaper job. Running distance does not use the ball.
             </label>
-          )}
+          ) : null}
           {source === "file" && profile !== "general" && !playerLoadOnly && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
           <p className="text-xs text-pitch-muted">
             Detailed analysis follows fast movement more closely and takes longer.

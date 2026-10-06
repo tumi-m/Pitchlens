@@ -39,6 +39,8 @@ export type VisionResult = {
   modelSha256: string;
   ballModel?: string;
   ballModelSha256?: string;
+  /** "none" is a player-load job: the ball model was not run. */
+  ballSearch?: string;
   video: { duration: number; width: number; height: number; fps: number };
   analysedDuration: number;
   analysedStart?: number;
@@ -60,6 +62,15 @@ export type VisionResult = {
     possessionShare: (number | null)[];
     possessionCoverage: number;
     trackCount: number;
+    /** Metres each kit ran, with the camera removed. Absent on results from before 2.6. */
+    playerLoad?: {
+      metres: [number, number];
+      maxSpeed: number;
+      steps: number;
+      method: string;
+      playerHeightM: number;
+      footNoisePx: number;
+    };
     /** Added in pipeline 1.5; older results do not have it. */
     possessions?: {
       teams: {
@@ -352,13 +363,14 @@ async function startAnalysis(id: string, signal?: AbortSignal): Promise<VisionJo
 /** The worker downloads the video itself; nothing large passes through the browser. */
 export async function analyseYouTube(
   url: string,
-  options: { title?: string; profile?: string; fps?: string },
+  options: { title?: string; profile?: string; fps?: string; search?: string },
 ): Promise<VisionJob> {
   const query = new URLSearchParams({
     url,
     title: options.title || "",
     profile: options.profile || "general",
     fps: options.fps || "3",
+    search: options.search || "none",
   });
   return visionJson<VisionJob>(`jobs/from-url?${query}`, { method: "POST" });
 }

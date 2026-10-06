@@ -418,7 +418,7 @@ def run_video(
     started = time.monotonic()
     reported = started
     progress(
-        stage="Detecting players, tracking kits and following the ball",
+        stage="Detecting players and tracking kits" if ball_detector is None else "Detecting players, tracking kits and following the ball",
         progress=5,
         processedSeconds=0,
     )
@@ -501,35 +501,40 @@ def run_video(
                     tick = time.monotonic()
                     raw_candidates = ball_detector.detect(frame, threshold=0.05, focus=focus)
                     timings["ballInferenceSeconds"] += time.monotonic() - tick
-            # Weak neural candidates plus difference-imaging candidates; the
-            # track-before-detect pass after the loop decides which are real.
-            diameter = ball_size_prior(detected or players, frame.shape[0])
-            raw_candidates = fuse_ball_candidates(
-                raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
-            )
-            if mask.any():
-                # Airborne balls remain candidates. Only prolonged stillness
-                # outside this generous field margin identifies a distractor.
-                margin = max(3, int(frame.shape[0] * 0.08))
-                region = cv2.dilate(mask, np.ones((margin, margin), np.uint8))
-                for candidate in raw_candidates:
-                    x, y = int(candidate["x"]), int(candidate["y"])
-                    candidate["outsidePitch"] = not (
-                        0 <= y < region.shape[0] and 0 <= x < region.shape[1] and bool(region[y, x])
-                    )
-            detector = sorted(raw_candidates, key=lambda c: -c["confidence"])
-            motion = []
-            if motion_ok and not cut:
-                motion = difference_candidates(
-                    previous_frame, frame, matrix, detected, diameter, mask=mask
+            if ball_detector is None:
+                # Player-load job: no detector, no motion blobs, no track to invent a ball.
+                ball = None
+                candidates = []
+            else:
+                # Weak neural candidates plus difference-imaging candidates; the
+                # track-before-detect pass after the loop decides which are real.
+                diameter = ball_size_prior(detected or players, frame.shape[0])
+                raw_candidates = fuse_ball_candidates(
+                    raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
                 )
-            candidates = merge_candidates(detector, motion)
-            strong = strong_candidates(candidates)
+                if mask.any():
+                    # Airborne balls remain candidates. Only prolonged stillness
+                    # outside this generous field margin identifies a distractor.
+                    margin = max(3, int(frame.shape[0] * 0.08))
+                    region = cv2.dilate(mask, np.ones((margin, margin), np.uint8))
+                    for candidate in raw_candidates:
+                        x, y = int(candidate["x"]), int(candidate["y"])
+                        candidate["outsidePitch"] = not (
+                            0 <= y < region.shape[0] and 0 <= x < region.shape[1] and bool(region[y, x])
+                        )
+                detector = sorted(raw_candidates, key=lambda c: -c["confidence"])
+                motion = []
+                if motion_ok and not cut:
+                    motion = difference_candidates(
+                        previous_frame, frame, matrix, detected, diameter, mask=mask
+                    )
+                candidates = merge_candidates(detector, motion)
+                strong = strong_candidates(candidates)
+                # Airborne balls can be outside the green surface; temporal association
+                # resolves candidates instead of rejecting them by background colour.
+                ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
             previous_frame = frame
             previous_boxes = [p["box"] for p in detected]
-            # Airborne balls can be outside the green surface; temporal association
-            # resolves candidates instead of rejecting them by background colour.
-            ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
             previous_ball = ball
             camera = None if cut or not motion_ok else matrix
             matrices.append(camera)
@@ -559,7 +564,7 @@ def run_video(
                 elapsed = now - started
                 done = t - start_seconds
                 progress(
-                    stage="Detecting players, tracking kits and following the ball",
+                    stage="Detecting players and tracking kits" if ball_detector is None else "Detecting players, tracking kits and following the ball",
                     progress=round(5 + done / duration * 88, 1),
                     processedSeconds=round(done, 1),
                     elapsedSeconds=round(elapsed),
@@ -623,32 +628,41 @@ def run_video(
         raise ValueError(
             "No on-pitch players detected. This video cannot be analysed by the installed model."
         )
-    progress(stage="Confirming faint ball tracks across frames", progress=94)
+    progress(
+        stage="Measuring what the players did" if ball_detector is None else "Confirming faint ball tracks across frames",
+        progress=94,
+    )
     tick = time.monotonic()
     diagonal = math.hypot(meta["width"], meta["height"])
-    rejected = reject_static_candidates(frames, matrices, diagonal, effective_fps)
-    if rejected:
-        # A removed distractor may have beaten the real ball online. Reassociate
-        # the remaining observed candidates before trying to bridge any gaps.
-        ball_tracker = BallTracker()
-        for i, f in enumerate(frames):
-            matrix = matrices[i] if matrices[i] is not None else np.eye(2, 3)
-            f["ball"] = ball_tracker.update(
-                strong_candidates(f["ballCandidates"]), f["t"], matrix,
-                (meta["height"], meta["width"]),
-                cut=i > 0 and f["scene"] != frames[i - 1]["scene"],
-            )
-    trajectory_recovered = (
-        recover_near_anchors(frames, matrices, diagonal, effective_fps)
-        if os.getenv("VISION_TRAJECTORY", "1") != "0" else 0
-    )
-    # These two recovery passes can be disabled separately for comparisons.
-    faint = (
-        recover_ball(frames, matrices, diagonal, effective_fps)
-        if os.getenv("VISION_FAINT", "1") != "0"
-        else {"recovered": 0, "inferred": 0, "disabled": True}
-    )
-    timings["ballRecoverySeconds"] = time.monotonic() - tick
+    if ball_detector is None:
+        rejected = 0
+        trajectory_recovered = 0
+        faint = {"recovered": 0, "inferred": 0, "droppedStatic": 0, "disabled": True}
+        timings["ballRecoverySeconds"] = 0
+    else:
+        rejected = reject_static_candidates(frames, matrices, diagonal, effective_fps)
+        if rejected:
+            # A removed distractor may have beaten the real ball online. Reassociate
+            # the remaining observed candidates before trying to bridge any gaps.
+            ball_tracker = BallTracker()
+            for i, f in enumerate(frames):
+                matrix = matrices[i] if matrices[i] is not None else np.eye(2, 3)
+                f["ball"] = ball_tracker.update(
+                    strong_candidates(f["ballCandidates"]), f["t"], matrix,
+                    (meta["height"], meta["width"]),
+                    cut=i > 0 and f["scene"] != frames[i - 1]["scene"],
+                )
+        trajectory_recovered = (
+            recover_near_anchors(frames, matrices, diagonal, effective_fps)
+            if os.getenv("VISION_TRAJECTORY", "1") != "0" else 0
+        )
+        # These two recovery passes can be disabled separately for comparisons.
+        faint = (
+            recover_ball(frames, matrices, diagonal, effective_fps)
+            if os.getenv("VISION_FAINT", "1") != "0"
+            else {"recovered": 0, "inferred": 0, "disabled": True}
+        )
+        timings["ballRecoverySeconds"] = time.monotonic() - tick
     faint["rejectedStaticCandidates"] = rejected
     faint["trajectoryRecovered"] = trajectory_recovered
     # Working data for the confirmation pass: ~12 dicts per frame, tens of MB
@@ -665,7 +679,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.5",
+        "pipelineVersion": "local-vision-2.6",
         "playerTracking": {"appearance": isinstance(tracker, ByteTracker), "roleCorrections": corrected_roles},
         "profile": profile,
         "performance": {
@@ -688,7 +702,7 @@ def run_video(
             ball_search if isinstance(ball_detector, TiledBallDetector) else "whole-frame"
         ),
         "ballTileCalls": getattr(ball_detector, "inference_calls", None),
-        "ballTracking": "camera-compensated-observations+track-before-detect",
+        "ballTracking": "skipped" if ball_detector is None else "camera-compensated-observations+track-before-detect",
         "ballRecovery": faint,
         "auxiliaryBallDetector": bool(ball_classes),
         "video": meta,

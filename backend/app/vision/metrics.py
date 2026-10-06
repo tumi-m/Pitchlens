@@ -10,6 +10,161 @@ from bisect import bisect_left, bisect_right
 # rarely attributed. The slack is in pixels: negligible on large players.
 POSSESSION_SLACK_PX = 14
 AMBIGUITY_SLACK_PX = 3
+# Same rules as the coach sheet: a pan is not running, a partial box is not a scale.
+FOOT_NOISE_PX = 3
+PLAYER_HEIGHT_M = 1.8
+MAX_PLAYER_SPEED = 11
+HEIGHT_LO = 0.55
+HEIGHT_HI = 1.8
+
+
+def _median(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def apply_camera(x, y, cam):
+    if not cam or len(cam) < 6:
+        return None
+    try:
+        a, b, tx, c, d, ty = (float(v) for v in cam[:6])
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (a, b, tx, c, d, ty)):
+        return None
+    return a * x + b * y + tx, c * x + d * y + ty
+
+
+def compose_camera(outer, inner):
+    """`outer` is applied after `inner`. Both are the six vision-file coefficients."""
+    a1, b1, tx1, c1, d1, ty1 = inner
+    a2, b2, tx2, c2, d2, ty2 = outer
+    return (
+        a2 * a1 + b2 * c1,
+        a2 * b1 + b2 * d1,
+        a2 * tx1 + b2 * ty1 + tx2,
+        c2 * a1 + d2 * c1,
+        c2 * b1 + d2 * d1,
+        c2 * tx1 + d2 * ty1 + ty2,
+    )
+
+
+def camera_span(frames, start, end):
+    """Affine that carries a point from frame `start` into frame `end`."""
+    if end <= start:
+        return None
+    acc = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    for i in range(start + 1, end + 1):
+        if frames[i].get("scene") != frames[i - 1].get("scene"):
+            return None
+        cam = frames[i].get("camera")
+        if not cam or len(cam) < 6:
+            return None
+        acc = compose_camera(tuple(float(v) for v in cam[:6]), acc)
+    return acc
+
+
+def _team_of(votes):
+    best, best_count, unknown, total = -1, 0, 0, 0
+    for team, count in votes.items():
+        total += count
+        if team is None or team < 0:
+            unknown += count
+        elif count > best_count:
+            best, best_count = team, count
+    if best < 0:
+        return -1
+    if best_count >= unknown or best_count >= total * 0.4:
+        return best
+    return -1
+
+
+def _step_metres(prev, nxt, frames, median, max_dt):
+    t0, x0, y0, scale0, height0, scene0, index0 = prev
+    t1, x1, y1, scale1, height1, scene1, index1 = nxt
+    dt = t1 - t0
+    if dt <= 0 or dt > max_dt or scene0 != scene1:
+        return None
+    if median <= 0 or not (HEIGHT_LO <= height0 / median <= HEIGHT_HI and HEIGHT_LO <= height1 / median <= HEIGHT_HI):
+        return None
+    warped = apply_camera(x0, y0, camera_span(frames, index0, index1))
+    if warped is None:
+        return None
+    pixels = math.hypot(x1 - warped[0], y1 - warped[1])
+    if pixels < FOOT_NOISE_PX:
+        return None
+    metres = pixels * (scale0 + scale1) / 2
+    if metres / dt > MAX_PLAYER_SPEED:
+        return None
+    return metres
+
+
+def player_load(frames):
+    """Metres each kit ran. The camera is removed. The ball is not used.
+
+    A step is dropped when the camera could not be estimated, the box is far
+    from that track's own height, the foot moved under 3 pixels, or the
+    implied speed is over 11 m/s. Track ids are not player names.
+    """
+    heights = {}
+    votes = {}
+    for frame in frames:
+        seen = set()
+        for player in frame.get("players") or []:
+            box = player.get("box")
+            pid = player.get("id")
+            if pid is None or pid in seen or not box or len(box) < 4:
+                continue
+            seen.add(pid)
+            height = float(box[3]) - float(box[1])
+            heights.setdefault(pid, []).append(height)
+            team = player.get("team", -1)
+            votes.setdefault(pid, {})
+            votes[pid][team] = votes[pid].get(team, 0) + 1
+    medians = {pid: _median(values) for pid, values in heights.items()}
+    metres = [0.0, 0.0]
+    max_speed = 0.0
+    kept = 0
+    previous = {}
+    for index, frame in enumerate(frames):
+        seen = set()
+        for player in frame.get("players") or []:
+            pid = player.get("id")
+            box = player.get("box")
+            if pid is None or pid in seen or not box or len(box) < 4:
+                continue
+            seen.add(pid)
+            height = max(float(box[3]) - float(box[1]), 1.0)
+            here = (
+                float(frame.get("t", index)),
+                (float(box[0]) + float(box[2])) / 2,
+                float(box[3]),
+                PLAYER_HEIGHT_M / height,
+                height,
+                frame.get("scene", 0),
+                index,
+            )
+            earlier = previous.get(pid)
+            if earlier is not None:
+                moved = _step_metres(earlier, here, frames, medians.get(pid, 0), 0.45)
+                team = _team_of(votes.get(pid, {}))
+                if moved is not None and team in (0, 1):
+                    metres[team] += moved
+                    kept += 1
+                    speed = moved / max(here[0] - earlier[0], 1e-6)
+                    if speed > max_speed:
+                        max_speed = speed
+            previous[pid] = here
+    return {
+        "metres": [round(value, 1) for value in metres],
+        "maxSpeed": round(max_speed, 2),
+        "steps": kept,
+        "method": "player-height-camera-compensated",
+        "playerHeightM": PLAYER_HEIGHT_M,
+        "footNoisePx": FOOT_NOISE_PX,
+    }
 
 
 def ball_shift(frames):
@@ -132,6 +287,7 @@ def derive_metrics(frames, sample_fps, duration, start_seconds=0):
         "events": events,
         "trackCount": len({p["id"] for f in frames for p in f["players"]}),
         "possessions": chains,
+        "playerLoad": player_load(frames),
     }
 
 

@@ -79,6 +79,69 @@ def test_player_load_is_a_ball_search_mode():
         run_video("/no/such/video.mp4", "/tmp/out", ball_search="sideways")
 
 
+def _load_player(pid=1, team=0, box=(92, 40, 108, 60)):
+    return {"id": pid, "team": team, "role": "player", "box": list(box), "confidence": 0.9}
+
+
+def test_a_camera_pan_is_not_player_running():
+    from app.vision.metrics import player_load
+
+    frames = []
+    x = 100.0
+    for i in range(6):
+        frames.append({
+            "t": i * 0.2,
+            "scene": 0,
+            "camera": None if i == 0 else [1, 0, 40, 0, 1, 0],
+            "players": [_load_player(box=(x - 8, 40, x + 8, 60))],
+            "ball": None,
+        })
+        x += 40
+    assert player_load(frames)["metres"] == [0.0, 0.0]
+
+
+def test_running_distance_uses_body_height_and_drops_a_partial_box():
+    from app.vision.metrics import player_load
+
+    frames = []
+    x = 100.0
+    for i in range(6):
+        height = 10 if i == 3 else 20
+        frames.append({
+            "t": i * 0.2,
+            "scene": 0,
+            "camera": None if i == 0 else [1, 0, 0, 0, 1, 0],
+            "players": [_load_player(box=(x - 8, 80 - height, x + 8, 80))],
+            "ball": None,
+        })
+        x += 10
+    # Three kept steps of 10px at 1.8 m / 20 px. The half-height box drops its two steps.
+    assert player_load(frames)["metres"] == [2.7, 0.0]
+
+
+def test_a_cut_without_a_camera_is_not_a_sprint():
+    from app.vision.metrics import player_load
+
+    frames = [
+        {"t": 0, "scene": 0, "camera": None, "players": [_load_player()], "ball": None},
+        {"t": 0.2, "scene": 1, "camera": None, "players": [_load_player(box=(200, 0, 216, 20))], "ball": None},
+    ]
+    assert player_load(frames)["metres"] == [0.0, 0.0]
+    assert derive_metrics(frames, 5, 0.4)["playerLoad"]["steps"] == 0
+
+
+def test_a_youtube_job_defaults_to_player_load(hosted):
+    _server, client, submitted = hosted
+    plain = client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ")
+    assert plain.status_code == 200
+    assert plain.json()["ballSearch"] == "none"
+    asked = client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ&search=exhaustive")
+    assert asked.status_code == 409
+    assert submitted[0][2]["ballSearch"] == "none"
+    refused = client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ&search=magic")
+    assert refused.status_code == 400
+
+
 def test_background_is_not_a_pitch_and_offscreen_is_rejected():
     mask = field_mask(np.zeros((100, 100, 3), np.uint8))
     assert mask.sum() == 0

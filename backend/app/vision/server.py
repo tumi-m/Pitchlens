@@ -599,6 +599,9 @@ async def create_from_url(request: Request):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
+    ball_search = request.query_params.get("search", "none")
+    if ball_search not in ("exhaustive", "adaptive", "none"):
+        raise HTTPException(400, "Invalid ball search mode")
     owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner")
     if require_owner(request) and not owner:
         raise HTTPException(400, "Match ownership is required")
@@ -625,6 +628,7 @@ async def create_from_url(request: Request):
             "progress": 0,
             "profile": profile,
             "sampleFps": sample_fps,
+            "ballSearch": ball_search,
             "sourceUrl": f"https://www.youtube.com/watch?v={vid}",
         }
         if owner:

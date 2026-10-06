@@ -96,12 +96,16 @@ export function matchStats(result: VisionResult): MatchStats {
   );
   const playerCoverage = pct(m.playerFrames, m.sampledFrames);
   const ballCoverage = pct(m.ballFrames, m.sampledFrames);
+  // A player-load job did not look for the ball. Scoring it on ball coverage
+  // would mark a finished job as weak evidence.
   const evidenceScore =
-    Math.round(
-      ((playerCoverage * 0.3 + ballCoverage * 0.4 + Math.min(100, m.possessionCoverage) * 0.3) /
-        10) *
-        10,
-    ) / 10;
+    result.ballSearch === "none"
+      ? Math.round(playerCoverage) / 10
+      : Math.round(
+          ((playerCoverage * 0.3 + ballCoverage * 0.4 + Math.min(100, m.possessionCoverage) * 0.3) /
+            10) *
+            10,
+        ) / 10;
   const n = Math.max(1, frames.length);
   const pos = m.possessions;
   const pair = <K extends "count" | "averageSeconds" | "longestSeconds" | "passesPerPossession" | "passesAllowedPerRegain">(

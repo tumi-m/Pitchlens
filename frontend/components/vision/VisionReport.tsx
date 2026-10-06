@@ -333,7 +333,17 @@ export function VisionReport({ jobId }: { jobId: string }) {
           )}
           {result && (
             <>
-              {result.metrics.ballFrames === 0 && (
+              {result.metrics.ballFrames === 0 && result.ballSearch === "none" && (
+                <section role="status" className="glass-card border-white/10 p-5 space-y-2">
+                  <h2 className="font-semibold">Player load</h2>
+                  <p className="text-sm text-pitch-muted">
+                    The ball model was not run. Distance is measured from the players.
+                    Possession, passes and shots are not part of this job. Turn the ball
+                    model on only if you need them, and check a short section first.
+                  </p>
+                </section>
+              )}
+              {result.metrics.ballFrames === 0 && result.ballSearch !== "none" && (
                 <section role="status" className="glass-card border-amber-400/40 p-5 space-y-2">
                   <h2 className="font-semibold text-amber-200">Ball tracking unavailable for this section</h2>
                   <p className="text-sm text-pitch-muted">

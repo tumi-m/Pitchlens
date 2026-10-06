@@ -183,7 +183,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
   const shareValues: [number | null, number | null] = shareKnown
     ? stats.controlShare
     : [null, null];
-  const lowEvidence = stats.controlCoverage < 50;
+  const lowEvidence = stats.controlCoverage < 50 && result.ballSearch !== "none";
   const events = result.metrics.events;
   return (
     <div className="space-y-6">
@@ -216,6 +216,22 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
             <span className="text-xs text-pitch-muted">~{stats.avgPlayers[0]} players tracked</span>
           </motion.div>
           <div className="flex flex-col items-center gap-2 text-center">
+            {result.ballSearch === "none" && result.metrics.playerLoad ? (
+              <>
+                <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">Distance</span>
+                <div className="text-4xl sm:text-5xl font-black tabular-nums flex items-baseline gap-2">
+                  <span style={{ color: colours[0] }}>
+                    <CountUp value={result.metrics.playerLoad.metres[0]} decimals={1} format={(v) => v.toFixed(1)} />
+                  </span>
+                  <span className="text-pitch-muted text-3xl">–</span>
+                  <span style={{ color: colours[1] }}>
+                    <CountUp value={result.metrics.playerLoad.metres[1]} decimals={1} format={(v) => v.toFixed(1)} />
+                  </span>
+                </div>
+                <span className="text-xs text-pitch-muted">metres, camera pan removed · not named players</span>
+              </>
+            ) : (
+              <>
             <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">Ball control</span>
             <div className="text-4xl sm:text-5xl font-black tabular-nums flex items-baseline gap-2">
               {shareKnown ? (
@@ -239,13 +255,19 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
                   : "% of observed control"
                 : "Not enough ball evidence"}
             </span>
+              </>
+            )}
             <div className="flex items-center gap-2 mt-2 text-xs text-pitch-muted">
               <span>{clockTime(result.analysedDuration)} analysed</span>
               <span>·</span>
               <span
                 className="px-2 py-0.5 rounded-md font-bold text-[#0b0f1a]"
                 style={{ background: scoreColour(stats.evidenceScore) }}
-                title="Evidence score: 30% player coverage, 40% ball coverage, 30% ball-control coverage, out of 10"
+                title={
+                  result.ballSearch === "none"
+                    ? "Evidence score: player coverage out of 10. The ball model was not run."
+                    : "Evidence score: 30% player coverage, 40% ball coverage, 30% ball-control coverage, out of 10"
+                }
               >
                 {stats.evidenceScore.toFixed(1)}
               </span>
@@ -286,6 +308,17 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
             </span>
           </div>
           <div className="divide-y divide-white/5">
+            {result.metrics.playerLoad && (
+              <StatRow
+                label="Distance"
+                values={result.metrics.playerLoad.metres}
+                colours={colours}
+                format={(v) => `${v.toFixed(1)} m`}
+                hint="How far the feet moved after the camera pan is removed, scaled by a 1.8 m player. Steps under 3 pixels, boxes far from that track's usual height, and anything over 11 m/s are dropped. Tracks are not named players. A squad 15 cm off 1.8 m moves this by about 8%."
+              />
+            )}
+            {result.ballSearch !== "none" && (
+              <>
             <StatRow
               label="Ball control"
               values={shareValues}
@@ -311,6 +344,8 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               colours={colours}
               hint="Ball moved from the other kit to this kit while visible. Unreviewed."
             />
+              </>
+            )}
             <StatRow
               label="Players tracked (avg)"
               values={stats.avgPlayers}
@@ -318,7 +353,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               format={(v) => v.toFixed(1)}
             />
             <StatRow label="Players tracked (peak)" values={stats.peakPlayers} colours={colours} />
-            {stats.possessions[0] !== null && (
+            {result.ballSearch !== "none" && stats.possessions[0] !== null && (
               <>
                 <StatRow
                   label="Possessions"
@@ -359,7 +394,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
         </section>
 
         <div className="space-y-6">
-          {/* Momentum */}
+          {result.ballSearch !== "none" && (
           <section className={card}>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Control momentum</h2>
@@ -400,21 +435,25 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               <span style={{ color: colours[1] }}>▼ {names[1]}</span>
             </div>
           </section>
+          )}
 
-          {/* Detection quality */}
           <section className={card}>
             <h2 className="text-xs uppercase tracking-widest text-pitch-muted mb-4">Tracking quality</h2>
+            {result.ballSearch === "none" ? (
+              <Ring value={stats.playerCoverage} label="Frames with players" colour="#22c55e" />
+            ) : (
             <div className="grid grid-cols-3 gap-2">
               <Ring value={stats.playerCoverage} label="Frames with players" colour="#22c55e" />
               <Ring value={stats.ballCoverage} label="Frames with the ball" colour="#38bdf8" />
               <Ring value={stats.controlCoverage} label="Time with ball control" colour="#a78bfa" />
             </div>
+            )}
           </section>
         </div>
       </div>
 
       {/* Cumulative control (in the style of an xG time plot) */}
-      {stats.cumulative.length > 2 && (
+      {stats.cumulative.length > 2 && result.ballSearch !== "none" && (
         <section className={card}>
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Control over time</h2>
