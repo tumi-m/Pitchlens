@@ -1558,6 +1558,31 @@ def test_auxiliary_ball_head_preserves_scores_and_merges_duplicate_views():
     primary = [{**found[0], "confidence": 0.7}]
     assert len(fuse_ball_candidates(primary, found)) == 1
     assert fuse_ball_candidates(primary, found)[0]["confidence"] == 0.8
+    dedicated = [{**found[0], "confidence": 0.22, "source": "detector"}]
+    agreed = fuse_ball_candidates(dedicated, found)
+    assert len(agreed) == 1 and agreed[0]["source"] == "detector" and agreed[0]["confidence"] == 0.8
+    alone = fuse_ball_candidates([], found)
+    assert alone[0]["source"] == "player-model"
+
+
+def test_still_player_model_mark_cannot_hide_the_dedicated_ball():
+    from app.vision.ball_tracking import BallTracker
+
+    tracker = BallTracker()
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    logo = {"x": 77.0, "y": 52.0, "confidence": 0.8, "source": "player-model", "box": [74, 49, 80, 55]}
+    shape = (360, 640)
+    assert tracker.update([logo], 0.0, identity, shape) is None
+    assert tracker.update([logo], 0.2, identity, shape) is None
+    real = {"x": 280.0, "y": 170.0, "confidence": 0.28, "source": "detector", "box": [277, 167, 283, 173]}
+    assert tracker.update([logo, real], 0.4, identity, shape) is None  # one weak hit cannot open a track
+    chosen = tracker.update([logo, real], 0.6, identity, shape)
+    assert chosen is not None and chosen["x"] == 280.0 and chosen["source"] == "detector"
+    # A player-network ball that actually travels is still reported.
+    moving = BallTracker()
+    assert moving.update([{**logo, "x": 200.0}], 0.0, identity, shape) is None
+    gone = moving.update([{**logo, "x": 230.0}], 0.2, identity, shape)
+    assert gone is not None and gone["x"] == 230.0
 
 
 def test_motion_recovery_requires_local_bracketing_neural_evidence():

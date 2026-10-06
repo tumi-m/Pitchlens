@@ -250,8 +250,24 @@ def create_ball_detector(path, device="cpu"):
 
 
 def fuse_ball_candidates(primary, auxiliary):
-    """Combine two detector views without counting the same ball twice."""
-    return TiledBallDetector._suppress(primary + auxiliary, 0.05)
+    """Combine two detector views without counting the same ball twice.
+
+    When the player network and the ball network land on the same spot, keep
+    the ball network's source. An uncorroborated player-network mark is how a
+    scoreboard graphic becomes the match ball.
+    """
+    found = [dict(c) for c in TiledBallDetector._suppress(primary + auxiliary, 0.05)]
+    primaries = [c for c in primary if c.get("source") != "player-model"]
+    for item in found:
+        if item.get("source") != "player-model":
+            continue
+        ix, iy = item["x"], item["y"]
+        for other in primaries:
+            if math.hypot(ix - other["x"], iy - other["y"]) <= 8:
+                item["source"] = other.get("source", "detector")
+                item["corroborated"] = True
+                break
+    return found
 
 
 def auxiliary_ball_candidates(boxes, scores, classes, ball_classes):

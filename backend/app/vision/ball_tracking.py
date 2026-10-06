@@ -52,6 +52,7 @@ class BallTracker:
                 p = {
                     "id": self.next_id,
                     "xy": np.array([candidate["x"], candidate["y"]]),
+                    "origin": np.array([candidate["x"], candidate["y"]]),
                     "velocity": np.zeros(2),
                     "seen": t,
                     "hits": 1,
@@ -62,6 +63,13 @@ class BallTracker:
         ranked = []
         for j, (p, residual) in matched.items():
             c = candidates[j]
+            # The player network's ball head fires on fixed graphics. It may
+            # support a ball the dedicated detector also sees, or a mark that
+            # then moves. It may not be the ball while it sits still.
+            if c.get("source") == "player-model":
+                origin = p.get("origin", p["xy"])
+                if np.linalg.norm(p["xy"] - origin) <= diagonal * 0.012:
+                    continue
             if p["hits"] < 2 and c["confidence"] < 0.6:
                 continue
             score = c["confidence"] + 0.08 * min(5, p["hits"] - 1) - 0.2 * residual
