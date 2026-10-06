@@ -76,6 +76,9 @@ def test_background_is_not_a_pitch_and_offscreen_is_rejected():
     mask = field_mask(np.zeros((100, 100, 3), np.uint8))
     assert mask.sum() == 0
     assert not inside_field(mask, [-30, 0, -10, 30])
+    grass = np.full((100, 120), 255, np.uint8)
+    assert inside_field(grass, [10, 40, 30, 102])  # feet two pixels past the bottom
+    assert not inside_field(grass, [10, -40, 30, -5])  # entirely above the frame
 
 
 def test_unknown_jersey_is_not_forced_to_a_team():

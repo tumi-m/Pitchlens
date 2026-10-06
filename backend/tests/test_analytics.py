@@ -779,3 +779,34 @@ def test_checked_sample_estimates_the_unchecked_detections():
     assert stats["passesComplete"]["checked"] == 10 and stats["passesComplete"]["checkedCorrect"] == 0
     assert stats["passesComplete"]["estimate"] == 0
     assert stats["passes"]["checkedCorrect"] == 10
+
+
+def test_off_pitch_points_do_not_pile_onto_the_heatmap_edge():
+    grid = analytics._grid([(-5, 10), (0, 0), (40, 20), (50, 10)], {"length": 40, "width": 20}, nx=4, ny=2)
+    assert grid[0][0] == 0.5
+    assert grid[1][3] == 0.5
+    assert sum(sum(row) for row in grid) == pytest.approx(1)
+
+
+def test_a_camera_pan_is_not_a_pass():
+    from app.vision.metrics import derive_metrics
+
+    def person(pid, x):
+        return {"id": pid, "team": 0, "box": [x - 20, 80, x + 20, 200]}
+
+    frames = []
+    for i in range(3):
+        frames.append({
+            "t": i / 5, "scene": 0,
+            "players": [person(1, 100), person(2, 400)],
+            "ball": {"x": 100, "y": 200, "confidence": 0.8, "trackId": 1},
+            "camera": [1, 0, 0, 0, 1, 0],
+        })
+    for i in range(3, 6):
+        frames.append({
+            "t": i / 5, "scene": 0,
+            "players": [person(1, 480), person(2, 180)],
+            "ball": {"x": 180, "y": 200, "confidence": 0.8, "trackId": 1},
+            "camera": [1, 0, 80 if i == 3 else 0, 0, 1, 0],
+        })
+    assert derive_metrics(frames, 5, 1.2)["events"] == []

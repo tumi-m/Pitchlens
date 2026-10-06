@@ -33,7 +33,7 @@ export function gradeFootage(width: number, height: number, duration: number, mo
   } else {
     score -= 55;
     notes.push(
-      `At ${side}p the ball is about ${ballPixels} pixels across. Player stats will work; ball stats will be partial.`,
+      `At ${side}p the ball is about ${ballPixels} pixels across, about the size of a boot. Upload the camera's original file if you have it.`,
     );
   }
   if (duration < 60) {

@@ -445,9 +445,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   {check.notes.map((n) => (
                     <li key={n}>· {n}</li>
                   ))}
-                  {check.height <= 480 && (
+                  {Math.min(check.width, check.height) <= 480 && (
                     <li className="text-amber-200">
-                      · This looks like a reduced copy ({preflight.height}p): the ball is only about{" "}
+                      · This looks like a reduced copy (shortest side {Math.min(preflight.width, preflight.height)}px): the ball is only about{" "}
                       {check.ballPixels}px across, about the size of a boot, and is easily missed or
                       confused. If you have the camera&apos;s original file (often 1080p), upload that
                       instead: the ball is about three times larger and every frame is analysed at full

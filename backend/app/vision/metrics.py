@@ -12,6 +12,24 @@ POSSESSION_SLACK_PX = 14
 AMBIGUITY_SLACK_PX = 3
 
 
+def ball_shift(frames):
+    """How far the ball moved, in the last frame's pixels.
+
+    When every step has a camera estimate, the first position is carried
+    forward so a pan is not mistaken for a pass. Otherwise the raw image
+    displacement is used.
+    """
+    first, last = frames[0]["ball"], frames[-1]["ball"]
+    x, y = first["x"], first["y"]
+    for frame in frames[1:]:
+        cam = frame.get("camera")
+        if not cam or len(cam) < 6:
+            return math.hypot(last["x"] - first["x"], last["y"] - first["y"])
+        a, b, tx, c, d, ty = (float(v) for v in cam[:6])
+        x, y = a * x + b * y + tx, c * x + d * y + ty
+    return math.hypot(last["x"] - x, last["y"] - y)
+
+
 def possession_owner(players, ball):
     if not ball:
         return None
@@ -85,8 +103,7 @@ def derive_metrics(frames, sample_fps, duration, start_seconds=0):
             if sender is None:
                 continue
             height = sender["box"][3] - sender["box"][1]
-            first, last = observed[0]["ball"], observed[-1]["ball"]
-            if math.hypot(last["x"] - first["x"], last["y"] - first["y"]) < height * 0.5:
+            if ball_shift(observed) < height * 0.5:
                 continue
         events.append(
             {

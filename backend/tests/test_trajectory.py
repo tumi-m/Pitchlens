@@ -69,3 +69,56 @@ def test_candidate_positions_follow_camera_pan_without_becoming_free_extrapolati
             c['x'] += i * 10
     assert recover_near_anchors(frames, [pan] * 4, 734, 5) == 2
     assert [f['ball']['x'] for f in frames] == [40, 70, 100, 130]
+
+
+def test_a_panning_camera_does_not_protect_a_fixed_graphic():
+    from app.vision.faint import drop_static_balls
+
+    def ball(x, confidence=0.2, recovered=True):
+        return {"x": x, "y": 40.0, "confidence": confidence, "trackId": 2, "recovered": recovered, "box": [x - 2, 38, x + 2, 42]}
+
+    pan = np.array([[1.0, 0, 5.0], [0, 1.0, 0]])
+    graphic = [{"scene": 0, "players": [], "ball": ball(50.0)} for _ in range(20)]
+    assert drop_static_balls(graphic, [pan] * 20, 734, sample_fps=5) == 20
+    # Motion was not estimated. The mark is still glued to the screen.
+    unknown = [{"scene": 0, "players": [], "ball": ball(50.0)} for _ in range(20)]
+    assert drop_static_balls(unknown, [None] * 20, 734, sample_fps=5) == 20
+    # A confident ball that sits still on the pitch while the camera pans is kept
+    # (four seconds is not a logo).
+    carried = [{"scene": 0, "players": [], "ball": ball(50.0 + 5 * i, confidence=0.8, recovered=False)} for i in range(20)]
+    assert drop_static_balls(carried, [pan] * 20, 734, sample_fps=5) == 0
+
+
+def test_player_model_mark_must_move_on_the_screen_and_the_pitch():
+    from app.vision.ball_tracking import BallTracker
+
+    identity = np.eye(2, 3)
+    pan = np.array([[1.0, 0, 30.0], [0, 1.0, 0]])
+    shape = (360, 640)
+
+    def logo(x):
+        return {"x": x, "y": 52.0, "confidence": 0.8, "source": "player-model"}
+
+    screen = BallTracker()
+    assert screen.update([logo(77)], 0.0, identity, shape) is None
+    assert screen.update([logo(77)], 0.2, pan, shape) is None
+    pitch = BallTracker()
+    assert pitch.update([logo(77)], 0.0, identity, shape) is None
+    assert pitch.update([logo(107)], 0.2, pan, shape) is None
+    moving = BallTracker()
+    assert moving.update([logo(200)], 0.0, identity, shape) is None
+    gone = moving.update([logo(270)], 0.2, pan, shape)
+    assert gone is not None and gone["x"] == 270
+
+
+def test_ball_search_does_not_follow_an_uncorroborated_player_model_mark():
+    from app.vision.ball import search_focus
+
+    matrix = np.array([[1.0, 0, 10.0], [0, 1.0, 0]])
+    graphic = {"x": 77.0, "y": 52.0, "source": "player-model"}
+    real = {"x": 200.0, "y": 150.0, "source": "detector"}
+    assert search_focus(graphic, cut=False, motion_ok=True, since_sweep=0.1, matrix=matrix) is None
+    focus = search_focus(real, cut=False, motion_ok=True, since_sweep=0.1, matrix=matrix)
+    assert focus is not None and abs(focus[0] - 210) < 1e-6
+    assert search_focus(real, cut=False, motion_ok=True, since_sweep=0.5, matrix=matrix) is None
+    assert search_focus(real, cut=True, motion_ok=True, since_sweep=0.1, matrix=matrix) is None

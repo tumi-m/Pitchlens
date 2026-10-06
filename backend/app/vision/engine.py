@@ -18,6 +18,7 @@ from app.vision.ball import (
     auxiliary_ball_candidates,
     create_ball_detector,
     fuse_ball_candidates,
+    search_focus,
 )
 from app.vision.ball_tracking import BallTracker
 from app.vision.faint import (
@@ -188,8 +189,13 @@ def jersey(frame, box, pitch=None):
 
 def inside_field(mask, box):
     x1, y1, x2, y2 = box
-    x, y = int((x1 + x2) / 2), int(y2 - 2)
     h, w = mask.shape
+    x = int((x1 + x2) / 2)
+    y = int(y2 - 2)
+    # Feet are often one or two pixels past the bottom of the frame. Sample the
+    # last row instead of dropping the player.
+    if y >= h and y1 < h:
+        y = h - 1
     return 0 <= x < w and 0 <= y < h and bool(mask[y, x]) and y2 - y1 >= 12
 
 
@@ -475,9 +481,13 @@ def run_video(
             if raw_candidates is None:
                 # Adaptive: look where the ball just was first, sweep the whole
                 # frame when that tile is empty or ambiguous, and at least twice a second.
-                focus = None
-                if previous_ball is not None and not cut and motion_ok and t - last_sweep < 0.5:
-                    focus = matrix @ np.array([previous_ball["x"], previous_ball["y"], 1.0])
+                focus = search_focus(
+                    previous_ball,
+                    cut=cut,
+                    motion_ok=motion_ok,
+                    since_sweep=t - last_sweep,
+                    matrix=matrix if motion_ok else None,
+                )
                 if focus is None:
                     last_sweep = t
                 tick = time.monotonic()

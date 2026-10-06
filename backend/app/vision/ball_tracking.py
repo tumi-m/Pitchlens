@@ -23,6 +23,8 @@ class BallTracker:
         for p in self.tracks:
             p["velocity"] = matrix[:, :2] @ p["velocity"]
             p["xy"] = matrix @ np.r_[p["xy"], 1] + p["velocity"] * step
+            if p.get("origin") is not None:
+                p["origin"] = matrix @ np.r_[p["origin"], 1]
         costs = np.full((len(self.tracks), len(candidates)), 1e6)
         for i, p in enumerate(self.tracks):
             # Image-space uncertainty grows with elapsed time. This is not speed in metres.
@@ -53,6 +55,7 @@ class BallTracker:
                     "id": self.next_id,
                     "xy": np.array([candidate["x"], candidate["y"]]),
                     "origin": np.array([candidate["x"], candidate["y"]]),
+                    "origin_image": np.array([candidate["x"], candidate["y"]]),
                     "velocity": np.zeros(2),
                     "seen": t,
                     "hits": 1,
@@ -63,12 +66,15 @@ class BallTracker:
         ranked = []
         for j, (p, residual) in matched.items():
             c = candidates[j]
-            # The player network's ball head fires on fixed graphics. It may
-            # support a ball the dedicated detector also sees, or a mark that
-            # then moves. It may not be the ball while it sits still.
+            # The player network's ball head fires on fixed graphics. Publish it
+            # only once it has moved on the screen and on the pitch. A pan moves
+            # one of those and not the other; neither is a pass.
             if c.get("source") == "player-model":
-                origin = p.get("origin", p["xy"])
-                if np.linalg.norm(p["xy"] - origin) <= diagonal * 0.012:
+                tol = diagonal * 0.012
+                xy = p["xy"]
+                image_still = np.linalg.norm(xy - p.get("origin_image", xy)) <= tol
+                pitch_still = np.linalg.norm(xy - p.get("origin", xy)) <= tol
+                if image_still or pitch_still:
                     continue
             if p["hits"] < 2 and c["confidence"] < 0.6:
                 continue

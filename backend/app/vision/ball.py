@@ -270,6 +270,21 @@ def fuse_ball_candidates(primary, auxiliary):
     return found
 
 
+def search_focus(previous_ball, *, cut, motion_ok, since_sweep, matrix):
+    """Where the next ball search should look. None means sweep the whole frame.
+
+    An uncorroborated player-network mark must not steer the search. That is
+    how a scoreboard graphic hides the real ball on the frames that do not sweep.
+    """
+    if previous_ball is None or cut or not motion_ok or since_sweep >= 0.5 or matrix is None:
+        return None
+    if previous_ball.get("source") == "player-model":
+        return None
+    return np.asarray(matrix, float) @ np.array(
+        [previous_ball["x"], previous_ball["y"], 1.0], dtype=float
+    )
+
+
 def auxiliary_ball_candidates(boxes, scores, classes, ball_classes):
     """Use the ball head already computed by the player network (no extra forward pass).
 

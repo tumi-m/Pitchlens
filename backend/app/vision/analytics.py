@@ -1241,6 +1241,8 @@ def _grid(points, template, nx=12, ny=8):
     L, W = template["length"], template["width"]
     grid = np.zeros((ny, nx))
     for x, y in points:
+        if x < 0 or y < 0 or x > L or y > W:
+            continue
         i = min(nx - 1, max(0, int(x / L * nx)))
         j = min(ny - 1, max(0, int(y / W * ny)))
         grid[j, i] += 1
@@ -1418,6 +1420,8 @@ def summarise(projected, states, spells, events, template, directions, player_of
                     continue
                 sign = attack_sign(directions, p["team"], f["t"]) or 1
                 x, y = p["xy"]
+                if x < 0 or y < 0 or x > template["length"] or y > template["width"]:
+                    continue
                 nx_, ny_ = (x, y) if sign == 1 else (template["length"] - x, template["width"] - y)
                 normalised[p["team"]].append((nx_, ny_))
                 per_player[(player_of.get(p["id"], p["id"]), p["team"])].append((nx_, ny_))

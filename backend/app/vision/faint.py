@@ -443,23 +443,34 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
                     dropped += 1
         run.clear()
 
-    anchor = None  # start of the run, carried through each frame's camera transform
+    anchor = None  # run start, carried through each frame's camera transform
+    screen = None  # run start in image pixels, never warped
     for i, f in enumerate(frames):
         b = f["ball"]
         if b is None or b.get("inferred"):
             flush()
-            anchor = None
+            anchor = screen = None
             continue
-        here = np.array([b["x"], b["y"]])
-        if anchor is not None and matrices[i] is not None and frames[i - 1]["scene"] == f["scene"]:
-            anchor = _warp_point(anchor, matrices[i])
-            if np.linalg.norm(here - anchor) <= tolerance:
+        here = np.array([float(b["x"]), float(b["y"])])
+        same = anchor is not None and i > 0 and frames[i - 1]["scene"] == f["scene"]
+        if same:
+            screen_still = np.linalg.norm(here - screen) <= tolerance
+            camera_still = False
+            matrix = matrices[i]
+            if matrix is not None and np.isfinite(np.asarray(matrix, dtype=float)).all():
+                anchor = np.asarray(_warp_point(anchor, matrix), dtype=float)
+                camera_still = float(np.linalg.norm(here - anchor)) <= tolerance
+            # Either frame is enough. A pan used to break the screen-fixed test
+            # and a missing camera estimate used to break the pitch-fixed test,
+            # so a graphic never reached the time limit.
+            if camera_still or screen_still:
                 if not run:
                     run.append(i - 1)
                 run.append(i)
                 continue
         flush()
-        anchor = here
+        anchor = here.copy()
+        screen = here.copy()
     flush()
     return dropped
 
