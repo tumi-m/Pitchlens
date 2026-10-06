@@ -303,6 +303,28 @@ def _attended(frame, ball):
     return False
 
 
+def _above_heads(frames, points):
+    """True when the mark sits above every visible player's head on most frames.
+
+    A scoreboard graphic does this. A dead ball on the grass does not. Frames
+    with nobody in them do not count, so a short clip of an empty set piece is
+    left alone.
+    """
+    above = comparable = 0
+    for i, _x, y in points:
+        heads = [
+            p["box"][1]
+            for p in frames[i].get("players", [])
+            if p.get("box") and len(p["box"]) == 4
+        ]
+        if not heads:
+            continue
+        comparable += 1
+        if y < min(heads) - 4:
+            above += 1
+    return comparable >= 3 and above * 2 >= comparable
+
+
 def reject_static_candidates(frames, matrices, diagonal, sample_fps):
     """Remove persistent unattended distractors before choosing a ball path.
 
@@ -322,7 +344,9 @@ def reject_static_candidates(frames, matrices, diagonal, sample_fps):
         # One score spike must not protect an otherwise weak, stationary logo.
         weak = np.median([c["confidence"] for c in candidates]) < 0.3
         outside = sum(c.get("outsidePitch", False) for c in candidates) >= 0.6 * len(candidates)
-        minimum = 3.0 if weak or outside else 20.0
+        points = [(i, frames[i]["ballCandidates"][j]["x"], frames[i]["ballCandidates"][j]["y"]) for i, j in keys]
+        # A confident mark glued above every head is a graphic, not a dead ball.
+        minimum = 3.0 if weak or outside or _above_heads(frames, points) else 20.0
         if span + 1e-6 < minimum or len(keys) / (span * sample_fps) < 0.6:
             return
         attended = sum(_attended(frames[i], frames[i]["ballCandidates"][j]) for i, j in keys)
@@ -388,11 +412,13 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
     object, not the match ball.
 
     Weak evidence (chain-recovered or detector confidence below 0.3) needs only
-    `seconds` of stillness; a confident detector observation needs
-    `confident_seconds`, long enough that a dead ball at a kick-off, corner or
-    penalty is kept. A still ball with a team player within one body height is
-    always kept. Drift is measured from where the run started, so a slowly
-    rolling ball is not "static".
+    `seconds` of stillness. So does a confident mark that sits above every
+    player's head: that is a scoreboard graphic, and a 20-second test is too
+    short for the old half-minute rule to catch it. A confident ball on the
+    grass needs `confident_seconds`, long enough that a dead ball at a kick-off,
+    corner or penalty is kept. A still ball with a team player within one body
+    height is always kept. Drift is measured from where the run started, so a
+    slowly rolling ball is not "static".
     """
     tolerance = diagonal * 0.004
     run = []  # indices of consecutive frames with a near-stationary ball
@@ -407,7 +433,9 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
                 frames[i]["ball"].get("recovered") or frames[i]["ball"]["confidence"] < 0.3
                 for i in run
             )
-            limit = max(2, int(round((seconds if weak else confident_seconds) * sample_fps)))
+            points = [(i, frames[i]["ball"]["x"], frames[i]["ball"]["y"]) for i in run]
+            short = weak or _above_heads(frames, points)
+            limit = max(2, int(round((seconds if short else confident_seconds) * sample_fps)))
             attended = sum(_attended(frames[i], frames[i]["ball"]) for i in run)
             if len(run) >= limit and attended * 2 < len(run):
                 for i in run:

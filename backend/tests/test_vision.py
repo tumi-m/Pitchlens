@@ -1150,6 +1150,30 @@ def test_only_weak_unattended_static_balls_are_dropped_as_markings():
     assert drop_static_balls(rolling, [identity] * 20, 734, sample_fps=5) == 0
 
 
+def test_confident_scoreboard_mark_above_the_players_is_dropped_on_a_short_clip():
+    """A 20s test used to keep a 0.75 logo at (77, 52) because it lasted under 20s."""
+    from app.vision.faint import drop_static_balls, reject_static_candidates
+
+    identity = np.array([[1.0, 0, 0], [0, 1.0, 0]])
+    frames = []
+    for _ in range(90):
+        frames.append({
+            "scene": 0,
+            "t": 0,
+            "players": [{"team": 1, "role": "player", "box": [200, 150, 230, 185]}],
+            "ball": {
+                "x": 77.0, "y": 52.0, "box": [74, 49, 80, 55],
+                "confidence": 0.75, "trackId": 2, "recovered": False,
+            },
+            "ballCandidates": [{"x": 77.0, "y": 52.0, "confidence": 0.75, "outsidePitch": False}],
+        })
+    for i, frame in enumerate(frames):
+        frame["t"] = i / 5
+    assert drop_static_balls([{"scene": f["scene"], "players": f["players"], "ball": dict(f["ball"])} for f in frames], [identity] * 90, 734, sample_fps=5) == 90
+    assert reject_static_candidates(frames, [identity] * 90, 734, 5) == 90
+    assert frames[10]["ballCandidates"] == []
+
+
 def test_bridging_uses_the_online_trackers_gate():
     """Two balls the tracker refused to link (too far for the gap) are never joined."""
     from app.vision.faint import recover_ball
