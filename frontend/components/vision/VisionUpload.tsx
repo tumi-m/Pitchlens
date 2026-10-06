@@ -37,6 +37,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [phase, setPhase] = useState("");
   const [profile, setProfile] = useState("general");
   const [fps, setFps] = useState("3");
+  const [playerLoadOnly, setPlayerLoadOnly] = useState(true);
   const [adaptive, setAdaptive] = useState(false);
   const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
   const [checking, setChecking] = useState(false);
@@ -159,7 +160,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         fps,
         diagnostic,
         start: diagnostic ? start : 0,
-        search: adaptive && profile !== "general" ? "adaptive" : "exhaustive",
+        search: playerLoadOnly ? "none" : adaptive && profile !== "general" ? "adaptive" : "exhaustive",
         signal: controller.signal,
         onProgress: (p) => {
           setPercent(p);
@@ -594,7 +595,13 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </select>
             </label>
           </div>
-          {source === "file" && profile !== "general" && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
+          {source === "file" && (
+            <label className="flex gap-2 text-sm">
+              <input type="checkbox" checked={playerLoadOnly} disabled={busy} onChange={(e) => setPlayerLoadOnly(e.target.checked)} />
+              Player load only. Skips the ball model, which on a full recording is about a third of the GPU time, and does not change the running distance.
+            </label>
+          )}
+          {source === "file" && profile !== "general" && !playerLoadOnly && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
           <p className="text-xs text-pitch-muted">
             Detailed analysis follows fast movement more closely and takes longer.
             The football-trained models come from Roboflow&apos;s football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.

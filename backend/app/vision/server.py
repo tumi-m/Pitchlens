@@ -431,7 +431,7 @@ async def create(request: Request):
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
     ball_search = request.query_params.get("search", "exhaustive")
-    if ball_search not in ("exhaustive", "adaptive"):
+    if ball_search not in ("exhaustive", "adaptive", "none"):
         raise HTTPException(400, "Invalid ball search mode")
     diagnostic = request.query_params.get("diagnostic", "false")
     if diagnostic not in ("true", "false"):

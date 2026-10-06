@@ -72,6 +72,13 @@ def test_temporal_opponent_transfer_is_turnover_candidate():
     assert out["possessionShare"] == [50, 50]
 
 
+def test_player_load_is_a_ball_search_mode():
+    from app.vision.engine import run_video
+
+    with pytest.raises(ValueError, match="Unknown ball search"):
+        run_video("/no/such/video.mp4", "/tmp/out", ball_search="sideways")
+
+
 def test_background_is_not_a_pitch_and_offscreen_is_rejected():
     mask = field_mask(np.zeros((100, 100, 3), np.uint8))
     assert mask.sum() == 0

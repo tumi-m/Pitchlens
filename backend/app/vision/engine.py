@@ -261,6 +261,8 @@ def run_video(
 ):
     total_started = time.monotonic()
     timings = Counter()
+    if ball_search not in ("exhaustive", "adaptive", "none"):
+        raise ValueError("Unknown ball search mode")
     import torch
     from ultralytics import YOLO, settings
 
@@ -274,8 +276,6 @@ def run_video(
         raise ValueError("Sampling rate must be between 1 and 15 frames/sec")
     if max_seconds is not None and (not math.isfinite(max_seconds) or max_seconds <= 0):
         raise ValueError("Diagnostic duration must be positive")
-    if ball_search not in ("exhaustive", "adaptive"):
-        raise ValueError("Unknown ball search mode")
     meta = probe(path)
     if not math.isfinite(start_seconds) or not 0 <= start_seconds < meta["duration"]:
         raise ValueError("Diagnostic start must be inside the video")
@@ -291,17 +291,20 @@ def run_video(
     duration = min(duration, meta["duration"] - start_seconds)
     device = inference_device(torch)
     model = YOLO(str(model_path))
-    if not ball_path.is_file():
-        raise ValueError(
-            "Football ball weights are missing. Run python scripts/setup_vision.py first."
-        )
-    ball_detector = create_ball_detector(ball_path, device)
+    if ball_search == "none":
+        ball_detector = None
+    else:
+        if not ball_path.is_file():
+            raise ValueError(
+                "Football ball weights are missing. Run python scripts/setup_vision.py first."
+            )
+        ball_detector = create_ball_detector(ball_path, device)
     names = model.names
     people = [
         i for i, n in names.items() if n.lower() in ("person", "player", "goalkeeper", "referee")
     ]
     ball_classes = [i for i, n in names.items() if n.lower() in ("ball", "sports ball")]
-    if os.getenv("VISION_AUX_BALL", "1") == "0":
+    if ball_detector is None or os.getenv("VISION_AUX_BALL", "1") == "0":
         ball_classes = []
     if not people:
         raise ValueError("Player model must contain a named person/player class.")
@@ -338,7 +341,7 @@ def run_video(
     batch_size = max(1, int(os.getenv("VISION_BATCH", default_batch)))
     # Adaptive search keys each frame's ball search on the previous frame's ball,
     # so ball inference runs frame by frame in that mode.
-    adaptive = isinstance(ball_detector, TiledBallDetector) and ball_search == "adaptive"
+    adaptive = ball_detector is not None and isinstance(ball_detector, TiledBallDetector) and ball_search == "adaptive"
 
     progress(stage="Learning kit colours from the footage", progress=1)
     cap = cv2.VideoCapture(str(path))
@@ -431,7 +434,9 @@ def run_video(
         if missing:
             for i, d in zip(missing, detect_batch([batch[i][1] for i in missing])):
                 detections[i] = d
-        if adaptive:
+        if ball_detector is None:
+            ball_batches = [[] for _ in batch]
+        elif adaptive:
             ball_batches = [None] * len(batch)
         else:
             tick = time.monotonic()
@@ -479,20 +484,23 @@ def run_video(
             # look like a moving ball or a camera-motion feature.
             detected = [{"box": o["box"]} for o in observations]
             if raw_candidates is None:
-                # Adaptive: look where the ball just was first, sweep the whole
-                # frame when that tile is empty or ambiguous, and at least twice a second.
-                focus = search_focus(
-                    previous_ball,
-                    cut=cut,
-                    motion_ok=motion_ok,
-                    since_sweep=t - last_sweep,
-                    matrix=matrix if motion_ok else None,
-                )
-                if focus is None:
-                    last_sweep = t
-                tick = time.monotonic()
-                raw_candidates = ball_detector.detect(frame, threshold=0.05, focus=focus)
-                timings["ballInferenceSeconds"] += time.monotonic() - tick
+                if ball_detector is None:
+                    raw_candidates = []
+                else:
+                    # Adaptive: look where the ball just was first, sweep the whole
+                    # frame when that tile is empty or ambiguous, and at least twice a second.
+                    focus = search_focus(
+                        previous_ball,
+                        cut=cut,
+                        motion_ok=motion_ok,
+                        since_sweep=t - last_sweep,
+                        matrix=matrix if motion_ok else None,
+                    )
+                    if focus is None:
+                        last_sweep = t
+                    tick = time.monotonic()
+                    raw_candidates = ball_detector.detect(frame, threshold=0.05, focus=focus)
+                    timings["ballInferenceSeconds"] += time.monotonic() - tick
             # Weak neural candidates plus difference-imaging candidates; the
             # track-before-detect pass after the loop decides which are real.
             diameter = ball_size_prior(detected or players, frame.shape[0])
@@ -671,12 +679,14 @@ def run_video(
         "videoSha256": file_sha256(path),
         "model": model_path.name,
         "modelSha256": file_sha256(model_path),
-        "ballModel": ball_path.name,
-        "ballModelSha256": file_sha256(ball_path),
-        "ballInference": "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles",
-        "ballSearch": ball_search
-        if isinstance(ball_detector, TiledBallDetector)
-        else "whole-frame",
+        "ballModel": None if ball_detector is None else ball_path.name,
+        "ballModelSha256": None if ball_detector is None else file_sha256(ball_path),
+        "ballInference": "skipped" if ball_detector is None else (
+            "whole-frame-onnx" if ball_path.suffix == ".onnx" else "overlapping-tiles"
+        ),
+        "ballSearch": "none" if ball_detector is None else (
+            ball_search if isinstance(ball_detector, TiledBallDetector) else "whole-frame"
+        ),
         "ballTileCalls": getattr(ball_detector, "inference_calls", None),
         "ballTracking": "camera-compensated-observations+track-before-detect",
         "ballRecovery": faint,
