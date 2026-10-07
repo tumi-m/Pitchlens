@@ -1939,3 +1939,65 @@ def test_full_rerun_validates_saved_footage_and_releases_failed_reservations(hos
     response = client.post(query, headers=headers)
     assert response.status_code == 200 and response.json()['maxSeconds'] is None
     assert response.json()['startSeconds'] == 0
+
+
+def test_a_still_mark_above_the_players_is_not_the_ball_even_from_the_ball_model():
+    """The opening of videoplayback locked onto a scoreboard at (77, 52).
+
+    Heads on that tape sit near y=137. A confident ball-model hit on that mark
+    must not be published, and must not hide a ball that is actually moving.
+    """
+    from app.vision.ball_tracking import BallTracker
+
+    tracker = BallTracker()
+    matrix = np.eye(2, 3)
+    shape = (360, 640)
+    published = []
+    for i in range(12):
+        graphic = {
+            "x": 77.2,
+            "y": 51.6,
+            "confidence": 0.82,
+            "source": "detector",
+            "aboveHeads": True,
+        }
+        candidates = [graphic]
+        if i >= 4:
+            candidates.append(
+                {
+                    "x": 180.0 + 18 * (i - 4),
+                    "y": 210.0,
+                    "confidence": 0.28,
+                    "source": "detector",
+                    "aboveHeads": False,
+                }
+            )
+        published.append(tracker.update(candidates, i * 0.2, matrix, shape, cut=False))
+    assert all(ball is None or ball["y"] > 100 for ball in published)
+    assert any(ball is not None and ball["x"] >= 180 for ball in published)
+
+
+def test_a_cross_above_head_height_is_kept_once_it_moves():
+    from app.vision.ball_tracking import BallTracker
+
+    tracker = BallTracker()
+    matrix = np.eye(2, 3)
+    seen = []
+    for i in range(6):
+        seen.append(
+            tracker.update(
+                [{
+                    "x": 100.0 + 20 * i,
+                    "y": 40.0,
+                    "confidence": 0.4,
+                    "source": "detector",
+                    "aboveHeads": True,
+                }],
+                i * 0.2,
+                matrix,
+                (360, 640),
+                cut=False,
+            )
+        )
+    assert seen[0] is None
+    assert seen[-1] is not None and seen[-1]["x"] == 200.0

@@ -66,10 +66,10 @@ class BallTracker:
         ranked = []
         for j, (p, residual) in matched.items():
             c = candidates[j]
-            # The player network's ball head fires on fixed graphics. Publish it
-            # only once it has moved on the screen and on the pitch. A pan moves
-            # one of those and not the other; neither is a pass.
-            if c.get("source") == "player-model":
+            # A fixed mark is not a pass. The player network's ball head does this
+            # on a scoreboard. So does the ball network, when the mark sits above
+            # every player: a cross moves, a graphic does not.
+            if c.get("source") == "player-model" or c.get("aboveHeads"):
                 tol = diagonal * 0.012
                 xy = p["xy"]
                 image_still = np.linalg.norm(xy - p.get("origin_image", xy)) <= tol

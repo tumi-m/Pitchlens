@@ -530,6 +530,12 @@ def run_video(
                     )
                 candidates = merge_candidates(detector, motion)
                 strong = strong_candidates(candidates)
+                heads = [o["box"][1] for o in observations if o.get("box") and len(o["box"]) == 4]
+                if heads:
+                    ceiling = min(heads) - 4
+                    for candidate in strong:
+                        if candidate["y"] < ceiling:
+                            candidate["aboveHeads"] = True
                 # Airborne balls can be outside the green surface; temporal association
                 # resolves candidates instead of rejecting them by background colour.
                 ball = ball_tracker.update(strong, t, matrix, frame.shape, cut=cut)
@@ -679,7 +685,7 @@ def run_video(
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.6",
+        "pipelineVersion": "local-vision-2.7",
         "playerTracking": {"appearance": isinstance(tracker, ByteTracker), "roleCorrections": corrected_roles},
         "profile": profile,
         "performance": {
