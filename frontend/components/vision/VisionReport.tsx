@@ -138,6 +138,14 @@ export function VisionReport({ jobId }: { jobId: string }) {
   useEffect(() => {
     if (result) loadAnalytics();
   }, [result, loadAnalytics]);
+  // A just-finished match may be getting its pitch set up from a saved venue:
+  // refresh the report when that finishes.
+  const autoSetup = calibration?.job?.state === "processing" && calibration?.job?.auto;
+  useEffect(() => {
+    if (!autoSetup) return;
+    const timer = setTimeout(loadAnalytics, 5000);
+    return () => clearTimeout(timer);
+  }, [autoSetup, calibration, loadAnalytics]);
   useEffect(() => {
     const video = player.current;
     if (!video || !result) return;

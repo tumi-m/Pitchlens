@@ -216,6 +216,7 @@ def work(directory, status, event):
             progress=100,
             engine="gpu" if ran_on_gpu else "cpu",
         )
+        threading.Thread(target=_auto_venue, args=(directory, dict(status)), daemon=True).start()
     except InterruptedError:
         if stopping:
             # A redeploy or restart is not the user's cancellation: allow a retry.
@@ -250,7 +251,9 @@ def recover_calibrations():
     """A calibration running when the worker stopped will never finish: say so."""
     for status in ROOT.glob("*/calibration-job.json"):
         data = _read_json(status) or {}
-        if data.get("state") == "processing":
+        if data.get("state") == "processing" and data.get("auto"):
+            status.unlink(missing_ok=True)  # an automatic attempt simply did not happen
+        elif data.get("state") == "processing":
             _write_json(status, {"state": "failed", "error": "The analysis server restarted. Apply the pitch setup again.", "finishedAt": time.time()})
 
 
@@ -995,6 +998,71 @@ def _run_calibration(directory, body):
     except Exception as exc:  # noqa: BLE001 - reported to the user; previous calibration kept
         _write_json(status_path, {"state": "failed", "error": str(exc)[:300], "finishedAt": time.time()})
     finally:
+        with calibrating_lock:
+            calibrating.discard(directory.name)
+
+
+def _auto_venue(directory, status, limit=5):
+    """Set up the pitch of a finished match from a saved venue, when one fits.
+
+    A fixed venue camera sees the same pitch every match: each of the owner's
+    venues with the same video size is checked against this match's painted
+    lines (build_from_venue refuses one that does not line up), and the first
+    verified fit is applied. Nothing is applied without the footage to check
+    against. VISION_AUTO_VENUE=0 turns it off.
+    """
+    from app.vision.calibrate import build_from_venue
+
+    if os.getenv("VISION_AUTO_VENUE", "1") == "0":
+        return None
+    video = directory / "video"
+    if not video.is_file() or (directory / "calibration.json").is_file():
+        return None
+    try:
+        result = json.loads((directory / "result.json").read_text())
+        size = [result["video"]["width"], result["video"]["height"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    owner = status.get("owner", "")
+    venues = [
+        v for v in (_read_json(p) for p in _venue_dir().glob("*.json"))
+        if isinstance(v, dict) and v.get("id") and v.get("owner", "") == owner and list(v.get("size") or []) == size
+    ]
+    if not venues:
+        return None
+    venues.sort(key=lambda v: -(v.get("createdAt") or 0))
+    with calibrating_lock:
+        if directory.name in calibrating:
+            return None
+        calibrating.add(directory.name)
+    job_path = directory / "calibration-job.json"
+    applied = None
+    try:
+        _write_json(job_path, {"state": "processing", "progress": 0, "startedAt": time.time(), "auto": True})
+        for venue in venues[:limit]:
+            try:
+                data = build_from_venue(result, venue, video)
+            except ValueError:
+                continue  # the lines do not match this venue
+            if not (data.get("venue") or {}).get("verified"):
+                continue
+            data["auto"] = True
+            if (directory / "calibration.json").is_file() or not (directory / "status.json").is_file():
+                return None  # the reviewer set one up meanwhile, or the match was deleted
+            _write_json(directory / "calibration.json", data)
+            compute_analysis(directory)
+            _write_json(job_path, {"state": "done", "progress": 100, "finishedAt": time.time(), "venue": venue["id"], "auto": True})
+            applied = venue["id"]
+            return applied
+        return None
+    except Exception:  # never fail a finished analysis over an optional setup
+        import logging
+
+        logging.exception("Automatic venue setup failed")
+        return None
+    finally:
+        if applied is None and (_read_json(job_path) or {}).get("auto"):
+            job_path.unlink(missing_ok=True)  # nothing matched: no setup to report
         with calibrating_lock:
             calibrating.discard(directory.name)
 

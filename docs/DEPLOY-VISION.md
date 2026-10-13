@@ -157,6 +157,15 @@ Modal → Settings → Usage & billing.
   available; 10 fps follows the ball best and costs proportionally more.
 - Modal → Settings → Usage & billing shows the cost per run ("Ephemeral Apps").
 
+### Automatic pitch setup for fixed venue cameras
+
+When a match finishes, the worker tries the owner's saved venues with the same
+video size, newest first. Each is checked against the painted lines in the new
+footage, and the first that lines up is applied automatically (the pitch panel
+says "Set up automatically from saved venue …"). Nothing is applied without
+the footage to check against or over a setup the reviewer made.
+`VISION_AUTO_VENUE=0` turns this off.
+
 ### Engine tuning variables
 
 - `VISION_DEVICE`: `auto` selects CUDA, Apple MPS, then CPU; an explicit device overrides selection. Modal sets `cuda`.

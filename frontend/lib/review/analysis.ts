@@ -296,6 +296,8 @@ export type Calibration = {
   state: "none" | "ready";
   /** Set when this calibration came from a saved venue. */
   venue?: { id: string; name: string; lineScore: number | null; verified?: boolean };
+  /** Set up automatically when the match finished, from a saved venue whose lines matched. */
+  auto?: boolean;
   template?: PitchTemplate;
   fit?: CalibrationFit;
   k1?: number;
@@ -307,7 +309,7 @@ export type Calibration = {
   anchorFrame?: number;
   frames?: ({ H: number[]; d: number } | null)[];
   request?: CalibrationRequest;
-  job?: { state: "processing" | "done" | "failed"; progress?: number; error?: string };
+  job?: { state: "processing" | "done" | "failed"; progress?: number; error?: string; auto?: boolean };
 };
 
 export type CalibrationRequest = {

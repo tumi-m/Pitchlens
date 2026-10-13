@@ -294,7 +294,7 @@ export function PitchCalibration({
         )}
         {calibration?.venue && (
           <p className="text-xs text-pitch-muted">
-            From saved venue &quot;{calibration.venue.name}&quot;
+            {calibration.auto ? "Set up automatically from saved venue" : "From saved venue"} &quot;{calibration.venue.name}&quot;
             {calibration.venue.lineScore !== null ? ` · lines matched ${Math.round(calibration.venue.lineScore * 100)}%` : ""}
           </p>
         )}
