@@ -588,3 +588,15 @@ test("a refused action asks for the site's access code on the match page", async
   await expect(prompt).toBeHidden();
   expect(await page.evaluate(() => localStorage.getItem("pitchlens-vision-access"))).toBe("new-code");
 });
+
+test("highlights play the goals and shots back to back", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await bar.getByRole("button", { name: "Play highlights (1)" }).click();
+  await expect(bar).toContainText("Highlight 1 of 1");
+  await expect.poll(() => page.evaluate(() => !document.querySelector("video")!.paused)).toBe(true);
+  await bar.getByRole("button", { name: "Stop" }).click();
+  await expect(bar.getByRole("button", { name: "Play highlights (1)" })).toBeVisible();
+  expect(await page.evaluate(() => document.querySelector("video")!.paused)).toBe(true);
+});
