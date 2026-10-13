@@ -111,6 +111,8 @@ export type VisionHealth = {
   /** The site owner requires an access code before videos can be analysed. */
   accessRequired?: boolean;
   retentionHours?: number | null;
+  /** Largest upload the worker accepts, in bytes. */
+  maxBytes?: number;
   /** Analysis runs on a Modal GPU (minutes rather than an hour). */
   gpu?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
@@ -386,4 +388,10 @@ export async function analyseYouTube(
     search: options.search || "none",
   });
   return visionJson<VisionJob>(`jobs/from-url?${query}`, { method: "POST" });
+}
+
+/** "2 GB" / "500 MB" for an upload limit in bytes. */
+export function sizeLabel(bytes: number) {
+  const gb = bytes / 1024 ** 3;
+  return gb >= 1 ? `${Number.isInteger(gb) ? gb : gb.toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
 }

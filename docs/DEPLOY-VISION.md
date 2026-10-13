@@ -45,9 +45,12 @@ Browser ──4 MB chunks──▶ Vercel /api/vision/* ──Bearer token──
    (default `*`; set to your Railway domain plus `healthcheck.railway.app` to
    lock it down).
 5. **Add a volume** (right-click the service → Attach volume) with mount path
-   **`/data`**. Without it every redeploy deletes all jobs and results. Hobby
-   volumes are 5 GB; that holds about ten 500 MB uploads within the retention
-   window. The worker answers "out of storage" instead of filling the disk.
+   **`/data`**. Without it every redeploy deletes all jobs and results. Uploads
+   are capped by `VISION_MAX_UPLOAD_MB` (default 2048): original 1080p
+   recordings of a 40-minute match are 2-5 GB, and reduced copies (360p) make
+   the ball too small to track. Size the volume for a few matches within the
+   retention window (for example 20-50 GB), or lower the cap or the retention.
+   The worker answers "out of storage" instead of filling the disk.
 6. Deploy. The first build downloads PyTorch and the model weights and takes
    several minutes. Check the build log mentions `vision.Dockerfile` and
    `Model: /app/models/yolo11s.pt`. When it is live,
@@ -122,7 +125,9 @@ set the three Vercel variables as above.
 ## YouTube links
 
 The upload page also accepts a YouTube link. The worker fetches the video itself
-with yt-dlp (plus the Deno runtime it now requires), up to 1080p and 500 MB, so
+with yt-dlp (plus the Deno runtime it now requires): the sharpest version up to
+1080p that fits the upload limit and the free space, stepping down to 720p and
+480p, so
 nothing large passes through the browser or Vercel. Users must confirm they
 filmed the video or have the owner's permission.
 

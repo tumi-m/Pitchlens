@@ -71,8 +71,20 @@ def remux(path):
     return target
 
 
+HEIGHTS = (1080, 720, 480)
+
+
+def _format(height):
+    # Video only: no audio track means no ffmpeg merge step on the worker.
+    # H.264 MP4 first because every browser can play it back in the report.
+    return (
+        f"bv*[height<={height}][ext=mp4][vcodec^=avc1]/bv*[height<={height}][ext=mp4]"
+        f"/b[height<={height}][ext=mp4]/bv*[height<={height}]/b[height<={height}]"
+    )
+
+
 def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=lambda: False):
-    """Download the best MP4 video stream up to 1080p. Returns (path, info)."""
+    """Download the sharpest MP4 video stream up to 1080p that fits. Returns (path, info)."""
     import yt_dlp
 
     vid = video_id(url)
@@ -99,12 +111,7 @@ def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=la
         return None
 
     options = {
-        # Video only: no audio track means no ffmpeg merge step on the worker.
-        # H.264 MP4 first because every browser can play it back in the report.
-        "format": (
-            "bv*[height<=1080][ext=mp4][vcodec^=avc1]/bv*[height<=1080][ext=mp4]"
-            "/b[height<=1080][ext=mp4]/bv*[height<=1080]/b[height<=1080]"
-        ),
+        "format": _format(1080),
         "outtmpl": str(directory / "download.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -123,29 +130,38 @@ def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=la
     if os.getenv("VISION_YOUTUBE_COOKIES"):
         options["cookiefile"] = os.environ["VISION_YOUTUBE_COOKIES"]
 
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True)
-    except InterruptedError:
-        raise
-    except yt_dlp.utils.DownloadError as exc:
-        if isinstance(getattr(exc, "exc_info", [None, None])[1], InterruptedError):
-            raise InterruptedError("Download cancelled") from exc
-        raise ValueError(friendly(exc)) from exc
-    if not info:
-        raise ValueError("YouTube returned no video for this link.")
+    # The sharpest version that fits: 1080p, else 720p, else 480p. A smaller
+    # ball in a reduced copy is still better than refusing the match.
+    info, files, height = None, [], None
+    for height in HEIGHTS:
+        options["format"] = _format(height)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True)
+        except InterruptedError:
+            raise
+        except yt_dlp.utils.DownloadError as exc:
+            if isinstance(getattr(exc, "exc_info", [None, None])[1], InterruptedError):
+                raise InterruptedError("Download cancelled") from exc
+            raise ValueError(friendly(exc)) from exc
+        if not info:
+            raise ValueError("YouTube returned no video for this link.")
+        files = [p for p in directory.glob("download.*") if not p.name.endswith(".part")]
+        if files:
+            break
+        progress(stage=f"Too large at {height}p; trying a smaller version", progress=0)
     if (info.get("duration") or 0) > MAX_SECONDS:
         raise ValueError("Videos longer than three hours are not supported.")
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
         raise ValueError(friendly("live not finished"))
-    files = [p for p in directory.glob("download.*") if not p.name.endswith(".part")]
     if not files:
+        limit = max_bytes / 1024**3
         raise ValueError(
-            "This video is larger than 500 MB at 1080p. Trim it or upload a shorter clip."
+            f"This video is larger than {limit:.1f} GB even at {HEIGHTS[-1]}p. Trim it or upload a shorter clip."
         )
     return remux(files[0]), {
         "title": info.get("title"),
         "duration": info.get("duration"),
-        "height": info.get("height"),
+        "height": info.get("height") or height,
         "url": f"https://www.youtube.com/watch?v={vid}",
     }

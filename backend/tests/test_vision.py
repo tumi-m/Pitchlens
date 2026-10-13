@@ -2053,3 +2053,43 @@ def test_ball_model_status_never_reveals_owner_keys(service, monkeypatch, tmp_pa
     monkeypatch.setattr(server, 'training', {'state': 'done', 'run': {'owner': owner, 'kept': False}})
     body = client.get('/ball-model').text
     assert owner not in body and 'ownerHash' not in body
+
+
+def test_youtube_download_steps_down_to_the_sharpest_version_that_fits(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from app.vision import youtube
+
+    asked = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download):
+            fmt = self.options["format"]
+            asked.append(fmt.split("height<=")[1].split("]")[0])
+            # Too large at 1080p (yt-dlp skips the file under max_filesize).
+            if "height<=1080" not in fmt:
+                (tmp_path / "download.mp4").write_bytes(b"video")
+            return {"title": "Match", "duration": 2400}
+
+    fake = types.SimpleNamespace(YoutubeDL=FakeYDL, utils=types.SimpleNamespace(DownloadError=RuntimeError))
+    monkeypatch.setitem(sys.modules, "yt_dlp", fake)
+    monkeypatch.setattr(youtube, "remux", lambda p: p)
+    stages = []
+    path, info = youtube.download("https://youtu.be/dQw4w9WgXcQ", tmp_path, 100, progress=lambda **kw: stages.append(kw.get("stage")))
+    assert asked == ["1080", "720"] and info["height"] == 720 and path.name == "download.mp4"
+    assert any("trying a smaller version" in (s or "") for s in stages)
+    # Nothing fits at any height: a clear message with the limit.
+    (tmp_path / "download.mp4").unlink()
+    monkeypatch.setattr(FakeYDL, "extract_info", lambda self, url, download: {"title": "Match", "duration": 2400})
+    with pytest.raises(ValueError, match="even at 480p"):
+        youtube.download("https://youtu.be/dQw4w9WgXcQ", tmp_path, 100)

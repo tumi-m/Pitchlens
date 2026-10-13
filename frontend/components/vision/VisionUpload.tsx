@@ -14,6 +14,7 @@ import {
   analyseYouTube,
   visionAccessCode,
   setVisionAccessCode,
+  sizeLabel,
 } from "@/lib/review/vision";
 
 export function VisionUpload({ onManual }: { onManual: () => void }) {
@@ -129,6 +130,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
       : `${Math.round(health.retentionHours)} hours`
     : "";
   const profiles = health?.profiles ?? ["general"];
+  const maxBytes = health?.maxBytes ?? 500 * 1024 * 1024;
   async function submit() {
     if (!ready) return;
     if (health?.accessRequired) {
@@ -317,7 +319,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               {file ? file.name : "Choose your match video"}
             </span>
             <span className="text-sm text-pitch-muted block mt-2">
-              MP4 or MOV (H.264/HEVC) · Up to 500 MB ·{" "}
+              MP4 or MOV (H.264/HEVC) · Up to {sizeLabel(maxBytes)} · upload the camera&apos;s original file ·{" "}
               {hosted
                 ? `Uploaded to the Pitchlens analysis server${retention ? `; footage deleted after ${retention}` : ""}`
                 : "Video stays on this computer"}
@@ -331,9 +333,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 if (!f) return;
-                if (f.size > 500 * 1024 * 1024) {
+                if (f.size > maxBytes) {
                   setFile(null);
-                  setError("Video exceeds 500 MB");
+                  setError(`This video is larger than ${sizeLabel(maxBytes)}. Trim it, or ask the Pitchlens owner to raise the limit.`);
                   return;
                 }
                 if (!/\.(mp4|mov)$/i.test(f.name)) {
@@ -368,8 +370,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 </p>
               )}
               <p className="text-sm text-pitch-muted">
-                The analysis server fetches the best version up to 1080p (under 500 MB,
-                up to three hours) — nothing is downloaded to your device. Public or
+                The analysis server fetches the sharpest version up to 1080p that fits
+                (under {sizeLabel(maxBytes)}, up to three hours) — nothing is downloaded to your device. Public or
                 unlisted videos only. Best results: one fixed, high camera showing the
                 whole pitch, at 1080p.
               </p>

@@ -31,7 +31,15 @@ from app.vision.profiles import available_profiles
 ROOT = Path(os.getenv("VISION_DATA_DIR", ".vision")).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.getenv("VISION_SERVICE_TOKEN", "")
-MAX_BYTES = 500 * 1024 * 1024
+# Original recordings, not reduced copies: at 360p the ball is a few pixels. A
+# 40-minute 1080p phone recording is 2-5 GB; size the volume to match
+# (check_space refuses an upload that would not fit).
+MAX_BYTES = max(50, int(os.getenv("VISION_MAX_UPLOAD_MB", "2048"))) * 1024 * 1024
+
+
+def max_size_text():
+    gb = MAX_BYTES / 1024**3
+    return f"{gb:.1f} GB" if gb >= 1 else f"{MAX_BYTES // 1024**2} MB"
 # Chunked uploads keep every request small enough for serverless proxies (Vercel: 4.5 MB).
 MAX_CHUNK = 8 * 1024 * 1024
 # A chunked upload that stops sending data releases the worker after this long.
@@ -368,10 +376,18 @@ app.add_event_handler("startup", recover_calibrations)
 app.add_event_handler("startup", start_retention_sweeper)
 
 
+SPACE_MARGIN = 256 * 1024 * 1024
+
+
 def check_space(size):
     free = shutil.disk_usage(ROOT).free
-    if free < size + 256 * 1024 * 1024:
+    if free < size + SPACE_MARGIN:
         raise HTTPException(507, "The analysis server is out of storage. Try again later.")
+
+
+def download_budget():
+    """Largest download that fits now: the upload limit, or the free space if smaller."""
+    return min(MAX_BYTES, shutil.disk_usage(ROOT).free - SPACE_MARGIN)
 
 
 @app.get("/healthz")
@@ -490,7 +506,7 @@ async def create(request: Request):
         except ValueError as exc:
             raise HTTPException(400, "Invalid video size") from exc
         if not 0 < expected <= MAX_BYTES:
-            raise HTTPException(413, "Maximum video size is 500 MB")
+            raise HTTPException(413, f"Maximum video size is {max_size_text()}")
     request_id = request.query_params.get("requestId")
     if request_id is not None and (
         not re.fullmatch(r"[a-f0-9-]{32,36}", request_id) or not owner or expected is None
@@ -556,7 +572,7 @@ async def create(request: Request):
             async for chunk in request.stream():
                 size += len(chunk)
                 if size > MAX_BYTES:
-                    raise HTTPException(413, "Maximum video size is 500 MB")
+                    raise HTTPException(413, f"Maximum video size is {max_size_text()}")
                 f.write(chunk)
                 upload_activity[job_id] = time.monotonic()
         if not size:
@@ -582,7 +598,7 @@ def fetch_and_work(directory, status, event, url):
     try:
         update(stage="Downloading from YouTube", progress=0)
         path, info = download(
-            url, directory, MAX_BYTES, progress=update, cancelled=event.is_set
+            url, directory, max(1, download_budget()), progress=update, cancelled=event.is_set
         )
         path.replace(directory / "video")
         size = (directory / "video").stat().st_size
@@ -644,7 +660,9 @@ async def create_from_url(request: Request):
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
     await asyncio.to_thread(delete_expired)
-    check_space(MAX_BYTES)
+    # The size is unknown until YouTube answers: the download steps down in
+    # resolution to fit the space there is, so only refuse when nearly full.
+    check_space(100 * 1024 * 1024)
     job_id = uuid.uuid4().hex
     with lock:
         release_stale_upload()
@@ -1643,7 +1661,7 @@ def rerun_job(job_id: str, request: Request):
         try:
             directory.mkdir()
             # Both jobs are read-only consumers; deleting either link preserves
-            # the other. This avoids another upload and another 500 MB disk copy.
+            # the other. This avoids another upload and another full-size disk copy.
             try:
                 os.link(source / "video", directory / "video")
             except OSError:
