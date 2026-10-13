@@ -11,12 +11,12 @@ const OWNER = 'a'.repeat(32);
 const OTHER = 'b'.repeat(32);
 const ID = 'c'.repeat(32);
 
-function setup() {
+function setup(env = {}) {
   const calls = [];
   const exports = {};
   const context = {
     exports, require, Buffer, URL, URLSearchParams, Headers, Response,
-    process: { env: { VISION_SERVICE_URL: 'https://worker.example', VISION_SERVICE_TOKEN: 'fixture-token', VISION_ACCESS_CODE: 'fixture-access' } },
+    process: { env: { VISION_SERVICE_URL: 'https://worker.example', VISION_SERVICE_TOKEN: 'fixture-token', VISION_ACCESS_CODE: 'fixture-access', ...env } },
     fetch: async (url, init) => {
       calls.push({ url, init });
       assert.equal(init.headers.Authorization, 'Bearer fixture-token');
@@ -87,4 +87,44 @@ test('billing requires owner and write authorization; browser proxy never accept
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), billing('checkout'))).status, 401);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), billing('verify'))).status, 200);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), billing('webhook'))).status, 404);
+});
+
+test('an access code pasted into the dashboard with a trailing newline still matches', async () => {
+  const s = setup({ VISION_ACCESS_CODE: 'fixture-access\n ' });
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('retry'))).status, 200);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-acces' }), s.route('retry'))).status, 401);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'Fixture-access' }), s.route('retry'))).status, 401);
+});
+
+test('without an access code set, the hosted site is open but still private per browser', async () => {
+  for (const code of ['', '   ']) {
+    const s = setup({ VISION_ACCESS_CODE: code });
+    assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('retry'))).status, 200);
+    // Another browser's match stays invisible, and anonymous requests are refused.
+    assert.equal((await s.api.GET(s.request({ owner: OTHER }), s.route('result'))).status, 404);
+    assert.equal((await s.api.GET(s.request(), s.route('result'))).status, 401);
+    // Cross-site writes are still refused.
+    assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, origin: 'https://attacker.example' }), s.route('retry'))).status, 403);
+  }
+});
+
+test('health tells the upload page whether a code is needed', async () => {
+  const health = async (code) => {
+    const s = setup({ VISION_ACCESS_CODE: code });
+    const response = await s.api.GET(s.request({ owner: OWNER }), { params: Promise.resolve({ path: ['health'] }) });
+    return response.json();
+  };
+  assert.equal((await health('')).accessRequired, false);
+  assert.equal((await health('fixture-access')).accessRequired, true);
+});
+
+test('site training is refused while the site has no access code', async () => {
+  const s = setup({ VISION_ACCESS_CODE: '' });
+  const request = s.request({ method: 'POST', owner: OWNER });
+  const response = await s.api.POST(request, { params: Promise.resolve({ path: ['ball-model', 'train'] }) });
+  assert.equal(response.status, 403);
+  assert.equal(s.calls.length, 0);
+  const closed = setup();
+  const allowed = await closed.api.POST(closed.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), { params: Promise.resolve({ path: ['ball-model', 'train'] }) });
+  assert.equal(allowed.status, 200);
 });

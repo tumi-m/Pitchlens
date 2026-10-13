@@ -111,6 +111,8 @@ export type VisionHealth = {
   /** The site owner requires an access code before videos can be analysed. */
   accessRequired?: boolean;
   retentionHours?: number | null;
+  /** Largest upload the worker accepts, in bytes. */
+  maxBytes?: number;
   /** Analysis runs on a Modal GPU (minutes rather than an hour). */
   gpu?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
@@ -155,6 +157,17 @@ export function visionAccessCode(): string {
   }
 }
 
+/** Fired when the site asks for an access code (none saved, or the saved one was refused). */
+export const ACCESS_EVENT = "pitchlens:access-required";
+
+function accessRejected() {
+  // A refused code is dropped so the next prompt starts empty.
+  setVisionAccessCode("");
+  try {
+    window.dispatchEvent(new CustomEvent(ACCESS_EVENT));
+  } catch {}
+}
+
 export function setVisionAccessCode(code: string) {
   try {
     if (code) localStorage.setItem(ACCESS_KEY, code);
@@ -189,12 +202,14 @@ export async function visionJson<T>(
         response.status,
       );
   }
-  if (!response.ok)
+  if (!response.ok) {
+    if (data.code === "access") accessRejected();
     throw new VisionError(
       data.detail || "Vision request failed",
       response.status,
       data.code,
     );
+  }
   return data as T;
 }
 
@@ -246,7 +261,7 @@ export async function uploadToVision(
     fps?: string;
     diagnostic?: boolean;
     start?: number;
-    search?: "exhaustive" | "adaptive";
+    search?: "exhaustive" | "adaptive" | "none";
     signal?: AbortSignal;
     onProgress?: (percent: number) => void;
   },
@@ -373,4 +388,10 @@ export async function analyseYouTube(
     search: options.search || "none",
   });
   return visionJson<VisionJob>(`jobs/from-url?${query}`, { method: "POST" });
+}
+
+/** "2 GB" / "500 MB" for an upload limit in bytes. */
+export function sizeLabel(bytes: number) {
+  const gb = bytes / 1024 ** 3;
+  return gb >= 1 ? `${Number.isInteger(gb) ? gb : gb.toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
 }

@@ -177,11 +177,19 @@ export function MatchReport({
                 ? ` · ${analysis.review.pendingKey} key moment${analysis.review.pendingKey === 1 ? "" : "s"} to check`
                 : ` · ${analysis.review.pending} waiting`}
             </button>
-            {(analysis.review.pendingByType?.pass ?? 0) > 0 && (
-              <span className="text-[11px] text-pitch-muted max-w-[18rem]">
-                {analysis.review.pendingByType?.pass} passes found: check a random sample of ten to estimate the totals, no need to go through them all.
-              </span>
-            )}
+            {(() => {
+              const by = analysis.review.pendingByType ?? {};
+              const found = [
+                by.pass ? `${by.pass} passes` : "",
+                by.interception ? `${by.interception} interceptions` : "",
+                by.tackle ? `${by.tackle} tackles` : "",
+              ].filter(Boolean);
+              return found.length ? (
+                <span className="text-[11px] text-pitch-muted max-w-[18rem]">
+                  {found.join(", ")} found: check a random sample of about ten of each to estimate the totals, no need to go through them all.
+                </span>
+              ) : null;
+            })()}
           </div>
           <div className="flex flex-col items-center gap-2">
             <span className="w-12 h-12 rounded-full border-4 border-white/20" style={{ background: colours[1] }} />

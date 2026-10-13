@@ -10,11 +10,13 @@ const OWNER_COOKIE = "pitchlens-vision-owner";
 // Vercel rejects function request bodies over 4.5 MB; the client sends 4 MB chunks.
 const MAX_CHUNK = 4.5 * 1024 * 1024;
 
+/** Spaces and line breaks around a code are never part of it: the site trims what
+ * people type, and a value pasted into the hosting dashboard often carries a newline. */
 function sameSecret(given: string | null, expected: string) {
   if (!given) return false;
-  const a = Buffer.from(given);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  const a = Buffer.from(given.trim());
+  const b = Buffer.from(expected.trim());
+  return b.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 
 async function proxy(
@@ -70,19 +72,11 @@ async function proxy(
         { status: 403 },
       );
   }
-  const accessCode = process.env.VISION_ACCESS_CODE || "";
-  // A public site in front of a paid worker must not run open to the internet.
-  if (hosted && !accessCode)
-    return Response.json(
-      {
-        detail:
-          "Hosted analysis needs VISION_ACCESS_CODE set on the website before it can accept videos.",
-        available: false,
-        configured: false,
-        hosted,
-      },
-      { status: 503 },
-    );
+  // Optional shared code. With VISION_ACCESS_CODE unset, anyone who has the
+  // site's link can start analyses on the paid worker (fine for a small test
+  // group); set it again to require the code. Each browser still only sees its
+  // own matches.
+  const accessCode = (process.env.VISION_ACCESS_CODE || "").trim();
   const writes = request.method !== "GET";
   if (writes) {
     const origin = request.headers.get("origin");
@@ -102,19 +96,25 @@ async function proxy(
         { detail: "Cross-origin upload rejected." },
         { status: 403 },
       );
-    // Analysis uses paid compute: an optional shared code keeps strangers out.
+    // Analysis uses paid compute: the optional shared code keeps strangers out.
     const sent = request.headers.get("x-pitchlens-access");
     if (accessCode && !sameSecret(sent, accessCode))
       return Response.json(
         {
           detail: sent
             ? "That access code was not accepted."
-            : "Enter the access code to analyse videos.",
+            : "Enter the access code to continue.",
           code: "access",
         },
         { status: 401 },
       );
   }
+  // Training switches the ball model every browser uses: never from an open site.
+  if (route === "ball-model/train" && request.method !== "GET" && !accessCode)
+    return Response.json(
+      { detail: "Training from the site needs an access code. Set VISION_ACCESS_CODE, or train from a terminal." },
+      { status: 403 },
+    );
   // Rebuild the query so a browser can never pick someone else's owner key.
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");

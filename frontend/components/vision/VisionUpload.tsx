@@ -14,6 +14,7 @@ import {
   analyseYouTube,
   visionAccessCode,
   setVisionAccessCode,
+  sizeLabel,
 } from "@/lib/review/vision";
 
 export function VisionUpload({ onManual }: { onManual: () => void }) {
@@ -105,7 +106,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           if (x.profiles?.includes("broadcast")) setProfile("broadcast");
           if (x.gpu) setFps("6");
         }
-        setNeedsCode(!!x.accessRequired && !visionAccessCode());
+        // Show the field whenever a code is required (pre-filled with any saved
+        // one); forget a saved code when the site is open.
+        if (x.accessRequired) setNeedsCode(true);
+        else if (x.available) setVisionAccessCode("");
       })
       .catch(() => {
         if (!stopped) { setHealth({ available: false }); retry(); }
@@ -126,6 +130,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
       : `${Math.round(health.retentionHours)} hours`
     : "";
   const profiles = health?.profiles ?? ["general"];
+  const maxBytes = health?.maxBytes ?? 500 * 1024 * 1024;
   async function submit() {
     if (!ready) return;
     if (health?.accessRequired) {
@@ -314,7 +319,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               {file ? file.name : "Choose your match video"}
             </span>
             <span className="text-sm text-pitch-muted block mt-2">
-              MP4 or MOV (H.264/HEVC) · Up to 500 MB ·{" "}
+              MP4 or MOV (H.264/HEVC) · Up to {sizeLabel(maxBytes)} · upload the camera&apos;s original file ·{" "}
               {hosted
                 ? `Uploaded to the Pitchlens analysis server${retention ? `; footage deleted after ${retention}` : ""}`
                 : "Video stays on this computer"}
@@ -328,9 +333,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 if (!f) return;
-                if (f.size > 500 * 1024 * 1024) {
+                if (f.size > maxBytes) {
                   setFile(null);
-                  setError("Video exceeds 500 MB");
+                  setError(`This video is larger than ${sizeLabel(maxBytes)}. Trim it, or ask the Pitchlens owner to raise the limit.`);
                   return;
                 }
                 if (!/\.(mp4|mov)$/i.test(f.name)) {
@@ -365,8 +370,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 </p>
               )}
               <p className="text-sm text-pitch-muted">
-                The analysis server fetches the best version up to 1080p (under 500 MB,
-                up to three hours) — nothing is downloaded to your device. Public or
+                The analysis server fetches the sharpest version up to 1080p that fits
+                (under {sizeLabel(maxBytes)}, up to three hours) — nothing is downloaded to your device. Public or
                 unlisted videos only. Best results: one fixed, high camera showing the
                 whole pitch, at 1080p.
               </p>
@@ -554,11 +559,16 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </span>
               <input
                 aria-label="Access code"
+                data-access-field
                 type="password"
                 autoComplete="off"
                 className="pitch-input w-full mt-2"
                 value={code}
-                onChange={(e) => setCode(e.target.value)}
+                onChange={(e) => {
+                  setCode(e.target.value);
+                  // Saved as typed, so returning to a match page works without uploading.
+                  setVisionAccessCode(e.target.value.trim());
+                }}
                 disabled={busy}
               />
               <span className="text-xs text-pitch-muted block mt-1">

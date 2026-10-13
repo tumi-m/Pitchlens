@@ -31,7 +31,15 @@ from app.vision.profiles import available_profiles
 ROOT = Path(os.getenv("VISION_DATA_DIR", ".vision")).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.getenv("VISION_SERVICE_TOKEN", "")
-MAX_BYTES = 500 * 1024 * 1024
+# Original recordings, not reduced copies: at 360p the ball is a few pixels. A
+# 40-minute 1080p phone recording is 2-5 GB; size the volume to match
+# (check_space refuses an upload that would not fit).
+MAX_BYTES = max(50, int(os.getenv("VISION_MAX_UPLOAD_MB", "2048"))) * 1024 * 1024
+
+
+def max_size_text():
+    gb = MAX_BYTES / 1024**3
+    return f"{gb:.1f} GB" if gb >= 1 else f"{MAX_BYTES // 1024**2} MB"
 # Chunked uploads keep every request small enough for serverless proxies (Vercel: 4.5 MB).
 MAX_CHUNK = 8 * 1024 * 1024
 # A chunked upload that stops sending data releases the worker after this long.
@@ -43,6 +51,36 @@ RETENTION_HOURS = float(os.getenv("VISION_RETENTION_HOURS", "0") or 0)
 # Open-ended playback ranges are capped so one response never streams a whole match.
 RANGE_CAP = 16 * 1024 * 1024
 OWNER = re.compile(r"[a-f0-9]{32}")
+# Analyses that may start in any 24 hours (0 = no limit). With the site open to
+# anyone holding the link, this bounds GPU spending; uploads are refused before
+# any bytes are sent once it is reached.
+STARTS = "starts.json"
+FULL_RERUNS_PER_MATCH = 3
+SECTION_RERUNS_PER_MATCH = 10
+
+
+def daily_cap():
+    try:
+        return max(0, int(os.getenv("VISION_MAX_JOBS_PER_DAY", "30")))
+    except ValueError:
+        return 30
+
+
+def _recent_starts(now):
+    data = _read_json(ROOT / STARTS, [])
+    return [t for t in data if isinstance(t, (int, float)) and 0 <= now - t < 86400] if isinstance(data, list) else []
+
+
+def check_daily_budget():
+    cap = daily_cap()
+    if cap and len(_recent_starts(time.time())) >= cap:
+        raise HTTPException(429, f"This server has reached its limit of {cap} analyses in 24 hours. Try again later.")
+
+
+def record_start():
+    """Count an analysis that has started (call while holding `lock`)."""
+    now = time.time()
+    _write_json(ROOT / STARTS, _recent_starts(now) + [round(now, 3)])
 # Re-entrant: stale-upload release runs while create() already holds the lock.
 lock = threading.RLock()
 active = None
@@ -186,6 +224,7 @@ def work(directory, status, event):
             progress=100,
             engine="gpu" if ran_on_gpu else "cpu",
         )
+        threading.Thread(target=_auto_venue, args=(directory, dict(status)), daemon=True).start()
     except InterruptedError:
         if stopping:
             # A redeploy or restart is not the user's cancellation: allow a retry.
@@ -220,7 +259,9 @@ def recover_calibrations():
     """A calibration running when the worker stopped will never finish: say so."""
     for status in ROOT.glob("*/calibration-job.json"):
         data = _read_json(status) or {}
-        if data.get("state") == "processing":
+        if data.get("state") == "processing" and data.get("auto"):
+            status.unlink(missing_ok=True)  # an automatic attempt simply did not happen
+        elif data.get("state") == "processing":
             _write_json(status, {"state": "failed", "error": "The analysis server restarted. Apply the pitch setup again.", "finishedAt": time.time()})
 
 
@@ -335,10 +376,18 @@ app.add_event_handler("startup", recover_calibrations)
 app.add_event_handler("startup", start_retention_sweeper)
 
 
+SPACE_MARGIN = 256 * 1024 * 1024
+
+
 def check_space(size):
     free = shutil.disk_usage(ROOT).free
-    if free < size + 256 * 1024 * 1024:
+    if free < size + SPACE_MARGIN:
         raise HTTPException(507, "The analysis server is out of storage. Try again later.")
+
+
+def download_budget():
+    """Largest download that fits now: the upload limit, or the free space if smaller."""
+    return min(MAX_BYTES, shutil.disk_usage(ROOT).free - SPACE_MARGIN)
 
 
 @app.get("/healthz")
@@ -406,6 +455,7 @@ def begin(directory, status, size):
         upload_started.pop(job_id, None)
         event = threading.Event()
         cancellations[job_id] = event
+        record_start()
         pool.submit(work, directory, status, event)
     return public(status)
 
@@ -413,6 +463,7 @@ def begin(directory, status, size):
 @app.post("/jobs")
 async def create(request: Request):
     global active
+    check_daily_budget()
     if request.headers.get("content-type", "").split(";")[0] not in (
         "video/mp4",
         "video/quicktime",
@@ -455,7 +506,7 @@ async def create(request: Request):
         except ValueError as exc:
             raise HTTPException(400, "Invalid video size") from exc
         if not 0 < expected <= MAX_BYTES:
-            raise HTTPException(413, "Maximum video size is 500 MB")
+            raise HTTPException(413, f"Maximum video size is {max_size_text()}")
     request_id = request.query_params.get("requestId")
     if request_id is not None and (
         not re.fullmatch(r"[a-f0-9-]{32,36}", request_id) or not owner or expected is None
@@ -521,7 +572,7 @@ async def create(request: Request):
             async for chunk in request.stream():
                 size += len(chunk)
                 if size > MAX_BYTES:
-                    raise HTTPException(413, "Maximum video size is 500 MB")
+                    raise HTTPException(413, f"Maximum video size is {max_size_text()}")
                 f.write(chunk)
                 upload_activity[job_id] = time.monotonic()
         if not size:
@@ -547,7 +598,7 @@ def fetch_and_work(directory, status, event, url):
     try:
         update(stage="Downloading from YouTube", progress=0)
         path, info = download(
-            url, directory, MAX_BYTES, progress=update, cancelled=event.is_set
+            url, directory, max(1, download_budget()), progress=update, cancelled=event.is_set
         )
         path.replace(directory / "video")
         size = (directory / "video").stat().st_size
@@ -582,6 +633,7 @@ def fetch_and_work(directory, status, event, url):
 async def create_from_url(request: Request):
     """Analyse a YouTube video by link: the worker downloads it itself."""
     global active
+    check_daily_budget()
     from app.vision.youtube import video_id
 
     try:
@@ -608,7 +660,9 @@ async def create_from_url(request: Request):
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
     await asyncio.to_thread(delete_expired)
-    check_space(MAX_BYTES)
+    # The size is unknown until YouTube answers: the download steps down in
+    # resolution to fit the space there is, so only refuse when nearly full.
+    check_space(100 * 1024 * 1024)
     job_id = uuid.uuid4().hex
     with lock:
         release_stale_upload()
@@ -853,7 +907,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 6
+ANALYTICS_VERSION = 8
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
@@ -962,6 +1016,71 @@ def _run_calibration(directory, body):
     except Exception as exc:  # noqa: BLE001 - reported to the user; previous calibration kept
         _write_json(status_path, {"state": "failed", "error": str(exc)[:300], "finishedAt": time.time()})
     finally:
+        with calibrating_lock:
+            calibrating.discard(directory.name)
+
+
+def _auto_venue(directory, status, limit=5):
+    """Set up the pitch of a finished match from a saved venue, when one fits.
+
+    A fixed venue camera sees the same pitch every match: each of the owner's
+    venues with the same video size is checked against this match's painted
+    lines (build_from_venue refuses one that does not line up), and the first
+    verified fit is applied. Nothing is applied without the footage to check
+    against. VISION_AUTO_VENUE=0 turns it off.
+    """
+    from app.vision.calibrate import build_from_venue
+
+    if os.getenv("VISION_AUTO_VENUE", "1") == "0":
+        return None
+    video = directory / "video"
+    if not video.is_file() or (directory / "calibration.json").is_file():
+        return None
+    try:
+        result = json.loads((directory / "result.json").read_text())
+        size = [result["video"]["width"], result["video"]["height"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    owner = status.get("owner", "")
+    venues = [
+        v for v in (_read_json(p) for p in _venue_dir().glob("*.json"))
+        if isinstance(v, dict) and v.get("id") and v.get("owner", "") == owner and list(v.get("size") or []) == size
+    ]
+    if not venues:
+        return None
+    venues.sort(key=lambda v: -(v.get("createdAt") or 0))
+    with calibrating_lock:
+        if directory.name in calibrating:
+            return None
+        calibrating.add(directory.name)
+    job_path = directory / "calibration-job.json"
+    applied = None
+    try:
+        _write_json(job_path, {"state": "processing", "progress": 0, "startedAt": time.time(), "auto": True})
+        for venue in venues[:limit]:
+            try:
+                data = build_from_venue(result, venue, video)
+            except ValueError:
+                continue  # the lines do not match this venue
+            if not (data.get("venue") or {}).get("verified"):
+                continue
+            data["auto"] = True
+            if (directory / "calibration.json").is_file() or not (directory / "status.json").is_file():
+                return None  # the reviewer set one up meanwhile, or the match was deleted
+            _write_json(directory / "calibration.json", data)
+            compute_analysis(directory)
+            _write_json(job_path, {"state": "done", "progress": 100, "finishedAt": time.time(), "venue": venue["id"], "auto": True})
+            applied = venue["id"]
+            return applied
+        return None
+    except Exception:  # never fail a finished analysis over an optional setup
+        import logging
+
+        logging.exception("Automatic venue setup failed")
+        return None
+    finally:
+        if applied is None and (_read_json(job_path) or {}).get("auto"):
+            job_path.unlink(missing_ok=True)  # nothing matched: no setup to report
         with calibrating_lock:
             calibrating.discard(directory.name)
 
@@ -1298,11 +1417,19 @@ def _models_dir():
 def ball_model():
     """Fine-tuned ball models: which one is active and how each run validated.
 
-    Service-token only (the website proxy does not route it): an operator action.
+    Browser owner keys are stripped from the response.
     """
     from app.vision import balltrain
 
-    return {**balltrain.registry(_models_dir()), "training": dict(training)}
+    def private(run):
+        # Owner keys are capabilities for a browser's matches: never hand them out.
+        return {k: v for k, v in run.items() if k not in ("owner", "ownerHash")} if isinstance(run, dict) else run
+
+    registry = balltrain.registry(_models_dir())
+    state = dict(training)
+    if "run" in state:
+        state["run"] = private(state["run"])
+    return {**registry, "runs": [private(r) for r in registry.get("runs", [])], "training": state}
 
 
 @app.post("/ball-model/train")
@@ -1457,6 +1584,7 @@ def retry_job(job_id: str):
             raise HTTPException(409, "No complete upload is available. Upload the video again.")
         if status.get("attempts", 1) >= 3:
             raise HTTPException(409, "Retry limit reached. Contact support before another attempt.")
+        check_daily_budget()
         if status.get("profile", "general") not in available_profiles():
             raise HTTPException(503, "The selected vision models are not installed")
         event = threading.Event()
@@ -1464,6 +1592,7 @@ def retry_job(job_id: str):
         write_status(directory, status)
         active = job_id
         cancellations[job_id] = event
+        record_start()
         pool.submit(work, directory, status, event)
         return public(status)
 
@@ -1495,6 +1624,17 @@ def rerun_job(job_id: str, request: Request):
                 return public(load_status(path.parent))
         if previous["status"] not in ("completed", "failed", "interrupted", "cancelled"):
             raise HTTPException(409, "Wait for this analysis to finish before starting another")
+        earlier = [
+            e for e in (_read_json(p, {}) for p in ROOT.glob("*/status.json"))
+            if isinstance(e, dict) and e.get("sourceJobId") == job_id
+        ]
+        full = sum(1 for e in earlier if str(e.get("rerunDigest", "")).startswith("full:"))
+        sections = len(earlier) - full
+        if mode == "full" and full >= FULL_RERUNS_PER_MATCH:
+            raise HTTPException(409, f"This match has already been re-analysed in full {full} times.")
+        if mode == "section" and sections >= SECTION_RERUNS_PER_MATCH:
+            raise HTTPException(409, f"This match already has {sections} test sections. Delete some before testing another.")
+        check_daily_budget()
         metadata = previous.get("video")
         if not metadata or not (source / "video").is_file() or expired(previous):
             raise HTTPException(409, "Saved footage is no longer available. Upload the video again.")
@@ -1521,7 +1661,7 @@ def rerun_job(job_id: str, request: Request):
         try:
             directory.mkdir()
             # Both jobs are read-only consumers; deleting either link preserves
-            # the other. This avoids another upload and another 500 MB disk copy.
+            # the other. This avoids another upload and another full-size disk copy.
             try:
                 os.link(source / "video", directory / "video")
             except OSError:
@@ -1531,6 +1671,7 @@ def rerun_job(job_id: str, request: Request):
             active = new_id
             event = threading.Event()
             cancellations[new_id] = event
+            record_start()
             pool.submit(work, directory, status, event)
         except BaseException:
             if active == new_id:

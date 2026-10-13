@@ -19,6 +19,9 @@ function shuffleKey(seed: string, id: string) {
   return h >>> 0;
 }
 
+/** Estimated from a random sample (mirrors SAMPLED_TYPES in the worker's analytics). */
+const SAMPLED = ["pass", "interception", "tackle"];
+
 const PRIORITY: Record<string, number> = { "goal-candidate": 0, shot: 1, interception: 2, tackle: 3, pass: 4, out: 5 };
 
 export function ReviewQueue({
@@ -48,12 +51,18 @@ export function ReviewQueue({
   const savingRef = useRef(false);
   const items = useMemo(() => {
     if (filter === "sample") {
-      // Unchecked passes in a fixed random order: checking the first ten gives an
-      // unbiased hit rate for estimating the rest (no need to review them all).
-      return analysis.events.filter((e) => e.type === "pass" && e.status === "proposed").sort((a, b) => shuffleKey(jobId, a.id) - shuffleKey(jobId, b.id));
+      // Unchecked passes, interceptions and tackles, each in a fixed random order
+      // and taken in turn: checking about ten of each gives an unbiased hit rate
+      // for estimating the rest (no need to review them all).
+      const byType = SAMPLED.map((type) =>
+        analysis.events.filter((e) => e.type === type && e.status === "proposed").sort((a, b) => shuffleKey(jobId, a.id) - shuffleKey(jobId, b.id)),
+      );
+      const mixed: AnalysisEvent[] = [];
+      for (let k = 0; byType.some((list) => k < list.length); k++) for (const list of byType) if (k < list.length) mixed.push(list[k]);
+      return mixed;
     }
     const list = analysis.events.filter((e) => {
-      if (filter === "key") return e.type !== "pass" && e.type !== "out";
+      if (filter === "key") return !SAMPLED.includes(e.type) && e.type !== "out";
       if (filter === "pending") return e.status === "proposed";
       return true;
     });
@@ -223,7 +232,7 @@ export function ReviewQueue({
         {(
           [
             ["key", "Shots & key moments"],
-            ["sample", "Check passes"],
+            ["sample", "Check a sample"],
             ["pending", "Not reviewed"],
             ["all", "Everything"],
           ] as const
@@ -236,10 +245,12 @@ export function ReviewQueue({
       {filter === "sample" && (
         <p className="text-xs text-pitch-muted" data-testid="sample-progress">
           {(() => {
-            const checked = analysis.events.filter((e) => e.type === "pass" && e.status !== "proposed" && e.source !== "reviewer" && e.sampled).length;
-            return checked >= 10
-              ? `${checked} passes checked: the report now estimates pass counts from them. More checks narrow the range.`
-              : `Random passes, one after another. ${checked} of 10 checked before the report can estimate pass counts.`;
+            const parts = SAMPLED.map((type) => {
+              const found = analysis.events.filter((e) => e.type === type || e.original?.type === type).length;
+              const checked = analysis.events.filter((e) => (e.original?.type ?? e.type) === type && e.status !== "proposed" && e.source !== "reviewer" && e.sampled).length;
+              return found ? `${type === "pass" ? "passes" : type === "interception" ? "interceptions" : "tackles"} ${Math.min(checked, 10)}/10` : "";
+            }).filter(Boolean);
+            return `Random passes, interceptions and tackles in turn. Check about ten of each and the report estimates their totals: ${parts.join(" · ") || "nothing to check"}.`;
           })()}
         </p>
       )}

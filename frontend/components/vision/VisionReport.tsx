@@ -21,6 +21,7 @@ import { MiniPitch } from "@/components/vision/PitchGraphics";
 import {
   Analysis,
   Calibration,
+  describeEvent,
   fetchAnalysis,
   fetchCalibration,
   pitchLines,
@@ -138,6 +139,14 @@ export function VisionReport({ jobId }: { jobId: string }) {
   useEffect(() => {
     if (result) loadAnalytics();
   }, [result, loadAnalytics]);
+  // A just-finished match may be getting its pitch set up from a saved venue:
+  // refresh the report when that finishes.
+  const autoSetup = calibration?.job?.state === "processing" && calibration?.job?.auto;
+  useEffect(() => {
+    if (!autoSetup) return;
+    const timer = setTimeout(loadAnalytics, 5000);
+    return () => clearTimeout(timer);
+  }, [autoSetup, calibration, loadAnalytics]);
   useEffect(() => {
     const video = player.current;
     if (!video || !result) return;
@@ -186,6 +195,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
   function seek(t: number) {
     if (player.current) {
       clipEnd.current = null;
+      reelRef.current = null;
+      setReel(null);
       player.current.currentTime = t;
       player.current.pause();
       player.current.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -200,6 +211,27 @@ export function VisionReport({ jobId }: { jobId: string }) {
     setTime(t);
     video.play().catch(() => {});
   }, []);
+  // Highlights: goals, possible goals and shots played back to back.
+  const highlights = useMemo(
+    () =>
+      (analysis?.events ?? [])
+        .filter((e) => e.status !== "rejected" && ["goal", "goal-candidate", "shot"].includes(e.type))
+        .filter((e, i, list) => i === 0 || Math.abs(e.t - list[i - 1].t) > 3)
+        .sort((a, b) => a.t - b.t),
+    [analysis],
+  );
+  const [reel, setReel] = useState<number | null>(null);
+  const reelRef = useRef<number | null>(null);
+  const playHighlight = useCallback(
+    (k: number | null) => {
+      reelRef.current = k;
+      setReel(k);
+      if (k === null || !highlights[k]) return;
+      const e = highlights[k];
+      watchClip(Math.max(0, e.t - 4), e.t + 2);
+    },
+    [highlights, watchClip],
+  );
   function videoClick(e: React.MouseEvent<SVGSVGElement>) {
     if (!calibrating || !result) return;
     const box = e.currentTarget.getBoundingClientRect();
@@ -397,6 +429,34 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       overlays need the video.
                     </p>
                   )}
+                  {analysis && highlights.length > 0 && !job?.videoDeleted && (
+                    <div className="flex flex-wrap items-center gap-2 text-sm" data-testid="highlights">
+                      {reel === null ? (
+                        <button className="pitch-button-secondary" onClick={() => playHighlight(0)}>
+                          Play highlights ({highlights.length})
+                        </button>
+                      ) : (
+                        <>
+                          <span className="text-pitch-muted">
+                            Highlight {reel + 1} of {highlights.length} · {clockTime(highlights[reel].t)} · {describeEvent(highlights[reel])}
+                            {highlights[reel].status === "confirmed" ? "" : " (to review)"}
+                          </span>
+                          <button className="pitch-button-secondary" onClick={() => playHighlight(reel + 1 < highlights.length ? reel + 1 : null)}>
+                            Next
+                          </button>
+                          <button
+                            className="pitch-button-secondary"
+                            onClick={() => {
+                              playHighlight(null);
+                              player.current?.pause();
+                            }}
+                          >
+                            Stop
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
                   <div
                     className="relative bg-black rounded-2xl overflow-hidden"
                     style={{
@@ -418,6 +478,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         if (clipEnd.current !== null && v.currentTime >= clipEnd.current) {
                           clipEnd.current = null;
                           v.pause();
+                          const k = reelRef.current;
+                          if (k !== null) playHighlight(k + 1 < highlights.length ? k + 1 : null);
                         }
                       }}
                       onSeeked={(e) => setTime(e.currentTarget.currentTime)}

@@ -45,9 +45,12 @@ Browser ──4 MB chunks──▶ Vercel /api/vision/* ──Bearer token──
    (default `*`; set to your Railway domain plus `healthcheck.railway.app` to
    lock it down).
 5. **Add a volume** (right-click the service → Attach volume) with mount path
-   **`/data`**. Without it every redeploy deletes all jobs and results. Hobby
-   volumes are 5 GB; that holds about ten 500 MB uploads within the retention
-   window. The worker answers "out of storage" instead of filling the disk.
+   **`/data`**. Without it every redeploy deletes all jobs and results. Uploads
+   are capped by `VISION_MAX_UPLOAD_MB` (default 2048): original 1080p
+   recordings of a 40-minute match are 2-5 GB, and reduced copies (360p) make
+   the ball too small to track. Size the volume for a few matches within the
+   retention window (for example 20-50 GB), or lower the cap or the retention.
+   The worker answers "out of storage" instead of filling the disk.
 6. Deploy. The first build downloads PyTorch and the model weights and takes
    several minutes. Check the build log mentions `vision.Dockerfile` and
    `Model: /app/models/yolo11s.pt`. When it is live,
@@ -69,7 +72,7 @@ Environment Variables** (tick Production and Preview):
 | --- | --- |
 | `VISION_SERVICE_URL` | The Railway URL, e.g. `https://pitchlens-vision.up.railway.app` (no trailing slash needed) |
 | `VISION_SERVICE_TOKEN` | Exactly the same secret as on Railway |
-| `VISION_ACCESS_CODE` | A code you give to people allowed to analyse videos. Use at least 12 random characters: wrong guesses are not rate-limited. The same code also unlocks the optional Roboflow frame inspection in manual review when Firebase sign-in is not configured. |
+| `VISION_ACCESS_CODE` | Optional. A code you give to people allowed to analyse videos. Use at least 12 random characters: wrong guesses are not rate-limited. The same code also unlocks the optional Roboflow frame inspection in manual review when Firebase sign-in is not configured. **Leave it unset only for a small test group:** anyone who has the site's link can then start analyses on your paid worker (each browser still sees only its own matches). While it is unset, AI frame inspection and site training stay off. With or without a code, the worker starts at most `VISION_MAX_JOBS_PER_DAY` analyses per 24 hours (a Railway variable; default 30, 0 = no limit). Set a spending limit in Modal too. To open a running site, deploy a build that supports it first, confirm it shows Ready, then delete the variable and redeploy: an older build refuses all analysis without a code. |
 
 Then **Deployments → ⋯ → Redeploy**. Environment variables only reach new
 deployments.
@@ -77,7 +80,8 @@ deployments.
 ## 3. Check it
 
 1. Open `https://pitchlens1.vercel.app/api/vision/health`. Expect
-   `"available":true,"hosted":true,"accessRequired":true`.
+   `"available":true,"hosted":true` and `"accessRequired":true` when an
+   access code is set (`false` when the site is open).
    - `"configured":false` → a Vercel variable is missing, or you did not redeploy.
    - `"Cannot reach the vision server"` → wrong URL or the Railway service is down.
    - `"Vision service authentication required"` → the two tokens differ.
@@ -121,7 +125,9 @@ set the three Vercel variables as above.
 ## YouTube links
 
 The upload page also accepts a YouTube link. The worker fetches the video itself
-with yt-dlp (plus the Deno runtime it now requires), up to 1080p and 500 MB, so
+with yt-dlp (plus the Deno runtime it now requires): the sharpest version up to
+1080p that fits the upload limit and the free space, stepping down to 720p and
+480p, so
 nothing large passes through the browser or Vercel. Users must confirm they
 filmed the video or have the owner's permission.
 
@@ -155,6 +161,15 @@ Modal → Settings → Usage & billing.
 - The upload page defaults to 6 analysed frames/second when a GPU is
   available; 10 fps follows the ball best and costs proportionally more.
 - Modal → Settings → Usage & billing shows the cost per run ("Ephemeral Apps").
+
+### Automatic pitch setup for fixed venue cameras
+
+When a match finishes, the worker tries the owner's saved venues with the same
+video size, newest first. Each is checked against the painted lines in the new
+footage, and the first that lines up is applied automatically (the pitch panel
+says "Set up automatically from saved venue …"). Nothing is applied without
+the footage to check against or over a setup the reviewer made.
+`VISION_AUTO_VENUE=0` turns this off.
 
 ### Engine tuning variables
 

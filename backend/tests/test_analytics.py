@@ -810,3 +810,77 @@ def test_a_camera_pan_is_not_a_pass():
             "camera": [1, 0, 80 if i == 3 else 0, 0, 1, 0],
         })
     assert derive_metrics(frames, 5, 1.2)["events"] == []
+
+
+def test_possession_survives_a_long_unseen_stretch_only_between_same_team_controls():
+    from app.vision import analytics as an
+
+    fps = 5.0
+    n = 200
+    projected = [{"t": i / fps, "scene": 0} for i in range(n)]
+    in_play = [True] * n
+
+    def spell(team, first, last):
+        return {"team": team, "first": first, "last": last, "start": first / fps, "end": last / fps, "scene": 0}
+
+    # Team 0 controls, the ball is unseen for 20 s, team 0 controls again.
+    owner, _, seconds, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(0, 110, 119)], in_play, fps)
+    assert all(o == 0 for o in owner[:120])
+    # Different teams either side: only the usual short bridge, the rest is unknown.
+    owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(1, 110, 119)], in_play, fps)
+    assert owner[50] is None and owner[115] == 1
+    # Never across a stoppage.
+    stopped = [True] * n
+    stopped[60] = False
+    owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(0, 110, 119)], stopped, fps)
+    assert owner[50] is None
+
+
+def test_interceptions_are_estimated_from_sampled_checks_and_are_not_key_moments():
+    from app.vision import analytics as an
+
+    events = [{"id": f"ev-{i}", "type": "interception", "t": float(i), "team": i % 2, "confidence": 0.5, "status": "proposed"} for i in range(40)]
+    events.append({"id": "ev-99", "type": "shot", "t": 99.0, "team": 0, "confidence": 0.5, "status": "proposed", "needsReview": True})
+    review = {"decisions": [{"action": "accept" if i < 8 else "reject", "eventId": f"ev-{i}", "sample": True} for i in range(10)]}
+    merged, _ = an.apply_review(events, review)
+    seen = ([{"t": 0.0, "calibrated": False, "players": [], "ball": None}], [{"state": "control", "team": 0}])
+    stats = an.summarise(*seen, [], merged, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
+    team0 = stats["teams"][0]["interceptions"]
+    assert team0["checked"] == 10 and team0["checkedCorrect"] == 8 and team0["estimate"] == 4 + round(15 * 0.8)
+    assert an.SAMPLED_TYPES == ("pass", "interception", "tackle")
+
+
+def test_a_finished_match_is_set_up_from_a_saved_venue_that_matches_its_lines(tmp_path, monkeypatch):
+    import json as _json
+
+    from app.vision import calibrate, server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    owner = "a" * 32
+    job, directory = make_job(server, build_match())
+    (directory / "video").write_bytes(b"footage")
+    venues = server._venue_dir()
+    size = [640, 360]
+    for k, (name, who) in enumerate((("Court 1", owner), ("Court 2", owner), ("Theirs", "b" * 32))):
+        (venues / f"{k:032x}.json").write_text(_json.dumps({"id": f"{k:032x}", "name": name, "owner": who, "size": size, "createdAt": k, "template": TEMPLATE, "H": [1, 0, 0, 0, 1, 0, 0, 0, 1]}))
+    tried = []
+
+    def fake(result, venue, video):
+        tried.append(venue["name"])
+        if venue["name"] != "Court 1":
+            raise ValueError("The painted lines in this match do not line up with the saved venue")
+        return {"state": "ready", "template": TEMPLATE, "frames": [], "coverage": 100.0, "venue": {"id": venue["id"], "name": venue["name"], "lineScore": 0.8, "verified": True}}
+
+    monkeypatch.setattr(calibrate, "build_from_venue", fake)
+    monkeypatch.setattr(server, "compute_analysis", lambda d: None)
+    assert server._auto_venue(directory, {"owner": owner}) == f"{0:032x}"
+    # The newest of the owner's venues is tried first; another owner's never.
+    assert tried == ["Court 2", "Court 1"]
+    cal = _json.loads((directory / "calibration.json").read_text())
+    assert cal["auto"] is True and cal["venue"]["name"] == "Court 1"
+    # Never over an existing setup, and never without footage to check against.
+    tried.clear()
+    assert server._auto_venue(directory, {"owner": owner}) is None and tried == []
+    (directory / "calibration.json").unlink()
+    (directory / "video").unlink()
+    assert server._auto_venue(directory, {"owner": owner}) is None and tried == []

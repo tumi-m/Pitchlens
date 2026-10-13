@@ -32,6 +32,13 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   const [loadedSrc, setLoadedSrc] = useState("");
   const image = useRef<HTMLImageElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const ready = !!state?.framesReady;
+  // Take keyboard focus when the frames appear: otherwise the button that opened
+  // the labeller keeps it, and Enter (accept the guess) would press that button.
+  useEffect(() => {
+    if (ready) root.current?.focus({ preventScroll: true });
+  }, [ready]);
   const positionRef = useRef(0);
   positionRef.current = position;
 
@@ -68,6 +75,14 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   const done = state ? state.frames.filter((f) => String(f.index) in state.labels).length : 0;
   const src = frame ? frameImageUrl(jobId, frame.index) : "";
   const loaded = !!src && loadedSrc.endsWith(src);
+  // Fetch the next few unlabelled frames ahead, so answering does not wait for
+  // a download each time (150 frames on a phone connection).
+  useEffect(() => {
+    if (!state?.framesReady) return;
+    const ahead = state.frames.slice(position + 1).filter((f) => !(String(f.index) in state.labels)).slice(0, 3);
+    // Not cancelled on change: a finished download stays in the browser cache.
+    for (const f of ahead) new Image().src = frameImageUrl(jobId, f.index);
+  }, [state, position, jobId]);
 
   const save = useCallback(
     async (body: { index: number; x: number; y: number } | { index: number; visible: false }) => {
@@ -190,7 +205,7 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   );
 
   return (
-    <div className="space-y-3" data-testid="ball-labeller">
+    <div ref={root} tabIndex={-1} className="space-y-3 outline-none" data-testid="ball-labeller">
       <div className="grid sm:grid-cols-3 gap-2 text-sm">
         <div className="rounded-lg bg-white/5 p-3">
           <p className="text-[11px] uppercase tracking-widest text-pitch-muted">Ball found when visible</p>

@@ -480,6 +480,9 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
   await expect(page.getByRole("button", { name: "Train on my labels" })).toBeDisabled();
   await expect(page.getByTestId("ball-labeller")).toBeVisible();
   await expect(page.getByText("Frame 1 of 3")).toBeVisible();
+  // Focus moves into the labeller, so Enter accepts the guess instead of
+  // pressing the button that opened it.
+  await expect(page.getByTestId("ball-labeller")).toBeFocused();
   await page.keyboard.press("Enter");
   await expect.poll(() => posts.length).toBe(1);
   expect(posts[0]).toEqual({ index: 2, x: 320, y: 180 });
@@ -498,6 +501,8 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
   expect(placed.index).toBe(9);
   expect(Math.abs(placed.x - 160)).toBeLessThan(2);
   expect(Math.abs(placed.y - 180)).toBeLessThan(2);
+  // Keys are ignored while a label is saving: wait for the next frame.
+  await expect(page.getByText("Frame 3 of 3")).toBeVisible();
   await page.keyboard.press("n");
   await expect.poll(() => posts.length).toBe(3);
   expect(posts[2]).toEqual({ index: 15, visible: false });
@@ -540,8 +545,8 @@ test("passes checked in the random-sample view are marked as sampled", async ({ 
   await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: /Enter the score and review|Review/ }).first().click();
-  await page.getByRole("tab", { name: "Check passes" }).click();
-  await expect(page.getByTestId("sample-progress")).toContainText("0 of 10 checked");
+  await page.getByRole("tab", { name: "Check a sample" }).click();
+  await expect(page.getByTestId("sample-progress")).toContainText("passes 0/10");
   await page.keyboard.press("a");
   await expect.poll(() => state.reviews.length).toBe(1);
   const decision = (state.reviews[0] as { decisions: { action: string; sample?: boolean }[] }).decisions[0];
@@ -563,4 +568,35 @@ test("the labeller waits while the worker prepares the frames", async ({ page })
   await page.getByRole("button", { name: "Label the ball" }).click();
   await expect(page.getByTestId("ball-frames-preparing")).toBeVisible();
   await expect(page.getByText("Frame 1 of 1")).toBeVisible({ timeout: 8000 });
+});
+
+test("a refused action asks for the site's access code on the match page", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/review$`), (r) =>
+    r.fulfill({ status: 401, json: { detail: "Enter the access code to continue.", code: "access" } }),
+  );
+  await page.goto(`/vision/${ID}`);
+  await page.evaluate(() => localStorage.setItem("pitchlens-vision-access", "old-code"));
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await page.keyboard.press("a");
+  const prompt = page.getByRole("dialog", { name: "Access code needed" });
+  await expect(prompt).toBeVisible();
+  // The refused code was dropped; the new one is saved for the next attempt.
+  expect(await page.evaluate(() => localStorage.getItem("pitchlens-vision-access"))).toBeNull();
+  await prompt.getByLabel("Site access code").fill("  new-code ");
+  await prompt.getByRole("button", { name: "Save code" }).click();
+  await expect(prompt).toBeHidden();
+  expect(await page.evaluate(() => localStorage.getItem("pitchlens-vision-access"))).toBe("new-code");
+});
+
+test("highlights play the goals and shots back to back", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await bar.getByRole("button", { name: "Play highlights (1)" }).click();
+  await expect(bar).toContainText("Highlight 1 of 1");
+  await expect.poll(() => page.evaluate(() => !document.querySelector("video")!.paused)).toBe(true);
+  await bar.getByRole("button", { name: "Stop" }).click();
+  await expect(bar.getByRole("button", { name: "Play highlights (1)" })).toBeVisible();
+  expect(await page.evaluate(() => document.querySelector("video")!.paused)).toBe(true);
 });

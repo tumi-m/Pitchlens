@@ -8,24 +8,28 @@ const MAX_BODY = 1_500_000;
 let active = 0;
 let windowStart = Date.now();
 let requests = 0;
-// Production spends the owner's Roboflow credits, so callers must prove access:
-// a Firebase sign-in when Firebase is configured, otherwise the shared access code.
+// Production spends the owner's Roboflow credits on every frame, and the budget
+// below is per server instance, not per site: callers must prove access with a
+// Firebase sign-in when Firebase is configured, otherwise the shared access code.
+// With neither, frame inspection stays off (video analysis can still be open).
 function accessMode() {
   const production = process.env.NODE_ENV === "production";
   const firebase =
     !!process.env.NEXT_PUBLIC_FIREBASE_API_KEY &&
     !!process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
-  const code = process.env.VISION_ACCESS_CODE || "";
+  const code = (process.env.VISION_ACCESS_CODE || "").trim();
   if (!production) return { kind: "open" as const };
   if (firebase) return { kind: "firebase" as const };
   if (code) return { kind: "code" as const, code };
   return { kind: "closed" as const };
 }
+/** Spaces and line breaks around a code are never part of it: the site trims what
+ * people type, and a value pasted into the hosting dashboard often carries a newline. */
 function sameSecret(given: string | null, expected: string) {
   if (!given) return false;
-  const a = Buffer.from(given);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  const a = Buffer.from(given.trim());
+  const b = Buffer.from(expected.trim());
+  return b.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 export async function GET() {
   const mode = accessMode();
@@ -47,7 +51,7 @@ export async function POST(request: NextRequest) {
   const mode = accessMode();
   if (mode.kind === "closed")
     return NextResponse.json(
-      { error: "Set VISION_ACCESS_CODE or Firebase sign-in to enable AI detection." },
+      { error: "AI frame inspection needs VISION_ACCESS_CODE or Firebase sign-in on this site." },
       { status: 503 },
     );
   const sent = request.headers.get("x-pitchlens-access");

@@ -31,7 +31,8 @@ export function AnalyseSavedVideo({
       .then((x: VisionHealth) => {
         setHealth(x);
         setCode(visionAccessCode());
-        setNeedsCode(!!x.accessRequired && !visionAccessCode());
+        if (x.accessRequired) setNeedsCode(true);
+        else if (x.available) setVisionAccessCode("");
       })
       .catch(() => setHealth({ available: false }));
     return () => upload.current?.abort();
@@ -90,6 +91,7 @@ export function AnalyseSavedVideo({
       {needsCode && (
         <input
           aria-label="Access code"
+          data-access-field
           type="password"
           autoComplete="off"
           placeholder="Access code"

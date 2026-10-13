@@ -3,6 +3,24 @@
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked; none of these is a held-out result.
 
+## E15 · Possession across long unseen stretches (2026-10-13)
+- Problem: the owner's 37-minute 360p match had the ball in 25% of frames
+  (median sighting 2 frames), so possession was followed for only 53% of
+  play and the report hid it (60% needed).
+- Hypothesis: when the same team controls the ball on both sides of an
+  unseen stretch, it usually kept possession.
+- Data: Metrica games 1 (dev) and 2 (held out), ball dropped in bursts (a
+  two-state Markov model, mean sighting 2 frames, 16% of frames visible:
+  harsher than the owner's footage), with and without pitch calibration.
+- Outcome, held-out game 2 (8 s current → 30 s same-team bridge):
+  calibrated agreement 90.6% → 89.8%, coverage 73% → 82%, share error
+  2.7 → 1.3 points; uncalibrated agreement 84.9% → 84.7%, coverage
+  85% → 90%. Game 1 the same within a point. 60 s added little more.
+- On the owner's match: possession followed 53% → 76%; now shown as
+  60/40 with unseen-play bounds 45-69%.
+- Decision: adopt 30 s (maxSameTeamGap). Opponent-to-opponent gaps keep the
+  8 s limit; no bridge across stoppages or cuts.
+
 ## E14 · Full-frame-rate ball trajectories at 360p (2026-10-04)
 - Hypothesis: at the full 30 fps a ball moves a few pixels per frame on a
   smooth path, so difference-image candidates linked by a constant-velocity
