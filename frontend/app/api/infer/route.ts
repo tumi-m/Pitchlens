@@ -8,8 +8,9 @@ const MAX_BODY = 1_500_000;
 let active = 0;
 let windowStart = Date.now();
 let requests = 0;
-// Production spends the owner's Roboflow credits, so callers must prove access:
-// a Firebase sign-in when Firebase is configured, otherwise the shared access code.
+// Production spends the owner's Roboflow credits: a Firebase sign-in when Firebase
+// is configured, otherwise the shared access code when VISION_ACCESS_CODE is set.
+// With neither, it is open to anyone with the site's link (a small test group).
 function accessMode() {
   const production = process.env.NODE_ENV === "production";
   const firebase =
@@ -19,7 +20,7 @@ function accessMode() {
   if (!production) return { kind: "open" as const };
   if (firebase) return { kind: "firebase" as const };
   if (code) return { kind: "code" as const, code };
-  return { kind: "closed" as const };
+  return { kind: "open" as const };
 }
 /** Spaces and line breaks around a code are never part of it: the site trims what
  * people type, and a value pasted into the hosting dashboard often carries a newline. */
@@ -33,7 +34,7 @@ export async function GET() {
   const mode = accessMode();
   return NextResponse.json(
     {
-      configured: !!process.env.ROBOFLOW_API_KEY && mode.kind !== "closed",
+      configured: !!process.env.ROBOFLOW_API_KEY,
       requiresSignIn: mode.kind === "firebase",
       accessRequired: mode.kind === "code",
     },
@@ -47,11 +48,6 @@ export async function POST(request: NextRequest) {
       { status: 503 },
     );
   const mode = accessMode();
-  if (mode.kind === "closed")
-    return NextResponse.json(
-      { error: "Set VISION_ACCESS_CODE or Firebase sign-in to enable AI detection." },
-      { status: 503 },
-    );
   const sent = request.headers.get("x-pitchlens-access");
   if (mode.kind === "code" && !sameSecret(sent, mode.code))
     return NextResponse.json(

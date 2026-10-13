@@ -69,7 +69,7 @@ Environment Variables** (tick Production and Preview):
 | --- | --- |
 | `VISION_SERVICE_URL` | The Railway URL, e.g. `https://pitchlens-vision.up.railway.app` (no trailing slash needed) |
 | `VISION_SERVICE_TOKEN` | Exactly the same secret as on Railway |
-| `VISION_ACCESS_CODE` | A code you give to people allowed to analyse videos. Use at least 12 random characters: wrong guesses are not rate-limited. The same code also unlocks the optional Roboflow frame inspection in manual review when Firebase sign-in is not configured. |
+| `VISION_ACCESS_CODE` | Optional. A code you give to people allowed to analyse videos. Use at least 12 random characters: wrong guesses are not rate-limited. The same code also unlocks the optional Roboflow frame inspection in manual review when Firebase sign-in is not configured. **Leave it unset only for a small test group:** anyone who has the site's link can then start analyses on your paid worker (each browser still sees only its own matches). Set a spending limit in Modal while it is open. |
 
 Then **Deployments → ⋯ → Redeploy**. Environment variables only reach new
 deployments.
@@ -77,7 +77,8 @@ deployments.
 ## 3. Check it
 
 1. Open `https://pitchlens1.vercel.app/api/vision/health`. Expect
-   `"available":true,"hosted":true,"accessRequired":true`.
+   `"available":true,"hosted":true` and `"accessRequired":true` when an
+   access code is set (`false` when the site is open).
    - `"configured":false` → a Vercel variable is missing, or you did not redeploy.
    - `"Cannot reach the vision server"` → wrong URL or the Railway service is down.
    - `"Vision service authentication required"` → the two tokens differ.

@@ -72,19 +72,11 @@ async function proxy(
         { status: 403 },
       );
   }
+  // Optional shared code. With VISION_ACCESS_CODE unset, anyone who has the
+  // site's link can start analyses on the paid worker (fine for a small test
+  // group); set it again to require the code. Each browser still only sees its
+  // own matches.
   const accessCode = (process.env.VISION_ACCESS_CODE || "").trim();
-  // A public site in front of a paid worker must not run open to the internet.
-  if (hosted && !accessCode)
-    return Response.json(
-      {
-        detail:
-          "Hosted analysis needs VISION_ACCESS_CODE set on the website before it can accept videos.",
-        available: false,
-        configured: false,
-        hosted,
-      },
-      { status: 503 },
-    );
   const writes = request.method !== "GET";
   if (writes) {
     const origin = request.headers.get("origin");
@@ -104,7 +96,7 @@ async function proxy(
         { detail: "Cross-origin upload rejected." },
         { status: 403 },
       );
-    // Analysis uses paid compute: an optional shared code keeps strangers out.
+    // Analysis uses paid compute: the optional shared code keeps strangers out.
     const sent = request.headers.get("x-pitchlens-access");
     if (accessCode && !sameSecret(sent, accessCode))
       return Response.json(

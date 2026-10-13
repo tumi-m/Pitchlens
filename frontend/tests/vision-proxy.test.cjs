@@ -96,9 +96,24 @@ test('an access code pasted into the dashboard with a trailing newline still mat
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'Fixture-access' }), s.route('retry'))).status, 401);
 });
 
-test('a code made only of spaces does not leave the site open', async () => {
-  const s = setup({ VISION_ACCESS_CODE: '   ' });
-  const response = await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: ' ' }), s.route('retry'));
-  assert.equal(response.status, 503);
-  assert.equal(s.calls.length, 0);
+test('without an access code set, the hosted site is open but still private per browser', async () => {
+  for (const code of ['', '   ']) {
+    const s = setup({ VISION_ACCESS_CODE: code });
+    assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('retry'))).status, 200);
+    // Another browser's match stays invisible, and anonymous requests are refused.
+    assert.equal((await s.api.GET(s.request({ owner: OTHER }), s.route('result'))).status, 404);
+    assert.equal((await s.api.GET(s.request(), s.route('result'))).status, 401);
+    // Cross-site writes are still refused.
+    assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, origin: 'https://attacker.example' }), s.route('retry'))).status, 403);
+  }
+});
+
+test('health tells the upload page whether a code is needed', async () => {
+  const health = async (code) => {
+    const s = setup({ VISION_ACCESS_CODE: code });
+    const response = await s.api.GET(s.request({ owner: OWNER }), { params: Promise.resolve({ path: ['health'] }) });
+    return response.json();
+  };
+  assert.equal((await health('')).accessRequired, false);
+  assert.equal((await health('fixture-access')).accessRequired, true);
 });
