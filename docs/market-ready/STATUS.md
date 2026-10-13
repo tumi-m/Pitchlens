@@ -1,22 +1,48 @@
 # Status
 
-Read this first after any break. Updated 2026-10-03.
+Read this first after any break. Updated 2026-10-13.
 
 ## Where things stand
 
-Claude implementation merged to main in `1b51ffb`. Commercial-hardening changes are recorded below; check current Git HEAD before resuming.
+`main` includes everything up to PR #21 (`dfd3e3d`). Branch
+`claude/pitchlens-mvp-8qhpP` carries later rounds; open a pull request to
+deploy them. CI runs on pull requests and on `main` only.
 
 A match now produces a Sofascore-style report:
-- **Automatic, with coverage shown:** observed control share (with missing-time sensitivity bounds, withheld under
-  60% estimated coverage), candidate pass share, field tilt and attack momentum.
-  Event counts are confirmed-only in the report; reviewed pass accuracy needs
-  20+ confirmed attempts. Automatic proposals remain in the review queue.
-- **After a two-minute pitch setup** (click landmarks on one frame, or reuse a
-  saved venue): shots, shots on target, shot map, possible goals, heatmaps,
-  average positions, a top-down live view, pitch lines drawn on the video.
-- **Human-confirmed:** goals (never automatic), shot outcomes, anything the
-  reviewer adds; the final score typed by the reviewer sets the scoreline.
-- **Not offered:** player identities, distance/speed, xG, PPDA.
+- **Automatic, with coverage shown:** possession (shown above 60% of play
+  followed, with unseen-play bounds; possession now carries across unseen
+  stretches between same-team controls, E15), field tilt, attack momentum.
+- **Estimated from a random sample of checks:** passes, interceptions and
+  tackles. Check about ten of each ("Check a sample") and the report shows
+  ≈N with a 95% range; only shots and possible goals are key moments.
+- **After pitch setup** (clicks once, a saved venue, or automatically when a
+  saved venue's lines match a new match from the same fixed camera): shots,
+  shot map, possible goals, heatmaps, average positions, live pitch view.
+- **Human-confirmed:** goals, shot outcomes, the final score.
+- **Ball accuracy and training:** label the ball on 150 frames per match; the
+  report measures ball recall/precision; a Modal GPU job fine-tunes the ball
+  model and keeps it only if held-out results improve (docs/BALL-TRAINING.md).
+- **Highlights:** goals, possible goals and shots played back to back.
+- **Open test site:** the access code is optional (unset = open to anyone with
+  the link); the worker caps analyses at `VISION_MAX_JOBS_PER_DAY` (30).
+- **Original recordings:** uploads up to `VISION_MAX_UPLOAD_MB` (2 GB); YouTube
+  links step down 1080p → 720p → 480p to fit. Size the Railway volume to match.
+
+## Improvement rounds (owner asked for 20, 13 October)
+
+Each round: independent finders per area reproduce problems, a verifier tries
+to refute each, then fixers apply the confirmed ones with regression tests and
+every check runs. Rounds run in isolated worktrees, two at a time.
+- Round 1 (correctness and security): 68 confirmed, 54 fixed (`c5c37ee`).
+- Round 2 (end-to-end on real footage): in progress.
+- Round 3 (measured accuracy): in progress.
+
+## Owner's 37-minute match (pipeline 2.5, 640x360 YouTube copy)
+
+Ball observed in 25% of frames (median continuous sighting 2 frames); 2171
+track fragments; 21 scene cuts; no pitch setup. Now: possession followed 76%
+(shown, 60/40, bounds 45-69%); 0 key moments plus ~20 sample checks instead
+of 354 moments. The root limit is the input: upload the original recording.
 
 ## Evidence so far (see EXPERIMENTS.md)
 
