@@ -501,6 +501,8 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
   expect(placed.index).toBe(9);
   expect(Math.abs(placed.x - 160)).toBeLessThan(2);
   expect(Math.abs(placed.y - 180)).toBeLessThan(2);
+  // Keys are ignored while a label is saving: wait for the next frame.
+  await expect(page.getByText("Frame 3 of 3")).toBeVisible();
   await page.keyboard.press("n");
   await expect.poll(() => posts.length).toBe(3);
   expect(posts[2]).toEqual({ index: 15, visible: false });
