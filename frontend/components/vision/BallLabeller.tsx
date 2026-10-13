@@ -75,6 +75,14 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   const done = state ? state.frames.filter((f) => String(f.index) in state.labels).length : 0;
   const src = frame ? frameImageUrl(jobId, frame.index) : "";
   const loaded = !!src && loadedSrc.endsWith(src);
+  // Fetch the next few unlabelled frames ahead, so answering does not wait for
+  // a download each time (150 frames on a phone connection).
+  useEffect(() => {
+    if (!state?.framesReady) return;
+    const ahead = state.frames.slice(position + 1).filter((f) => !(String(f.index) in state.labels)).slice(0, 3);
+    // Not cancelled on change: a finished download stays in the browser cache.
+    for (const f of ahead) new Image().src = frameImageUrl(jobId, f.index);
+  }, [state, position, jobId]);
 
   const save = useCallback(
     async (body: { index: number; x: number; y: number } | { index: number; visible: false }) => {
