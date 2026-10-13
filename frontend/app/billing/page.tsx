@@ -127,7 +127,7 @@ export default function BillingPage() {
         </section>
         <details className="glass-card p-5" open={!!error}>
           <summary className="cursor-pointer text-sm font-medium">Pilot access code</summary>
-          <label className="block text-sm text-pitch-muted mt-3">Required for payment tests on the hosted pilot
+          <label className="block text-sm text-pitch-muted mt-3">Needed only when this site uses an access code
             <input type="password" autoComplete="off" value={access} onChange={(e) => { setAccess(e.target.value); setVisionAccessCode(e.target.value); }}
               className="pitch-input w-full mt-2" aria-label="Pilot access code" />
           </label>

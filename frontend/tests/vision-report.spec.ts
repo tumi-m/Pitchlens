@@ -564,3 +564,22 @@ test("the labeller waits while the worker prepares the frames", async ({ page })
   await expect(page.getByTestId("ball-frames-preparing")).toBeVisible();
   await expect(page.getByText("Frame 1 of 1")).toBeVisible({ timeout: 8000 });
 });
+
+test("a refused action asks for the site's access code on the match page", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/review$`), (r) =>
+    r.fulfill({ status: 401, json: { detail: "Enter the access code to continue.", code: "access" } }),
+  );
+  await page.goto(`/vision/${ID}`);
+  await page.evaluate(() => localStorage.setItem("pitchlens-vision-access", "old-code"));
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await page.keyboard.press("a");
+  const prompt = page.getByRole("dialog", { name: "Access code needed" });
+  await expect(prompt).toBeVisible();
+  // The refused code was dropped; the new one is saved for the next attempt.
+  expect(await page.evaluate(() => localStorage.getItem("pitchlens-vision-access"))).toBeNull();
+  await prompt.getByLabel("Site access code").fill("  new-code ");
+  await prompt.getByRole("button", { name: "Save code" }).click();
+  await expect(prompt).toBeHidden();
+  expect(await page.evaluate(() => localStorage.getItem("pitchlens-vision-access"))).toBe("new-code");
+});

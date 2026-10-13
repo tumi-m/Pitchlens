@@ -43,6 +43,36 @@ RETENTION_HOURS = float(os.getenv("VISION_RETENTION_HOURS", "0") or 0)
 # Open-ended playback ranges are capped so one response never streams a whole match.
 RANGE_CAP = 16 * 1024 * 1024
 OWNER = re.compile(r"[a-f0-9]{32}")
+# Analyses that may start in any 24 hours (0 = no limit). With the site open to
+# anyone holding the link, this bounds GPU spending; uploads are refused before
+# any bytes are sent once it is reached.
+STARTS = "starts.json"
+FULL_RERUNS_PER_MATCH = 3
+SECTION_RERUNS_PER_MATCH = 10
+
+
+def daily_cap():
+    try:
+        return max(0, int(os.getenv("VISION_MAX_JOBS_PER_DAY", "30")))
+    except ValueError:
+        return 30
+
+
+def _recent_starts(now):
+    data = _read_json(ROOT / STARTS, [])
+    return [t for t in data if isinstance(t, (int, float)) and 0 <= now - t < 86400] if isinstance(data, list) else []
+
+
+def check_daily_budget():
+    cap = daily_cap()
+    if cap and len(_recent_starts(time.time())) >= cap:
+        raise HTTPException(429, f"This server has reached its limit of {cap} analyses in 24 hours. Try again later.")
+
+
+def record_start():
+    """Count an analysis that has started (call while holding `lock`)."""
+    now = time.time()
+    _write_json(ROOT / STARTS, _recent_starts(now) + [round(now, 3)])
 # Re-entrant: stale-upload release runs while create() already holds the lock.
 lock = threading.RLock()
 active = None
@@ -406,6 +436,7 @@ def begin(directory, status, size):
         upload_started.pop(job_id, None)
         event = threading.Event()
         cancellations[job_id] = event
+        record_start()
         pool.submit(work, directory, status, event)
     return public(status)
 
@@ -413,6 +444,7 @@ def begin(directory, status, size):
 @app.post("/jobs")
 async def create(request: Request):
     global active
+    check_daily_budget()
     if request.headers.get("content-type", "").split(";")[0] not in (
         "video/mp4",
         "video/quicktime",
@@ -582,6 +614,7 @@ def fetch_and_work(directory, status, event, url):
 async def create_from_url(request: Request):
     """Analyse a YouTube video by link: the worker downloads it itself."""
     global active
+    check_daily_budget()
     from app.vision.youtube import video_id
 
     try:
@@ -1298,11 +1331,19 @@ def _models_dir():
 def ball_model():
     """Fine-tuned ball models: which one is active and how each run validated.
 
-    Service-token only (the website proxy does not route it): an operator action.
+    Browser owner keys are stripped from the response.
     """
     from app.vision import balltrain
 
-    return {**balltrain.registry(_models_dir()), "training": dict(training)}
+    def private(run):
+        # Owner keys are capabilities for a browser's matches: never hand them out.
+        return {k: v for k, v in run.items() if k not in ("owner", "ownerHash")} if isinstance(run, dict) else run
+
+    registry = balltrain.registry(_models_dir())
+    state = dict(training)
+    if "run" in state:
+        state["run"] = private(state["run"])
+    return {**registry, "runs": [private(r) for r in registry.get("runs", [])], "training": state}
 
 
 @app.post("/ball-model/train")
@@ -1457,6 +1498,7 @@ def retry_job(job_id: str):
             raise HTTPException(409, "No complete upload is available. Upload the video again.")
         if status.get("attempts", 1) >= 3:
             raise HTTPException(409, "Retry limit reached. Contact support before another attempt.")
+        check_daily_budget()
         if status.get("profile", "general") not in available_profiles():
             raise HTTPException(503, "The selected vision models are not installed")
         event = threading.Event()
@@ -1464,6 +1506,7 @@ def retry_job(job_id: str):
         write_status(directory, status)
         active = job_id
         cancellations[job_id] = event
+        record_start()
         pool.submit(work, directory, status, event)
         return public(status)
 
@@ -1495,6 +1538,17 @@ def rerun_job(job_id: str, request: Request):
                 return public(load_status(path.parent))
         if previous["status"] not in ("completed", "failed", "interrupted", "cancelled"):
             raise HTTPException(409, "Wait for this analysis to finish before starting another")
+        earlier = [
+            e for e in (_read_json(p, {}) for p in ROOT.glob("*/status.json"))
+            if isinstance(e, dict) and e.get("sourceJobId") == job_id
+        ]
+        full = sum(1 for e in earlier if str(e.get("rerunDigest", "")).startswith("full:"))
+        sections = len(earlier) - full
+        if mode == "full" and full >= FULL_RERUNS_PER_MATCH:
+            raise HTTPException(409, f"This match has already been re-analysed in full {full} times.")
+        if mode == "section" and sections >= SECTION_RERUNS_PER_MATCH:
+            raise HTTPException(409, f"This match already has {sections} test sections. Delete some before testing another.")
+        check_daily_budget()
         metadata = previous.get("video")
         if not metadata or not (source / "video").is_file() or expired(previous):
             raise HTTPException(409, "Saved footage is no longer available. Upload the video again.")
@@ -1531,6 +1585,7 @@ def rerun_job(job_id: str, request: Request):
             active = new_id
             event = threading.Event()
             cancellations[new_id] = event
+            record_start()
             pool.submit(work, directory, status, event)
         except BaseException:
             if active == new_id:

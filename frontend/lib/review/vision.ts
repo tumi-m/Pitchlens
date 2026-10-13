@@ -155,6 +155,17 @@ export function visionAccessCode(): string {
   }
 }
 
+/** Fired when the site asks for an access code (none saved, or the saved one was refused). */
+export const ACCESS_EVENT = "pitchlens:access-required";
+
+function accessRejected() {
+  // A refused code is dropped so the next prompt starts empty.
+  setVisionAccessCode("");
+  try {
+    window.dispatchEvent(new CustomEvent(ACCESS_EVENT));
+  } catch {}
+}
+
 export function setVisionAccessCode(code: string) {
   try {
     if (code) localStorage.setItem(ACCESS_KEY, code);
@@ -189,12 +200,14 @@ export async function visionJson<T>(
         response.status,
       );
   }
-  if (!response.ok)
+  if (!response.ok) {
+    if (data.code === "access") accessRejected();
     throw new VisionError(
       data.detail || "Vision request failed",
       response.status,
       data.code,
     );
+  }
   return data as T;
 }
 

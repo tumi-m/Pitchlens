@@ -69,7 +69,7 @@ Environment Variables** (tick Production and Preview):
 | --- | --- |
 | `VISION_SERVICE_URL` | The Railway URL, e.g. `https://pitchlens-vision.up.railway.app` (no trailing slash needed) |
 | `VISION_SERVICE_TOKEN` | Exactly the same secret as on Railway |
-| `VISION_ACCESS_CODE` | Optional. A code you give to people allowed to analyse videos. Use at least 12 random characters: wrong guesses are not rate-limited. The same code also unlocks the optional Roboflow frame inspection in manual review when Firebase sign-in is not configured. **Leave it unset only for a small test group:** anyone who has the site's link can then start analyses on your paid worker (each browser still sees only its own matches). Set a spending limit in Modal while it is open. |
+| `VISION_ACCESS_CODE` | Optional. A code you give to people allowed to analyse videos. Use at least 12 random characters: wrong guesses are not rate-limited. The same code also unlocks the optional Roboflow frame inspection in manual review when Firebase sign-in is not configured. **Leave it unset only for a small test group:** anyone who has the site's link can then start analyses on your paid worker (each browser still sees only its own matches). While it is unset, AI frame inspection and site training stay off. With or without a code, the worker starts at most `VISION_MAX_JOBS_PER_DAY` analyses per 24 hours (a Railway variable; default 30, 0 = no limit). Set a spending limit in Modal too. To open a running site, deploy a build that supports it first, confirm it shows Ready, then delete the variable and redeploy: an older build refuses all analysis without a code. |
 
 Then **Deployments → ⋯ → Redeploy**. Environment variables only reach new
 deployments.

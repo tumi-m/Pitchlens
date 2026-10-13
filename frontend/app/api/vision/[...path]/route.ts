@@ -103,12 +103,18 @@ async function proxy(
         {
           detail: sent
             ? "That access code was not accepted."
-            : "Enter the access code to analyse videos.",
+            : "Enter the access code to continue.",
           code: "access",
         },
         { status: 401 },
       );
   }
+  // Training switches the ball model every browser uses: never from an open site.
+  if (route === "ball-model/train" && request.method !== "GET" && !accessCode)
+    return Response.json(
+      { detail: "Training from the site needs an access code. Set VISION_ACCESS_CODE, or train from a terminal." },
+      { status: 403 },
+    );
   // Rebuild the query so a browser can never pick someone else's owner key.
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");

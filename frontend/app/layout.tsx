@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { Toaster } from 'react-hot-toast';
 import { AuthProvider } from '@/components/auth/AuthProvider';
+import { AccessCodePrompt } from '@/components/vision/AccessCodePrompt';
 
 export const metadata: Metadata = {
   title: { default: 'Pitchlens', template: '%s | Pitchlens' },
@@ -32,6 +33,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="min-h-screen bg-pitch-black text-pitch-white">
           <AuthProvider>
             {children}
+            <AccessCodePrompt />
             <Toaster
               position="bottom-right"
               toastOptions={{

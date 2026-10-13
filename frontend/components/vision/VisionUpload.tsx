@@ -105,7 +105,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           if (x.profiles?.includes("broadcast")) setProfile("broadcast");
           if (x.gpu) setFps("6");
         }
-        setNeedsCode(!!x.accessRequired && !visionAccessCode());
+        // Show the field whenever a code is required (pre-filled with any saved
+        // one); forget a saved code when the site is open.
+        if (x.accessRequired) setNeedsCode(true);
+        else if (x.available) setVisionAccessCode("");
       })
       .catch(() => {
         if (!stopped) { setHealth({ available: false }); retry(); }
@@ -554,11 +557,16 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </span>
               <input
                 aria-label="Access code"
+                data-access-field
                 type="password"
                 autoComplete="off"
                 className="pitch-input w-full mt-2"
                 value={code}
-                onChange={(e) => setCode(e.target.value)}
+                onChange={(e) => {
+                  setCode(e.target.value);
+                  // Saved as typed, so returning to a match page works without uploading.
+                  setVisionAccessCode(e.target.value.trim());
+                }}
                 disabled={busy}
               />
               <span className="text-xs text-pitch-muted block mt-1">

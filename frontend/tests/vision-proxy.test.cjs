@@ -117,3 +117,14 @@ test('health tells the upload page whether a code is needed', async () => {
   assert.equal((await health('')).accessRequired, false);
   assert.equal((await health('fixture-access')).accessRequired, true);
 });
+
+test('site training is refused while the site has no access code', async () => {
+  const s = setup({ VISION_ACCESS_CODE: '' });
+  const request = s.request({ method: 'POST', owner: OWNER });
+  const response = await s.api.POST(request, { params: Promise.resolve({ path: ['ball-model', 'train'] }) });
+  assert.equal(response.status, 403);
+  assert.equal(s.calls.length, 0);
+  const closed = setup();
+  const allowed = await closed.api.POST(closed.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), { params: Promise.resolve({ path: ['ball-model', 'train'] }) });
+  assert.equal(allowed.status, 200);
+});

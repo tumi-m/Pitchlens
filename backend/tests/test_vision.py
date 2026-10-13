@@ -2001,3 +2001,55 @@ def test_a_cross_above_head_height_is_kept_once_it_moves():
         )
     assert seen[0] is None
     assert seen[-1] is not None and seen[-1]["x"] == 200.0
+
+
+def test_open_site_limits_daily_analyses_and_reruns_per_match(hosted, monkeypatch):
+    import json
+    import time as clock
+    from types import SimpleNamespace
+    server, client, _ = hosted
+    owner, job = 'c' * 32, 'a' * 32
+    source = server.ROOT / job
+    source.mkdir()
+    (source / 'video').write_bytes(b'complete saved video')
+    server.write_status(source, {'id': job, 'owner': owner, 'title': 'Saved match', 'status': 'completed',
+        'createdAt': 0, 'profile': 'general', 'sampleFps': 6, 'video': {'duration': 600}})
+    monkeypatch.setattr(server, 'pool', SimpleNamespace(submit=lambda *args: None))
+    headers = {'x-pitchlens-owner': owner}
+
+    def rerun(mode, n):
+        global_query = f'/jobs/{job}/rerun?mode={mode}&start=0&requestId={n:032x}'
+        response = client.post(global_query, headers=headers)
+        if response.status_code == 200:
+            # Let the next one start: this test does not run the analysis.
+            server.active = None
+            server.cancellations.clear()
+            done = server.ROOT / response.json()['id']
+            status = json.loads((done / 'status.json').read_text())
+            server.write_status(done, {**status, 'status': 'completed'})
+        return response.status_code
+
+    monkeypatch.setenv('VISION_MAX_JOBS_PER_DAY', '0')
+    assert [rerun('full', n) for n in range(1, 5)] == [200, 200, 200, 409]
+    # The daily cap counts every start and refuses uploads before any bytes are sent.
+    monkeypatch.setenv('VISION_MAX_JOBS_PER_DAY', '3')
+    assert len(json.loads((server.ROOT / 'starts.json').read_text())) == 3
+    assert rerun('section', 10) == 429
+    upload = client.post('/jobs?profile=general', headers={**headers, 'content-type': 'video/mp4', 'x-upload-size': '100'})
+    assert upload.status_code == 429
+    # Starts older than a day no longer count.
+    (server.ROOT / 'starts.json').write_text(json.dumps([clock.time() - 90000] * 3))
+    assert rerun('section', 11) == 200
+
+
+def test_ball_model_status_never_reveals_owner_keys(service, monkeypatch, tmp_path):
+    import json
+    server, client = service
+    monkeypatch.setenv('VISION_DATA_DIR', str(tmp_path))
+    models = tmp_path / 'models'
+    models.mkdir()
+    owner = 'f' * 32
+    (models / 'ball-model.json').write_text(json.dumps({'active': None, 'runs': [{'weights': 'ball-0123456789abcdef.pt', 'owner': owner, 'ownerHash': 'abc', 'kept': False}]}))
+    monkeypatch.setattr(server, 'training', {'state': 'done', 'run': {'owner': owner, 'kept': False}})
+    body = client.get('/ball-model').text
+    assert owner not in body and 'ownerHash' not in body
