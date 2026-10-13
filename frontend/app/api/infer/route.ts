@@ -15,17 +15,19 @@ function accessMode() {
   const firebase =
     !!process.env.NEXT_PUBLIC_FIREBASE_API_KEY &&
     !!process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
-  const code = process.env.VISION_ACCESS_CODE || "";
+  const code = (process.env.VISION_ACCESS_CODE || "").trim();
   if (!production) return { kind: "open" as const };
   if (firebase) return { kind: "firebase" as const };
   if (code) return { kind: "code" as const, code };
   return { kind: "closed" as const };
 }
+/** Spaces and line breaks around a code are never part of it: the site trims what
+ * people type, and a value pasted into the hosting dashboard often carries a newline. */
 function sameSecret(given: string | null, expected: string) {
   if (!given) return false;
-  const a = Buffer.from(given);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  const a = Buffer.from(given.trim());
+  const b = Buffer.from(expected.trim());
+  return b.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 export async function GET() {
   const mode = accessMode();

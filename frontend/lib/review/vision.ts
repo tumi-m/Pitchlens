@@ -246,7 +246,7 @@ export async function uploadToVision(
     fps?: string;
     diagnostic?: boolean;
     start?: number;
-    search?: "exhaustive" | "adaptive";
+    search?: "exhaustive" | "adaptive" | "none";
     signal?: AbortSignal;
     onProgress?: (percent: number) => void;
   },

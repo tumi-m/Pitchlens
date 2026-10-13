@@ -11,12 +11,12 @@ const OWNER = 'a'.repeat(32);
 const OTHER = 'b'.repeat(32);
 const ID = 'c'.repeat(32);
 
-function setup() {
+function setup(env = {}) {
   const calls = [];
   const exports = {};
   const context = {
     exports, require, Buffer, URL, URLSearchParams, Headers, Response,
-    process: { env: { VISION_SERVICE_URL: 'https://worker.example', VISION_SERVICE_TOKEN: 'fixture-token', VISION_ACCESS_CODE: 'fixture-access' } },
+    process: { env: { VISION_SERVICE_URL: 'https://worker.example', VISION_SERVICE_TOKEN: 'fixture-token', VISION_ACCESS_CODE: 'fixture-access', ...env } },
     fetch: async (url, init) => {
       calls.push({ url, init });
       assert.equal(init.headers.Authorization, 'Bearer fixture-token');
@@ -87,4 +87,18 @@ test('billing requires owner and write authorization; browser proxy never accept
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), billing('checkout'))).status, 401);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), billing('verify'))).status, 200);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), billing('webhook'))).status, 404);
+});
+
+test('an access code pasted into the dashboard with a trailing newline still matches', async () => {
+  const s = setup({ VISION_ACCESS_CODE: 'fixture-access\n ' });
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('retry'))).status, 200);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-acces' }), s.route('retry'))).status, 401);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'Fixture-access' }), s.route('retry'))).status, 401);
+});
+
+test('a code made only of spaces does not leave the site open', async () => {
+  const s = setup({ VISION_ACCESS_CODE: '   ' });
+  const response = await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: ' ' }), s.route('retry'));
+  assert.equal(response.status, 503);
+  assert.equal(s.calls.length, 0);
 });

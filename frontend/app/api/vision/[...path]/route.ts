@@ -10,11 +10,13 @@ const OWNER_COOKIE = "pitchlens-vision-owner";
 // Vercel rejects function request bodies over 4.5 MB; the client sends 4 MB chunks.
 const MAX_CHUNK = 4.5 * 1024 * 1024;
 
+/** Spaces and line breaks around a code are never part of it: the site trims what
+ * people type, and a value pasted into the hosting dashboard often carries a newline. */
 function sameSecret(given: string | null, expected: string) {
   if (!given) return false;
-  const a = Buffer.from(given);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  const a = Buffer.from(given.trim());
+  const b = Buffer.from(expected.trim());
+  return b.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 
 async function proxy(
@@ -70,7 +72,7 @@ async function proxy(
         { status: 403 },
       );
   }
-  const accessCode = process.env.VISION_ACCESS_CODE || "";
+  const accessCode = (process.env.VISION_ACCESS_CODE || "").trim();
   // A public site in front of a paid worker must not run open to the internet.
   if (hosted && !accessCode)
     return Response.json(
