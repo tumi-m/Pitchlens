@@ -273,3 +273,172 @@ test("worker startup is retried automatically", async ({ page }) => {
   await expect(reconnect).toHaveCount(0, { timeout: 10000 });
   expect(attempts).toBe(2);
 });
+
+test("the upload page says possession and passes need the ball model", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true, diagnostics: true } }));
+  await page.goto("/upload");
+  await expect(page.getByLabel(/Player load only/)).toBeChecked();
+  await expect(page.getByText(/Possession and passes\s+need the ball model/)).toBeVisible();
+  await expect(page.getByText(/You get possession and passes automatically/)).toHaveCount(0);
+});
+
+test("once the upload is complete the analysis cannot be cancelled from the upload page", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  const calls = await mockChunkedWorker(page);
+  const cancels: string[] = [];
+  await page.route(/\/api\/vision\/jobs\/[a-f0-9]{32}\/cancel$/, (r) => {
+    cancels.push(r.request().url());
+    return r.fulfill({ json: { status: "cancelled" } });
+  });
+  // A slow /start reply (mobile network): the worker may already be analysing.
+  let reply!: () => void;
+  const replied = new Promise<void>((resolve) => (reply = resolve));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/start$`), async (r) => {
+    calls.started++;
+    await replied;
+    await r.fulfill({ json: { id: ID, title: "Vision test", status: "processing", stage: "Opening video", progress: 0, createdAt: 0 } }).catch(() => {});
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect(page.getByText("Checking the video…").first()).toBeVisible();
+  await expect.poll(() => calls.started).toBe(1);
+  // Still waiting for the reply, still on the upload page: no cancel offered.
+  await page.waitForTimeout(1000);
+  await expect(page).toHaveURL(/\/upload$/);
+  expect(await page.getByRole("button", { name: "Cancel upload" }).count()).toBe(0);
+  reply();
+  await expect(page).toHaveURL(`/vision/${ID}`, { timeout: 15_000 });
+  expect(calls.started).toBe(1);
+  expect(cancels).toEqual([]);
+});
+
+test("a dropped connection says so in words, not the browser's raw fetch error", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true } }));
+  let tries = 0;
+  await page.route(/\/api\/vision\/jobs\?/, (r) => {
+    tries++;
+    return r.abort("internetdisconnected");
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect(page.getByText("Connection lost. Check your signal and press Analyse again; your file is still selected.")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(/Failed to fetch|Load failed|NetworkError/)).toHaveCount(0);
+  expect(tries).toBeGreaterThan(1);
+});
+
+test("the daily analysis cap is shown at once instead of being retried", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true } }));
+  let tries = 0;
+  await page.route(/\/api\/vision\/jobs\?/, (r) => {
+    tries++;
+    return r.fulfill({ status: 429, json: { detail: "This server has reached its limit of 30 analyses in 24 hours. Try again later." } });
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect(page.getByText(/reached its limit of 30 analyses/)).toBeVisible({ timeout: 2000 });
+  await page.waitForTimeout(1500);
+  expect(tries).toBe(1);
+});
+
+test("an undecodable file never turns on the 20-second test, even when the server answers late", async ({ page }) => {
+  let checks = 0;
+  await page.route("**/api/vision/health", (r) => {
+    checks++;
+    return checks === 1
+      ? r.fulfill({ status: 503, json: { available: false, hosted: true, detail: "Cannot reach the vision server. It may be starting up; retry in a minute." } })
+      : r.fulfill({ json: { available: true, hosted: true, diagnostics: true } });
+  });
+  const calls = await mockChunkedWorker(page);
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles({ name: "phone.mov", mimeType: "video/quicktime", buffer: Buffer.from("not decodable here") });
+  await expect(page.getByRole("alert").filter({ hasText: "could not decode" })).toBeVisible();
+  await page.getByRole("button", { name: "Retry connection" }).click();
+  const analyse = page.getByRole("button", { name: "Analyse video automatically", exact: true });
+  await expect(analyse).toBeEnabled();
+  await analyse.click();
+  await expect(page.getByRole("heading", { name: "Detecting players", exact: true })).toBeVisible();
+  expect(calls.created).toBe(1);
+  expect(calls.diagnostic).not.toBe("true");
+  expect(calls.start).toBe("0");
+});
+
+test("closing the tab mid-upload frees the worker, but never cancels a started analysis", async ({ page }) => {
+  // A request sent while a tab unloads is not reliably visible to Playwright, so
+  // the tab's pagehide event is fired in place: the same handler a close, reload
+  // or navigation runs, and the keepalive cancel it sends is intercepted as usual.
+  const leave = () => page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: false })));
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  const calls = await mockChunkedWorker(page);
+  const cancels: string[] = [];
+  await page.route(/\/api\/vision\/jobs\/[a-f0-9]{32}\/cancel$/, (r) => {
+    cancels.push(r.request().method());
+    return r.fulfill({ json: { status: "cancelled" } });
+  });
+  // The first chunk is held: the upload is in flight.
+  let sending = false;
+  let chunk!: () => void;
+  const chunkReplied = new Promise<void>((resolve) => (chunk = resolve));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    sending = true;
+    await chunkReplied;
+    await r.fallback();
+  });
+  let start!: () => void;
+  const startReplied = new Promise<void>((resolve) => (start = resolve));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/start$`), async (r) => {
+    calls.started++;
+    await startReplied;
+    await r.fulfill({ json: { id: ID, title: "Vision test", status: "processing", stage: "Opening video", progress: 0, createdAt: 0 } }).catch(() => {});
+  });
+  await page.goto("/upload");
+  // Before any reservation there is nothing to cancel.
+  await leave();
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect.poll(() => sending).toBe(true);
+  await leave();
+  await expect.poll(() => cancels).toEqual(["POST"]);
+  // Let the upload finish: once /start has been sent the analysis may be running.
+  chunk();
+  await expect.poll(() => calls.started).toBe(1);
+  await leave();
+  await page.waitForTimeout(1000);
+  expect(cancels).toEqual(["POST"]);
+  start();
+  await expect(page).toHaveURL(`/vision/${ID}`);
+  await leave();
+  await page.waitForTimeout(500);
+  expect(cancels).toEqual(["POST"]);
+});
+
+test("analysing a saved review defaults to player load and the worker's football models", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) =>
+    r.fulfill({ json: { available: true, hosted: false, diagnostics: true, profiles: ["general", "broadcast"] } }),
+  );
+  const reservations: URLSearchParams[] = [];
+  await page.route(/\/api\/vision\/jobs\?/, (r) => {
+    reservations.push(new URL(r.request().url()).searchParams);
+    return r.fulfill({ status: 400, json: { detail: "Fixture: stop after the reservation." } });
+  });
+  await page.goto("/upload");
+  await page.getByRole("button", { name: "Open manual review instead" }).click();
+  await page.getByLabel("Match video").setInputFiles(FIXTURE);
+  await page.getByLabel("Home team").fill("Reds");
+  await page.getByLabel("Away team").fill("Blues");
+  await page.getByRole("button", { name: "Open review room" }).click();
+  const analyse = page.getByRole("button", { name: "Analyse this video automatically" });
+  await expect(analyse).toBeEnabled();
+  await analyse.click();
+  await expect(page.getByText("Fixture: stop after the reservation.")).toBeVisible();
+  expect(reservations[0].get("search")).toBe("none");
+  expect(reservations[0].get("profile")).toBe("broadcast");
+  // Opting in to the ball model sends what the upload page sends with it on.
+  await page.getByLabel(/Run the ball model/).check();
+  await analyse.click();
+  await expect.poll(() => reservations.length).toBe(2);
+  expect(reservations[1].get("search")).toBe("exhaustive");
+  expect(reservations[1].get("profile")).toBe("broadcast");
+});

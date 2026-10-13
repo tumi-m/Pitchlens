@@ -289,6 +289,12 @@ export function ReviewQueue({
               <ArrowLeftRight size={15} /> Other team <kbd className="text-[10px] opacity-60">T</kbd>
             </button>
           </div>
+          {/* Confirming this shot only says a shot happened; the goal needs its own decision. */}
+          {current.type === "shot" && current.outcome === "goal-candidate" && current.outcomeBy !== "reviewer" && (
+            <p className="text-xs text-pitch-muted" data-testid="shot-goal-note">
+              Looks like a goal: confirm the Possible goal or choose Goal below to count it.
+            </p>
+          )}
           {current.type === "shot" && (
             <label className="block text-sm">
               Shot outcome
@@ -305,7 +311,11 @@ export function ReviewQueue({
                 <option value="saved">Saved</option>
                 <option value="blocked">Blocked</option>
                 <option value="off-target">Off target</option>
-                <option value="goal-candidate">Goal</option>
+                <option value="goal">Goal</option>
+                {/* The automatic reading; shown, never chosen: only "Goal" counts in the score. */}
+                <option value="goal-candidate" disabled>
+                  Possible goal (unconfirmed)
+                </option>
               </select>
             </label>
           )}

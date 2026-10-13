@@ -32,6 +32,9 @@ const LINES: { name: string; label: string }[] = [
   { name: "right-goal-line", label: "Right goal line" },
 ];
 
+/** A pitch setup whose progress has not moved for this long is reported as stuck. */
+const STALL_MS = 10 * 60_000;
+
 const QUALITY: Record<string, { label: string; colour: string }> = {
   good: { label: "Good fit", colour: "#22c55e" },
   check: { label: "Usable, check the lines", colour: "#f59e0b" },
@@ -80,6 +83,7 @@ export function PitchCalibration({
   const [frameTime, setFrameTime] = useState<number | null>(null);
   const [preview, setPreview] = useState<{ fit: CalibrationFit; lines: ([number, number] | null)[][] } | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState<"" | "preview" | "save">("");
   const [progress, setProgress] = useState<number | null>(null);
   const handled = useRef(0);
@@ -104,18 +108,39 @@ export function PitchCalibration({
       .catch(() => setVenues([]));
   }, []);
 
+  /** Follows the run on the worker. Re-aligning a moving camera through a full
+   *  match can take half an hour on a CPU, so there is no fixed limit: it gives up
+   *  only when the progress has not moved for 10 minutes. A restarting worker
+   *  (network error, 5xx, 429) is retried. */
   async function waitForCalibration() {
-    for (let i = 0; i < 600; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
+    let last: number | null = null;
+    let movedAt = Date.now();
+    let failures = 0;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, failures ? Math.min(15_000, 1500 * 2 ** failures) : 1500));
       // Leaving the page stops the polling (and skips the callbacks).
       if (!mounted.current) throw new DOMException("Left the page", "AbortError");
-      const current = await fetchCalibration(jobId, undefined, false);
-      const job = current.job;
-      if (job?.state === "processing") setProgress(job.progress ?? 0);
-      else if (job?.state === "failed") throw new Error(job.error || "Calibration failed");
+      if (Date.now() - movedAt > STALL_MS)
+        throw new Error("The pitch setup has not moved on for 10 minutes. Reload the page to check on it.");
+      let job: Calibration["job"];
+      try {
+        job = (await fetchCalibration(jobId, undefined, false)).job;
+        failures = 0;
+      } catch (e) {
+        if (e instanceof VisionError && e.status < 500 && e.status !== 429) throw e;
+        failures++;
+        continue;
+      }
+      if (job?.state === "processing") {
+        const progress = job.progress ?? 0;
+        setProgress(progress);
+        if (progress !== last) {
+          last = progress;
+          movedAt = Date.now();
+        }
+      } else if (job?.state === "failed") throw new Error(job.error || "Calibration failed");
       else if (job?.state === "done") return;
     }
-    throw new Error("The pitch setup is taking too long. Reload the page to check on it.");
   }
 
   async function useVenue() {
@@ -201,17 +226,40 @@ export function PitchCalibration({
     }
   }, [active, click, frameTime, time, mode, landmarkName, lineName, marks]);
 
+  /** A new pitch may lack landmarks already clicked (a futsal court has no box
+   *  corners): drop those clicks and pick a landmark the new pitch has, so the
+   *  next click is never saved under a name the worker does not know. */
+  function changeTemplate(next: PitchTemplate) {
+    setTemplate(next);
+    setPreview(null);
+    const available = landmarks(next);
+    const names = new Set(available.map((m) => m.name));
+    const kept = points.filter((p) => names.has(p.name));
+    const removed = points.length - kept.length;
+    if (removed) setPoints(kept);
+    if (!names.has(landmarkName)) {
+      const used = new Set(kept.map((p) => p.name));
+      setLandmarkName((available.find((m) => !used.has(m.name)) ?? available[0]).name);
+    }
+    // Nothing left on the chosen frame: the frame buttons work again.
+    if (!kept.length && !linePoints.length) setFrameTime(null);
+    setNotice(
+      removed
+        ? `${removed} point${removed === 1 ? " was" : "s were"} removed: this pitch has no such landmark${removed === 1 ? "" : "s"}.`
+        : "",
+    );
+  }
+
   function choosePreset(key: string) {
     setPresetKey(key);
-    if (PITCH_PRESETS[key]) setTemplate(PITCH_PRESETS[key].template);
-    setPreview(null);
+    if (PITCH_PRESETS[key]) changeTemplate(PITCH_PRESETS[key].template);
+    else setPreview(null);
   }
 
   function setDim(key: keyof PitchTemplate, value: string) {
     const n = Number(value);
-    setTemplate((t) => ({ ...t, [key]: value === "" ? null : Number.isFinite(n) ? n : t[key] }));
+    changeTemplate({ ...template, [key]: value === "" ? null : Number.isFinite(n) ? n : template[key] });
     setPresetKey("custom");
-    setPreview(null);
   }
 
   const request = () => ({
@@ -267,6 +315,8 @@ export function PitchCalibration({
   };
   const quality = preview ? QUALITY[preview.fit.quality] : null;
   const ready = calibration?.state === "ready";
+  // A setup applied before a reload (or set up from a saved venue) still running on the worker.
+  const running = calibration?.job?.state === "processing" && busy !== "save";
 
   if (!active)
     return (
@@ -286,6 +336,12 @@ export function PitchCalibration({
         </p>
         {calibration?.job?.state === "failed" && (
           <p className="text-sm text-amber-200">Last attempt failed: {calibration.job.error}</p>
+        )}
+        {running && (
+          <p className="text-sm text-pitch-muted flex items-center gap-2" role="status" data-testid="calibration-running">
+            <Loader2 size={15} className="animate-spin shrink-0" />
+            Applying the pitch setup to the match · {Math.round(calibration?.job?.progress ?? 0)}%. The report updates when it finishes.
+          </p>
         )}
         {ready && calibration?.static === false && (calibration?.coverage ?? 0) < 60 && (
           <p className="text-sm text-amber-200">
@@ -310,7 +366,7 @@ export function PitchCalibration({
                   </option>
                 ))}
               </select>
-              <button className="pitch-button-secondary" disabled={!venueId || !!busy} onClick={useVenue}>
+              <button className="pitch-button-secondary" disabled={!venueId || !!busy || running} onClick={useVenue}>
                 {busy === "save" ? <Loader2 size={15} className="animate-spin" /> : null}
                 {busy === "save" && progress !== null ? `${Math.round(progress)}%` : "Apply"}
               </button>
@@ -335,7 +391,7 @@ export function PitchCalibration({
             {error}
           </p>
         )}
-        <button className="pitch-button-secondary w-full" onClick={() => onActive(true)}>
+        <button className="pitch-button-secondary w-full" disabled={running} onClick={() => onActive(true)}>
           <Crosshair size={16} /> {ready ? "Adjust pitch setup" : "Set up the pitch"}
         </button>
       </section>
@@ -481,6 +537,11 @@ export function PitchCalibration({
         {points.length} landmark{points.length === 1 ? "" : "s"} · {linePoints.length} line point{linePoints.length === 1 ? "" : "s"}
         {frameTime !== null ? ` · frame ${clockTime(frameTime)}` : " · click on the paused video"}
       </p>
+      {notice && (
+        <p className="text-xs text-amber-200" role="status">
+          {notice}
+        </p>
+      )}
       <div className="flex gap-2">
         <button
           className="pitch-button-secondary flex-1"
@@ -501,6 +562,7 @@ export function PitchCalibration({
             setFrameTime(null);
             setPreview(null);
             setError("");
+            setNotice("");
             setLandmarkName(marks[0].name);
           }}
         >

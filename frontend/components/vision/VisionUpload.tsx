@@ -15,6 +15,11 @@ import {
   visionAccessCode,
   setVisionAccessCode,
   sizeLabel,
+  cleanAccessCode,
+  ACCESS_CODE_CHARACTERS,
+  CONNECTION_LOST,
+  connectionLost,
+  defaultVisionOptions,
 } from "@/lib/review/vision";
 
 export function VisionUpload({ onManual }: { onManual: () => void }) {
@@ -79,9 +84,16 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
   const upload = useRef<AbortController | null>(null);
+  const left = useRef(false);
+  const [codeProblem, setCodeProblem] = useState("");
   useEffect(() => {
+    left.current = false;
     setCode(visionAccessCode());
-    return () => upload.current?.abort();
+    return () => {
+      left.current = true;
+      // Stops an unfinished upload; an analysis already started is never cancelled.
+      upload.current?.abort();
+    };
   }, []);
   useEffect(() => {
     const controller = new AbortController();
@@ -103,7 +115,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           defaultsApplied.current = true;
           setDiagnostic(x.diagnostics === true);
           // Initial choices only: reconnecting must preserve the user's options.
-          if (x.profiles?.includes("broadcast")) setProfile("broadcast");
+          setProfile(defaultVisionOptions(x, { playerLoadOnly: true }).profile);
           if (x.gpu) setFps("6");
         }
         // Show the field whenever a code is required (pre-filled with any saved
@@ -134,13 +146,19 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   async function submit() {
     if (!ready) return;
     if (health?.accessRequired) {
-      if (!code.trim()) {
+      if (!cleanAccessCode(code)) {
         setNeedsCode(true);
         setError("Enter the access code first.");
         return;
       }
-      setVisionAccessCode(code.trim());
+      if (!setVisionAccessCode(code)) {
+        setError(ACCESS_CODE_CHARACTERS);
+        return;
+      }
     }
+    // The short test needs the decoded preview: without one (a file this browser
+    // cannot decode) its checkbox is not even shown, so it can never apply.
+    const shortTest = diagnostic && !!preflight;
     const controller = new AbortController();
     upload.current = controller;
     setError("");
@@ -164,16 +182,19 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
         title: title.trim() || file.name,
         profile,
         fps,
-        diagnostic,
-        start: diagnostic ? start : 0,
-        search: playerLoadOnly ? "none" : adaptive && profile !== "general" ? "adaptive" : "exhaustive",
+        diagnostic: shortTest,
+        start: shortTest ? start : 0,
+        search: defaultVisionOptions(health, { playerLoadOnly, adaptive, profile }).search,
         signal: controller.signal,
         onProgress: (p) => {
           setPercent(p);
+          // From 100% the analysis is being started on the server: it can no
+          // longer be cancelled here (the report page offers that).
           setPhase(p < 100 ? "Uploading" : "Checking the video");
         },
       });
-      router.push(`/vision/${job.id}`);
+      // Left the page meanwhile: the analysis runs on and is listed on the dashboard.
+      if (!left.current) router.push(`/vision/${job.id}`);
     } catch (e) {
       if (e instanceof VisionError && e.code === "access") {
         setVisionAccessCode("");
@@ -183,9 +204,11 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
       setError(
         e instanceof DOMException && e.name === "AbortError"
           ? "Upload cancelled. Your file is still selected."
-          : e instanceof Error
-            ? e.message
-            : "Unable to start analysis",
+          : connectionLost(e)
+            ? CONNECTION_LOST
+            : e instanceof Error
+              ? e.message
+              : "Unable to start analysis",
       );
       setBusy(false);
     } finally {
@@ -567,10 +590,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 onChange={(e) => {
                   setCode(e.target.value);
                   // Saved as typed, so returning to a match page works without uploading.
-                  setVisionAccessCode(e.target.value.trim());
+                  setCodeProblem(setVisionAccessCode(e.target.value) ? "" : ACCESS_CODE_CHARACTERS);
                 }}
                 disabled={busy}
               />
+              {codeProblem && (
+                <span role="alert" className="text-xs text-red-300 block mt-1">
+                  {codeProblem}
+                </span>
+              )}
               <span className="text-xs text-pitch-muted block mt-1">
                 Analysis runs on paid servers. Ask the Pitchlens owner for the code.
               </span>
@@ -581,10 +609,12 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               ? "Analysis runs on a GPU (the first run of the day can take a few extra minutes to start). "
               : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
             The report shows a live time estimate, and you can leave and come
-            back. You get possession and passes automatically; a two-minute pitch
-            setup (or a saved venue) adds shots, heatmaps and positions. Goals and
-            shots are proposed for you to confirm, and the score comes from you.
-            Speed, distance and xG are not measured.
+            back. Every job measures how far each kit ran. Possession and passes
+            need the ball model: untick &quot;Player load only&quot; below. A
+            two-minute pitch setup (or a saved venue) adds heatmaps and positions,
+            and shots when the ball model runs. Goals and shots are proposed for
+            you to confirm, and the score comes from you. Speed and xG are not
+            measured.
           </p>
           <div className="grid sm:grid-cols-2 gap-4">
             <label className="text-sm">Footage type
@@ -671,12 +701,16 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   Keep this tab open until the upload finishes. After that the analysis
                   runs on the server and you can leave.
                 </p>
-                <button
-                  onClick={() => upload.current?.abort()}
-                  className="pitch-button-secondary"
-                >
-                  Cancel upload
-                </button>
+                {/* Once the video is being checked the analysis may already be running:
+                    the report page it opens next can cancel it. */}
+                {phase !== "Checking the video" && (
+                  <button
+                    onClick={() => upload.current?.abort()}
+                    className="pitch-button-secondary"
+                  >
+                    Cancel upload
+                  </button>
+                )}
               </motion.div>
             )}
           </AnimatePresence>

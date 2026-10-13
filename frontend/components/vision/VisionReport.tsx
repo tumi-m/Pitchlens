@@ -20,13 +20,16 @@ import { PitchCalibration, CalibrationOverlay } from "@/components/vision/PitchC
 import { MiniPitch } from "@/components/vision/PitchGraphics";
 import {
   Analysis,
+  AnalysisEvent,
   Calibration,
   describeEvent,
   fetchAnalysis,
   fetchCalibration,
+  isConfirmedGoal,
   pitchLines,
   pitchToImage,
 } from "@/lib/review/analysis";
+import { overlayAt, playerMaps } from "@/lib/review/overlay";
 
 export function VisionReport({ jobId }: { jobId: string }) {
   const [job, setJob] = useState<VisionJob | null>(null);
@@ -139,14 +142,34 @@ export function VisionReport({ jobId }: { jobId: string }) {
   useEffect(() => {
     if (result) loadAnalytics();
   }, [result, loadAnalytics]);
-  // A just-finished match may be getting its pitch set up from a saved venue:
-  // refresh the report when that finishes.
-  const autoSetup = calibration?.job?.state === "processing" && calibration?.job?.auto;
+  // A pitch setup is running on the worker: set up automatically from a saved
+  // venue, or applied by hand before a reload. Follow it (the light status only)
+  // and refresh the report when it finishes.
+  const setupRunning = calibration?.job?.state === "processing";
   useEffect(() => {
-    if (!autoSetup) return;
-    const timer = setTimeout(loadAnalytics, 5000);
-    return () => clearTimeout(timer);
-  }, [autoSetup, calibration, loadAnalytics]);
+    if (!setupRunning) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const next = await fetchCalibration(jobId, undefined, false);
+        if (stopped) return;
+        if (next.job?.state === "processing") {
+          setCalibration((prev) => (prev ? { ...prev, job: next.job } : next));
+          timer = setTimeout(poll, 5000);
+        } else loadAnalytics();
+      } catch (e) {
+        if (stopped || (e instanceof VisionError && e.status < 500 && e.status !== 429)) return;
+        // A restarting worker comes back: keep checking, more slowly.
+        timer = setTimeout(poll, 15_000);
+      }
+    };
+    timer = setTimeout(poll, 5000);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [setupRunning, jobId, loadAnalytics]);
   useEffect(() => {
     const video = player.current;
     if (!video || !result) return;
@@ -178,6 +201,12 @@ export function VisionReport({ jobId }: { jobId: string }) {
     return Math.abs(result.frames[l].t - time) <= (1 / result.sampleFps) * 1.5 ? l : -1;
   }, [result, time]);
   const frame = frameIndex >= 0 && result ? result.frames[frameIndex] : null;
+  // Drawn boxes glide between analysed frames; the status line and the ball stay on the held frame.
+  const maps = useMemo(() => (result ? playerMaps(result.frames) : null), [result]);
+  const drawn = useMemo(
+    () => (result && maps && frameIndex >= 0 ? overlayAt(result.frames, frameIndex, time, result.sampleFps, maps) : null),
+    [result, maps, frameIndex, time],
+  );
   // Painted pitch lines projected through this frame's calibration (a live check of its accuracy).
   const projectedLines = useMemo(() => {
     if (!showLines || calibrating || !calibration || calibration.state !== "ready" || !calibration.template || frameIndex < 0) return null;
@@ -192,12 +221,23 @@ export function VisionReport({ jobId }: { jobId: string }) {
       ) || [],
     [result, filter],
   );
+  // A seek made before the video's metadata arrives is replayed once it does
+  // (the browser would otherwise start at the default position).
+  const pendingSeek = useRef<{ t: number; play: boolean } | null>(null);
+  // Where the page itself last moved the video: any other seek is the viewer's.
+  const ownSeekTo = useRef<number | null>(null);
+  const moveVideo = useCallback((video: HTMLVideoElement, t: number, play = false) => {
+    ownSeekTo.current = t;
+    // readyState 0 (HAVE_NOTHING): no metadata yet.
+    pendingSeek.current = video.readyState < 1 ? { t, play } : null;
+    video.currentTime = t;
+  }, []);
   function seek(t: number) {
     if (player.current) {
       clipEnd.current = null;
       reelRef.current = null;
       setReel(null);
-      player.current.currentTime = t;
+      moveVideo(player.current, t);
       player.current.pause();
       player.current.scrollIntoView({ behavior: "smooth", block: "center" });
       setTime(t);
@@ -207,19 +247,29 @@ export function VisionReport({ jobId }: { jobId: string }) {
     const video = player.current;
     if (!video) return;
     clipEnd.current = until;
-    video.currentTime = t;
+    moveVideo(video, t, true);
     setTime(t);
     video.play().catch(() => {});
-  }, []);
-  // Highlights: goals, possible goals and shots played back to back.
-  const highlights = useMemo(
-    () =>
-      (analysis?.events ?? [])
-        .filter((e) => e.status !== "rejected" && ["goal", "goal-candidate", "shot"].includes(e.type))
-        .filter((e, i, list) => i === 0 || Math.abs(e.t - list[i - 1].t) > 3)
-        .sort((a, b) => a.t - b.t),
-    [analysis],
-  );
+  }, [moveVideo]);
+  // Highlights: goals, possible goals and shots played back to back. Moments
+  // within 3 s of each other are one highlight, shown as its most important
+  // moment and played from before the first to after the last.
+  const highlights = useMemo(() => {
+    const moments = (analysis?.events ?? [])
+      .filter((e) => e.status !== "rejected" && ["goal", "goal-candidate", "shot"].includes(e.type))
+      .sort((a, b) => a.t - b.t);
+    const groups: AnalysisEvent[][] = [];
+    for (const e of moments) {
+      const group = groups[groups.length - 1];
+      if (group && e.t - group[group.length - 1].t <= 3) group.push(e);
+      else groups.push([e]);
+    }
+    return groups.map((group) => ({
+      event: group.reduce((best, e) => (highlightRank(e) < highlightRank(best) ? e : best)),
+      from: Math.max(0, group[0].t - 4),
+      until: group[group.length - 1].t + 2,
+    }));
+  }, [analysis]);
   const [reel, setReel] = useState<number | null>(null);
   const reelRef = useRef<number | null>(null);
   const playHighlight = useCallback(
@@ -227,10 +277,22 @@ export function VisionReport({ jobId }: { jobId: string }) {
       reelRef.current = k;
       setReel(k);
       if (k === null || !highlights[k]) return;
-      const e = highlights[k];
-      watchClip(Math.max(0, e.t - 4), e.t + 2);
+      watchClip(highlights[k].from, highlights[k].until);
     },
     [highlights, watchClip],
+  );
+  // Review clips own the video: the reel stops, so the end of a review clip
+  // never jumps to the next highlight.
+  const stopReel = useCallback(() => {
+    reelRef.current = null;
+    setReel(null);
+  }, []);
+  const reviewWatch = useCallback(
+    (t: number, until: number) => {
+      stopReel();
+      watchClip(t, until);
+    },
+    [stopReel, watchClip],
   );
   function videoClick(e: React.MouseEvent<SVGSVGElement>) {
     if (!calibrating || !result) return;
@@ -251,10 +313,15 @@ export function VisionReport({ jobId }: { jobId: string }) {
     if (!v) return;
     v.pause();
     clipEnd.current = null;
-    v.currentTime = t;
+    moveVideo(v, t);
     setTime(t);
   }
   const startCalibration = () => {
+    // One setup at a time: while one runs the panel shows its progress instead.
+    if (setupRunning) {
+      calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     setCalibrating(true);
     // Adjusting a saved setup returns to the frame it was clicked on.
     const savedAt = calibration?.request?.t;
@@ -262,6 +329,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
     calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
   const openReview = () => {
+    stopReel();
     // One panel with keyboard shortcuts at a time (both use Enter and arrows).
     setLabelling(false);
     setReviewOpen(true);
@@ -312,8 +380,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
             )}
           </header>
           {result?.performance && <div className="glass-card p-4 text-sm space-y-2">
-            <p>Processing took {result.performance.totalSeconds.toFixed(1)}s on {result.performance.device} · players {result.performance.playerInferenceSeconds.toFixed(1)}s · ball {result.performance.ballInferenceSeconds.toFixed(1)}s.</p>
-            <p>{(result.performance.totalSeconds / result.analysedDuration).toFixed(1)} seconds processing per second of footage. Full matches may take a different amount of time.</p>
+            <p data-testid="processing-times">{processingTimes(result)}</p>
+            {typeof result.performance.totalSeconds === "number" && result.analysedDuration > 0 && (
+              <p>{(result.performance.totalSeconds / result.analysedDuration).toFixed(1)} seconds processing per second of footage. Full matches may take a different amount of time.</p>
+            )}
             {result.analysedDuration < result.video.duration - .5 && <p className="text-amber-200">Diagnostic section: {clockTime(result.analysedStart ?? 0)}–{clockTime((result.analysedStart ?? 0) + result.analysedDuration)}. These results do not describe the full match.</p>}
           </div>}
           {result && !job?.videoDeleted && (
@@ -405,6 +475,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   onSeek={seek}
                   onCalibrate={startCalibration}
                   onReview={openReview}
+                  playerLoad={result.metrics.playerLoad}
+                  ballTracked={result.ballSearch !== "none"}
                 />
               ) : (
                 <MatchCentre
@@ -430,16 +502,20 @@ export function VisionReport({ jobId }: { jobId: string }) {
                     </p>
                   )}
                   {analysis && highlights.length > 0 && !job?.videoDeleted && (
-                    <div className="flex flex-wrap items-center gap-2 text-sm" data-testid="highlights">
-                      {reel === null ? (
+                    <div
+                      className="flex flex-wrap items-center gap-2 text-sm"
+                      data-testid="highlights"
+                      data-clip={reel !== null && highlights[reel] ? `${highlights[reel].from.toFixed(1)}-${highlights[reel].until.toFixed(1)}` : undefined}
+                    >
+                      {reel === null || !highlights[reel] ? (
                         <button className="pitch-button-secondary" onClick={() => playHighlight(0)}>
                           Play highlights ({highlights.length})
                         </button>
                       ) : (
                         <>
                           <span className="text-pitch-muted">
-                            Highlight {reel + 1} of {highlights.length} · {clockTime(highlights[reel].t)} · {describeEvent(highlights[reel])}
-                            {highlights[reel].status === "confirmed" ? "" : " (to review)"}
+                            Highlight {reel + 1} of {highlights.length} · {clockTime(highlights[reel].event.t)} · {highlightLabel(highlights[reel].event)}
+                            {highlights[reel].event.status === "confirmed" ? "" : " (to review)"}
                           </span>
                           <button className="pitch-button-secondary" onClick={() => playHighlight(reel + 1 < highlights.length ? reel + 1 : null)}>
                             Next
@@ -466,7 +542,24 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   >
                     <video
                       ref={player}
-                    onLoadedMetadata={() => { if (player.current) player.current.currentTime = result?.analysedStart ?? 0; }}
+                      onLoadedMetadata={(e) => {
+                        const v = e.currentTarget;
+                        const pending = pendingSeek.current;
+                        pendingSeek.current = null;
+                        if (pending) {
+                          // A marker, bar or review clip chosen while the video was still loading.
+                          moveVideo(v, pending.t);
+                          if (pending.play) v.play().catch(() => {});
+                        } else if (v.currentTime === 0 && (result.analysedStart ?? 0) > 0) moveVideo(v, result.analysedStart ?? 0);
+                      }}
+                      onSeeking={(e) => {
+                        const target = ownSeekTo.current;
+                        if (target !== null && Math.abs(e.currentTarget.currentTime - target) < 0.25) return;
+                        // The viewer moved the video with its own controls: the reel and
+                        // any clip end stop, so dragging past a clip end does not jump on.
+                        clipEnd.current = null;
+                        if (reelRef.current !== null) stopReel();
+                      }}
                       controls
                       playsInline
                       preload="metadata"
@@ -529,7 +622,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         className="absolute inset-0 w-full h-full pointer-events-none"
                         viewBox={`0 0 ${result.video.width} ${result.video.height}`}
                       >
-                        {frame.players.map((p) => (
+                        {(drawn?.players ?? frame.players).map((p) => (
                           <g key={p.id}>
                             <rect
                               x={p.box[0]}
@@ -679,7 +772,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       names={names}
                       colours={[colour(0), colour(1)]}
                       time={time}
-                      onWatch={watchClip}
+                      onWatch={reviewWatch}
                       onAnalysis={(next) =>
                         // Review responses leave out the per-frame positions (unchanged).
                         setAnalysis((prev) => ({ ...next, positions: next.positions ?? prev?.positions ?? null }))
@@ -799,6 +892,34 @@ export function VisionReport({ jobId }: { jobId: string }) {
     </>
   );
 }
+/** Which moment names a highlight: a confirmed goal; a confirmed possible goal
+ *  or a shot confirmed as a goal; a possible goal; then shots. Within a type,
+ *  confirmed comes before proposed. */
+function highlightRank(e: AnalysisEvent) {
+  const confirmed = e.status === "confirmed";
+  if (e.type === "goal") return confirmed ? 0 : 2;
+  if (isConfirmedGoal(e)) return 1;
+  if (e.type === "goal-candidate") return 2;
+  return confirmed ? 3 : 4;
+}
+
+const highlightLabel = (e: AnalysisEvent) => (highlightRank(e) <= 1 ? "Goal" : describeEvent(e));
+
+/** "Processing took 12.5s on cpu · players 10.1s · ball 1.2s", from whichever
+ *  timings the result has: player-load jobs have no ball time (null or absent),
+ *  and older results may lack others. */
+function processingTimes(result: VisionResult): string {
+  const p = result.performance ?? {};
+  const seconds = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? `${v.toFixed(1)}s` : null);
+  const total = seconds(p.totalSeconds);
+  const parts = [
+    `Processing took ${total ?? "an unknown time"}${p.device ? ` on ${p.device}` : ""}`,
+    seconds(p.playerInferenceSeconds) && `players ${seconds(p.playerInferenceSeconds)}`,
+    result.ballSearch === "none" ? "ball model not run" : seconds(p.ballInferenceSeconds) && `ball ${seconds(p.ballInferenceSeconds)}`,
+  ];
+  return `${parts.filter(Boolean).join(" · ")}.`;
+}
+
 /** Split polylines where points are missing (behind the camera) instead of joining across. */
 function splitAtGaps(lines: (([number, number] | null)[] | undefined)[] | null | undefined): [number, number][][] {
   const out: [number, number][][] = [];

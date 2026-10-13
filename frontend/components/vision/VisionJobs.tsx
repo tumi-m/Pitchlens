@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { VisionJob, visionJson, clockTime } from "@/lib/review/vision";
+import { VisionJob, VisionError, visionJson, clockTime } from "@/lib/review/vision";
 export function VisionJobs() {
   const [jobs, setJobs] = useState<VisionJob[]>([]);
   const [error, setError] = useState("");
@@ -43,8 +43,12 @@ export function VisionJobs() {
           if (next.some((j) => ["uploading", "processing"].includes(j.status)))
             schedule(5000);
         })
-        // A worker that is restarting comes back: keep checking, more slowly.
-        .catch(() => schedule(30_000))
+        .catch((e) => {
+          // A refusal (400, 401, 403...) does not change by asking again.
+          if (e instanceof VisionError && e.status < 500 && e.status !== 408 && e.status !== 429) return;
+          // A worker that is restarting comes back: keep checking, more slowly.
+          schedule(30_000);
+        })
         .finally(() => {
           inFlight = false;
         });

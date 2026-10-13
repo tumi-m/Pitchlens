@@ -9,8 +9,8 @@ engine's guess, and confirms it, clicks the ball, or marks it not visible.
 
 Those labels give, for the first time, a measured ball accuracy for the match
 (recall on visible balls, false detections where there is none), and they are
-exported as a training set for fine-tuning the ball detector (see
-backend/scripts/train_ball.py).
+exported as a training set for fine-tuning the ball detector (balltrain.py;
+started with the curl command in docs/BALL-TRAINING.md).
 """
 
 import json
@@ -196,10 +196,28 @@ def metrics(result, store):
       engine still reported one;
     precision: of the engine's observed positions on labelled frames, how many
       were the ball. Inferred (gap-filled) positions are scored separately.
+
+    A player-load job never ran the ball model: its rates are not measured
+    (None, not 0%), while the labels still count and still train the finder.
     """
     frames = result.get("frames") or []
     video = result.get("video") or {}
     tol = ball_tolerance(float(video.get("width") or 640), float(video.get("height") or 360))
+    if result.get("ballSearch") == "none" or result.get("ballInference") == "skipped":
+        labels = (store or {}).get("labels", {})
+        shown = [label for key, label in labels.items() if int(key) < len(frames)]
+        unmeasured = {"value": None, "n": 0, "interval95": None}
+        return {
+            "labelled": len(shown),
+            "visible": sum(1 for label in shown if label.get("visible")),
+            "tolerancePixels": round(tol, 1),
+            "measured": False,
+            "recall": dict(unmeasured),
+            "precision": dict(unmeasured),
+            "falseDetections": dict(unmeasured),
+            "inferredAccuracy": dict(unmeasured),
+            "medianHitErrorPixels": None,
+        }
     hit = visible = absent = false_detections = detections = correct = 0
     inferred_hit = inferred_n = 0
     errors = []
@@ -230,6 +248,7 @@ def metrics(result, store):
         "labelled": visible + absent,
         "visible": visible,
         "tolerancePixels": round(tol, 1),
+        "measured": True,
         "recall": _rate(hit, visible),
         "precision": _rate(correct, detections),
         "falseDetections": _rate(false_detections, absent),

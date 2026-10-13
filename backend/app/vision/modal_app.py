@@ -82,16 +82,17 @@ def analyse(
     import requests
 
     from app.vision.engine import run_video
-    from app.vision.profiles import CUSTOM_BALL, model_paths
+    from app.vision.profiles import CUSTOM_BALL, missing_models
 
-    if ball_weights:
+    if ball_weights and ball_search != "none":
         # The worker's fine-tuned ball model: copied below like any other weights.
+        # Player load never loads a ball model, so it is not fetched for one.
         if not CUSTOM_BALL.fullmatch(ball_weights):
             yield {"error": "Unknown ball model", "user": False}
             return
         os.environ["VISION_BALL_WEIGHTS"] = f"/root/models/{ball_weights}"
 
-    missing = [p for p in model_paths(profile) if not p.is_file()]
+    missing = missing_models(profile, ball_search)
     if missing:
         yield {"stage": "GPU: preparing football models", "progress": 1}
         base = video_url.split("/jobs/")[0]

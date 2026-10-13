@@ -1,7 +1,13 @@
 "use client";
 import { useEffect, useState } from "react";
 import { KeyRound } from "lucide-react";
-import { ACCESS_EVENT, setVisionAccessCode } from "@/lib/review/vision";
+import {
+  ACCESS_CODE_CHARACTERS,
+  ACCESS_EVENT,
+  accessCodeSendable,
+  cleanAccessCode,
+  setVisionAccessCode,
+} from "@/lib/review/vision";
 
 /**
  * Asks for the site's access code wherever an action needs it (review, pitch
@@ -27,14 +33,16 @@ export function AccessCodePrompt() {
   }, []);
 
   if (!open) return null;
+  const clean = cleanAccessCode(code);
+  // Request headers carry Latin-1 only: say so here instead of failing every request.
+  const unsendable = !!clean && !accessCodeSendable(clean);
   return (
     <div className="fixed inset-x-0 bottom-0 z-50 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))]" role="dialog" aria-label="Access code needed">
       <form
         className="mx-auto max-w-md glass-card p-4 space-y-3 border border-pitch-green/40"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!code.trim()) return;
-          setVisionAccessCode(code.trim());
+          if (!clean || !setVisionAccessCode(clean)) return;
           setSaved(true);
           setOpen(false);
         }}
@@ -52,11 +60,16 @@ export function AccessCodePrompt() {
           onChange={(e) => setCode(e.target.value)}
           autoFocus
         />
+        {unsendable && (
+          <p role="alert" className="text-xs text-red-300">
+            {ACCESS_CODE_CHARACTERS}
+          </p>
+        )}
         <div className="flex gap-2 justify-end">
           <button type="button" className="pitch-button-secondary" onClick={() => setOpen(false)}>
             Not now
           </button>
-          <button type="submit" className="pitch-button-primary" disabled={!code.trim()}>
+          <button type="submit" className="pitch-button-primary" disabled={!clean || unsendable}>
             Save code
           </button>
         </div>

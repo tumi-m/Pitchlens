@@ -97,7 +97,8 @@ def test_a_camera_pan_is_not_player_running():
             "ball": None,
         })
         x += 40
-    assert player_load(frames)["metres"] == [0.0, 0.0]
+    # Kit A was measured and stood still (0.0); nobody in kit B was seen (None).
+    assert player_load(frames)["metres"] == [0.0, None]
 
 
 def test_running_distance_uses_body_height_and_drops_a_partial_box():
@@ -115,8 +116,25 @@ def test_running_distance_uses_body_height_and_drops_a_partial_box():
             "ball": None,
         })
         x += 10
-    # Three kept steps of 10px at 1.8 m / 20 px. The half-height box drops its two steps.
-    assert player_load(frames)["metres"] == [2.7, 0.0]
+    # 50 px of true movement (4.5 m at 1.8 m / 20 px). The half-height box is
+    # skipped, the gap over it is bridged, and steps are at least 0.3 s: 0-0.4 s
+    # and 0.4-0.8 s count (20 px each); the last 10 px is still inside its step.
+    load = player_load(frames)
+    assert load["metres"] == [3.6, None]
+    assert load["measuredSamples"] == [4, 0]
+
+
+def test_slow_walking_adds_up_instead_of_being_dropped_step_by_step():
+    from app.vision.metrics import player_load
+
+    # 1 px per sample at 10 fps: every step is under the 3 px band, but the
+    # walk is 30 px (2.7 m) over 3 s.
+    frames = [
+        {"t": i * 0.1, "scene": 0, "camera": None if i == 0 else [1, 0, 0, 0, 1, 0],
+         "players": [_load_player(box=(92 + i, 60, 108 + i, 80))], "ball": None}
+        for i in range(31)
+    ]
+    assert player_load(frames)["metres"][0] == pytest.approx(2.7, abs=0.1)
 
 
 def test_a_cut_without_a_camera_is_not_a_sprint():
@@ -126,8 +144,24 @@ def test_a_cut_without_a_camera_is_not_a_sprint():
         {"t": 0, "scene": 0, "camera": None, "players": [_load_player()], "ball": None},
         {"t": 0.2, "scene": 1, "camera": None, "players": [_load_player(box=(200, 0, 216, 20))], "ball": None},
     ]
-    assert player_load(frames)["metres"] == [0.0, 0.0]
+    # Nothing could be measured across the cut: not a measured 0.
+    assert player_load(frames)["metres"] == [None, None]
+    assert player_load(frames)["maxSpeed"] is None
     assert derive_metrics(frames, 5, 0.4)["playerLoad"]["steps"] == 0
+
+
+def test_kits_that_were_not_separated_have_no_distance():
+    from app.vision.metrics import player_load
+
+    # The engine's kit warning path: every player's team is -1.
+    frames = [
+        {"t": i * 0.2, "scene": 0, "camera": None if i == 0 else [1, 0, 0, 0, 1, 0],
+         "players": [_load_player(team=-1, box=(92 + 10 * i, 60, 108 + 10 * i, 80))], "ball": None}
+        for i in range(6)
+    ]
+    load = player_load(frames)
+    assert load["metres"] == [None, None]
+    assert load["maxSpeed"] is None and load["measuredSamples"] == [0, 0]
 
 
 def test_a_youtube_job_defaults_to_player_load(hosted):
@@ -343,10 +377,14 @@ def test_missing_ball_weights_are_reported_before_upload(service, monkeypatch, t
     model.write_bytes(b"fixture")
     monkeypatch.setenv("VISION_MODEL_PATH", str(model))
     monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(tmp_path / "missing"))
-    assert client.get("/health").json()["available"] is False
+    health = client.get("/health").json()
+    # Player load still runs; no profile is offered for a ball search.
+    assert health["available"] is True and "general" not in health["profiles"]
     response = client.post("/jobs", content=b"data", headers={"Content-Type": "video/mp4"})
     assert response.status_code == 503
     assert server.active is None
+    monkeypatch.setenv("VISION_MODEL_PATH", str(tmp_path / "missing-too"))
+    assert client.get("/health").json()["available"] is False
 
 
 def test_weak_detections_sustain_but_cannot_create_tracks():
@@ -501,6 +539,7 @@ def hosted(service, monkeypatch, tmp_path):
     monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(model))
     monkeypatch.setattr(server, "upload_activity", {})
     monkeypatch.setattr(server, "upload_started", {})
+    monkeypatch.setattr(server, "upload_sizes", {})
     submitted = []
     monkeypatch.setattr(server.pool, "submit", lambda *args: submitted.append(args))
     return server, client, submitted
@@ -811,7 +850,37 @@ def test_youtube_block_fails_clearly_and_frees_the_worker(hosted, monkeypatch):
     fn(directory, status, event, url)
     assert status["status"] == "failed" and "Upload a file" in status["stage"]
     assert server.active is None
+    # A blocked download used no GPU: it does not use up the daily allowance.
+    assert not (server.ROOT / "starts.json").exists()
     assert client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).status_code == 200
+
+
+def test_youtube_analyses_count_toward_the_daily_cap(hosted, monkeypatch):
+    import json
+
+    server, client, submitted = hosted
+    monkeypatch.setenv("VISION_MAX_JOBS_PER_DAY", "2")
+
+    def fake_download(url, directory, max_bytes, progress, cancelled):
+        target = directory / "download.mp4"
+        target.write_bytes(FIXTURE.read_bytes())
+        return target, {"title": "Match", "duration": 4}
+
+    ran = []
+    monkeypatch.setattr("app.vision.youtube.download", fake_download)
+    monkeypatch.setattr(server, "work", lambda d, s, e: ran.append(s["id"]))
+    codes = []
+    for _ in range(3):
+        response = client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ")
+        codes.append(response.status_code)
+        if response.status_code == 200:
+            fn, directory, status, event, url = submitted[-1]
+            fn(directory, status, event, url)  # what the inference thread does
+            server.active = None  # the analysis finished
+            server.cancellations.clear()
+    assert codes == [200, 200, 429]
+    assert len(ran) == 2
+    assert len(json.loads((server.ROOT / "starts.json").read_text())) == 2
 
 
 def test_invalid_youtube_link_is_rejected_before_reserving(hosted):
@@ -2041,6 +2110,26 @@ def test_open_site_limits_daily_analyses_and_reruns_per_match(hosted, monkeypatc
     (server.ROOT / 'starts.json').write_text(json.dumps([clock.time() - 90000] * 3))
     assert rerun('section', 11) == 200
 
+    def recent():
+        return len(server._recent_starts(clock.time()))
+
+    assert recent() == 1
+    # A chunked upload counts when it starts (begin), and so does a retry.
+    data = FIXTURE.read_bytes()
+    created = client.post(f'/jobs?size={len(data)}', headers={**headers, 'content-type': 'video/mp4'})
+    assert created.status_code == 200, created.text
+    upload = created.json()['id']
+    client.put(f'/jobs/{upload}/video?offset=0', content=data, headers=headers)
+    assert client.post(f'/jobs/{upload}/start', headers=headers).status_code == 200
+    assert recent() == 2
+    server.active = None  # the analysis stopped: it can be retried
+    server.cancellations.clear()
+    assert client.post(f'/jobs/{upload}/retry', headers=headers).status_code == 200
+    assert recent() == 3
+    server.active = None
+    server.cancellations.clear()
+    assert rerun('section', 12) == 429
+
 
 def test_ball_model_status_never_reveals_owner_keys(service, monkeypatch, tmp_path):
     import json
@@ -2093,3 +2182,504 @@ def test_youtube_download_steps_down_to_the_sharpest_version_that_fits(tmp_path,
     monkeypatch.setattr(FakeYDL, "extract_info", lambda self, url, download: {"title": "Match", "duration": 2400})
     with pytest.raises(ValueError, match="even at 480p"):
         youtube.download("https://youtu.be/dQw4w9WgXcQ", tmp_path, 100)
+
+
+# ── Retention, model availability and request limits ──────────────────────
+def _saved_match(server, job='a' * 32, owner='c' * 32, created=0.0, video=b'video-bytes'):
+    import json
+
+    directory = server.ROOT / job
+    directory.mkdir()
+    if video is not None:
+        (directory / 'video').write_bytes(video)
+    (directory / 'result.json').write_text(json.dumps({'frames': [], 'video': {'width': 640, 'height': 360}}))
+    server.write_status(directory, {'id': job, 'owner': owner, 'title': 'Match', 'status': 'completed',
+        'createdAt': created, 'profile': 'general', 'sampleFps': 6, 'video': {'duration': 600}})
+    return directory
+
+
+def test_a_rerun_expires_with_the_original_upload(hosted, monkeypatch):
+    import json
+    import time as clock
+
+    server, client, _ = hosted
+    monkeypatch.setattr(server, 'RETENTION_HOURS', 168)
+    monkeypatch.setenv('VISION_MAX_JOBS_PER_DAY', '0')
+    headers = {'x-pitchlens-owner': 'c' * 32}
+    source = _saved_match(server, created=clock.time() - 167 * 3600)  # an hour before expiry
+    response = client.post(f"/jobs/{'a' * 32}/rerun?mode=section&start=0&requestId={'1' * 32}", headers=headers)
+    assert response.status_code == 200, response.text
+    rerun = response.json()['id']
+    server.active = None
+    server.cancellations.clear()
+    status = json.loads((server.ROOT / rerun / 'status.json').read_text())
+    server.write_status(server.ROOT / rerun, {**status, 'status': 'completed'})
+    # Two hours later the upload is past its retention, and so is every link to it.
+    real = clock.time
+    monkeypatch.setattr(server.time, 'time', lambda: real() + 2 * 3600)
+    server.delete_expired()
+    assert not (source / 'video').exists() and not (server.ROOT / rerun / 'video').exists()
+    assert client.get(f'/jobs/{rerun}/video', headers=headers).status_code == 404
+    again = client.post(f"/jobs/{rerun}/rerun?mode=section&start=0&requestId={'2' * 32}", headers=headers)
+    assert again.status_code == 409
+
+
+def test_player_load_runs_without_the_ball_model(hosted, monkeypatch, tmp_path):
+    from app.vision.profiles import missing_models
+
+    server, client, submitted = hosted
+    monkeypatch.setenv('VISION_BALL_MODEL_PATH', str(tmp_path / 'missing-ball.onnx'))
+    health = client.get('/health').json()
+    assert health['available'] is True and health['profiles'] == []
+    # small-ball shares the general player model, so player load can run on it too.
+    assert health['playerLoadProfiles'] == ['general', 'small-ball']
+    assert client.post('/jobs?search=none&size=10', headers={'Content-Type': 'video/mp4'}).status_code == 200
+    server.active = None
+    assert client.post('/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ').status_code == 200
+    server.active = None
+    refused = client.post('/jobs?search=exhaustive&size=10', headers={'Content-Type': 'video/mp4'})
+    assert refused.status_code == 503 and 'models are not installed' in refused.json()['detail']
+    asked = client.post('/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ&search=adaptive')
+    assert asked.status_code == 503 and server.active is None
+    # The GPU copies in only what the job will load.
+    assert missing_models('general', 'none') == []
+    assert missing_models('general', 'exhaustive') == [tmp_path / 'missing-ball.onnx']
+    monkeypatch.setenv('VISION_MODEL_PATH', str(tmp_path / 'missing-player.pt'))
+    assert missing_models('general', 'none') == [tmp_path / 'missing-player.pt']
+
+
+def test_retry_and_rerun_need_only_the_models_their_mode_loads(hosted, monkeypatch, tmp_path):
+    import json
+
+    server, client, _ = hosted
+    monkeypatch.setenv('VISION_BALL_MODEL_PATH', str(tmp_path / 'missing-ball.onnx'))
+    monkeypatch.setenv('VISION_MAX_JOBS_PER_DAY', '0')
+    headers = {'x-pitchlens-owner': 'c' * 32}
+    source = _saved_match(server)
+    status = json.loads((source / 'status.json').read_text())
+    server.write_status(source, {**status, 'status': 'failed', 'ballSearch': 'none'})
+    assert client.post(f"/jobs/{'a' * 32}/retry", headers=headers).status_code == 200
+    server.active = None
+    server.cancellations.clear()
+    server.write_status(source, {**status, 'status': 'completed', 'ballSearch': 'none'})
+    assert client.post(f"/jobs/{'a' * 32}/rerun?mode=section&start=0&requestId={'1' * 32}", headers=headers).status_code == 200
+    server.active = None
+    server.cancellations.clear()
+    server.write_status(source, {**status, 'status': 'failed', 'ballSearch': 'exhaustive'})
+    assert client.post(f"/jobs/{'a' * 32}/retry", headers=headers).status_code == 503
+
+
+def test_deeply_nested_json_is_a_bad_request_not_a_crash(hosted):
+    server, client, _ = hosted
+    job = 'a' * 32
+    _saved_match(server, job=job)
+    payload = '{"a":' + '[' * 50000 + ']' * 50000 + '}'
+    headers = {'x-pitchlens-owner': 'c' * 32, 'content-type': 'application/json'}
+    for path in ('/venues', f'/jobs/{job}/review', f'/jobs/{job}/calibration/preview',
+                 f'/jobs/{job}/calibration', f'/jobs/{job}/ball-labels'):
+        assert client.post(path, content=payload, headers=headers).status_code == 400, path
+
+
+def test_a_large_upload_gets_longer_than_an_hour_but_not_forever(hosted, monkeypatch):
+    server, client, _ = hosted
+    monkeypatch.setattr(server, 'check_space', lambda size: None)
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(server.time, 'monotonic', lambda: clock['now'])
+    content = {'Content-Type': 'video/mp4'}
+
+    def reserve(size):
+        response = client.post(f'/jobs?size={size}', headers=content)
+        assert response.status_code == 200, response.text
+        return response.json()['id']
+
+    def state(job):
+        return client.get(f'/jobs/{job}').json()['status']
+
+    big = reserve(2 * 1024**3)  # 2 GB: about 2.4 h at 2 Mbit/s
+    offset = 0
+    for minute in range(10, 62, 3):  # still sending at 61 minutes
+        clock['now'] = 1000.0 + minute * 60
+        assert client.put(f'/jobs/{big}/video?offset={offset}', content=b'x' * 10).status_code == 200
+        offset += 10
+    assert state(big) == 'uploading' and server.active == big
+    clock['now'] = 1000.0 + 2.4 * 3600 - 60
+    client.put(f'/jobs/{big}/video?offset={offset}', content=b'x' * 10)
+    assert state(big) == 'uploading'
+    clock['now'] = 1000.0 + 2.5 * 3600
+    client.put(f'/jobs/{big}/video?offset={offset + 10}', content=b'x' * 10)
+    assert state(big) == 'failed' and server.active is None
+
+    small = reserve(100 * 1024**2)  # 100 MB keeps the one-hour limit
+    start = clock['now']
+    clock['now'] = start + 59 * 60
+    client.put(f'/jobs/{small}/video?offset=0', content=b'x' * 10)
+    assert state(small) == 'uploading'
+    clock['now'] = start + 60 * 60
+    assert state(small) == 'failed'
+
+    idle = reserve(2 * 1024**3)  # stalled: the idle rule still frees the worker
+    clock['now'] += 299
+    assert state(idle) == 'uploading'
+    clock['now'] += 2
+    assert state(idle) == 'failed' and server.active is None
+
+
+# ── Engine: player load, adaptive search, decoder time, calibration reuse ──
+FIXTURES = __import__("pathlib").Path(__file__).resolve().parent / "fixtures"
+
+
+def _mock_yolo(monkeypatch, names, box=lambda image: [10, 10, 30, 50]):
+    """Mocked ultralytics/torch (as in test_short_diagnostic_...): one box per image."""
+    import sys
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Tensor:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+    class Model:
+        def __init__(self):
+            self.names = names
+
+        def predict(self, images, **options):
+            images = images if isinstance(images, list) else [images]
+            calls.append(options)
+            return [
+                SimpleNamespace(boxes=SimpleNamespace(xyxy=Tensor([box(image)]), conf=Tensor([0.9]), cls=Tensor([0])))
+                for image in images
+            ]
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(set_num_threads=lambda n: None))
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=lambda path: Model(), settings={}))
+    return calls
+
+
+def _green_clip(tmp_path, frames=25, fps=10):
+    import cv2
+
+    video = tmp_path / "fixture.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), fps, (80, 60))
+    for _ in range(frames):
+        writer.write(np.full((60, 80, 3), (40, 150, 40), np.uint8))
+    writer.release()
+    return video
+
+
+def _decoder_times(path, seek=0):
+    """Frame number -> the decoder's own timestamp, counted as the engine counts
+    (seek once to `seek`, then read on)."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(path))
+    out, n = {}, 0
+    if seek:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, seek)
+        n = seek
+    while cap.grab():
+        out[n] = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+        n += 1
+    cap.release()
+    return out
+
+
+def test_player_load_never_needs_or_runs_a_ball_model(tmp_path, monkeypatch):
+    from app.vision import engine
+
+    calls = _mock_yolo(monkeypatch, {0: "person", 32: "sports ball"})
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test")
+    monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, tmp_path / "missing-ball.onnx"))
+
+    def no_ball_model(*args, **kwargs):
+        raise AssertionError("a player-load job must not load the ball model")
+
+    monkeypatch.setattr(engine, "create_ball_detector", no_ball_model)
+    result = engine.run_video(_green_clip(tmp_path), tmp_path / "result.json", max_seconds=1, sample_fps=6, ball_search="none")
+    assert result["ballSearch"] == "none" and result["ballInference"] == "skipped"
+    assert result["ballModel"] is None and result["ballTracking"] == "skipped"
+    assert calls and all(c["classes"] == [0] for c in calls)  # never the player model's ball class
+    assert all(f["ball"] is None for f in result["frames"])
+    assert "playerLoad" in result["metrics"]
+    # Unmeasured, not missing (the report reads the key) and never 0.
+    assert "ballInferenceSeconds" in result["performance"] and result["performance"]["ballInferenceSeconds"] is None
+    m = result["metrics"]
+    assert m["teamSeconds"] is None and m["possessionCoverage"] is None
+    assert m["possessionShare"] == [None, None] and m["possessions"] is None
+
+
+def test_adaptive_search_runs_the_focused_tile_path(tmp_path, monkeypatch):
+    from app.vision import engine
+    from app.vision.ball import TiledBallDetector
+
+    _mock_yolo(monkeypatch, {0: "person"})
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test")
+    monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
+    seen = []
+
+    class Tiles(TiledBallDetector):
+        def __init__(self):
+            self.inference_calls = 0
+
+        def detect(self, frame, threshold=0.05, focus=None):
+            seen.append(focus)
+            return []
+
+        def detect_batch(self, frames, **kwargs):
+            raise AssertionError("adaptive search goes frame by frame")
+
+    monkeypatch.setattr(engine, "create_ball_detector", lambda *args: Tiles())
+    result = engine.run_video(_green_clip(tmp_path), tmp_path / "result.json", max_seconds=1, sample_fps=6, ball_search="adaptive")
+    assert result["ballSearch"] == "adaptive"
+    assert len(seen) == len(result["frames"]) > 0
+    # The ball model ran, so its time is a number and possession was measured.
+    assert isinstance(result["performance"]["ballInferenceSeconds"], (int, float))
+    assert isinstance(result["metrics"]["teamSeconds"], list)
+
+
+def test_frame_times_follow_the_decoder_on_variable_frame_rate_video(tmp_path, monkeypatch):
+    """vfr-30-15.mp4: 2 s at 30 fps then 2 s at 15 fps (OpenCV reports 23.08 fps,
+    so the frame count drifts 0.6 s away from the real time). Made with the
+    imageio-ffmpeg binary in the venv:
+
+    ffmpeg -f lavfi -i "color=c=0x289628:size=160x96:rate=30:duration=4" \\
+      -f lavfi -i "color=c=white:size=10x24:rate=30:duration=4" \\
+      -f lavfi -i "color=c=0xc02020:size=10x24:rate=30:duration=4" \\
+      -filter_complex "[0][1]overlay=x='10+30*t':y=30[a];[a][2]overlay=x='130-25*t':y=52,select='lt(t\\,2)+not(mod(n\\,2))'" \\
+      -fps_mode vfr -c:v libx264 -preset veryslow -crf 30 -pix_fmt yuv420p -g 30 -movflags +faststart vfr-30-15.mp4
+    """
+    from app.vision import engine
+
+    _mock_yolo(monkeypatch, {0: "person"})
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test")
+    monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
+    path = FIXTURES / "vfr-30-15.mp4"
+    pts = _decoder_times(path)
+    for sample_fps in (6, 10):
+        result = engine.run_video(path, tmp_path / "result.json", sample_fps=sample_fps, ball_search="none")
+        frames = result["frames"]
+        assert len(frames) > 10
+        # Half a source-frame interval (30 fps): every overlay and seek lands on its picture.
+        assert all(abs(f["t"] - pts[f["frame"]]) < 0.5 / 30 for f in frames)
+        assert result["analysedStart"] == frames[0]["t"]
+        assert abs(frames[-1]["t"] - pts[frames[-1]["frame"]]) < 0.017 and frames[-1]["t"] > 3.5
+        assert result["analysedDuration"] == pytest.approx(result["video"]["duration"], abs=0.2)
+    # A diagnostic window starts where the seek really landed: the seek to frame
+    # 47 (2 s at the average rate) decodes the picture shown at 1.8 s.
+    result = engine.run_video(path, tmp_path / "result.json", sample_fps=6, start_seconds=2, max_seconds=1, ball_search="none")
+    frames = result["frames"]
+    landed = _decoder_times(path, seek=frames[0]["frame"])
+    assert result["analysedStart"] == frames[0]["t"] == pytest.approx(landed[frames[0]["frame"]], abs=0.001)
+    assert all(abs(f["t"] - landed[f["frame"]]) < 0.5 / 30 for f in frames)
+    assert frames[-1]["t"] < result["analysedStart"] + 1
+
+
+def test_frame_times_are_unchanged_on_trimmed_and_constant_rate_video(tmp_path, monkeypatch):
+    from app.vision import engine
+
+    _mock_yolo(monkeypatch, {0: "person"})
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test")
+    monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
+    monkeypatch.setattr(engine, "field_mask", lambda frame: np.full(frame.shape[:2], 255, np.uint8))
+    for path in (FIXTURES / "trimmed-vfr.mp4", _green_clip(tmp_path, frames=40)):
+        pts = _decoder_times(path)
+        result = engine.run_video(path, tmp_path / "result.json", sample_fps=6, ball_search="none")
+        # These decoder times agree with the frame count, so they were used before as well.
+        assert [f["t"] for f in result["frames"]] == [round(pts[f["frame"]], 3) for f in result["frames"]]
+        assert result["analysedStart"] == 0
+
+
+def test_one_corrupt_timestamp_is_ignored_and_a_real_jump_re_anchors():
+    from app.vision.engine import _frame_time
+
+    fps, stride = 30.0, 5
+
+    def run(positions):
+        state, last, out = {}, -1.0, []
+        for k, position in enumerate(positions):
+            last = _frame_time(position, last, k * stride / fps, fps, stride, state)
+            out.append(round(last, 3))
+        return out
+
+    step = stride / fps
+    clean = [round(k * step, 3) for k in range(6)]
+    assert run(clean) == clean
+    # One corrupt forward jump: that frame falls back to its frame-count time, the rest follow the decoder.
+    corrupt = list(clean)
+    corrupt[3] = 1000.0
+    assert run(corrupt) == clean
+    # A real discontinuity (the stream jumps 30 s ahead and continues): re-anchored on the next reading.
+    jumped = clean[:3] + [30.0 + k * step for k in range(3)]
+    times = run(jumped)
+    assert times[:3] == clean[:3] and times[3] < 30 and times[4:] == [round(30.0 + step, 3), round(30.0 + 2 * step, 3)]
+    # The first frame takes any valid position (a seek may land anywhere).
+    assert run([12.02, 12.19]) == [12.02, 12.19]
+    # Without a usable position, frame-count time (when it moves forward); never backwards.
+    assert run([float("nan"), 0.1, 0.05]) == [0.0, 0.1, round(2 * step, 3)]
+    assert run([0.5, 0.4]) == [0.5, round(0.5 + 1 / fps, 3)]
+
+
+def test_kit_calibration_detections_are_reused_only_for_the_same_picture(tmp_path, monkeypatch):
+    """Seeking to a frame number lands one frame late on trimmed-vfr.mp4 (from
+    frame 56 on); the main pass counts decoded frames. Each detection must come
+    from the picture it is attached to."""
+    import cv2
+
+    from app.vision import engine
+
+    def box(image):
+        # The box encodes the picture: its x is the frame's mean brightness.
+        x = round(float(image.mean()), 1)
+        return [x, 10, x + 20, 60]
+
+    _mock_yolo(monkeypatch, {0: "person"}, box=box)
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test")
+    monkeypatch.setattr(engine, "model_paths", lambda profile: (weights, weights))
+    monkeypatch.setattr(engine, "field_mask", lambda frame: np.full(frame.shape[:2], 255, np.uint8))
+    path = FIXTURES / "trimmed-vfr.mp4"
+    cap = cv2.VideoCapture(str(path))
+    pictures = []
+    while True:
+        ok, image = cap.read()
+        if not ok:
+            break
+        pictures.append(image)
+    cap.release()
+    result = engine.run_video(path, tmp_path / "result.json", sample_fps=6, ball_search="none")
+    checked = 0
+    for f in result["frames"]:
+        for p in f["players"]:
+            assert p["box"][0] == round(float(pictures[f["frame"]].mean()), 1), f["frame"]
+            checked += 1
+    assert checked >= len(result["frames"]) - 2 and any(f["frame"] >= 56 for f in result["frames"])
+
+
+def test_a_second_pitch_check_waits_its_turn(hosted, monkeypatch):
+    import time
+
+    from app.vision import calibrate
+
+    server, client, _ = hosted
+    _saved_match(server)
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_preview(result, body):
+        entered.set()
+        release.wait(10)
+        return {"fit": {"quality": "good"}, "template": None, "lines": []}
+
+    monkeypatch.setattr(calibrate, "preview", slow_preview)
+    headers = {"x-pitchlens-owner": "c" * 32}
+    first = {}
+    worker = threading.Thread(target=lambda: first.setdefault("response", client.post(f"/jobs/{'a' * 32}/calibration/preview", json={}, headers=headers)))
+    worker.start()
+    assert entered.wait(10)
+    second = client.post(f"/jobs/{'a' * 32}/calibration/preview", json={}, headers=headers)
+    assert second.status_code == 429 and "Another pitch check is running" in second.json()["detail"]
+    release.set()
+    worker.join(10)
+    assert first["response"].status_code == 200
+    # Free again afterwards.
+    for _ in range(50):
+        if server.pitch_slot.acquire(blocking=False):
+            server.pitch_slot.release()
+            break
+        time.sleep(0.02)
+    assert client.post(f"/jobs/{'a' * 32}/calibration/preview", json={}, headers=headers).status_code == 200
+
+
+def _court_camera(template, size=(640, 360)):
+    """A fixed camera behind the near touchline, in pitch axes."""
+    import math
+
+    L, W = template["length"], template["width"]
+    position, target = np.array([L / 2, W + 6.0, 7.0]), np.array([L / 2, W * 0.42, 0.0])
+    f = size[0] / 2 / math.tan(math.radians(95.0) / 2)
+    K = np.array([[f, 0, size[0] / 2], [0, f, size[1] / 2], [0, 0, 1]])
+    forward = (target - position) / np.linalg.norm(target - position)
+    right = np.cross(forward, [0, 0, 1.0])
+    right /= np.linalg.norm(right)
+    R = np.vstack([right, np.cross(forward, right), forward])
+    P = K @ np.hstack([R, (-R @ position).reshape(3, 1)])
+    return P[:, [0, 1, 3]] @ np.array([[-1, 0, L], [0, 1, 0], [0, 0, 1.0]])
+
+
+def _venue_match(server, truth, template, venues, owner='a' * 32):
+    """A finished match filmed through `truth`, and the owner's saved venues [(id, template, H, createdAt, extra)]."""
+    import json
+
+    import cv2
+
+    from app.vision import pitch
+
+    size = (640, 360)
+    for vid, venue_template, H, created, extra in venues:
+        (server._venue_dir() / f"{vid}.json").write_text(json.dumps({
+            "id": vid, "name": f"Court {venue_template['length']:.0f}x{venue_template['width']:.0f} {vid[:2]}", "template": venue_template,
+            "size": list(size), "k1": 0.0, "H": np.linalg.inv(H).reshape(-1).tolist(), "static": True, "rms": 0.1,
+            "owner": owner, "createdAt": created, **extra}))
+    frame = np.full((size[1], size[0], 3), (40, 140, 40), np.uint8)
+    cal = {"H": np.linalg.inv(truth).tolist(), "k1": 0.0, "size": list(size)}
+    for line in pitch.line_segments(template, step=0.05):
+        pts = pitch.pitch_to_image(cal, line)
+        for a, b in zip(pts[:-1], pts[1:]):
+            if np.isfinite(a).all() and np.isfinite(b).all():
+                cv2.line(frame, tuple(np.round(a).astype(int)), tuple(np.round(b).astype(int)), (235, 235, 235), 2)
+    job = 'd' * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    writer = cv2.VideoWriter(str(directory / "video.avi"), cv2.VideoWriter_fourcc(*"MJPG"), 3.0, size)
+    frames = []
+    for i in range(60):
+        writer.write(frame)
+        frames.append({"t": round(i / 3, 3), "frame": i, "scene": 0, "ball": None, "camera": None if i == 0 else [1, 0, 0, 0, 1, 0],
+                       "players": [{"id": k, "box": [100 + 90 * k, 200, 110 + 90 * k, 230], "team": k % 2} for k in range(5)]})
+    writer.release()
+    (directory / "video.avi").rename(directory / "video")
+    (directory / "result.json").write_text(json.dumps({"frames": frames, "sampleFps": 3.0, "video": {"width": size[0], "height": size[1], "fps": 3.0}}))
+    server.write_status(directory, {"id": job, "status": "completed", "owner": owner, "createdAt": 0})
+    return directory
+
+
+def test_automatic_venue_setup_picks_the_court_that_fits_best(service, monkeypatch):
+    import json
+
+    from app.vision import pitch
+
+    server, _ = service
+    monkeypatch.setattr(server, "compute_analysis", lambda d: None)
+    five, futsal = pitch.normalise_template("five-a-side"), pitch.normalise_template("futsal")
+    # Two courts at one facility, same video size; the newer venue is the futsal court.
+    venues = [("b" * 32, five, _court_camera(five), 1000.0, {}), ("c" * 32, futsal, _court_camera(futsal), 2000.0, {})]
+    directory = _venue_match(server, _court_camera(five), five, venues)  # filmed on the 36 x 24 court
+    assert server._auto_venue(directory, {"owner": "a" * 32}) == "b" * 32
+    cal = json.loads((directory / "calibration.json").read_text())
+    assert cal["template"]["length"] == 36 and cal["auto"] is True and cal["venue"]["lineScore"] >= 0.9
+
+
+def test_two_venues_that_fit_about_equally_are_left_to_the_reviewer(service, monkeypatch):
+    import json
+
+    from app.vision import pitch
+
+    server, _ = service
+    monkeypatch.setattr(server, "compute_analysis", lambda d: None)
+    five = pitch.normalise_template("five-a-side")
+    camera = _court_camera(five)
+    venues = [("b" * 32, five, camera, 1000.0, {}), ("c" * 32, five, camera, 2000.0, {"selfScore": 1.0})]
+    directory = _venue_match(server, camera, five, venues)
+    assert server._auto_venue(directory, {"owner": "a" * 32}) is None
+    assert not (directory / "calibration.json").exists()
+    job = json.loads((directory / "calibration-job.json").read_text())
+    assert job["state"] == "failed" and "both fit this match" in job["error"]

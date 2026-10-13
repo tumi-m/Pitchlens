@@ -188,7 +188,8 @@ export type TeamStats = {
   passShare?: number | null;
   shots: CountStat | null;
   shotsOnTarget: CountStat | null;
-  goals: { value: number; candidates: number } | null;
+  /** candidates is null when possible goals were not looked for (no pitch setup). */
+  goals: { value: number; candidates: number | null } | null;
   interceptions: CountStat | null;
   tackles: CountStat | null;
   /** Share of both teams' attacking-third control that was this team's. */
@@ -204,6 +205,8 @@ export type AnalysisEvent = {
   confidence: number;
   status: "proposed" | "confirmed" | "rejected";
   outcome?: string;
+  /** "reviewer" when a person set the outcome (not the automatic reading). */
+  outcomeBy?: string;
   onTarget?: boolean;
   x?: number | null;
   y?: number | null;
@@ -250,6 +253,9 @@ export type Analysis = {
       contestedSeconds: number;
       looseSeconds: number;
       unknownSeconds: number;
+      /** Why shots are not measured: no ball in the footage (player-load job), no
+       *  pitch setup, or no attacking direction. null when they are measured. */
+      shotsBasis?: "no-ball" | "no-pitch" | "no-direction" | null;
     };
     momentum: (number | null)[];
     heatmaps: Record<string, number[][] | null> | null;
@@ -380,6 +386,14 @@ export const EVENT_LABELS: Record<string, string> = {
   note: "Note",
 };
 
+/** A goal a person stands behind: their goal, a possible goal they confirmed, or
+ *  a confirmed shot whose goal outcome they set themselves. */
+export function isConfirmedGoal(e: AnalysisEvent): boolean {
+  if (e.status !== "confirmed") return false;
+  if (e.type === "goal" || e.type === "goal-candidate") return true;
+  return e.type === "shot" && (e.outcome === "goal" || e.outcome === "goal-candidate") && e.outcomeBy === "reviewer";
+}
+
 export function describeEvent(e: AnalysisEvent): string {
   const base = EVENT_LABELS[e.type] || e.type;
   if (e.type === "pass") return `${base}${e.outcome === "intercepted" ? " (intercepted)" : ""}${e.length ? ` · ${e.length} m` : ""}`;
@@ -397,6 +411,8 @@ export type BallLabelState = {
     labelled: number;
     visible: number;
     tolerancePixels: number;
+    /** false on a player-load job: the ball model never ran, so its rates are not measured. */
+    measured?: boolean;
     recall: Rate;
     precision: Rate;
     falseDetections: Rate;

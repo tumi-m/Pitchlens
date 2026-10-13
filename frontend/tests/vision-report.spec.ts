@@ -476,8 +476,11 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
   });
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: "Label the ball" }).click();
-  // Training needs labels first.
-  await expect(page.getByRole("button", { name: "Train on my labels" })).toBeDisabled();
+  // The default open site cannot start training (the proxy refuses it): no
+  // button that could only fail, and no operator instructions for the viewer.
+  await expect(page.getByTestId("training-operator")).toHaveText("Training is run by the site operator.");
+  await expect(page.getByRole("button", { name: "Train on my labels" })).toHaveCount(0);
+  await expect(page.getByText(/VISION_ACCESS_CODE/)).toHaveCount(0);
   await expect(page.getByTestId("ball-labeller")).toBeVisible();
   await expect(page.getByText("Frame 1 of 3")).toBeVisible();
   // Focus moves into the labeller, so Enter accepts the guess instead of
@@ -510,12 +513,15 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
 
 test("training on the labels reports old and new ball recall and whether it was switched on", async ({ page }) => {
   await mockReport(page, { calibrated: false });
-  const frames = Array.from({ length: 40 }, (_, i) => ({ index: i, t: i, guess: null }));
-  const labels = Object.fromEntries(frames.map((f) => [String(f.index), { visible: false }]));
+  // A site with an access code whose worker allows training from the site.
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true, analytics: true, accessRequired: true, siteTraining: true } }));
+  let count = 149;
   const empty = { value: null, n: 0, interval95: null };
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) =>
-    r.fulfill({ json: { frames, labels, metrics: { labelled: 40, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: true, size: [640, 360] } }),
-  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) => {
+    const frames = Array.from({ length: 150 }, (_, i) => ({ index: i, t: i, guess: null }));
+    const labels = Object.fromEntries(frames.slice(0, count).map((f) => [String(f.index), { visible: false }]));
+    return r.fulfill({ json: { frames, labels, metrics: { labelled: count, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: true, size: [640, 360] } });
+  });
   await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
   const model = { active: null as string | null, runs: [] as unknown[], training: { state: "idle" } as Record<string, unknown> };
   const started: unknown[] = [];
@@ -529,6 +535,12 @@ test("training on the labels reports old and new ball recall and whether it was 
     return r.fulfill({ json: { started: true } });
   });
   await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  // A run needs about 150 labelled frames (30 visible balls held back); one match is enough.
+  await expect(page.getByRole("button", { name: "Train on my labels" })).toBeDisabled();
+  await expect(page.getByText(/One match is enough/)).toBeVisible();
+  count = 150;
+  await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Label the ball" }).click();
   await page.getByRole("button", { name: "Train on my labels" }).click();
   await expect.poll(() => started.length).toBe(1);
@@ -599,4 +611,493 @@ test("highlights play the goals and shots back to back", async ({ page }) => {
   await bar.getByRole("button", { name: "Stop" }).click();
   await expect(bar.getByRole("button", { name: "Play highlights (1)" })).toBeVisible();
   expect(await page.evaluate(() => document.querySelector("video")!.paused)).toBe(true);
+});
+
+/** Real compute_analysis output for a ball-free (player-load) result: nothing about the ball was measured. */
+function playerLoadAnalysis() {
+  const team = {
+    controlSeconds: 0, possessionSeconds: 0, possession: null, possessions: null, averagePossession: null,
+    passes: null, passesComplete: null, passAccuracy: null, passShare: null, shots: null, shotsOnTarget: null,
+    goals: { value: 0, candidates: null }, interceptions: null, tackles: null, fieldTilt: null,
+  };
+  return {
+    schemaVersion: 1, calibrated: false, template: null, directions: null, events: [], kickoffs: [], enteredScore: null,
+    stats: {
+      teams: [team, { ...team }],
+      coverage: { possessionPercent: 0, possessionShown: false, possessionInterval: null, possessionMissingBounds: null, controlPercent: 0, ballStatePercent: 0, calibratedPercent: 0, inPlaySeconds: 180.2, deadBallSeconds: 0, contestedSeconds: 0, looseSeconds: 0, unknownSeconds: 180.2 },
+      momentum: [null, null, null, null], heatmaps: null, averagePositions: null, shotMap: null, possessionSequences: [],
+      tracks: { fragments: 336, players: 199 },
+    },
+    review: { byType: {}, decisions: 0, confirmed: 0, rejected: 0, pending: 0, pendingKey: 0, pendingByType: {} },
+    positions: null,
+  };
+}
+
+const playerLoad = (metres: (number | null)[]) => ({ metres, maxSpeed: null, steps: 1200, method: "feet-homography", playerHeightM: 1.8, footNoisePx: 3 });
+
+test("a player-load job leads with the distance it measured, not dashes, unmeasured 0% or a review banner", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const base = result();
+  const loadOnly = {
+    ...base,
+    ballSearch: "none",
+    // Player-load results have no ball timing at all.
+    performance: { totalSeconds: 12.5, playerInferenceSeconds: 10.1, device: "cpu" },
+    metrics: { ...base.metrics, ballFrames: 0, playerLoad: playerLoad([4321.9, 3876.2]) },
+    frames: base.frames.map((f) => ({ ...f, ball: null })),
+  };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: playerLoadAnalysis() }));
+  await page.goto(`/vision/${ID}`);
+  const hero = page.getByTestId("report-hero");
+  await expect(hero).toContainText("4321.9");
+  await expect(hero).toContainText("3876.2");
+  await expect(hero).not.toContainText("– : –");
+  await expect(page.locator('[data-stat="Distance"]')).toContainText("4321.9 m");
+  await expect(page.getByText("Assisted review", { exact: true })).toHaveCount(0);
+  // The ball was not tracked: no coverage shown as 0%, no ball-only rows.
+  await expect(page.getByText("Ball not tracked (player-load job)")).toBeVisible();
+  await expect(page.getByText(/Ball position coverage/)).toHaveCount(0);
+  await expect(page.getByText(/Possession followed/)).toHaveCount(0);
+  await expect(page.getByText(/could only be followed for 0%/)).toHaveCount(0);
+  for (const stat of ["Observed control share", "Passes", "Shots", "Interceptions", "Tackles / balls won", "Field tilt"])
+    await expect(page.locator(`[data-stat="${stat}"]`)).toHaveCount(0);
+  await expect(page.getByText(/ball model not run/)).toBeVisible();
+  // Score entry and manual goals still work, and the pitch setup is still offered.
+  await expect(page.getByRole("button", { name: /Enter the score and review/ })).toBeVisible();
+  await expect(page.getByText("Unlock heatmaps and positions")).toBeVisible();
+});
+
+test("a ball job shows the distance too, keeps its coverage chips, and an unmeasured kit reads —", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const withLoad = result() as ReturnType<typeof result> & { metrics: { playerLoad?: unknown } };
+  withLoad.metrics.playerLoad = playerLoad([1234.5, null]);
+  const data = analysis(false);
+  data.stats.coverage.deadBallSeconds = 42;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: withLoad }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const distance = page.locator('[data-stat="Distance"]');
+  await expect(distance).toContainText("1234.5 m");
+  await expect(distance).toContainText("—");
+  await expect(distance).not.toContainText("0.0");
+  await expect(page.getByText("Ball position coverage 95%")).toBeVisible();
+  await expect(page.getByText("Possession followed at least 100% of play")).toBeVisible();
+  await expect(page.getByText("Assisted review", { exact: true })).toBeVisible();
+  // Stoppage detection finds only a sliver of real stoppages: not shown as a figure.
+  await expect(page.getByText(/Ball out of play/)).toHaveCount(0);
+});
+
+test("the score says which possible goals are still to check instead of a hard 0", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  let reviewed = false;
+  const scored = () => {
+    const data = analysis(true);
+    data.events = [
+      { id: "g0", type: "goal-candidate", t: 1, team: 0, confidence: 0.4, status: "confirmed" },
+      { id: "g1", type: "goal-candidate", t: 2, team: 1, confidence: 0.4, status: reviewed ? "rejected" : "proposed" },
+      { id: "g2", type: "goal-candidate", t: 3.5, team: 1, confidence: 0.4, status: reviewed ? "rejected" : "proposed" },
+    ] as never;
+    data.stats.teams[0].goals = { value: 1, candidates: 1 };
+    data.stats.teams[1].goals = { value: 0, candidates: reviewed ? 0 : 2 };
+    return data;
+  };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: scored() }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByTestId("report-hero")).toHaveText(/1\s*–\s*0/);
+  await expect(page.getByText("1 confirmed · 2 possible goals still to check")).toBeVisible();
+  await expect(page.getByText("Goals confirmed by review")).toHaveCount(0);
+  // Team 0's candidate is confirmed (none left to check); team 1 still has two.
+  await expect(page.locator('[data-stat="Possible goals"]')).toHaveText(/^0\s*1 confirmed\s*Possible goals\s*2$/, { useInnerText: true });
+  reviewed = true;
+  await page.reload();
+  await expect(page.getByText("Goals confirmed by review")).toBeVisible();
+  await expect(page.getByText(/still to check/)).toHaveCount(0);
+});
+
+test("a highlight is named by its most important moment: a confirmed possible goal beats its shot", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.events = [
+    { id: "s1", type: "shot", t: 2, team: 0, confidence: 0.6, status: "proposed", outcome: "goal-candidate", x: 39, y: 10 },
+    { id: "g1", type: "goal-candidate", t: 2, team: 0, confidence: 0.45, status: "confirmed" },
+  ] as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await bar.getByRole("button", { name: "Play highlights (1)" }).click();
+  await expect(bar).toContainText("Highlight 1 of 1 · 0:02 · Goal");
+  await expect(bar).not.toContainText("(to review)");
+  await expect(bar).not.toContainText("Shot");
+});
+
+test("a reviewer's goal after an automatic shot is one highlight, labelled and timed as the goal", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.events = [
+    { id: "s1", type: "shot", t: 1, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 35, y: 10 },
+    { id: "added-1", type: "goal", t: 3, team: 0, confidence: 1, status: "confirmed", source: "manual" },
+  ] as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await bar.getByRole("button", { name: "Play highlights (1)" }).click();
+  await expect(bar).toContainText("0:03 · Goal");
+  await expect(bar).not.toContainText("(to review)");
+  // From before the shot to after the goal.
+  await expect(bar).toHaveAttribute("data-clip", "0.0-5.0");
+});
+
+test("a run of close shots is one highlight that plays through every shot", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.events = [0.5, 3, 5.5, 8].map((t, i) => ({ id: `s${i}`, type: "shot", t, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 35, y: 10 })) as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await bar.getByRole("button", { name: "Play highlights (1)" }).click();
+  await expect(bar).toHaveAttribute("data-clip", "0.0-10.0");
+  // The old clip stopped 2 s after the first shot; this one keeps playing.
+  await expect.poll(() => page.evaluate(() => document.querySelector("video")!.currentTime), { timeout: 10_000 }).toBeGreaterThan(3);
+});
+
+test("a review clip ending never hands the video back to the highlight reel", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.events = [
+    { id: "ev-0", type: "shot", t: 0.6, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 30, y: 10 },
+    { id: "ev-1", type: "shot", t: 3.9, team: 1, confidence: 0.6, status: "proposed", outcome: "off-target", x: 30, y: 10 },
+  ] as never;
+  data.review.pending = 2;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await expect(bar).toBeVisible();
+  await page.waitForFunction(() => (document.querySelector("video")?.readyState ?? 0) >= 1);
+  await bar.getByRole("button", { name: "Play highlights (2)" }).click();
+  await expect(bar).toContainText("Highlight 1 of 2");
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await expect(page.getByRole("heading", { name: "Review moments" })).toBeVisible();
+  // The review clip for the 0.6 s shot runs to 3.1 s and stops there.
+  const samples: { t: number; bar: string }[] = [];
+  for (let i = 0; i < 14; i++) {
+    await page.waitForTimeout(350);
+    samples.push({ t: await page.evaluate(() => document.querySelector("video")!.currentTime), bar: await bar.innerText() });
+  }
+  expect(samples.some((s) => s.bar.includes("Highlight 2 of 2"))).toBe(false);
+  const late = samples.findIndex((s) => s.t > 2.9);
+  expect(late).toBeGreaterThanOrEqual(0);
+  for (const s of samples.slice(late)) expect(s.t).toBeGreaterThan(2.9);
+});
+
+test("a seek made before the video has loaded is kept when it loads", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video`), async (r) => {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await r.fulfill({ status: 200, body: VIDEO, headers: { "content-type": "video/mp4", "accept-ranges": "bytes" } }).catch(() => {});
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole("heading", { name: "Match timeline" })).toBeVisible();
+  expect(await page.evaluate(() => document.querySelector("video")!.readyState)).toBe(0);
+  await page.getByRole("button", { name: "Seek to 0:03" }).first().click();
+  await page.waitForFunction(() => document.querySelector("video")!.readyState >= 1, null, { timeout: 15_000 });
+  await page.waitForTimeout(600);
+  expect(await page.evaluate(() => document.querySelector("video")!.currentTime)).toBeCloseTo(3, 1);
+  await expect(page.getByText(/visible\s+tracks/)).toContainText("0:03 ·");
+});
+
+test("the labeller keeps polling through a worker restart, and stops on a refusal", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const empty = { value: null, n: 0, interval95: null };
+  const state = (ready: boolean) => ({ frames: [{ index: 3, t: 0.6, guess: null }], labels: {}, metrics: { labelled: 0, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: ready, size: [640, 360] });
+  let calls = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) => {
+    calls++;
+    if (calls === 2) return r.fulfill({ status: 503, json: { detail: "Cannot reach the vision server. It may be starting up; retry in a minute.", available: false } });
+    return r.fulfill({ json: state(calls > 2) });
+  });
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: { active: null, runs: [], training: { state: "idle" } } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  await expect(page.getByTestId("ball-frames-preparing")).toBeVisible();
+  await expect(page.getByText(/Cannot reach the vision server/)).toBeVisible({ timeout: 8000 });
+  await expect(page.getByText("Frame 1 of 1")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/Cannot reach the vision server/)).toHaveCount(0);
+
+  // A 404 is final: shown, and not asked again.
+  let refused = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) => {
+    refused++;
+    return r.fulfill({ status: 404, json: { detail: "Job not found" } });
+  });
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  await expect(page.getByText("Job not found")).toBeVisible();
+  await page.waitForTimeout(4000);
+  expect(refused).toBe(1);
+});
+
+test("after a reload a running pitch setup shows its progress, blocks a second one and refreshes the report", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: false });
+  await page.route("**/api/vision/venues", (r) =>
+    r.fulfill({ json: [{ id: "e".repeat(32), name: "Tekkerz Court 2", template: analysis(true).template, size: [640, 360], static: true, createdAt: 0 }] }),
+  );
+  let reads = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration(\\?.*)?$`), (r) => {
+    reads++;
+    if (reads >= 3) {
+      state.calibrated = true;
+      return r.fulfill({ json: { state: "ready", template: analysis(true).template, k1: 0, size: [640, 360], coverage: 100, static: true, frames: Array(20).fill({ H: [1 / 15, 0, -20 / 15, 0, 1 / 15, -20 / 15, 0, 0, 1], d: 0 }), job: { state: "done", progress: 100 } } });
+    }
+    // Applied by hand before the reload (not an automatic venue setup).
+    return r.fulfill({ json: { state: "none", job: { state: "processing", progress: reads === 1 ? 12 : 58 } } });
+  });
+  await page.goto(`/vision/${ID}`);
+  const panel = page.getByRole("region", { name: "Pitch setup" });
+  await expect(panel.getByTestId("calibration-running")).toContainText("12%");
+  await expect(panel.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
+  await expect(panel.getByRole("button", { name: /Set up the pitch/ })).toBeDisabled();
+  await expect(panel.getByTestId("calibration-running")).toContainText("58%", { timeout: 10_000 });
+  await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible({ timeout: 20_000 });
+  await expect(panel.getByTestId("calibration-running")).toHaveCount(0);
+});
+
+test("one failed status check does not abandon a pitch setup that is still running", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: false });
+  let posted = false;
+  let polls = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration(\\?.*)?$`), (r) => {
+    if (r.request().method() === "POST") {
+      posted = true;
+      return r.fulfill({ json: { state: "processing", fit: { quality: "good" } } });
+    }
+    if (!posted) return r.fulfill({ json: { state: "none" } });
+    polls++;
+    if (polls === 1) return r.fulfill({ json: { state: "none", job: { state: "processing", progress: 40 } } });
+    if (polls === 2) return r.fulfill({ status: 503, json: { detail: "Cannot reach the vision server. It may be starting up; retry in a minute." } });
+    state.calibrated = true;
+    return r.fulfill({ json: { state: "ready", template: analysis(true).template, k1: 0, size: [640, 360], coverage: 100, static: true, frames: Array(20).fill({ H: [1 / 15, 0, -20 / 15, 0, 1 / 15, -20 / 15, 0, 0, 1], d: 0 }), job: { state: "done", progress: 100 } } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Set up the pitch" }).first().click();
+  const overlay = page.getByTestId("calibration-overlay");
+  await expect(overlay).toBeVisible();
+  for (const [x, y] of [[20, 20], [620, 20], [620, 320], [20, 320]]) {
+    const box = (await overlay.boundingBox())!;
+    await overlay.click({ position: { x: (x / 640) * box.width, y: (y / 360) * box.height } });
+  }
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await page.getByRole("button", { name: "Apply to the whole match" }).click();
+  await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible({ timeout: 20_000 });
+  expect(polls).toBeGreaterThanOrEqual(3);
+  await expect(page.getByText(/Cannot reach the vision server/)).toHaveCount(0);
+});
+
+test("changing the pitch type drops clicks the new pitch has no landmark for", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const previews: { points: { name: string }[] }[] = [];
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration/preview$`), (r) => {
+    previews.push(r.request().postDataJSON());
+    return r.fulfill({ json: { template: analysis(true).template, lines: [], fit: { H: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], k1: 0, size: [640, 360], rms: 0.2, rmsPixels: 1.1, quality: "good", warnings: [], fieldOfView: null, cameraHeight: null, lineResiduals: [], residuals: [] } } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Set up the pitch" }).first().click();
+  const overlay = page.getByTestId("calibration-overlay");
+  await expect(overlay).toBeVisible();
+  const clickAt = async (x: number, y: number) => {
+    const box = (await overlay.boundingBox())!;
+    await overlay.click({ position: { x: (x / 640) * box.width, y: (y / 360) * box.height } });
+  };
+  await page.getByLabel("Pitch type").selectOption("eleven-a-side");
+  await page.getByLabel("Landmark to place").selectOption("left-area-far");
+  await clickAt(200, 100);
+  await expect(page.getByText("1 landmark ·")).toBeVisible();
+  await page.getByLabel("Pitch type").selectOption("futsal");
+  await expect(page.getByText("1 point was removed", { exact: false })).toBeVisible();
+  await expect(page.getByText("0 landmarks ·")).toBeVisible();
+  for (const [x, y] of [[20, 20], [620, 20], [620, 320], [20, 320]]) await clickAt(x, y);
+  await expect(page.getByText("4 landmarks ·")).toBeVisible();
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await expect.poll(() => previews.length).toBe(1);
+  expect(previews[0].points.map((p) => p.name)).toEqual(["corner-far-left", "corner-far-right", "corner-near-right", "corner-near-left"]);
+  await expect(page.getByText(/Unknown landmark/)).toHaveCount(0);
+});
+
+test("the dashboard stops asking for its list after a refusal, but keeps checking through a worker restart", async ({ page }) => {
+  await page.clock.install();
+  let status = 401;
+  let reads = 0;
+  await page.route("**/api/vision/jobs", (r) => {
+    reads++;
+    return status === 401
+      ? r.fulfill({ status, json: { detail: "Open this match in the browser that uploaded it.", code: "ownership" } })
+      : r.fulfill({ status, json: { detail: "Cannot reach the vision server. It may be starting up; retry in a minute." } });
+  });
+  await page.goto("/dashboard");
+  await expect.poll(() => reads).toBe(1);
+  await page.clock.runFor(65_000);
+  await page.waitForTimeout(500);
+  expect(reads).toBe(1);
+  // A worker that is restarting (5xx) is checked again, every 30 s.
+  status = 503;
+  await page.reload();
+  await expect.poll(() => reads).toBe(2);
+  await page.clock.runFor(31_000);
+  await expect.poll(() => reads).toBe(3);
+});
+
+test("dragging the video's own scrubber stops the highlight reel", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.events = [
+    { id: "ev-0", type: "shot", t: 0.6, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 30, y: 10 },
+    { id: "ev-1", type: "shot", t: 3.9, team: 1, confidence: 0.6, status: "proposed", outcome: "off-target", x: 30, y: 10 },
+  ] as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const bar = page.getByTestId("highlights");
+  await expect(bar).toBeVisible();
+  await page.waitForFunction(() => (document.querySelector("video")?.readyState ?? 0) >= 1);
+  await bar.getByRole("button", { name: "Play highlights (2)" }).click();
+  await expect(bar).toContainText("Highlight 1 of 2");
+  // A seek the page did not make (the native controls) hands the video back to the viewer.
+  await page.evaluate(() => { document.querySelector("video")!.currentTime = 3.5; });
+  await expect(bar.getByRole("button", { name: "Play highlights (2)" })).toBeVisible();
+  await page.waitForTimeout(1500);
+  await expect(bar).not.toContainText("Highlight 2 of 2");
+});
+
+/** The performance block a real player-load run writes (engine 2.7 adds ballInferenceSeconds: null). */
+const playerLoadTimings = {
+  playerInferenceSeconds: 41.2, playerInferenceCalls: 68, setupSeconds: 3.1, decodeSeconds: 6.4, cameraMotionSeconds: 2.2,
+  ballRecoverySeconds: 0, totalSeconds: 58.9, device: "cpu", batchSize: 8, analysedFrames: 540,
+};
+
+for (const [name, timings] of [
+  ["without a ball time (results from before the fix)", playerLoadTimings],
+  ["with a null ball time", { ...playerLoadTimings, ballInferenceSeconds: null }],
+] as const) {
+  test(`a player-load report renders ${name}, instead of crashing the page`, async ({ page }) => {
+    const errors: Error[] = [];
+    page.on("pageerror", (e) => errors.push(e));
+    await mockReport(page, { calibrated: false });
+    const base = result();
+    const loadOnly = {
+      ...base,
+      ballSearch: "none",
+      ballInference: "skipped",
+      performance: timings,
+      metrics: { ...base.metrics, ballFrames: 0, teamSeconds: null, possessionCoverage: null, possessionShare: [null, null], possessions: null, playerLoad: playerLoad([98.2, 84.6]) },
+      frames: base.frames.map((f) => ({ ...f, ball: null })),
+    };
+    await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
+    await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: playerLoadAnalysis() }));
+    await page.goto(`/vision/${ID}`);
+    await expect(page.getByTestId("report-hero")).toContainText("98.2");
+    const times = page.getByTestId("processing-times");
+    await expect(times).toHaveText("Processing took 58.9s on cpu · players 41.2s · ball model not run.");
+    await expect(page.getByText("Application error")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+}
+
+test("a shot read as a possible goal says confirming it is not a goal, and Goal sends a goal outcome", async ({ page }) => {
+  const state = await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.events = [
+    { id: "s1", type: "shot", t: 2, team: 0, confidence: 0.6, status: "proposed", outcome: "goal-candidate", onTarget: true, x: 35, y: 10 },
+    { id: "g1", type: "goal-candidate", t: 2, team: 0, confidence: 0.45, status: "proposed", x: 35, y: 10 },
+  ] as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Start reviewing" }).click();
+  await expect(page.getByRole("heading", { name: "Review moments" })).toBeVisible();
+  // Possible goals come first; the shot is next.
+  await expect(page.getByTestId("shot-goal-note")).toHaveCount(0);
+  await page.getByRole("button", { name: "Next moment" }).click();
+  await expect(page.getByTestId("shot-goal-note")).toHaveText("Looks like a goal: confirm the Possible goal or choose Goal below to count it.");
+  const outcome = page.getByLabel("Shot outcome");
+  // The automatic reading is shown but cannot be chosen.
+  await expect(outcome).toHaveValue("goal-candidate");
+  await expect(outcome.locator('option[value="goal-candidate"]')).toHaveAttribute("disabled", "");
+  await outcome.selectOption("goal");
+  await expect.poll(() => state.reviews.length).toBe(1);
+  expect((state.reviews[0] as { decisions: unknown[] }).decisions[0]).toEqual({
+    action: "outcome",
+    eventId: "s1",
+    event: { type: "shot", t: 2, team: 0, outcome: "goal-candidate" },
+    value: "goal",
+  });
+});
+
+test("the labeller shows no ball accuracy for a job that never ran the ball model", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const unmeasured = { value: null, n: 0, interval95: null };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) =>
+    r.fulfill({ json: {
+      frames: [{ index: 2, t: 0.4, guess: null }, { index: 9, t: 1.8, guess: null }],
+      labels: { "2": { visible: true, x: 100, y: 100 } },
+      metrics: { labelled: 1, visible: 1, tolerancePixels: 3, measured: false, recall: unmeasured, precision: unmeasured, falseDetections: unmeasured, inferredAccuracy: unmeasured, medianHitErrorPixels: null },
+      videoAvailable: true, framesReady: true, size: [640, 360],
+    } }),
+  );
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: { active: null, runs: [], training: { state: "idle" } } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  const labeller = page.getByTestId("ball-labeller");
+  await expect(page.getByTestId("ball-recall")).toHaveText("—");
+  await expect(page.getByTestId("ball-precision")).toHaveText("—");
+  await expect(page.getByTestId("ball-not-run")).toHaveText("The ball model was not run on this job; your labels still train the ball finder.");
+  await expect(labeller).toContainText("ball not searched in this job");
+  await expect(labeller).not.toContainText("0%");
+  await expect(labeller).not.toContainText("Pitchlens found no ball");
+});
+
+test("the classic report shows a measured kit's distance and — for an unmeasured one, without crashing", async ({ page }) => {
+  const errors: Error[] = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await mockReport(page, { calibrated: false });
+  // Analytics unavailable (an older worker): the classic match centre is shown.
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ status: 404, json: { detail: "Not found" } }));
+  const base = result();
+  const loadOnly = {
+    ...base,
+    ballSearch: "none",
+    metrics: { ...base.metrics, ballFrames: 0, teamSeconds: null, possessionCoverage: null, possessionShare: [null, null], possessions: null, playerLoad: playerLoad([119.7, null]) },
+    frames: base.frames.map((f) => ({ ...f, ball: null })),
+  };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("119.7 m")).toBeVisible();
+  const hero = page.getByTestId("centre-distance");
+  await hero.scrollIntoViewIfNeeded(); // the figure counts up once it is on screen
+  await expect(hero).toContainText("119.7");
+  await expect(hero).toContainText("—");
+  await expect(hero).not.toContainText("0.0");
+  await expect(page.getByText("Application error")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a set-up pitch on a player-load job says shots were not looked for, not 'no shots'", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const base = result();
+  const loadOnly = { ...base, ballSearch: "none", metrics: { ...base.metrics, ballFrames: 0, playerLoad: playerLoad([98.2, 84.6]) }, frames: base.frames.map((f) => ({ ...f, ball: null })) };
+  const pl = playerLoadAnalysis();
+  const calibrated = analysis(true);
+  const data = {
+    ...pl,
+    calibrated: true,
+    template: calibrated.template,
+    directions: calibrated.directions,
+    positions: calibrated.positions,
+    stats: { ...pl.stats, shotMap: [], heatmaps: calibrated.stats.heatmaps, coverage: { ...pl.stats.coverage, calibratedPercent: 100, shotsBasis: "no-ball" } },
+  };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible();
+  await expect(page.getByTestId("shot-map-empty")).toHaveText("Shots are not looked for in a player-load job; add any you saw in the review.");
+  await expect(page.getByText("No shots detected", { exact: false })).toHaveCount(0);
 });

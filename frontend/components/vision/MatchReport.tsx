@@ -2,10 +2,12 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { Info, Target, Crosshair } from "lucide-react";
-import type { Analysis, CountStat, TeamStats } from "@/lib/review/analysis";
-import { describeEvent } from "@/lib/review/analysis";
+import type { Analysis, AnalysisEvent, CountStat, TeamStats } from "@/lib/review/analysis";
+import { describeEvent, isConfirmedGoal } from "@/lib/review/analysis";
 import { clockTime } from "@/lib/review/vision";
+import type { VisionResult } from "@/lib/review/vision";
 import { AveragePositions, Heatmap, ShotMap } from "@/components/vision/PitchGraphics";
+import { DISTANCE_HINT } from "@/components/vision/MatchCentre";
 
 const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p-5";
 
@@ -23,6 +25,12 @@ function count(c: CountStat | null | undefined): Value {
   }
   const need = Math.max(0, MIN_CHECKED - (c.checked ?? 0));
   return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review${need ? ` · ${need} more checks to estimate` : ""}` };
+}
+
+/** Possible goals still to check; null when they were not looked for (no pitch setup). */
+function possibleGoals(team: TeamStats, open: number): Value {
+  if (!team.goals || team.goals.candidates === null || team.goals.candidates === undefined) return { value: null };
+  return { value: open, note: team.goals.value ? `${team.goals.value} confirmed` : undefined };
 }
 
 function Row({
@@ -83,6 +91,32 @@ function Row({
   );
 }
 
+/** Why shots were not counted (stats.coverage.shotsBasis), in words; null when they were. */
+function shotsMissing(basis: Analysis["stats"]["coverage"]["shotsBasis"], ballTracked: boolean): string | null {
+  if (basis === "no-ball")
+    return ballTracked
+      ? "The ball was not found in this footage, so shots were not looked for; add any you saw in the review."
+      : "Shots are not looked for in a player-load job; add any you saw in the review.";
+  if (basis === "no-direction") return "Shots need to know which way each team attacks. Set the direction in the review, or add shots you saw.";
+  if (basis === "no-pitch") return "Set up the pitch to find shots, or add shots you saw in the review.";
+  return null;
+}
+
+/** Possible goals per team still waiting for a decision (one already confirmed
+ *  within 3 s for the same team is the same goal). */
+function pendingGoals(events: AnalysisEvent[]): [number, number] {
+  const confirmed = events.filter(isConfirmedGoal);
+  const open = (team: number) =>
+    events.filter(
+      (e) =>
+        e.type === "goal-candidate" &&
+        e.status === "proposed" &&
+        e.team === team &&
+        !confirmed.some((g) => g.team === team && Math.abs(g.t - e.t) <= 3),
+    ).length;
+  return [open(0), open(1)];
+}
+
 function Group({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
@@ -101,6 +135,8 @@ export function MatchReport({
   onSeek,
   onCalibrate,
   onReview,
+  playerLoad,
+  ballTracked = true,
 }: {
   analysis: Analysis;
   names: string[];
@@ -110,26 +146,46 @@ export function MatchReport({
   onSeek: (t: number) => void;
   onCalibrate: () => void;
   onReview: () => void;
+  /** Metres per kit, measured for every job (with or without the ball model). */
+  playerLoad?: VisionResult["metrics"]["playerLoad"];
+  /** False for a player-load job: the ball model was not run, so nothing about the ball was measured. */
+  ballTracked?: boolean;
 }) {
   const [heatTeam, setHeatTeam] = useState<0 | 1>(0);
   const [A, B] = analysis.stats.teams as [TeamStats, TeamStats];
   const cov = analysis.stats.coverage;
   // Reviewer-confirmed goals count with or without a pitch setup.
   const goalsKnown = A.goals !== null && B.goals !== null;
-  const candidates = (A.goals?.candidates ?? 0) + (B.goals?.candidates ?? 0);
   const reviewedGoals = (A.goals?.value ?? 0) + (B.goals?.value ?? 0);
+  // A team's 0 is only a measured 0 once its possible goals have been checked.
+  const pending = pendingGoals(analysis.events);
+  const pendingTotal = pending[0] + pending[1];
+  const metres = playerLoad?.metres;
+  const metre = (v: number | null | undefined) => (typeof v === "number" ? v.toFixed(1) : "—");
   const possessionShown = cov.possessionShown;
   const range = cov.possessionMissingBounds;
   const pct = (v: number) => `${Math.round(v)}%`;
   const events = analysis.events.filter((e) => e.status !== "rejected" && ["shot", "goal", "goal-candidate", "interception", "tackle", "pass"].includes(e.type));
   const keyEvents = events.filter((e) => e.type !== "pass");
+  const scoreShown = !!analysis.enteredScore || (goalsKnown && reviewedGoals > 0);
+  // Older analyses have no shotsBasis: unmeasured shots there meant no direction.
+  const shotsNote =
+    cov.shotsBasis !== undefined
+      ? shotsMissing(cov.shotsBasis, ballTracked)
+      : A.shots === null
+        ? shotsMissing(analysis.calibrated ? "no-direction" : "no-pitch", ballTracked)
+        : null;
+  // Player-load job without a score: what was measured (distance) leads instead of "– : –".
+  const distanceHero = !ballTracked && !scoreShown && !!metres;
   return (
     <div className="space-y-6">
-      <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
-        <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check about ten random
-        passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
-        detections you checked were right. Moments the system never found are not included; add them in the review.
-      </section>
+      {ballTracked && (
+        <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
+          <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check about ten random
+          passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
+          detections you checked were right. Moments the system never found are not included; add them in the review.
+        </section>
+      )}
       <motion.section
         initial={{ opacity: 0, y: 14 }}
         animate={{ opacity: 1, y: 0 }}
@@ -142,8 +198,8 @@ export function MatchReport({
             <span className="font-bold text-lg text-center break-words">{names[0]}</span>
           </div>
           <div className="flex flex-col items-center gap-2 text-center">
-            <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">Score</span>
-            <div className="text-5xl font-black tabular-nums">
+            <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">{distanceHero ? "Distance" : "Score"}</span>
+            <div className={`${distanceHero ? "text-4xl sm:text-5xl" : "text-5xl"} font-black tabular-nums`} data-testid="report-hero">
               {analysis.enteredScore ? (
                 <>
                   <span style={{ color: colours[0] }}>{analysis.enteredScore[0]}</span>
@@ -156,6 +212,12 @@ export function MatchReport({
                   <span className="text-pitch-muted text-3xl mx-2">–</span>
                   <span style={{ color: colours[1] }}>{B.goals?.value}</span>
                 </>
+              ) : distanceHero ? (
+                <>
+                  <span style={{ color: colours[0] }}>{metre(metres?.[0])}</span>
+                  <span className="text-pitch-muted text-3xl mx-2">–</span>
+                  <span style={{ color: colours[1] }}>{metre(metres?.[1])}</span>
+                </>
               ) : (
                 <span className="text-pitch-muted text-3xl">– : –</span>
               )}
@@ -164,12 +226,18 @@ export function MatchReport({
               {analysis.enteredScore
                 ? `Score entered by you · ${reviewedGoals} of ${analysis.enteredScore[0] + analysis.enteredScore[1]} goals located in the video`
                 : reviewedGoals > 0
-                ? "Goals confirmed by review"
-                : !analysis.calibrated
-                  ? "Enter the score, or set up the pitch to find shots and possible goals"
-                  : candidates
-                    ? `${candidates} possible goal${candidates === 1 ? "" : "s"} to confirm`
-                    : "No goal confirmed yet. Add goals you saw in the review."}
+                ? pendingTotal
+                  ? `${reviewedGoals} confirmed · ${pendingTotal} possible goal${pendingTotal === 1 ? "" : "s"} still to check`
+                  : "Goals confirmed by review"
+                : distanceHero
+                  ? "metres, camera pan removed · not named players · enter the score in the review"
+                  : !ballTracked
+                    ? "The ball was not tracked: enter the score in the review"
+                    : !analysis.calibrated
+                      ? "Enter the score, or set up the pitch to find shots and possible goals"
+                      : pendingTotal
+                        ? `${pendingTotal} possible goal${pendingTotal === 1 ? "" : "s"} to confirm`
+                        : "No goal confirmed yet. Add goals you saw in the review."}
             </span>
             <button className="text-xs underline text-pitch-green" onClick={onReview}>
               {analysis.enteredScore ? "Review" : "Enter the score and review"}
@@ -197,9 +265,18 @@ export function MatchReport({
           </div>
         </div>
         <p className="relative border-t border-white/10 px-5 py-2.5 text-xs text-pitch-muted flex flex-wrap gap-x-4 gap-y-1 justify-center">
-          <span title="Retained detector and inferred positions; this is coverage, not verified accuracy.">Ball position coverage {cov.ballStatePercent}%</span>
-          <span>Possession followed {cov.possessionPercent}% of play</span>
-          {cov.deadBallSeconds > 0 && <span>Ball out of play {clockTime(cov.deadBallSeconds)}</span>}
+          {/* Stoppage time is not shown: against labelled matches the detector found
+              only a few percent of real stoppages, and most of what it flagged was live play. */}
+          {ballTracked ? (
+            <>
+              <span title="Retained detector and inferred positions; this is coverage, not verified accuracy.">Ball position coverage {cov.ballStatePercent}%</span>
+              <span title="Breaks in play are only partly detected, so the true share of live play followed can be higher.">
+                Possession followed at least {cov.possessionPercent}% of play
+              </span>
+            </>
+          ) : (
+            <span>Ball not tracked (player-load job)</span>
+          )}
           {cov.calibratedPercent > 0 ? (
             <span>Pitch mapped {cov.calibratedPercent}%</span>
           ) : (
@@ -214,7 +291,7 @@ export function MatchReport({
       {!analysis.calibrated && (
         <section className="rounded-2xl border border-pitch-green/40 bg-pitch-green/5 p-5 flex flex-wrap gap-4 items-center justify-between">
           <div>
-            <p className="font-semibold">Unlock shots, heatmaps and positions</p>
+            <p className="font-semibold">{ballTracked ? "Unlock shots, heatmaps and positions" : "Unlock heatmaps and positions"}</p>
             <p className="text-sm text-pitch-muted">Click a few landmarks on one frame so Pitchlens knows where the pitch is. It takes about two minutes.</p>
           </div>
           <button className="pitch-button-primary" onClick={onCalibrate}>
@@ -236,6 +313,20 @@ export function MatchReport({
               <span className="w-2.5 h-2.5 rounded-full" style={{ background: colours[1] }} />
             </span>
           </div>
+          {playerLoad && (
+            <Group title="Running">
+              <Row
+                label="Distance"
+                a={{ value: metres?.[0] ?? null }}
+                b={{ value: metres?.[1] ?? null }}
+                colours={colours}
+                format={(v) => `${v.toFixed(1)} m`}
+                hint={DISTANCE_HINT}
+              />
+            </Group>
+          )}
+          {ballTracked ? (
+          <>
           <Group title="Possession">
             <Row
               label="Observed control share"
@@ -286,6 +377,11 @@ export function MatchReport({
               </p>
             )}
             <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up." />
+            {shotsNote && (
+              <p className="text-[11px] text-pitch-muted pb-1" data-testid="shots-note">
+                {shotsNote}
+              </p>
+            )}
             <Row
               label="Shots on target"
               a={count(A.shotsOnTarget)}
@@ -295,16 +391,22 @@ export function MatchReport({
             />
             <Row
               label="Possible goals"
-              a={{ value: A.goals ? A.goals.candidates : null }}
-              b={{ value: B.goals ? B.goals.candidates : null }}
+              a={possibleGoals(A, pending[0])}
+              b={possibleGoals(B, pending[1])}
               colours={colours}
-              hint="The ball appeared to cross the goal line between the posts. A person must confirm each goal."
+              hint="Still to check: the ball appeared to cross the goal line between the posts. A person must confirm each goal."
             />
           </Group>
           <Group title="Defending">
             <Row label="Interceptions" a={count(A.interceptions)} b={count(B.interceptions)} colours={colours} />
             <Row label="Tackles / balls won" a={count(A.tackles)} b={count(B.tackles)} colours={colours} />
           </Group>
+          </>
+          ) : (
+            <p className="text-sm text-pitch-muted pt-3">
+              Possession, passes, shots, interceptions and tackles need the ball model, which this job did not run.
+            </p>
+          )}
           <p className="text-xs text-pitch-muted mt-4">
             — means not measured or nothing confirmed yet, not zero. ≈ marks an estimate from the moments you checked:
             confirmed events plus unchecked detections at the rate you found them right, with a 95% range. Moments the
@@ -325,15 +427,21 @@ export function MatchReport({
               </div>
               {analysis.stats.shotMap?.length ? (
                 <ShotMap analysis={analysis} colours={colours} names={names} onSeek={onSeek} />
-              ) : A.shots === null ? (
-                <p className="text-sm text-pitch-muted py-6 text-center">
-                  Shots need to know which way each team attacks. Set the direction in the review, or add shots you saw.
+              ) : shotsNote ? (
+                <p className="text-sm text-pitch-muted py-6 text-center" data-testid="shot-map-empty">
+                  {shotsNote}
+                </p>
+              ) : (A.shots?.value ?? 0) + (B.shots?.value ?? 0) > 0 ? (
+                <p className="text-sm text-pitch-muted py-6 text-center" data-testid="shot-map-empty">
+                  The shots counted here have no position on the pitch to draw.
                 </p>
               ) : (
-                <p className="text-sm text-pitch-muted py-6 text-center">No shots detected. Add any you saw in the review.</p>
+                <p className="text-sm text-pitch-muted py-6 text-center" data-testid="shot-map-empty">No shots detected. Add any you saw in the review.</p>
               )}
             </section>
           )}
+          {/* Momentum is built from ball control: nothing to draw without the ball model. */}
+          {ballTracked && (
           <section className={card}>
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Attack momentum</h2>
@@ -359,6 +467,7 @@ export function MatchReport({
               })}
             </svg>
           </section>
+          )}
           {analysis.calibrated && analysis.stats.heatmaps && analysis.template && (
             <section className={card}>
               <div className="flex items-center justify-between mb-3">

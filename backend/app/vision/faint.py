@@ -406,7 +406,7 @@ def reject_static_candidates(frames, matrices, diagonal, sample_fps):
     return len(rejected)
 
 
-def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confident_seconds=20.0):
+def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confident_seconds=20.0, max_bridge=0.5):
     """A 'ball' that has not moved for a long time (after cancelling camera
     motion) with nobody standing over it is a pitch marking, a logo or a stray
     object, not the match ball.
@@ -417,16 +417,25 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
     short for the old half-minute rule to catch it. A confident ball on the
     grass needs `confident_seconds`, long enough that a dead ball at a kick-off,
     corner or penalty is kept. A still ball with a team player within one body
-    height is always kept. Drift is measured from where the run started, so a
-    slowly rolling ball is not "static".
+    height is always kept (judged over the frames it was seen). Drift is
+    measured from where the run started, so a slowly rolling ball is not "static".
+
+    A run is timed in seconds and survives frames without an observed ball for
+    up to `max_bridge` (the gap recover_ball bridges), its start carried through
+    each frame's camera motion: a mark the detector sees only on every second
+    or third frame would otherwise never reach the limit, and the bridge would
+    then fill the gaps with it.
     """
     tolerance = diagonal * 0.004
-    run = []  # indices of consecutive frames with a near-stationary ball
+    run = []  # indices of frames with the same near-stationary ball
     dropped = 0
+
+    def when(i):
+        return frames[i].get("t", i / sample_fps)
 
     def flush():
         nonlocal dropped
-        if run:
+        if len(run) >= 2:
             # "Confident" means the detector was fairly sure, not merely above
             # the tracker's 0.15 entry bar: a 0.17 blob still for 14 s is a marking.
             weak = all(
@@ -435,42 +444,51 @@ def drop_static_balls(frames, matrices, diagonal, sample_fps, seconds=3.0, confi
             )
             points = [(i, frames[i]["ball"]["x"], frames[i]["ball"]["y"]) for i in run]
             short = weak or _above_heads(frames, points)
-            limit = max(2, int(round((seconds if short else confident_seconds) * sample_fps)))
+            span = when(run[-1]) - when(run[0]) + 1 / sample_fps
             attended = sum(_attended(frames[i], frames[i]["ball"]) for i in run)
-            if len(run) >= limit and attended * 2 < len(run):
+            if span + 1e-6 >= (seconds if short else confident_seconds) and attended * 2 < len(run):
                 for i in run:
                     frames[i]["ball"] = None
                     dropped += 1
         run.clear()
 
-    anchor = None  # run start, carried through each frame's camera transform
+    anchor = None  # run start, carried through each frame's camera transform (False: unknown)
     screen = None  # run start in image pixels, never warped
+    last = None  # latest frame of the run with an observed ball
     for i, f in enumerate(frames):
+        if anchor is not None:
+            if f["scene"] != frames[i - 1]["scene"]:
+                flush()
+                anchor = screen = None
+            elif anchor is not False:
+                matrix = matrices[i]
+                if matrix is not None and np.isfinite(np.asarray(matrix, dtype=float)).all():
+                    anchor = np.asarray(_warp_point(anchor, matrix), dtype=float)
+                else:
+                    anchor = False  # pitch position unknown for the rest of this run
         b = f["ball"]
         if b is None or b.get("inferred"):
-            flush()
-            anchor = screen = None
+            if anchor is not None and when(i) - when(last) > max_bridge + 1 / sample_fps + 1e-6:
+                flush()
+                anchor = screen = None
             continue
         here = np.array([float(b["x"]), float(b["y"])])
-        same = anchor is not None and i > 0 and frames[i - 1]["scene"] == f["scene"]
-        if same:
+        if anchor is not None:
             screen_still = np.linalg.norm(here - screen) <= tolerance
-            camera_still = False
-            matrix = matrices[i]
-            if matrix is not None and np.isfinite(np.asarray(matrix, dtype=float)).all():
-                anchor = np.asarray(_warp_point(anchor, matrix), dtype=float)
-                camera_still = float(np.linalg.norm(here - anchor)) <= tolerance
+            camera_still = anchor is not False and float(np.linalg.norm(here - anchor)) <= tolerance
             # Either frame is enough. A pan used to break the screen-fixed test
             # and a missing camera estimate used to break the pitch-fixed test,
             # so a graphic never reached the time limit.
             if camera_still or screen_still:
                 if not run:
-                    run.append(i - 1)
+                    run.append(last)
                 run.append(i)
+                last = i
                 continue
         flush()
         anchor = here.copy()
         screen = here.copy()
+        last = i
     flush()
     return dropped
 
@@ -508,7 +526,7 @@ def recover_ball(frames, matrices, diagonal, sample_fps, max_bridge=0.5):
             recovered += 1
     # Reject static hypotheses before interpolation, so guessed positions cannot
     # break a static run or leave ghost bridges after its endpoints are removed.
-    dropped = drop_static_balls(frames, matrices, diagonal, sample_fps)
+    dropped = drop_static_balls(frames, matrices, diagonal, sample_fps, max_bridge=max_bridge)
     inferred = 0
     max_gap = max(1, int(round(max_bridge * sample_fps))) + 1
     last = None

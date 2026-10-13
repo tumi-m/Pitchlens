@@ -31,8 +31,13 @@ These are the first real accuracy numbers for your footage, with a 95% range.
 They count toward the release gate "visible-ball recall ≥ 90%"
 (market-ready/RELEASE-GATES.md).
 
-Label at least two matches (ideally different days and lighting) so one can be
-held out for checking.
+A player-load job (the upload default) never ran the ball model, so it has no
+ball accuracy: the labeller shows — instead of a rate, and those matches do not
+count toward the gate. Their labels still train the ball finder.
+
+One fully labelled match (about 150 frames) is enough to train: its last 30%
+is held out for checking. More matches (ideally different days and lighting)
+give a fairer check, because a whole match can then be held out.
 
 ## 2. Train (about $1 of GPU, 15-30 minutes)
 
@@ -50,10 +55,12 @@ curl "$VISION_SERVICE_URL/ball-model" -H "Authorization: Bearer $VISION_SERVICE_
 
 On a deployment with a single owner, set `VISION_SITE_TRAINING=1` on the
 worker to enable **Label the ball → Train on my labels** in the app (needs
-30+ labelled frames; uses only the matches uploaded from that browser). The
-site refuses it while `VISION_ACCESS_CODE` is unset, so an open test site can
-never retrain the model everyone uses. Leave it off when other people use the
-site.
+about 150 labelled frames in the match; uses only the matches uploaded from
+that browser). The site refuses it while `VISION_ACCESS_CODE` is unset, so an
+open test site can never retrain the model everyone uses. Leave it off when
+other people use the site. Without both settings the app shows "Training is
+run by the site operator." instead of the button (the worker reports
+`siteTraining` in `/health`).
 
 With Modal configured on the worker, training runs on a Modal GPU in its own
 app, so it never blocks an analysis (`VISION_MODAL_TRAIN_GPU`, default L4);

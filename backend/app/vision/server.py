@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.vision import billing, gpu
 from app.vision.access import valid_video_grant
 from app.vision.engine import probe, run_video
-from app.vision.profiles import available_profiles
+from app.vision.profiles import available_profiles, player_load_profiles
 
 ROOT = Path(os.getenv("VISION_DATA_DIR", ".vision")).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -44,8 +44,12 @@ def max_size_text():
 MAX_CHUNK = 8 * 1024 * 1024
 # A chunked upload that stops sending data releases the worker after this long.
 UPLOAD_IDLE_SECONDS = int(os.getenv("VISION_UPLOAD_IDLE_SECONDS", "300"))
-# Even a trickling upload cannot hold the single worker longer than this.
+# Even a trickling upload cannot hold the single worker longer than this. A
+# large declared upload gets longer, at a 2 Mbit/s floor (2 GB: about 2.4 h),
+# up to UPLOAD_SIZED_MAX_SECONDS.
 UPLOAD_MAX_SECONDS = int(os.getenv("VISION_UPLOAD_MAX_SECONDS", "3600"))
+UPLOAD_FLOOR_BYTES_PER_SECOND = 250_000
+UPLOAD_SIZED_MAX_SECONDS = 4 * 3600
 # Hosted deployments delete uploaded footage after this many hours (unset = keep forever).
 RETENTION_HOURS = float(os.getenv("VISION_RETENTION_HOURS", "0") or 0)
 # Open-ended playback ranges are capped so one response never streams a whole match.
@@ -81,6 +85,36 @@ def record_start():
     """Count an analysis that has started (call while holding `lock`)."""
     now = time.time()
     _write_json(ROOT / STARTS, _recent_starts(now) + [round(now, 3)])
+
+
+# Ball-model training started from the website, per 24 hours (0 = no limit):
+# each run can hold a GPU for up to two hours. Operator runs are not counted.
+TRAINING_STARTS = "training-starts.json"
+# The most epochs the website may ask for (what its button sends).
+SITE_TRAINING_EPOCHS = 60
+
+
+def training_cap():
+    try:
+        return max(0, int(os.getenv("VISION_MAX_TRAINING_PER_DAY", "2")))
+    except ValueError:
+        return 2
+
+
+def _recent_training_starts(now):
+    data = _read_json(ROOT / TRAINING_STARTS, [])
+    return [t for t in data if isinstance(t, (int, float)) and 0 <= now - t < 86400] if isinstance(data, list) else []
+
+
+def check_training_budget():
+    cap = training_cap()
+    if cap and len(_recent_training_starts(time.time())) >= cap:
+        raise HTTPException(429, "Ball-model training has reached today's limit.")
+
+
+def record_training_start():
+    now = time.time()
+    _write_json(ROOT / TRAINING_STARTS, _recent_training_starts(now) + [round(now, 3)])
 # Re-entrant: stale-upload release runs while create() already holds the lock.
 lock = threading.RLock()
 active = None
@@ -88,6 +122,7 @@ stopping = False
 cancellations = {}
 upload_activity = {}
 upload_started = {}
+upload_sizes = {}  # job id -> size declared when a chunked upload reserved the worker
 pool = ThreadPoolExecutor(max_workers=1)
 # Calibration and analytics are CPU post-processing of a finished result: they
 # must never queue behind (or block) an upload or a GPU analysis.
@@ -95,6 +130,14 @@ post_pool = ThreadPoolExecutor(max_workers=1)
 post_lock = threading.Lock()
 calibrating = set()  # job ids with a calibration queued or running in this process
 calibrating_lock = threading.Lock()
+# Pitch checks (previews, and the fit that starts POST /calibration) cost up to
+# seconds of CPU each: they get their own threads, never the default executor
+# that upload probes and analytics share, and run one at a time (another asks
+# again with a 429 rather than queueing). The slot is freed when the request
+# ends; a check whose browser went away may still be finishing, so a second
+# thread lets the next one start at once.
+pitch_pool = ThreadPoolExecutor(max_workers=2)
+pitch_slot = threading.BoundedSemaphore(1)
 MAX_JSON_BODY = 256 * 1024
 
 
@@ -280,6 +323,10 @@ def recover_after_restart():
         write_status(path.parent, data)
     for temporary in ROOT.glob("*/*.tmp"):
         temporary.unlink(missing_ok=True)
+    # A training run killed with the process never reached its cleanup: frame
+    # copies of customers' footage must not stay behind (its state was in memory).
+    shutil.rmtree(ROOT / "training" / "dataset", ignore_errors=True)
+    shutil.rmtree(ROOT / "training" / "runs", ignore_errors=True)
 
 
 app.add_event_handler("shutdown", stop_jobs)
@@ -295,8 +342,17 @@ def release(job_id, directory, status, stage):
             (directory / "video").unlink(missing_ok=True)
         upload_activity.pop(job_id, None)
         upload_started.pop(job_id, None)
+        upload_sizes.pop(job_id, None)
         if active == job_id:
             active = None
+
+
+def upload_deadline(job_id):
+    """Seconds an upload may hold the worker: longer for a large declared size."""
+    size = upload_sizes.get(job_id)
+    if not size:
+        return UPLOAD_MAX_SECONDS
+    return max(UPLOAD_MAX_SECONDS, min(UPLOAD_SIZED_MAX_SECONDS, size / UPLOAD_FLOOR_BYTES_PER_SECOND))
 
 
 def release_stale_upload():
@@ -309,7 +365,7 @@ def release_stale_upload():
         return
     now = time.monotonic()
     idle = now - last >= UPLOAD_IDLE_SECONDS
-    overdue = now - upload_started.get(job_id, now) >= UPLOAD_MAX_SECONDS
+    overdue = now - upload_started.get(job_id, now) >= upload_deadline(job_id)
     if not (idle or overdue):
         return
     directory = ROOT / job_id
@@ -327,10 +383,13 @@ def sweep_stale():
 
 
 def expired(data):
+    # From when the footage arrived: a re-analysis links the same file, so it
+    # expires with the original upload and a chain of reruns cannot extend it.
+    uploaded = data.get("uploadedAt", data.get("createdAt", time.time()))
     return (
         RETENTION_HOURS > 0
         and data.get("id") != active
-        and data.get("createdAt", time.time()) < time.time() - RETENTION_HOURS * 3600
+        and uploaded < time.time() - RETENTION_HOURS * 3600
     )
 
 
@@ -344,6 +403,11 @@ def delete_expired():
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
+        if not expired(data) and not data.get("videoDeleted"):
+            continue
+        # Label stills are full-resolution pictures of the footage: they go with
+        # it (also on deployments that expired footage before stills were swept).
+        _remove_label_frames(path.parent)
         if not expired(data):
             continue
         video_path = path.parent / "video"
@@ -351,6 +415,11 @@ def delete_expired():
             video_path.unlink(missing_ok=True)
             data["videoDeleted"] = True
             write_status(path.parent, data)
+
+
+def _remove_label_frames(directory):
+    with label_lock:
+        shutil.rmtree(directory / "labelframes", ignore_errors=True)
 
 
 def start_retention_sweeper():
@@ -385,6 +454,12 @@ def check_space(size):
         raise HTTPException(507, "The analysis server is out of storage. Try again later.")
 
 
+def check_models(profile, ball_search):
+    """Refuse a job whose weights are missing; player load never needs the ball model."""
+    if profile not in (player_load_profiles() if ball_search == "none" else available_profiles()):
+        raise HTTPException(503, "The selected vision models are not installed")
+
+
 def download_budget():
     """Largest download that fits now: the upload limit, or the free space if smaller."""
     return min(MAX_BYTES, shutil.disk_usage(ROOT).free - SPACE_MARGIN)
@@ -398,9 +473,13 @@ def healthz():
 @app.get("/health")
 def health():
     sweep_stale()
+    load_only = player_load_profiles()
     return {
-        "available": "general" in available_profiles(),
+        # Uploads default to player load, which needs only the player weights;
+        # "profiles" lists those that can also search for the ball.
+        "available": "general" in load_only,
         "profiles": available_profiles(),
+        "playerLoadProfiles": load_only,
         "activeJob": active is not None,
         "mode": "computer-vision",
         "diagnostics": True,
@@ -413,6 +492,8 @@ def health():
         "privateJobs": True,
         "reviewIdempotency": True,
         "savedVideoReruns": True,
+        # Whether the website may start ball-model training (otherwise an operator action).
+        "siteTraining": os.getenv("VISION_SITE_TRAINING", "0") == "1",
     }
 
 
@@ -453,6 +534,7 @@ def begin(directory, status, size):
         write_status(directory, status)
         upload_activity.pop(job_id, None)
         upload_started.pop(job_id, None)
+        upload_sizes.pop(job_id, None)
         event = threading.Event()
         cancellations[job_id] = event
         record_start()
@@ -473,17 +555,16 @@ async def create(request: Request):
     profile = request.query_params.get("profile", "general")
     if profile not in ("general", "broadcast", "small-ball"):
         raise HTTPException(400, "Unknown footage profile")
-    if profile not in available_profiles():
-        raise HTTPException(503, "The selected vision models are not installed")
+    ball_search = request.query_params.get("search", "exhaustive")
+    if ball_search not in ("exhaustive", "adaptive", "none"):
+        raise HTTPException(400, "Invalid ball search mode")
+    check_models(profile, ball_search)
     try:
         sample_fps = int(request.query_params.get("fps", "3"))
     except ValueError as exc:
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
-    ball_search = request.query_params.get("search", "exhaustive")
-    if ball_search not in ("exhaustive", "adaptive", "none"):
-        raise HTTPException(400, "Invalid ball search mode")
     diagnostic = request.query_params.get("diagnostic", "false")
     if diagnostic not in ("true", "false"):
         raise HTTPException(400, "Invalid diagnostic option")
@@ -540,6 +621,8 @@ async def create(request: Request):
             )
         active = job_id
     upload_activity[job_id] = upload_started[job_id] = time.monotonic()
+    if expected is not None:
+        upload_sizes[job_id] = expected
     directory = ROOT / job_id
     status = {
         "id": job_id,
@@ -607,6 +690,11 @@ def fetch_and_work(directory, status, event, url):
             status["title"] = str(info["title"])[:200]
         status.pop("receivedBytes", None)
         status.update(video=metadata, fileSize=size, source=info)
+        # Counted like begin(): only once there is a decodable video to analyse
+        # (a blocked download costs no GPU). The worker stayed reserved for the
+        # whole download, so no other start can have used the allowance meanwhile.
+        with lock:
+            record_start()
         handed_over = True
         work(directory, status, event)
     except InterruptedError:
@@ -643,17 +731,16 @@ async def create_from_url(request: Request):
     profile = request.query_params.get("profile", "general")
     if profile not in ("general", "broadcast", "small-ball"):
         raise HTTPException(400, "Unknown footage profile")
-    if profile not in available_profiles():
-        raise HTTPException(503, "The selected vision models are not installed")
+    ball_search = request.query_params.get("search", "none")
+    if ball_search not in ("exhaustive", "adaptive", "none"):
+        raise HTTPException(400, "Invalid ball search mode")
+    check_models(profile, ball_search)
     try:
         sample_fps = int(request.query_params.get("fps", "3"))
     except ValueError as exc:
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second") from exc
     if sample_fps not in (3, 6, 10):
         raise HTTPException(400, "Choose 3, 6 or 10 analysed frames per second")
-    ball_search = request.query_params.get("search", "none")
-    if ball_search not in ("exhaustive", "adaptive", "none"):
-        raise HTTPException(400, "Invalid ball search mode")
     owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner")
     if require_owner(request) and not owner:
         raise HTTPException(400, "Match ownership is required")
@@ -811,6 +898,7 @@ def video(job_id: str, request: Request):
     data = json.loads((directory / "status.json").read_text())
     if expired(data):
         path.unlink(missing_ok=True)
+        _remove_label_frames(directory)
         data["videoDeleted"] = True
         write_status(directory, data)
         raise HTTPException(404, "Video is unavailable")
@@ -886,7 +974,7 @@ async def _json_body(request: Request):
     try:
         # NaN/Infinity are not JSON; refusing them keeps stored files valid.
         data = json.loads(body or b"{}", parse_constant=reject_constant)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:  # deep nesting fits in 256 KB
         raise HTTPException(400, "Invalid JSON") from exc
     if not isinstance(data, dict):
         raise HTTPException(400, "Expected a JSON object")
@@ -907,13 +995,43 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 8
+ANALYTICS_VERSION = 9
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
 
 def _stamp(path):
     return [path.stat().st_mtime_ns, path.stat().st_size] if path.is_file() else 0
+
+
+# Labelling and pitch previews read little of result.json, but parsing a
+# 90-minute result takes about a second (and 160 MB live). Keep a slim view per
+# result version: video, sampling and each frame's time, number and ball.
+_slim = OrderedDict()  # (job, result stamp) -> slim result
+_slim_lock = threading.Lock()
+SLIM_CACHE = 3
+SLIM_KEYS = ("video", "sampleFps", "ballSearch", "ballInference")
+
+
+def _slim_result(directory):
+    path = directory / "result.json"
+    stamp = _stamp(path)
+    key = (directory.name, tuple(stamp) if stamp else ())
+    with _slim_lock:
+        cached = _slim.get(key)
+        if cached is not None:
+            _slim.move_to_end(key)
+            return cached
+    full = json.loads(path.read_text())
+    view = {k: full[k] for k in SLIM_KEYS if k in full}
+    view["frames"] = [{k: f[k] for k in ("t", "frame", "ball") if k in f} for f in full.get("frames") or []]
+    del full
+    with _slim_lock:
+        _slim[key] = view
+        _slim.move_to_end(key)
+        while len(_slim) > SLIM_CACHE:
+            _slim.popitem(last=False)
+    return view
 
 
 def compute_analysis(directory, include_positions=True):
@@ -981,15 +1099,24 @@ def calibration(job_id: str, request: Request):
     return data
 
 
+async def _pitch_check(fn, *args):
+    if not pitch_slot.acquire(blocking=False):
+        raise HTTPException(429, "Another pitch check is running; try again in a moment.")
+    try:
+        return await asyncio.get_running_loop().run_in_executor(pitch_pool, fn, *args)
+    finally:
+        pitch_slot.release()
+
+
 @app.post("/jobs/{job_id}/calibration/preview")
 async def calibration_preview(job_id: str, request: Request):
     from app.vision.calibrate import preview
 
-    _, path = _finished_result(job_id)
+    directory, _ = _finished_result(job_id)
     body = await _json_body(request)
-    result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    result = await asyncio.to_thread(_slim_result, directory)  # only the video size is read
     try:
-        return await asyncio.to_thread(preview, result, body)
+        return await _pitch_check(preview, result, body)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1020,14 +1147,16 @@ def _run_calibration(directory, body):
             calibrating.discard(directory.name)
 
 
-def _auto_venue(directory, status, limit=5):
+def _auto_venue(directory, status, limit=5, margin=0.1):
     """Set up the pitch of a finished match from a saved venue, when one fits.
 
     A fixed venue camera sees the same pitch every match: each of the owner's
     venues with the same video size is checked against this match's painted
-    lines (build_from_venue refuses one that does not line up), and the first
-    verified fit is applied. Nothing is applied without the footage to check
-    against. VISION_AUTO_VENUE=0 turns it off.
+    lines (build_from_venue refuses one that does not line up), and the one
+    that fits them best is applied. A neighbouring court of a similar size can
+    also line up, so when the runner-up fits almost as well (median line score
+    within `margin`), nothing is applied and the reviewer chooses. Nothing is
+    applied without the footage to check against. VISION_AUTO_VENUE=0 turns it off.
     """
     from app.vision.calibrate import build_from_venue
 
@@ -1055,31 +1184,46 @@ def _auto_venue(directory, status, limit=5):
         calibrating.add(directory.name)
     job_path = directory / "calibration-job.json"
     applied = None
+    explained = False
     try:
         _write_json(job_path, {"state": "processing", "progress": 0, "startedAt": time.time(), "auto": True})
+        fits = []
         for venue in venues[:limit]:
             try:
                 data = build_from_venue(result, venue, video)
             except ValueError:
                 continue  # the lines do not match this venue
-            if not (data.get("venue") or {}).get("verified"):
-                continue
-            data["auto"] = True
-            if (directory / "calibration.json").is_file() or not (directory / "status.json").is_file():
-                return None  # the reviewer set one up meanwhile, or the match was deleted
-            _write_json(directory / "calibration.json", data)
-            compute_analysis(directory)
-            _write_json(job_path, {"state": "done", "progress": 100, "finishedAt": time.time(), "venue": venue["id"], "auto": True})
-            applied = venue["id"]
-            return applied
-        return None
+            check = data.get("venue") or {}
+            if check.get("verified") and isinstance(check.get("lineScore"), (int, float)):
+                fits.append((check["lineScore"], venue, data))
+        if not fits:
+            return None
+        fits.sort(key=lambda fit: -fit[0])
+        score, venue, data = fits[0]
+        if len(fits) > 1 and score - fits[1][0] < margin:
+            names = " and ".join(f'"{v.get("name")}"' for _, v, _ in fits[:2])
+            _write_json(job_path, {
+                "state": "failed", "auto": True, "finishedAt": time.time(),
+                "error": f"Saved venues {names} both fit this match's lines (scores {score:.2f} and {fits[1][0]:.2f}), "
+                         "so neither was applied automatically. Choose one, or set up the pitch.",
+            })
+            explained = True
+            return None
+        data["auto"] = True
+        if (directory / "calibration.json").is_file() or not (directory / "status.json").is_file():
+            return None  # the reviewer set one up meanwhile, or the match was deleted
+        _write_json(directory / "calibration.json", data)
+        compute_analysis(directory)
+        _write_json(job_path, {"state": "done", "progress": 100, "finishedAt": time.time(), "venue": venue["id"], "auto": True})
+        applied = venue["id"]
+        return applied
     except Exception:  # never fail a finished analysis over an optional setup
         import logging
 
         logging.exception("Automatic venue setup failed")
         return None
     finally:
-        if applied is None and (_read_json(job_path) or {}).get("auto"):
+        if applied is None and not explained and (_read_json(job_path) or {}).get("auto"):
             job_path.unlink(missing_ok=True)  # nothing matched: no setup to report
         with calibrating_lock:
             calibrating.discard(directory.name)
@@ -1124,7 +1268,7 @@ async def save_calibration(job_id: str, request: Request):
 
 
 async def _start_calibration(job_id, directory, path, body):
-    from app.vision.calibrate import preview
+    from app.vision.calibrate import poor_fit_message, preview
 
     if "venue" in body:
         venue_id = body.get("venue")
@@ -1137,17 +1281,13 @@ async def _start_calibration(job_id, directory, path, body):
         post_pool.submit(_run_venue_calibration, directory, venue)
         return {"state": "processing", "venue": {"id": venue_id, "name": venue.get("name")}}
 
-    result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    result = await asyncio.to_thread(_slim_result, directory)  # only the video size is read
     try:
-        fit = await asyncio.to_thread(preview, result, body)
+        fit = await _pitch_check(preview, result, body)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if fit["fit"]["quality"] == "poor":
-        raise HTTPException(
-            400,
-            f"These clicks do not fit a flat pitch (error {fit['fit']['rmsPixels']:.1f} px). "
-            "Check each landmark is the right one and the pitch size.",
-        )
+        raise HTTPException(400, poor_fit_message(fit["fit"]))
     _write_json(
         directory / "calibration-job.json",
         {"state": "processing", "progress": 0, "startedAt": time.time(), "fit": fit["fit"]},
@@ -1352,17 +1492,17 @@ def _ball_labels_response(job_id, directory, result, prepare=True):
 
 @app.get("/jobs/{job_id}/ball-labels")
 def ball_labels(job_id: str):
-    directory, path = _finished_result(job_id)
-    return _ball_labels_response(job_id, directory, json.loads(path.read_text()))
+    directory, _ = _finished_result(job_id)
+    return _ball_labels_response(job_id, directory, _slim_result(directory))
 
 
 @app.post("/jobs/{job_id}/ball-labels")
 async def add_ball_label(job_id: str, request: Request):
     from app.vision import balllabels
 
-    directory, path = _finished_result(job_id)
+    directory, _ = _finished_result(job_id)
     body = await _json_body(request)
-    result = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    result = await asyncio.to_thread(_slim_result, directory)
     size = ((result.get("video") or {}).get("width") or 0, (result.get("video") or {}).get("height") or 0)
     try:
         label = balllabels.clean_label(body, size)
@@ -1395,11 +1535,15 @@ def frame_image(job_id: str, index: int):
     from app.vision import balllabels
 
     directory, _ = _finished_result(job_id)
+    # Footage gone (expired or deleted): its stills go too, before any is served.
+    # This also catches a background extraction that wrote after the sweep.
+    data = _read_json(directory / "status.json", {})
+    if not isinstance(data, dict) or expired(data) or data.get("videoDeleted") or _video_path(directory) is None:
+        _remove_label_frames(directory)
+        raise HTTPException(404, "Video is unavailable")
     path = balllabels.frame_cache(directory) / f"{index}.jpg"
     if index >= 0 and path.is_file():
         return Response(path.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
-    if _video_path(directory) is None:
-        raise HTTPException(404, "Video is unavailable")
     raise HTTPException(409, "This frame is still being prepared")
 
 
@@ -1449,18 +1593,32 @@ async def train_ball_model(request: Request):
     # Switching the ball model changes every later analysis on this worker, and a
     # run costs GPU time: an operator action. A single-owner deployment can allow
     # its website to start it (VISION_SITE_TRAINING=1), on that owner's matches.
-    from_site = require_owner(request) or bool(request.headers.get("x-pitchlens-owner"))
+    # Only the website's proxy adds these headers (server-side); an operator's
+    # terminal request with the service token carries neither, even on a hosted
+    # worker (where require_owner() is always true).
+    from_site = request.headers.get("x-pitchlens-require-owner") == "1" or bool(request.headers.get("x-pitchlens-owner"))
     if from_site and os.getenv("VISION_SITE_TRAINING", "0") != "1":
         raise HTTPException(403, "Training is an operator action on this server (see docs/BALL-TRAINING.md).")
-    owner = _owner(request) or owner
+    if from_site:
+        owner = _owner(request)
+        epochs = min(epochs, SITE_TRAINING_EPOCHS)
     base = model_paths("broadcast")[1]
     if not base.is_file():
         raise HTTPException(409, "No tiled ball model is installed to start from")
     with training_lock:
         if training.get("state") == "running":
             raise HTTPException(409, "A training run is already in progress")
+        if from_site:
+            check_training_budget()
         training.clear()
         training.update(state="running", stage="Starting", startedAt=round(time.time(), 3))
+
+    def started():
+        # Counted only once the labels passed every check and a GPU (or this
+        # machine) is about to train: a "too few labels" refusal costs nothing.
+        if from_site:
+            with training_lock:
+                record_training_start()
 
     def remote(dataset_zip, base_bytes, n):
         from app.vision.modal_train import app as modal_app, train_ball
@@ -1480,8 +1638,11 @@ async def train_ball_model(request: Request):
                 device=inference_device(),
                 now=round(time.time(), 3),
                 progress=lambda message: training.update(stage=message),
+                on_start=started,
+                usable=lambda d: balltrain._usable(d) and _video_path(d) is not None,
             )
-            training.update(state="done", stage="Finished", run=run)
+            # A run refused for too few held-out balls says why (nothing was trained).
+            training.update(state="done", stage=run.get("message") or "Finished", run=run)
         except Exception as exc:  # reported to the operator; nothing is switched
             training.update(state="failed", stage=str(exc))
 
@@ -1560,6 +1721,10 @@ def delete_job(job_id: str):
             for key in list(_prepared):
                 if key[0] == job_id:
                     del _prepared[key]
+            with _slim_lock:
+                for key in list(_slim):
+                    if key[0] == job_id:
+                        del _slim[key]
             # Saved venues derived from this match are personal derived data too.
             for path in _venue_dir().glob("*.json"):
                 if (_read_json(path) or {}).get("sourceJob") == job_id:
@@ -1585,8 +1750,7 @@ def retry_job(job_id: str):
         if status.get("attempts", 1) >= 3:
             raise HTTPException(409, "Retry limit reached. Contact support before another attempt.")
         check_daily_budget()
-        if status.get("profile", "general") not in available_profiles():
-            raise HTTPException(503, "The selected vision models are not installed")
+        check_models(status.get("profile", "general"), status.get("ballSearch", "exhaustive"))
         event = threading.Event()
         status.update(status="processing", stage="Retrying saved upload", progress=0, attempts=status.get("attempts", 1) + 1)
         write_status(directory, status)
@@ -1640,8 +1804,7 @@ def rerun_job(job_id: str, request: Request):
             raise HTTPException(409, "Saved footage is no longer available. Upload the video again.")
         if not 0 <= start < metadata["duration"] or (mode == "full" and start != 0):
             raise HTTPException(400, "Test start must be inside the video; full matches start at zero")
-        if previous.get("profile", "general") not in available_profiles():
-            raise HTTPException(503, "The selected vision models are not installed")
+        check_models(previous.get("profile", "general"), previous.get("ballSearch", "exhaustive"))
         release_stale_upload()
         if active is not None:
             raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
@@ -1649,7 +1812,8 @@ def rerun_job(job_id: str, request: Request):
         directory = ROOT / new_id
         status = {
             "id": new_id, "sourceJobId": job_id, "title": previous["title"],
-            "createdAt": time.time(), "status": "processing", "stage": "Opening saved footage",
+            "createdAt": time.time(), "uploadedAt": previous.get("uploadedAt", previous["createdAt"]),
+            "status": "processing", "stage": "Opening saved footage",
             "progress": 0, "video": metadata, "fileSize": (source / "video").stat().st_size,
             "profile": previous.get("profile", "general"), "sampleFps": previous.get("sampleFps", 3),
             "ballSearch": previous.get("ballSearch", "exhaustive"),

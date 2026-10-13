@@ -44,11 +44,20 @@ export type VisionResult = {
   video: { duration: number; width: number; height: number; fps: number };
   analysedDuration: number;
   analysedStart?: number;
+  /** Timings as the engine measured them; any may be missing from older results. */
   performance?: {
-    totalSeconds: number;
-    playerInferenceSeconds: number;
-    ballInferenceSeconds: number;
-    device: string;
+    totalSeconds?: number;
+    playerInferenceSeconds?: number;
+    playerInferenceCalls?: number;
+    /** null (or absent, before 2.7) on player-load jobs: the ball model was not run. */
+    ballInferenceSeconds?: number | null;
+    setupSeconds?: number;
+    decodeSeconds?: number;
+    cameraMotionSeconds?: number;
+    ballRecoverySeconds?: number;
+    device?: string;
+    batchSize?: number;
+    analysedFrames?: number;
   };
   sampleFps: number;
   teams: { id: number; label: string; colour: string }[];
@@ -57,21 +66,25 @@ export type VisionResult = {
     playerFrames: number;
     ballFrames: number;
     ballFramesInferred?: number;
-    teamSeconds: number[];
+    /** Possession figures are null on player-load jobs: the ball was not looked for. */
+    teamSeconds: number[] | null;
     unknownSeconds: number;
     possessionShare: (number | null)[];
-    possessionCoverage: number;
+    possessionCoverage: number | null;
     trackCount: number;
-    /** Metres each kit ran, with the camera removed. Absent on results from before 2.6. */
+    /** Metres each kit ran, with the camera removed. Absent on results from before 2.6.
+     *  A kit with no usable track has null (not measured), never 0. */
     playerLoad?: {
-      metres: [number, number];
-      maxSpeed: number;
+      metres: [number | null, number | null];
+      maxSpeed: number | null;
       steps: number;
+      /** Samples per kit that passed the scene, camera, height and gap checks. */
+      measuredSamples?: [number, number];
       method: string;
       playerHeightM: number;
       footNoisePx: number;
     };
-    /** Added in pipeline 1.5; older results do not have it. */
+    /** Added in pipeline 1.5; older results do not have it; null on player-load jobs. */
     possessions?: {
       teams: {
         count: number;
@@ -87,7 +100,7 @@ export type VisionResult = {
         controlSeconds: number;
         passes: number;
       }[];
-    };
+    } | null;
     events: {
       id: string;
       type: string;
@@ -117,6 +130,8 @@ export type VisionHealth = {
   gpu?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
   configured?: boolean;
+  /** The site may start ball-model training (an access code is set and the worker allows it). */
+  siteTraining?: boolean;
   detail?: string;
 };
 export const clockTime = (seconds: number) =>
@@ -134,12 +149,13 @@ export class VisionError extends Error {
 
 const OWNER_KEY = "pitchlens-vision-owner";
 const ACCESS_KEY = "pitchlens-vision-access";
+const OWNER = /^[a-f0-9]{32}$/;
 
 /** Random per-browser key: the hosted worker only lists this browser's analyses. */
 export function visionOwner(): string {
   try {
     const saved = localStorage.getItem(OWNER_KEY);
-    if (saved && /^[a-f0-9]{32}$/.test(saved)) return saved;
+    if (saved && OWNER.test(saved)) return saved;
     const bytes = crypto.getRandomValues(new Uint8Array(16));
     const created = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
     localStorage.setItem(OWNER_KEY, created);
@@ -149,9 +165,30 @@ export function visionOwner(): string {
   }
 }
 
+/** The proxy answers with the key it used: its HttpOnly cookie wins over a key
+ *  minted after script storage was cleared, so copy that one back. */
+function adoptOwner(response: Response) {
+  const used = response.headers.get("x-pitchlens-owner");
+  if (!used || !OWNER.test(used)) return;
+  try {
+    if (localStorage.getItem(OWNER_KEY) !== used) localStorage.setItem(OWNER_KEY, used);
+  } catch {}
+}
+
+/** Zero-width, bidi and BOM marks ride along with pasted codes; they are never part of one. */
+export function cleanAccessCode(code: string): string {
+  return code.replace(/\p{Cf}/gu, "").trim();
+}
+
+/** Request headers carry Latin-1 only: a code with ’, — or emoji cannot be sent at all. */
+export const accessCodeSendable = (code: string) =>
+  Array.from(code).every((c) => (c.codePointAt(0) ?? 0) <= 0xff);
+
+export const ACCESS_CODE_CHARACTERS = "Codes use letters, numbers and symbols only.";
+
 export function visionAccessCode(): string {
   try {
-    return localStorage.getItem(ACCESS_KEY) || "";
+    return cleanAccessCode(localStorage.getItem(ACCESS_KEY) || "");
   } catch {
     return "";
   }
@@ -168,11 +205,16 @@ function accessRejected() {
   } catch {}
 }
 
-export function setVisionAccessCode(code: string) {
+/** Saves the code as it will be sent. Returns false (and keeps nothing) for a
+ *  code that cannot be sent; the field then says which characters work. */
+export function setVisionAccessCode(code: string): boolean {
+  const clean = cleanAccessCode(code);
+  const sendable = accessCodeSendable(clean);
   try {
-    if (code) localStorage.setItem(ACCESS_KEY, code);
+    if (clean && sendable) localStorage.setItem(ACCESS_KEY, clean);
     else localStorage.removeItem(ACCESS_KEY);
   } catch {}
+  return sendable;
 }
 
 function visionHeaders(extra?: HeadersInit): Headers {
@@ -180,7 +222,13 @@ function visionHeaders(extra?: HeadersInit): Headers {
   const owner = visionOwner();
   if (owner) headers.set("x-pitchlens-owner", owner);
   const access = visionAccessCode();
-  if (access) headers.set("x-pitchlens-access", access);
+  try {
+    if (access) headers.set("x-pitchlens-access", access);
+  } catch {
+    // A code saved before it was checked (’ or — pasted in): drop it and ask
+    // again, rather than failing every request with a TypeError.
+    accessRejected();
+  }
   return headers;
 }
 
@@ -192,6 +240,7 @@ export async function visionJson<T>(
     ...init,
     headers: visionHeaders(init?.headers),
   });
+  adoptOwner(response);
   let data: { detail?: string; code?: string } = {};
   try {
     data = await response.json();
@@ -246,8 +295,33 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 /** Network drops shorter than this resume where they left off. It stays under
  *  the worker's 5-minute idle release (VISION_UPLOAD_IDLE_SECONDS). */
 const RESUME_WINDOW_MS = 240_000;
+// Not 429: the worker's only 429 here is its 24-hour cap, which retrying cannot lift.
 const transient = (e: unknown) =>
-  !(e instanceof VisionError) || e.status >= 500 || e.status === 429;
+  !(e instanceof VisionError) || e.status >= 500;
+
+/** fetch rejects with a TypeError when the connection drops ("Failed to fetch",
+ *  "Load failed", "NetworkError…"): say so in words people recognise. */
+export const CONNECTION_LOST =
+  "Connection lost. Check your signal and press Analyse again; your file is still selected.";
+export const connectionLost = (e: unknown) => e instanceof TypeError;
+
+/**
+ * Choices shared by every analyse button: the football-trained models when the
+ * worker has them, and player load unless the ball model is asked for (it costs
+ * about 55% more GPU and followed a graphic on real tape).
+ */
+export function defaultVisionOptions(
+  health: Pick<VisionHealth, "profiles"> | null,
+  choice: { playerLoadOnly: boolean; adaptive?: boolean; profile?: string },
+): { profile: string; search: "none" | "adaptive" | "exhaustive" } {
+  const profile = choice.profile ?? (health?.profiles?.includes("broadcast") ? "broadcast" : "general");
+  const search = choice.playerLoadOnly
+    ? "none"
+    : choice.adaptive && profile !== "general"
+      ? "adaptive"
+      : "exhaustive";
+  return { profile, search };
+}
 
 /**
  * Resumable chunked upload: reserve the worker, send 4 MB pieces (each retried
@@ -295,6 +369,18 @@ export async function uploadToVision(
     }
   }
   let starting = false;
+  // Closing or reloading the tab runs no cleanup: free the single worker with a
+  // keepalive cancel instead of leaving it reserved until the idle timeout. An
+  // upload cannot resume after a reload, so nothing is lost.
+  const leave = () => {
+    fetch(`/api/vision/jobs/${job.id}/cancel`, {
+      method: "POST",
+      keepalive: true,
+      headers: visionHeaders(),
+    }).catch(() => {});
+  };
+  const listen = typeof window !== "undefined";
+  if (listen) window.addEventListener("pagehide", leave);
   try {
     signal?.throwIfAborted();
     let offset = 0;
@@ -337,31 +423,35 @@ export async function uploadToVision(
           await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
         }
       }
-      onProgress?.(Math.round((offset / file.size) * 100));
+      // Rounded down: 100% means every byte arrived and the analysis is starting.
+      onProgress?.(Math.floor((offset / file.size) * 100));
     }
+    // Last moment a cancel applies. From here the server may already be analysing
+    // (paid GPU time): closing the tab, leaving the page or a late abort must not
+    // cancel it. The report page offers a cancel for a running analysis.
+    signal?.throwIfAborted();
+    if (listen) window.removeEventListener("pagehide", leave);
     starting = true;
-    return await startAnalysis(job.id, signal);
+    return await startAnalysis(job.id);
   } catch (e) {
-    // Once /start has been sent the server may already be analysing, and a
-    // cancel would stop it; the worker releases unstarted uploads by itself.
+    // The worker releases unstarted uploads by itself; once /start has been sent
+    // a cancel could stop an analysis that is already running.
     if (!starting)
       // Free the worker straight away instead of waiting for the idle timeout.
       visionJson(`jobs/${job.id}/cancel`, { method: "POST" }).catch(() => {});
     throw e;
+  } finally {
+    if (listen) window.removeEventListener("pagehide", leave);
   }
 }
 
-/** /start is retried: a lost response must not throw away a complete upload. */
-async function startAnalysis(id: string, signal?: AbortSignal): Promise<VisionJob> {
+/** /start is retried: a lost response must not throw away a complete upload.
+ *  It takes no abort signal: once sent, the analysis may already be running. */
+async function startAnalysis(id: string): Promise<VisionJob> {
   for (let attempt = 0; ; attempt++) {
-    signal?.throwIfAborted();
     try {
-      return await visionJson<VisionJob>(`jobs/${id}/start`, {
-        method: "POST",
-        signal,
-      });
+      return await visionJson<VisionJob>(`jobs/${id}/start`, { method: "POST" });
     } catch (e) {
-      if (signal?.aborted) throw e;
       // An earlier attempt may have started it and only the reply was lost.
       if (e instanceof VisionError && e.status === 409) {
         const current = await visionJson<VisionJob>(`jobs/${id}`).catch(() => null);
@@ -370,7 +460,7 @@ async function startAnalysis(id: string, signal?: AbortSignal): Promise<VisionJo
         throw e;
       }
       if (!transient(e) || attempt >= 4) throw e;
-      await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
+      await sleep(Math.min(15_000, 1000 * 2 ** attempt));
     }
   }
 }
