@@ -1076,6 +1076,10 @@ def detect_events(projected, states, spells, template, directions, sample_fps, i
 
 ON_TARGET = {"on-target", "saved", "goal-candidate", "goal"}
 
+# Frequent events are estimated from a random sample of checks instead of being
+# reviewed one by one; shots and goals stay individual key moments.
+SAMPLED_TYPES = ("pass", "interception", "tackle")
+
 
 REANCHOR_SECONDS = 1.0
 
@@ -1301,9 +1305,10 @@ def summarise(projected, states, spells, events, template, directions, player_of
         A check counts when the reviewer judged an automatic event whose original
         reading matched (type, and the predicate such as 'complete' or 'on
         target'); it was right if the reviewer kept that reading (same type, team
-        and predicate). Passes are reviewed in bulk, so only passes checked in the
-        random-sample view count (an unbiased rate); shots and turnovers are
-        reviewed one by one, so every check counts. Teams are pooled.
+        and predicate). Passes, interceptions and tackles are too many to review
+        one by one, so only those checked in the random-sample view count (an
+        unbiased rate); shots and goals are reviewed one by one, so every check
+        counts. Teams are pooled.
         """
         ok = n = 0
         for e in events:
@@ -1312,7 +1317,7 @@ def summarise(projected, states, spells, events, template, directions, player_of
             original = e.get("original") or e
             if original.get("type") != kind or (predicate is not None and not predicate(original)):
                 continue
-            if kind == "pass" and not e.get("sampled"):
+            if kind in SAMPLED_TYPES and not e.get("sampled"):
                 continue
             n += 1
             ok += (
@@ -1557,7 +1562,7 @@ def finish(base, review=None, include_positions=True):
             "pending": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True)),
             # Shots, possible goals and turnovers deserve a look each; passes are
             # better estimated from a random sample than reviewed one by one.
-            "pendingKey": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True) and e["type"] not in ("pass", "out")),
+            "pendingKey": sum(1 for e in events if e["status"] == "proposed" and e.get("needsReview", True) and e["type"] not in SAMPLED_TYPES and e["type"] != "out"),
             "pendingByType": dict(Counter(e["type"] for e in events if e["status"] == "proposed" and e.get("needsReview", True))),
         },
         "positions": base["positions"] if include_positions else None,

@@ -217,8 +217,10 @@ export type AnalysisEvent = {
   ballSeen?: number;
   needsReview?: boolean;
   source?: string;
-  /** Checked in the random-sample view (counts toward pass estimates). */
+  /** Checked in the random-sample view (counts toward pass, interception and tackle estimates). */
   sampled?: boolean;
+  /** What the automatic detection said before any review decision. */
+  original?: { type: string; team: number | null; outcome?: string | null; onTarget?: boolean | null };
   note?: string;
   evidence?: string[];
   restartAt?: number;

@@ -834,3 +834,17 @@ def test_possession_survives_a_long_unseen_stretch_only_between_same_team_contro
     stopped[60] = False
     owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(0, 110, 119)], stopped, fps)
     assert owner[50] is None
+
+
+def test_interceptions_are_estimated_from_sampled_checks_and_are_not_key_moments():
+    from app.vision import analytics as an
+
+    events = [{"id": f"ev-{i}", "type": "interception", "t": float(i), "team": i % 2, "confidence": 0.5, "status": "proposed"} for i in range(40)]
+    events.append({"id": "ev-99", "type": "shot", "t": 99.0, "team": 0, "confidence": 0.5, "status": "proposed", "needsReview": True})
+    review = {"decisions": [{"action": "accept" if i < 8 else "reject", "eventId": f"ev-{i}", "sample": True} for i in range(10)]}
+    merged, _ = an.apply_review(events, review)
+    seen = ([{"t": 0.0, "calibrated": False, "players": [], "ball": None}], [{"state": "control", "team": 0}])
+    stats = an.summarise(*seen, [], merged, None, {"segments": []}, {}, 5, 100, 0, [], None, [], [0.0, 0.0], 0.0)
+    team0 = stats["teams"][0]["interceptions"]
+    assert team0["checked"] == 10 and team0["checkedCorrect"] == 8 and team0["estimate"] == 4 + round(15 * 0.8)
+    assert an.SAMPLED_TYPES == ("pass", "interception", "tackle")

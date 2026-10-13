@@ -545,8 +545,8 @@ test("passes checked in the random-sample view are marked as sampled", async ({ 
   await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: /Enter the score and review|Review/ }).first().click();
-  await page.getByRole("tab", { name: "Check passes" }).click();
-  await expect(page.getByTestId("sample-progress")).toContainText("0 of 10 checked");
+  await page.getByRole("tab", { name: "Check a sample" }).click();
+  await expect(page.getByTestId("sample-progress")).toContainText("passes 0/10");
   await page.keyboard.press("a");
   await expect.poll(() => state.reviews.length).toBe(1);
   const decision = (state.reviews[0] as { decisions: { action: string; sample?: boolean }[] }).decisions[0];
