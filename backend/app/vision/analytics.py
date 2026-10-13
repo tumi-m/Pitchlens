@@ -74,6 +74,7 @@ PARAMS = {
     "onTargetMargin": 0.3,  # m outside the posts (ball radius + noise)
     # Possession sequences and dead ball.
     "maxPossessionGap": 8.0,  # s of unseen/loose ball a possession survives (E10)
+    "maxSameTeamGap": 30.0,  # s, when the same team controls on both sides of the gap (E15)
     "deadBallSpeed": 1.5,  # m/s mean player speed...
     "deadBallSeconds": 3.0,  # ...for at least this long
     "possessionMinCoverage": 0.6,  # share of in-play time before possession % is shown
@@ -671,6 +672,10 @@ def possession_sequences(projected, spells, in_play, sample_fps):
     The ball's flight between teammates belongs to the team that played it;
     a possession ends at the next opponent control, a cut, dead ball, or after
     maxPossessionGap seconds without any control (then the time is unknown).
+    When the same team controls the ball on both sides of an unseen stretch,
+    it keeps possession for up to maxSameTeamGap seconds (E15): on labelled
+    matches degraded to a few-pixel ball, that raised coverage by 7-11 points
+    for at most ~1.5 points of agreement.
     """
     n = len(projected)
     owner = [None] * n
@@ -679,7 +684,10 @@ def possession_sequences(projected, spells, in_play, sample_fps):
             if in_play[i]:
                 owner[i] = s["team"]
         nxt = spells[k + 1] if k + 1 < len(spells) else None
-        if nxt and nxt["scene"] == s["scene"] and nxt["start"] - s["end"] <= PARAMS["maxPossessionGap"]:
+        gap_limit = PARAMS["maxPossessionGap"]
+        if nxt and nxt["team"] == s["team"]:
+            gap_limit = max(gap_limit, PARAMS["maxSameTeamGap"])
+        if nxt and nxt["scene"] == s["scene"] and nxt["start"] - s["end"] <= gap_limit:
             between = range(s["last"] + 1, nxt["first"])
             if all(in_play[i] for i in between):
                 for i in between:

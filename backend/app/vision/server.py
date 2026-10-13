@@ -886,7 +886,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 6
+ANALYTICS_VERSION = 7
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 

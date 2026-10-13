@@ -810,3 +810,27 @@ def test_a_camera_pan_is_not_a_pass():
             "camera": [1, 0, 80 if i == 3 else 0, 0, 1, 0],
         })
     assert derive_metrics(frames, 5, 1.2)["events"] == []
+
+
+def test_possession_survives_a_long_unseen_stretch_only_between_same_team_controls():
+    from app.vision import analytics as an
+
+    fps = 5.0
+    n = 200
+    projected = [{"t": i / fps, "scene": 0} for i in range(n)]
+    in_play = [True] * n
+
+    def spell(team, first, last):
+        return {"team": team, "first": first, "last": last, "start": first / fps, "end": last / fps, "scene": 0}
+
+    # Team 0 controls, the ball is unseen for 20 s, team 0 controls again.
+    owner, _, seconds, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(0, 110, 119)], in_play, fps)
+    assert all(o == 0 for o in owner[:120])
+    # Different teams either side: only the usual short bridge, the rest is unknown.
+    owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(1, 110, 119)], in_play, fps)
+    assert owner[50] is None and owner[115] == 1
+    # Never across a stoppage.
+    stopped = [True] * n
+    stopped[60] = False
+    owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(0, 110, 119)], stopped, fps)
+    assert owner[50] is None
