@@ -86,6 +86,7 @@ PARAMS = {
     # Momentum.
     "momentumGoalScale": 8.0,  # m, exp(-distance to attacked goal / scale)
     "momentumHalfLifeMinutes": 1.5,
+    "minMomentumControlSeconds": 5.0,  # observed control in a minute before its bar is drawn
     # Positions and tracks.
     "offPitchMargin": 2.0,
     "maxPlayerSpeed": 8.5,
@@ -1343,7 +1344,11 @@ def summarise(projected, states, spells, events, template, directions, player_of
         return basis or any(e["type"] in kinds and e.get("source") == "reviewer" for e in live)
 
     teams_ok = measured(("pass", "interception", "tackle"), has_teams)
-    shots_ok = template is not None and measured(("shot", "goal", "goal-candidate"), has_direction)
+    # Automatic shots need the pitch and the attacking direction. Shots a reviewer
+    # logged count without them; a reviewer goal alone does not make "0 shots" known.
+    auto_shots = template is not None and has_direction
+    reviewer_shots = any(e["type"] == "shot" and e.get("source") == "reviewer" for e in live)
+    shots_ok = auto_shots or reviewer_shots
     teams = []
     for team in (0, 1):
         passes = count("pass", team)
@@ -1359,8 +1364,9 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 "controlSeconds": round(control[team], 1),
                 "possessionSeconds": round(possession_seconds[team], 1),
                 "possession": round(possession_seconds[team] / total_possession * 100, 1) if shown else None,
-                "possessions": len(own) if has_teams else None,
-                "averagePossession": round(sum(s["seconds"] for s in own) / len(own), 1) if own else None,
+                # Same coverage gate as the share: a 0 over mostly unseen play would be invented.
+                "possessions": len(own) if has_teams and shown else None,
+                "averagePossession": round(sum(s["seconds"] for s in own) / len(own), 1) if own and shown else None,
                 "passes": passes if teams_ok else None,
                 "passesComplete": complete if teams_ok else None,
                 "passAccuracy": accuracy,
@@ -1372,7 +1378,7 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 "shots": count("shot", team) if shots_ok else None,
                 "shotsOnTarget": count("shot", team, lambda e: e.get("onTarget") is True) if shots_ok else None,
                 # Confirmed goals count with or without a pitch setup; candidates need one.
-                "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"] if shots_ok else None},
+                "goals": {"value": goals_confirmed, "candidates": count("goal-candidate", team)["value"] if auto_shots else None},
                 "interceptions": count("interception", team) if teams_ok else None,
                 "tackles": count("tackle", team) if teams_ok else None,
                 # Withheld on a sliver of evidence (seconds of final-third control).
@@ -1401,10 +1407,12 @@ def summarise(projected, states, spells, events, template, directions, player_of
     }
     minutes = max(1, math.ceil(duration / 60))
     per_minute = [[0.0, 0.0] for _ in range(minutes)]
+    observed = [0.0] * minutes  # unweighted control seconds
     for f, s in zip(projected, states):
         if s["state"] != "control":
             continue
         m = min(minutes - 1, max(0, int((f["t"] - start) // 60)))
+        observed[m] += dt
         weight = 1.0
         if template and s.get("ball") is not None:
             sign = attack_sign(directions, s["team"], f["t"])
@@ -1413,7 +1421,12 @@ def summarise(projected, states, spells, events, template, directions, player_of
                 distance = math.dist(s["ball"], (goal_x, template["width"] / 2))
                 weight = math.exp(-distance / PARAMS["momentumGoalScale"])
         per_minute[m][s["team"]] += weight * dt
-    raw = [(a - b) / max(a + b, 1e-9) if a + b > 0 else None for a, b in per_minute]
+    # A few seconds of control would draw a full-height bar (the chart scales to its
+    # peak): a minute with too little observed control is a gap, not a swing.
+    raw = [
+        (a - b) / max(a + b, 1e-9) if a + b > 0 and seen >= PARAMS["minMomentumControlSeconds"] else None
+        for (a, b), seen in zip(per_minute, observed)
+    ]
     # Exponentially weighted smoothing (half-life in minutes), leaving gaps as gaps.
     alpha = 1 - 0.5 ** (1 / PARAMS["momentumHalfLifeMinutes"])
     momentum, level = [], None

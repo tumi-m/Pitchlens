@@ -3,13 +3,55 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { VisionJob, visionJson, clockTime } from "@/lib/review/vision";
-export function VisionJobs() {
+
+/** Which part of the file a job analysed: a test section, or the whole match. */
+function span(j: VisionJob) {
+  const duration = j.video?.duration;
+  if (j.maxSeconds) {
+    const start = j.startSeconds ?? 0;
+    const end = duration !== undefined ? Math.min(start + j.maxSeconds, duration) : start + j.maxSeconds;
+    return `Test ${clockTime(start)}–${clockTime(end)}`;
+  }
+  return duration !== undefined ? `Full match · ${clockTime(duration)}` : "Full match";
+}
+
+/** Which saved venues deleting this match also deletes (the worker removes venues saved from it). */
+async function venuesFrom(jobId: string): Promise<string[] | null> {
+  try {
+    const venues = await visionJson<{ name?: string; sourceJob?: string | null }[]>("venues");
+    return venues.filter((v) => v.sourceJob === jobId).map((v) => v.name || "Unnamed venue");
+  } catch {
+    return null; // unknown: say so in general terms
+  }
+}
+
+function deleteMessage(title: string, venues: string[] | null) {
+  const quoted = (venues ?? []).map((v) => `"${v}"`);
+  const venueNote =
+    venues === null
+      ? " Any venue saved from this match is deleted too."
+      : quoted.length
+        ? ` This also deletes the saved venue${quoted.length === 1 ? "" : "s"} ${quoted.length === 1 ? quoted[0] : `${quoted.slice(0, -1).join(", ")} and ${quoted.at(-1)}`}; later matches will no longer set up automatically.`
+        : "";
+  return `Delete "${title}" and its video, report, reviews and pitch setup?${venueNote} This cannot be undone.`;
+}
+
+/** Lists this browser's analyses. onCount reports how many once the first read has finished. */
+export function VisionJobs({ onCount }: { onCount?: (count: number) => void }) {
   const [jobs, setJobs] = useState<VisionJob[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
+  useEffect(() => {
+    if (loaded) onCount?.(jobs.length);
+  }, [loaded, jobs.length, onCount]);
   async function remove(job: VisionJob) {
-    if (!window.confirm(`Delete "${job.title}" and its video, report, reviews and derived venue setup? This cannot be undone.`)) return;
     setDeleting(job.id);
+    const venues = await venuesFrom(job.id);
+    if (!window.confirm(deleteMessage(job.title, venues))) {
+      setDeleting(null);
+      return;
+    }
     setError("");
     try {
       await visionJson(`jobs/${job.id}`, { method: "DELETE" });
@@ -47,6 +89,7 @@ export function VisionJobs() {
         .catch(() => schedule(30_000))
         .finally(() => {
           inFlight = false;
+          if (!stopped) setLoaded(true);
         });
     };
     const visible = () => {
@@ -81,10 +124,14 @@ export function VisionJobs() {
           >
             <p className="text-pitch-green text-xs uppercase">
               {j.status === "completed" ? "Vision report" : j.status}
+              {j.sourceJobId ? " · Re-analysis" : ""}
             </p>
             <h3 className="font-semibold break-words">{j.title}</h3>
+            <p className="text-sm text-pitch-muted" data-testid="vision-job-span">
+              {span(j)}
+              {j.createdAt ? ` · ${new Date(j.createdAt * 1000).toLocaleDateString()}` : ""}
+            </p>
             <p className="text-sm text-pitch-muted">
-              {j.video ? `${clockTime(j.video.duration)} · ` : ""}
               {j.stage}
               {j.status === "processing" ? ` · ${j.progress}%` : ""}
             </p>

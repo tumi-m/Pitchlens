@@ -230,6 +230,15 @@ export type Analysis = {
   schemaVersion: 1;
   calibrated: boolean;
   template: PitchTemplate | null;
+  /** The worker's thresholds (absent on older workers). */
+  params?: {
+    /** Share of in-play time the ball must be followed before possession is shown (0-1). */
+    possessionMinCoverage?: number;
+    /** Checked detections of a type before the unchecked ones are estimated. */
+    minCheckedForEstimate?: number;
+    /** Observed control seconds in a minute before its momentum is shown. */
+    minMomentumControlSeconds?: number;
+  };
   directions: { segments: { start: number; end: number | null; team0Attacks: "left" | "right" }[]; confidence: number; source: string } | null;
   events: AnalysisEvent[];
   stats: {
@@ -431,6 +440,8 @@ export type BallModelState = {
   active: string | null;
   runs: BallModelRun[];
   training: { state: "idle" | "running" | "done" | "failed"; stage?: string; run?: BallModelRun };
+  /** True only when this site may start a training run (absent on older workers: treat as no). */
+  siteTraining?: boolean;
 };
 
 export const fetchBallModel = () => visionJson<BallModelState>("ball-model");

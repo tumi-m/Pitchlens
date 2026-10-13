@@ -48,6 +48,8 @@ def run_on_modal(
     max_seconds=None,
     start_seconds=0,
     ball_search="exhaustive",
+    reference_colours=None,
+    reference_job=None,
 ):
     """Stream progress from the GPU function and write its result to `output`."""
     base = public_base()
@@ -69,6 +71,8 @@ def run_on_modal(
                 ball_search,
                 video_grant(token, job_id),
                 active_ball_name(),
+                reference_colours,
+                reference_job,
             )
             for item in stream:
                 if cancelled():

@@ -43,11 +43,28 @@ Browser ──4 MB chunks──▶ Vercel /api/vision/* ──Bearer token──
 
    Optional: `VISION_RETENTION_HOURS` (default `168`), `VISION_ALLOWED_HOSTS`
    (default `*`; set to your Railway domain plus `healthcheck.railway.app` to
-   lock it down).
+   lock it down), `VISION_MAX_BYTES` (see below).
 5. **Add a volume** (right-click the service → Attach volume) with mount path
    **`/data`**. Without it every redeploy deletes all jobs and results. Hobby
    volumes are 5 GB; that holds about ten 500 MB uploads within the retention
    window. The worker answers "out of storage" instead of filling the disk.
+
+### Upload size limit (`VISION_MAX_BYTES`)
+
+The largest accepted video, in bytes (default `524288000`, 500 MiB). The upload
+page reads it from `/health` and refuses a larger file before sending it,
+showing how many minutes fit at that file's bitrate. 500 MB is about 8 minutes
+of an iPhone's default 1080p HEVC (about 60 MB per minute), so a full match
+needs a higher limit or a 720p export. Before raising it:
+
+- Size the volume for about **ten uploads of that size** within the retention
+  window (a 2 GB limit needs a volume of about 20 GB).
+- The Modal GPU downloads the **whole file** for every analysis and every
+  rerun, so a larger limit means longer fetches and more transfer.
+- YouTube downloads share the same limit.
+
+A value that is not a positive whole number is ignored (with a warning in the
+log) and the default applies.
 6. Deploy. The first build downloads PyTorch and the model weights and takes
    several minutes. Check the build log mentions `vision.Dockerfile` and
    `Model: /app/models/yolo11s.pt`. When it is live,
@@ -103,8 +120,16 @@ Runtime on CPU; switching it to `onnxruntime-gpu` is a separate change.
 ## Redeploys and failures
 
 A redeploy restarts the worker. An analysis in progress is marked
-**interrupted** (not cancelled); submit the video again. Uploads that stop
-half-way free the worker after five minutes (`VISION_UPLOAD_IDLE_SECONDS`).
+**interrupted** (not cancelled); its saved upload can be retried from the
+report. An upload in progress survives: after the restart the worker keeps
+the newest unfinished upload (trimmed to the bytes it had confirmed) and
+reserves itself for it again. The browser keeps retrying through the outage
+(a 502/503/504 from the site counts as a dropped connection, for up to four
+minutes) and continues from the server's offset. A page reloaded meanwhile
+resumes too when the same file is chosen again. Any older unfinished upload is
+marked interrupted and its partial file deleted. Uploads that stop half-way
+free the worker after five minutes (`VISION_UPLOAD_IDLE_SECONDS`), including
+one kept across a restart whose browser never comes back.
 Check the Railway **Deploy logs** for model or decoding errors.
 
 ## Run the same container anywhere
@@ -122,7 +147,7 @@ set the three Vercel variables as above.
 ## YouTube links
 
 The upload page also accepts a YouTube link. The worker fetches the video itself
-with yt-dlp (plus the Deno runtime it now requires), up to 1080p and 500 MB, so
+with yt-dlp (plus the Deno runtime it now requires), up to 1080p and `VISION_MAX_BYTES` (500 MB by default), so
 nothing large passes through the browser or Vercel. Users must confirm they
 filmed the video or have the owner's permission.
 
@@ -208,7 +233,9 @@ Hosted full matches fail visibly when GPU execution is unavailable, preserving t
 complete upload for retry. CPU diagnostics remain possible; setting
 `VISION_ALLOW_CPU_FALLBACK=1` explicitly restores full-match CPU fallback, with the
 associated latency risk. `/jobs/{id}/retry` reuses saved complete footage for stopped
-jobs and caps attempts at three. It does not recover partial interrupted uploads.
+jobs and caps attempts at three. It does not recover partial interrupted uploads
+(the browser resumes those itself; see Redeploys and failures). Job reads carry
+`retryable`, so the report offers Retry only when it can work.
 
 `DELETE /jobs/{id}` removes the match directory, derived venue setups and in-memory
 analysis cache; it refuses while upload/inference/calibration is active. External

@@ -110,9 +110,10 @@ async function proxy(
       );
   }
   // Training switches the ball model every browser uses: never from an open site.
+  // The person reading this is a team owner, not the operator: no settings named.
   if (route === "ball-model/train" && request.method !== "GET" && !accessCode)
     return Response.json(
-      { detail: "Training from the site needs an access code. Set VISION_ACCESS_CODE, or train from a terminal." },
+      { detail: "Training is not available on this site. Your labels are saved for the next ball-model update." },
       { status: 403 },
     );
   // Rebuild the query so a browser can never pick someone else's owner key.
@@ -205,6 +206,16 @@ async function proxy(
   ]) {
     const value = upstream.headers.get(name);
     if (value) out.set(name, value);
+  }
+  if (route === "ball-model" && request.method === "GET" && !accessCode && upstream.ok) {
+    // An open site refuses training above, whatever the worker allows: say so up front.
+    const data = await upstream.json().catch(() => null);
+    out.delete("content-length");
+    out.set("content-type", "application/json");
+    return new Response(JSON.stringify(data && typeof data === "object" ? { ...data, siteTraining: false } : data), {
+      status: upstream.status,
+      headers: out,
+    });
   }
   return new Response(upstream.body, {
     status: upstream.status,

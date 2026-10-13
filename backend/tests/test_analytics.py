@@ -698,6 +698,67 @@ def test_counts_are_unmeasured_not_zero_without_kit_labels():
     assert out["stats"]["teams"][0]["passes"]["value"] == 1
 
 
+def _control_summary(control, seconds=120, events=()):
+    """summarise() over `seconds` of play at 5 fps; `control` maps a frame index to the team in control."""
+    n = int(seconds * FPS)
+    projected = [{"t": i / FPS, "calibrated": False, "players": [], "ball": None} for i in range(n)]
+    states = [{"state": "control", "team": control[i]} if i in control else {"state": "unknown"} for i in range(n)]
+    sequences, seconds_by_team, run = [], [0.0, 0.0], None
+    for i in range(n + 1):
+        team = control.get(i)
+        if run and (team != run["team"] or i == n):
+            run["seconds"] = round((i - run["first"]) / FPS, 1)
+            seconds_by_team[run["team"]] += run["seconds"]
+            sequences.append(run)
+            run = None
+        if team is not None and run is None:
+            run = {"team": team, "first": i, "start": i / FPS}
+    return analytics.summarise(projected, states, [], list(events), None, None, {}, FPS, seconds, 0, [True] * n, None, sequences, seconds_by_team, float(seconds))
+
+
+def test_possession_counts_follow_the_coverage_gate_of_the_share():
+    # One short blip of control for team 0 over two minutes of play (job 4255b6f5: 1.7%).
+    stats = _control_summary({i: 0 for i in range(2)})
+    assert stats["coverage"]["possessionShown"] is False
+    for team in stats["teams"]:
+        assert team["possession"] is None and team["possessions"] is None and team["averagePossession"] is None
+    # Followed for most of play, the counts are measured (and a team without a possession is 0).
+    stats = _control_summary({i: 0 for i in range(500)} | {i: 1 for i in range(500, 600)})
+    assert stats["coverage"]["possessionShown"] is True
+    assert [t["possessions"] for t in stats["teams"]] == [1, 1]
+    assert [t["averagePossession"] for t in stats["teams"]] == [100.0, 20.0]
+    stats = _control_summary({i: 0 for i in range(600)})
+    assert [t["possessions"] for t in stats["teams"]] == [1, 0]
+
+
+def test_a_momentum_minute_needs_enough_observed_control():
+    # Minute 1: 20 s of team 0 against 10 s of team 1. Minute 2: 2.6 s observed (2.2 s against 0.4 s).
+    control = {i: 0 for i in range(100)} | {i: 1 for i in range(100, 150)}
+    control |= {i: 0 for i in range(300, 311)} | {i: 1 for i in range(311, 313)}
+    momentum = _control_summary(control)["momentum"]
+    assert momentum[0] == pytest.approx(1 / 3, abs=0.01)
+    assert momentum[1] is None
+
+
+def _reviewer(kind, team, t):
+    return {"id": f"added-{kind}-{t}", "type": kind, "t": t, "team": team, "status": "confirmed", "source": "reviewer", "confidence": 1.0,
+            **({"outcome": "on-target", "onTarget": True} if kind == "shot" else {})}
+
+
+def test_reviewer_shots_count_without_a_pitch_setup():
+    stats = _control_summary({}, events=[_reviewer("shot", 0, 40.0), _reviewer("goal", 0, 44.0)])
+    a, b = stats["teams"]
+    assert a["shots"]["value"] == 1 and b["shots"]["value"] == 0
+    assert a["shotsOnTarget"]["value"] == 1 and b["shotsOnTarget"]["value"] == 0
+    assert a["goals"] == {"value": 1, "candidates": None} and b["goals"]["candidates"] is None
+    # A reviewer goal alone does not make "no shots" known next to a 1-0 score.
+    stats = _control_summary({}, events=[_reviewer("goal", 0, 44.0)])
+    assert [t["shots"] for t in stats["teams"]] == [None, None]
+    assert stats["teams"][0]["goals"]["value"] == 1
+    # Nothing logged: still unmeasured.
+    assert [t["shots"] for t in _control_summary({})["teams"]] == [None, None]
+
+
 def test_an_off_pitch_bystander_does_not_split_a_player_across_a_missed_frame():
     def run(bystander_start):
         frames = []

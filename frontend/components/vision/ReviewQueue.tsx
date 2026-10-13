@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, X, ArrowLeftRight, ChevronLeft, ChevronRight, Plus } from "lucide-react";
 import type { Analysis, AnalysisEvent, ReviewDecision } from "@/lib/review/analysis";
 import { describeEvent, sendReview } from "@/lib/review/analysis";
-import { clockTime } from "@/lib/review/vision";
+import { clockTime, isMatchDeleted } from "@/lib/review/vision";
 
 /** Stable pseudo-random rank for an event in this match (same order on every visit). */
 function shuffleKey(seed: string, id: string) {
@@ -32,6 +32,7 @@ export function ReviewQueue({
   time,
   onWatch,
   onAnalysis,
+  onDeleted,
 }: {
   jobId: string;
   analysis: Analysis;
@@ -41,6 +42,8 @@ export function ReviewQueue({
   /** Seek to t and play a short clip around it. */
   onWatch: (t: number, until: number) => void;
   onAnalysis: (analysis: Analysis) => void;
+  /** The worker no longer has this match. */
+  onDeleted?: () => void;
 }) {
   const [filter, setFilter] = useState<"key" | "sample" | "pending" | "all">("key");
   // The selection follows the event, not a position: decisions change the list.
@@ -98,13 +101,14 @@ export function ReviewQueue({
         // takes its place, so stay on the same position rather than skipping.
         if (advance) setSelectedId(filter === "pending" || filter === "sample" ? nextId : nextId ?? current?.id ?? null);
       } catch (e) {
-        setError(e instanceof Error ? e.message : "The decision could not be saved");
+        if (isMatchDeleted(e) && onDeleted) onDeleted();
+        else setError(e instanceof Error ? e.message : "The decision could not be saved");
       } finally {
         savingRef.current = false;
         setSaving(false);
       }
     },
-    [jobId, onAnalysis, items, index, current, filter, analysis.review.decisions],
+    [jobId, onAnalysis, onDeleted, items, index, current, filter, analysis.review.decisions],
   );
 
   /** The moment as the reviewer sees it, so the decision survives re-analysis. */
@@ -228,7 +232,8 @@ export function ReviewQueue({
           )}
         </div>
       )}
-      <div className="flex gap-1 p-1 rounded-lg bg-white/5 text-sm" role="tablist" aria-label="Which moments">
+      {/* data-reveal: on a phone the page scrolls this to just below the pinned video. */}
+      <div className="flex gap-1 p-1 rounded-lg bg-white/5 text-sm" role="tablist" aria-label="Which moments" data-reveal>
         {(
           [
             ["key", "Shots & key moments"],
@@ -248,9 +253,11 @@ export function ReviewQueue({
             const parts = SAMPLED.map((type) => {
               const found = analysis.events.filter((e) => e.type === type || e.original?.type === type).length;
               const checked = analysis.events.filter((e) => (e.original?.type ?? e.type) === type && e.status !== "proposed" && e.source !== "reviewer" && e.sampled).length;
-              return found ? `${type === "pass" ? "passes" : type === "interception" ? "interceptions" : "tackles"} ${Math.min(checked, 10)}/10` : "";
+              // With fewer than ten found, checking them all is the whole sample.
+              const target = Math.min(found, analysis.params?.minCheckedForEstimate ?? 10);
+              return found ? `${type === "pass" ? "passes" : type === "interception" ? "interceptions" : "tackles"} ${Math.min(checked, target)}/${target}` : "";
             }).filter(Boolean);
-            return `Random passes, interceptions and tackles in turn. Check about ten of each and the report estimates their totals: ${parts.join(" · ") || "nothing to check"}.`;
+            return `Random passes, interceptions and tackles in turn. Check about ten of each (all of them when there are fewer) and the report estimates their totals: ${parts.join(" · ") || "nothing to check"}.`;
           })()}
         </p>
       )}

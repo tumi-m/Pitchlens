@@ -16,7 +16,9 @@ A match now produces a Sofascore-style report:
   average positions, a top-down live view, pitch lines drawn on the video.
 - **Human-confirmed:** goals (never automatic), shot outcomes, anything the
   reviewer adds; the final score typed by the reviewer sets the scoreline.
-- **Not offered:** player identities, distance/speed, xG, PPDA.
+- **Player load (the upload default, no ball model):** per-kit running
+  distance estimate (camera pan removed, 1.8 m player scale), unvalidated.
+- **Not offered:** player identities, per-player distance/speed, xG, PPDA.
 
 ## Evidence so far (see EXPERIMENTS.md)
 

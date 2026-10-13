@@ -15,7 +15,7 @@ import {
   applyVenue,
   Venue,
 } from "@/lib/review/analysis";
-import { VisionError, clockTime } from "@/lib/review/vision";
+import { VisionError, clockTime, isMatchDeleted } from "@/lib/review/vision";
 import { PitchSvg } from "@/components/vision/PitchGraphics";
 
 export type CalibrationOverlay = {
@@ -51,9 +51,11 @@ export function PitchCalibration({
   onApplied,
   onStep,
   videoAvailable = true,
+  onDeleted,
 }: {
   jobId: string;
   videoSize: [number, number];
+  /** The analysed frame's stored time when one is on screen (the playback time otherwise). */
   time: number;
   /** Latest click on the video in video pixels; n increments per click. */
   click: { x: number; y: number; n: number; moved?: boolean } | null;
@@ -64,8 +66,10 @@ export function PitchCalibration({
   onApplied: () => void;
   /** Move the paused video by this many seconds (the click layer covers the player's controls). */
   onStep: (seconds: number) => void;
-  /** False once retention deleted the footage: a saved venue could not be checked. */
+  /** False once retention deleted the footage: landmarks cannot be clicked and a saved venue could not be checked. */
   videoAvailable?: boolean;
+  /** The worker no longer has this match. */
+  onDeleted?: () => void;
 }) {
   const saved = calibration?.request;
   const [presetKey, setPresetKey] = useState<string>("five-a-side");
@@ -80,6 +84,11 @@ export function PitchCalibration({
   const [frameTime, setFrameTime] = useState<number | null>(null);
   const [preview, setPreview] = useState<{ fit: CalibrationFit; lines: ([number, number] | null)[][] } | null>(null);
   const [error, setError] = useState("");
+  /** Shows a failed request's message, or hands a deleted match to the page. */
+  const fail = (e: unknown, message: string) => {
+    if (isMatchDeleted(e) && onDeleted) onDeleted();
+    else setError(message);
+  };
   const [busy, setBusy] = useState<"" | "preview" | "save">("");
   const [progress, setProgress] = useState<number | null>(null);
   const handled = useRef(0);
@@ -130,7 +139,7 @@ export function PitchCalibration({
     } catch (e) {
       if (!mounted.current) return;
       setProgress(null);
-      setError(e instanceof Error ? e.message : "The saved venue could not be applied");
+      fail(e, e instanceof Error ? e.message : "The saved venue could not be applied");
     } finally {
       setBusy("");
     }
@@ -145,7 +154,7 @@ export function PitchCalibration({
       setVenueNote(`Saved as "${venue.name}". Future matches from this camera can use it without clicks.`);
       setVenueName("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The venue could not be saved");
+      fail(e, e instanceof Error ? e.message : "The venue could not be saved");
     }
   }
 
@@ -230,7 +239,7 @@ export function PitchCalibration({
       const out = await previewCalibration(jobId, request());
       setPreview({ fit: out.fit, lines: out.lines });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The fit could not be checked");
+      fail(e, e instanceof Error ? e.message : "The fit could not be checked");
       setPreview(null);
     } finally {
       setBusy("");
@@ -251,7 +260,7 @@ export function PitchCalibration({
     } catch (e) {
       if (!mounted.current) return;
       setProgress(null);
-      setError(e instanceof VisionError && e.code === "access" ? "Enter the access code on the upload page first." : e instanceof Error ? e.message : "Calibration failed");
+      fail(e, e instanceof VisionError && e.code === "access" ? "Enter the access code on the upload page first." : e instanceof Error ? e.message : "Calibration failed");
     } finally {
       setBusy("");
     }
@@ -303,7 +312,8 @@ export function PitchCalibration({
             <p className="text-sm font-semibold">Use a saved venue</p>
             <p className="text-xs text-pitch-muted">Same fixed camera as before? Apply its pitch setup without clicking; it is checked against the painted lines.</p>
             <div className="flex gap-2">
-              <select aria-label="Saved venue" className="pitch-input flex-1" value={venueId} onChange={(e) => setVenueId(e.target.value)}>
+              {/* min-w-0: a long venue name must not widen the page past a phone screen. */}
+              <select aria-label="Saved venue" className="pitch-input flex-1 min-w-0 w-full" value={venueId} onChange={(e) => setVenueId(e.target.value)}>
                 {venues.map((v) => (
                   <option key={v.id} value={v.id}>
                     {v.name} · {v.template.length}×{v.template.width} m
@@ -322,7 +332,7 @@ export function PitchCalibration({
             <p className="text-sm font-semibold">Save as a venue</p>
             <p className="text-xs text-pitch-muted">For a fixed camera: later matches from it reuse this setup automatically.</p>
             <div className="flex gap-2">
-              <input aria-label="Venue name" maxLength={80} placeholder="e.g. Tekkerz Court 2" className="pitch-input flex-1" value={venueName} onChange={(e) => setVenueName(e.target.value)} />
+              <input aria-label="Venue name" maxLength={80} placeholder="e.g. Tekkerz Court 2" className="pitch-input flex-1 min-w-0 w-full" value={venueName} onChange={(e) => setVenueName(e.target.value)} />
               <button className="pitch-button-secondary" disabled={!venueName.trim()} onClick={storeVenue}>
                 Save
               </button>
@@ -335,7 +345,17 @@ export function PitchCalibration({
             {error}
           </p>
         )}
-        <button className="pitch-button-secondary w-full" onClick={() => onActive(true)}>
+        {!videoAvailable && (
+          <p className="text-sm text-pitch-muted" id="pitch-setup-unavailable">
+            Pitch setup needs the footage, which was deleted after the retention period.
+          </p>
+        )}
+        <button
+          className="pitch-button-secondary w-full"
+          disabled={!videoAvailable}
+          aria-describedby={videoAvailable ? undefined : "pitch-setup-unavailable"}
+          onClick={() => onActive(true)}
+        >
           <Crosshair size={16} /> {ready ? "Adjust pitch setup" : "Set up the pitch"}
         </button>
       </section>
@@ -354,7 +374,8 @@ export function PitchCalibration({
         <li>Pick a landmark below, then click exactly on it in the video. Aim for 6 or more, spread out.</li>
         <li>Low cameras rarely see the near corners: add points along any straight line you can see.</li>
       </ol>
-      <div className="flex items-center gap-1 text-sm" role="group" aria-label="Choose the frame">
+      {/* data-reveal: on a phone the page scrolls this to just below the pinned video. */}
+      <div className="flex flex-wrap items-center gap-1 text-sm" role="group" aria-label="Choose the frame" data-reveal>
         <span className="text-pitch-muted mr-1">Frame {clockTime(time)}</span>
         {(
           [

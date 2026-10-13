@@ -2,6 +2,21 @@
 
 Each entry: the decision, what else was considered, and why. Newest first.
 
+## 2026-10-13 · Low-coverage possession counts and momentum are withheld
+
+- Possession counts and average possession follow the same 60% coverage gate
+  as the possession share. Below it they are null ("—"). A real job that
+  followed 1.7% of play showed "Possessions 1 – 0", and that 0 covered 98% of
+  unseen play.
+- A momentum minute needs at least 5 s of observed ball control
+  (`minMomentumControlSeconds`). Otherwise it is a gap. The chart scales to its
+  peak, so 2.3 s against 0.3 s used to draw a full-height bar. Without a pitch
+  setup and attacking directions, momentum is the plain control difference,
+  and the report says so instead of claiming field position is weighted.
+- Shots a reviewer logged count without a pitch setup. A reviewer goal alone
+  does not count, because it would show "0 shots" next to a 1–0 score.
+  Possible goals still need the pitch and an attacking direction.
+
 ## 2026-09-28 · South Africa: prepare Paystack in ZAR, sandbox only
 
 The owner confirmed South Africa and approved Paystack preparation without an

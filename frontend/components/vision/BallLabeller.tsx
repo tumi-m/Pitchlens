@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, EyeOff, SkipForward, ChevronLeft, ZoomIn } from "lucide-react";
 import type { BallLabelState, BallModelState, Rate } from "@/lib/review/analysis";
 import { fetchBallLabels, fetchBallModel, frameImageUrl, sendBallLabel, trainBallModel } from "@/lib/review/analysis";
-import { clockTime } from "@/lib/review/vision";
+import { clockTime, isMatchDeleted } from "@/lib/review/vision";
 
 const ZOOM = 5; // magnification of the precise-click view
 
@@ -22,7 +22,17 @@ function range(rate: Rate) {
  * visible. The answers measure the ball finder on this match and become
  * training data for a better one.
  */
-export function BallLabeller({ jobId }: { jobId: string }) {
+export function BallLabeller({
+  jobId,
+  onDeleted,
+  ballModel = true,
+}: {
+  jobId: string;
+  /** The worker no longer has this match. */
+  onDeleted?: () => void;
+  /** False on a player-load job: no ball model ran, so there is no accuracy to measure. */
+  ballModel?: boolean;
+}) {
   const [state, setState] = useState<BallLabelState | null>(null);
   const [position, setPosition] = useState(0);
   const [zoom, setZoom] = useState<{ x: number; y: number } | null>(null);
@@ -41,6 +51,9 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   }, [ready]);
   const positionRef = useRef(0);
   positionRef.current = position;
+  // Latest callback without restarting the label polling when the page re-renders.
+  const gone = useRef(onDeleted);
+  gone.current = onDeleted;
 
   useEffect(() => {
     let stop = false;
@@ -59,7 +72,11 @@ export function BallLabeller({ jobId }: { jobId: string }) {
           // The worker extracts the frames from the video in one pass first.
           if (data.videoAvailable && !data.framesReady) timer = setTimeout(load, 3000);
         })
-        .catch((e) => !stop && setError(e instanceof Error ? e.message : "Labels could not be loaded"));
+        .catch((e) => {
+          if (stop) return;
+          if (isMatchDeleted(e) && gone.current) gone.current();
+          else setError(e instanceof Error ? e.message : "Labels could not be loaded");
+        });
     load();
     return () => {
       stop = true;
@@ -101,7 +118,8 @@ export function BallLabeller({ jobId }: { jobId: string }) {
           setPosition(target);
         }
       } catch (e) {
-        setError(e instanceof Error ? e.message : "The label could not be saved");
+        if (isMatchDeleted(e) && gone.current) gone.current();
+        else setError(e instanceof Error ? e.message : "The label could not be saved");
       } finally {
         setSaving(false);
       }
@@ -199,16 +217,25 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   return (
     <div ref={root} tabIndex={-1} className="space-y-3 outline-none" data-testid="ball-labeller">
       <div className="grid sm:grid-cols-3 gap-2 text-sm">
-        <div className="rounded-lg bg-white/5 p-3">
-          <p className="text-[11px] uppercase tracking-widest text-pitch-muted">Ball found when visible</p>
-          <p className="text-xl font-bold" data-testid="ball-recall">{pct(m.recall)}</p>
-          <p className="text-[11px] text-pitch-muted">{m.recall.n ? `${range(m.recall)} · ${m.recall.n} frames you saw it` : "label frames to measure"}</p>
-        </div>
-        <div className="rounded-lg bg-white/5 p-3">
-          <p className="text-[11px] uppercase tracking-widest text-pitch-muted">Ball positions that were right</p>
-          <p className="text-xl font-bold">{pct(m.precision)}</p>
-          <p className="text-[11px] text-pitch-muted">{m.precision.n ? `${range(m.precision)} · within ${m.tolerancePixels} px` : "—"}</p>
-        </div>
+        {ballModel ? (
+          <>
+            <div className="rounded-lg bg-white/5 p-3">
+              <p className="text-[11px] uppercase tracking-widest text-pitch-muted">Ball found when visible</p>
+              <p className="text-xl font-bold" data-testid="ball-recall">{pct(m.recall)}</p>
+              <p className="text-[11px] text-pitch-muted">{m.recall.n ? `${range(m.recall)} · ${m.recall.n} frames you saw it` : "label frames to measure"}</p>
+            </div>
+            <div className="rounded-lg bg-white/5 p-3">
+              <p className="text-[11px] uppercase tracking-widest text-pitch-muted">Ball positions that were right</p>
+              <p className="text-xl font-bold">{pct(m.precision)}</p>
+              <p className="text-[11px] text-pitch-muted">{m.precision.n ? `${range(m.precision)} · within ${m.tolerancePixels} px` : "—"}</p>
+            </div>
+          </>
+        ) : (
+          // No ball model ran: a recall here could only read 0%, which says nothing about the finder.
+          <p className="rounded-lg bg-white/5 p-3 sm:col-span-2 text-pitch-muted" data-testid="ball-accuracy-unmeasured">
+            Ball accuracy is not measured on a player-load job; your labels are saved for training.
+          </p>
+        )}
         <div className="rounded-lg bg-white/5 p-3">
           <p className="text-[11px] uppercase tracking-widest text-pitch-muted">Labelled</p>
           <p className="text-xl font-bold">
@@ -305,20 +332,29 @@ export function BallTraining({ labelled }: { labelled: number }) {
   }
 
   const last = model?.training.run ?? model?.runs[model.runs.length - 1];
+  // Most sites cannot start a run (an open site never can): no button that only leads to a refusal.
+  const allowed = model?.siteTraining === true;
   return (
     <div className="rounded-lg border border-white/10 p-4 space-y-2 text-sm" data-testid="ball-training">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="font-semibold">Train a better ball finder</p>
-          <p className="text-pitch-muted text-xs max-w-xl">
-            Uses the frames you labelled in every match from this browser. Some matches are held back to check the
-            result; the new finder is switched on only if it finds more balls there without more false ones.
-            Label at least two matches first ({labelled} frames labelled here).
-          </p>
+          {allowed ? (
+            <p className="text-pitch-muted text-xs max-w-xl">
+              Uses the frames you labelled in every match from this browser. Some matches are held back to check the
+              result; the new finder is switched on only if it finds more balls there without more false ones.
+              Starts once this match has 30 labelled frames ({labelled} so far); labels from two or more matches give a
+              fairer check.
+            </p>
+          ) : (
+            model && <p className="text-pitch-muted text-xs max-w-xl">Your labels are saved and will be used in the next ball-model update.</p>
+          )}
         </div>
-        <button className="pitch-button-primary" onClick={start} disabled={running || labelled < 30}>
-          {running ? "Training…" : "Train on my labels"}
-        </button>
+        {allowed && (
+          <button className="pitch-button-primary" onClick={start} disabled={running || labelled < 30}>
+            {running ? "Training…" : "Train on my labels"}
+          </button>
+        )}
       </div>
       {running && <p className="text-pitch-muted">{model?.training.stage}</p>}
       {model?.training.state === "failed" && <p className="text-amber-200">{model.training.stage}</p>}

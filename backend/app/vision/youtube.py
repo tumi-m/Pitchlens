@@ -141,7 +141,7 @@ def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=la
     files = [p for p in directory.glob("download.*") if not p.name.endswith(".part")]
     if not files:
         raise ValueError(
-            "This video is larger than 500 MB at 1080p. Trim it or upload a shorter clip."
+            f"This video is larger than {max_bytes / (1024 * 1024):.0f} MB at 1080p. Trim it or upload a shorter clip."
         )
     return remux(files[0]), {
         "title": info.get("title"),

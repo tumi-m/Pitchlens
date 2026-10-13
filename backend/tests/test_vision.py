@@ -79,6 +79,20 @@ def test_player_load_is_a_ball_search_mode():
         run_video("/no/such/video.mp4", "/tmp/out", ball_search="sideways")
 
 
+def test_limitations_describe_running_distance_as_a_per_kit_estimate():
+    import re
+
+    from app.vision.engine import limitations
+
+    notes = limitations(None, 180, 180, 180)
+    text = " ".join(notes)
+    assert not re.search(r"distance[^.;]*not measured", text)
+    assert "per-kit estimate" in text and "speed and xG are not measured" in text
+    # A kit failure leads the list; a file that ends early says so.
+    short = limitations("Kits failed.", 180, 60, 180)
+    assert short[0] == "Kits failed." and "decoding ended at 60 s" in short[-1]
+
+
 def _load_player(pid=1, team=0, box=(92, 40, 108, 60)):
     return {"id": pid, "team": team, "role": "player", "box": list(box), "confidence": 0.9}
 
@@ -658,6 +672,44 @@ def test_shutdown_during_analysis_is_interrupted_not_user_cancelled(service, mon
     server.cancellations[job] = event
     server.work(directory, status, event)
     assert status["status"] == "interrupted"
+    # Persisted, so the retry after the redeploy is not charged to the user.
+    import json
+
+    assert json.loads((directory / "status.json").read_text())["interruptedBy"] == "shutdown"
+
+
+def _stopped_job(server, job, attempts, **extra):
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "video").write_bytes(b"saved video")
+    server.write_status(directory, {
+        "id": job, "status": "interrupted", "createdAt": __import__("time").time(), "profile": "general",
+        "video": {"duration": 60}, "attempts": attempts, **extra,
+    })
+    return directory
+
+
+def test_a_redeploy_does_not_use_up_the_retry_budget(hosted):
+    import json
+
+    server, client, submitted = hosted
+    job = "4" * 32
+    directory = _stopped_job(server, job, 3, interruptedBy="shutdown")
+    response = client.post(f"/jobs/{job}/retry")
+    assert response.status_code == 200, response.text
+    saved = json.loads((directory / "status.json").read_text())
+    assert saved["attempts"] == 3 and "interruptedBy" not in saved and len(submitted) == 1
+
+
+def test_crash_recoveries_still_count_and_the_refusal_offers_an_action(hosted):
+    server, client, submitted = hosted
+    job = "5" * 32
+    directory = _stopped_job(server, job, 3)
+    server.write_status(directory, {**__import__("json").loads((directory / "status.json").read_text()), "status": "processing"})
+    server.recover_after_restart()
+    response = client.post(f"/jobs/{job}/retry")
+    assert response.status_code == 409 and not submitted
+    assert "support" not in response.json()["detail"] and "Upload it again" in response.json()["detail"]
 
 
 def test_identical_kit_colours_fail_with_a_clear_message():
@@ -676,6 +728,37 @@ def test_trickling_upload_cannot_hold_the_worker_past_the_deadline(hosted, monke
     replacement = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"})
     assert replacement.status_code == 200
     assert client.get(f"/jobs/{job['id']}").json()["status"] == "failed"
+
+
+def test_upload_time_limit_applies_only_when_another_start_waits_and_says_so(hosted, monkeypatch):
+    server, client, _ = hosted
+    monkeypatch.setattr(server, "UPLOAD_MAX_SECONDS", 0)
+    monkeypatch.setattr(server, "UPLOAD_IDLE_SECONDS", 10_000)
+    mine, other = "c" * 32, "d" * 32
+    job = client.post(f"/jobs?size=8&owner={mine}", headers={"Content-Type": "video/mp4"}).json()
+    headers = {"x-pitchlens-owner": mine}
+    assert client.put(f"/jobs/{job['id']}/video?offset=0", content=b"0123", headers=headers).status_code == 200
+    # Polling (even this user's own dashboard) is not contention: a lone slow upload continues.
+    client.get(f"/jobs?owner={mine}")
+    client.get("/health")
+    client.get(f"/jobs/{job['id']}", headers=headers)
+    assert client.put(f"/jobs/{job['id']}/video?offset=4", content=b"45", headers=headers).status_code == 200
+    # Someone else wants the worker: the overdue upload gives way, and its uploader learns why.
+    assert client.post(f"/jobs?size=10&owner={other}", headers={"Content-Type": "video/mp4"}).status_code == 200
+    late = client.put(f"/jobs/{job['id']}/video?offset=6", content=b"67", headers=headers)
+    assert late.status_code == 409
+    assert "within 1 minute" in late.json()["detail"] and "75%" in late.json()["detail"]
+    assert client.get(f"/jobs/{job['id']}", headers=headers).json()["stage"] == "Upload took longer than the 1-minute limit."
+
+
+def test_idle_upload_is_still_released_by_any_poll_with_the_idle_message(hosted, monkeypatch):
+    server, client, _ = hosted
+    job = client.post("/jobs?size=8", headers={"Content-Type": "video/mp4"}).json()
+    monkeypatch.setattr(server, "UPLOAD_IDLE_SECONDS", 0)
+    client.get("/jobs")
+    assert server.active is None
+    late = client.put(f"/jobs/{job['id']}/video?offset=0", content=b"0123")
+    assert late.status_code == 409 and late.json()["detail"] == "This upload is no longer accepting data. Start again."
 
 
 def test_late_chunk_after_cancel_does_not_resurrect_the_upload(hosted, monkeypatch):
@@ -746,6 +829,108 @@ def test_expired_footage_is_not_served_even_before_the_sweep(service, monkeypatc
     assert client.get(f"/jobs/{job}/video").status_code == 404
     assert not (directory / "video").exists()
     assert client.get(f"/jobs/{job}").json()["videoDeleted"] is True
+
+
+def _finished_job(server, job, created, frames=True):
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "video").write_bytes(b"video")
+    (directory / "result.json").write_text("{}")
+    if frames:
+        (directory / "labelframes").mkdir()
+        (directory / "labelframes" / "0.jpg").write_bytes(b"jpeg copy of the footage")
+    server.write_status(directory, {"id": job, "status": "completed", "createdAt": created})
+    return directory
+
+
+def test_retention_sweep_also_deletes_label_frames(service, monkeypatch):
+    import json
+
+    server, client = service
+    monkeypatch.setattr(server, "RETENTION_HOURS", 1)
+    job = "6" * 32
+    directory = _finished_job(server, job, 0)
+    server.delete_expired()
+    assert not (directory / "labelframes").exists() and not (directory / "video").exists()
+    assert json.loads((directory / "status.json").read_text())["videoDeleted"] is True
+    assert client.get(f"/jobs/{job}/frames/0").status_code == 404
+
+
+def test_a_cached_label_frame_is_not_served_without_the_footage(service, monkeypatch):
+    server, client = service
+    monkeypatch.setattr(server, "RETENTION_HOURS", 0)
+    job = "7" * 32
+    directory = _finished_job(server, job, 0)
+    assert client.get(f"/jobs/{job}/frames/0").status_code == 200
+    (directory / "video").unlink()
+    assert client.get(f"/jobs/{job}/frames/0").status_code == 404
+
+
+def test_reading_an_expired_job_applies_retention_before_any_video_request(service, monkeypatch):
+    server, client = service
+    monkeypatch.setattr(server, "RETENTION_HOURS", 1)
+    listed, read = "8" * 32, "9" * 32
+    for job in (listed, read):
+        _finished_job(server, job, 0)
+    assert client.get(f"/jobs/{read}").json()["videoDeleted"] is True
+    assert not (server.ROOT / read / "video").exists() and not (server.ROOT / read / "labelframes").exists()
+    assert {j["id"]: j.get("videoDeleted") for j in client.get("/jobs").json()}[listed] is True
+    assert not (server.ROOT / listed / "video").exists()
+
+
+def _rerun_chain_job(server, job, created):
+    source = server.ROOT / job
+    source.mkdir()
+    (source / "video").write_bytes(b"complete saved video")
+    server.write_status(source, {"id": job, "owner": "c" * 32, "title": "Saved match", "status": "completed",
+        "createdAt": created, "profile": "general", "sampleFps": 6, "video": {"duration": 600}})
+
+
+def _rerun(server, client, job, mode, n):
+    import json
+
+    response = client.post(f"/jobs/{job}/rerun?mode={mode}&start=0&requestId={n:032x}",
+                           headers={"x-pitchlens-owner": "c" * 32})
+    if response.status_code == 200:
+        # Let the next one start: these tests do not run the analysis.
+        server.active = None
+        server.cancellations.clear()
+        done = server.ROOT / response.json()["id"]
+        server.write_status(done, {**json.loads((done / "status.json").read_text()), "status": "completed"})
+    return response
+
+
+def test_a_rerun_keeps_the_original_footage_retention_clock(hosted, monkeypatch):
+    import json
+    import time as clock
+
+    server, client, _ = hosted
+    monkeypatch.setattr(server, "RETENTION_HOURS", 1)
+    job, uploaded = "a" * 32, clock.time() - 3000
+    _rerun_chain_job(server, job, uploaded)
+    first = _rerun(server, client, job, "section", 1).json()["id"]
+    second = _rerun(server, client, first, "section", 2).json()["id"]
+    saved = json.loads((server.ROOT / second / "status.json").read_text())
+    assert saved["footageCreatedAt"] == uploaded and saved["rootJobId"] == job
+    assert saved["createdAt"] > uploaded
+    # Fifty minutes after the upload, a 30-minute retention has expired every copy.
+    monkeypatch.setattr(server, "RETENTION_HOURS", 0.5)
+    assert server.expired(saved)
+    server.delete_expired()
+    assert not any((server.ROOT / j / "video").exists() for j in (job, first, second))
+
+
+def test_rerun_limits_count_the_whole_chain_from_the_upload(hosted, monkeypatch):
+    server, client, _ = hosted
+    monkeypatch.setattr(server, "SECTION_RERUNS_PER_MATCH", 3)
+    job = "a" * 32
+    _rerun_chain_job(server, job, 0)
+    first = _rerun(server, client, job, "section", 1).json()["id"]
+    second = _rerun(server, client, first, "section", 2).json()["id"]
+    third = _rerun(server, client, second, "section", 3).json()["id"]
+    assert [_rerun(server, client, j, "section", 4 + i).status_code for i, j in enumerate((job, first, second, third))] == [409] * 4
+    # A lost reply is still answered from its own source job.
+    assert _rerun(server, client, first, "section", 2).json()["id"] == second
 
 
 # ── YouTube links ─────────────────────────────────────────────────────────
@@ -1559,6 +1744,10 @@ def test_gpu_receives_bounded_diagnostic_options(tmp_path, monkeypatch):
     from app.vision.access import valid_video_grant
     assert valid_video_grant("fixture-token", "a" * 32, calls[0][7])
     assert (tmp_path / "result.json").read_text() == '{"frames":[]}'
+    # A rerun's kit order reaches the GPU engine too.
+    gpu.run_on_modal("a" * 32, tmp_path / "result.json", "fixture-token", lambda **kw: None, lambda: False, "general", 6,
+                     reference_colours=["#dc2626", "#22c55e"], reference_job="e" * 32)
+    assert calls[1][9:] == (["#dc2626", "#22c55e"], "e" * 32)
 
 
 def test_gap_does_not_join_nearby_balls_with_different_identities():
@@ -2053,3 +2242,255 @@ def test_ball_model_status_never_reveals_owner_keys(service, monkeypatch, tmp_pa
     monkeypatch.setattr(server, 'training', {'state': 'done', 'run': {'owner': owner, 'kept': False}})
     body = client.get('/ball-model').text
     assert owner not in body and 'ownerHash' not in body
+
+
+def test_ball_model_status_says_whether_the_site_may_train(service, monkeypatch, tmp_path):
+    server, client = service
+    monkeypatch.setenv('VISION_DATA_DIR', str(tmp_path))
+    monkeypatch.delenv('VISION_SITE_TRAINING', raising=False)
+    assert client.get('/ball-model').json()['siteTraining'] is False
+    # A refusal reaches a team owner: no server settings or operator documents in it.
+    refused = client.post('/ball-model/train', json={}, headers={'x-pitchlens-require-owner': '1'})
+    assert refused.status_code == 403
+    assert 'VISION_' not in refused.json()['detail'] and 'docs/' not in refused.json()['detail']
+    assert 'labels are saved' in refused.json()['detail']
+    monkeypatch.setenv('VISION_SITE_TRAINING', '1')
+    assert client.get('/ball-model').json()['siteTraining'] is True
+    monkeypatch.setenv('VISION_SITE_TRAINING', 'yes')
+    assert client.get('/ball-model').json()['siteTraining'] is False
+
+
+# ── Reruns choose the ball model; kits keep the source order ─────────────
+def _player_load_source(server, job, owner='c' * 32):
+    import json
+    import time as clock
+
+    source = server.ROOT / job
+    source.mkdir()
+    (source / 'video').write_bytes(b'complete saved video')
+    (source / 'result.json').write_text(json.dumps({'teams': [
+        {'id': 0, 'label': 'Kit A', 'colour': '#dc2626'}, {'id': 1, 'label': 'Kit B', 'colour': '#22c55e'}]}))
+    server.write_status(source, {'id': job, 'owner': owner, 'title': 'Player load', 'status': 'completed', 'createdAt': clock.time(),
+                                 'profile': 'general', 'sampleFps': 6, 'video': {'duration': 600}, 'ballSearch': 'none'})
+    return {'x-pitchlens-owner': owner}
+
+
+def _free(server):
+    # These tests do not run the analysis: let the next start in.
+    server.active = None
+    server.cancellations.clear()
+
+
+def test_a_rerun_can_turn_the_ball_model_on_and_defaults_to_the_source(hosted):
+    server, client, submitted = hosted
+    job = 'e' * 32
+    headers = _player_load_source(server, job)
+    url = f'/jobs/{job}/rerun?mode=section&start=30&requestId={1:032x}'
+    on = client.post(url + '&search=exhaustive', headers=headers)
+    assert on.status_code == 200, on.text
+    assert on.json()['ballSearch'] == 'exhaustive' and submitted[-1][2]['ballSearch'] == 'exhaustive'
+    # The same request again is the same job; the same ID with other options is refused.
+    assert client.post(url + '&search=exhaustive', headers=headers).json()['id'] == on.json()['id']
+    assert client.post(url + '&search=none', headers=headers).status_code == 409
+    assert client.post(url, headers=headers).status_code == 409  # omitted = the source's "none"
+    _free(server)
+    copied = client.post(f'/jobs/{job}/rerun?mode=section&start=30&requestId={2:032x}', headers=headers)
+    assert copied.status_code == 200 and copied.json()['ballSearch'] == 'none'
+    _free(server)
+    assert client.post(f'/jobs/{job}/rerun?mode=section&start=30&requestId={3:032x}&search=bogus', headers=headers).status_code == 400
+    # A full rerun with the ball model still counts against the full-rerun limit.
+    full = client.post(f'/jobs/{job}/rerun?mode=full&start=0&requestId={4:032x}&search=exhaustive', headers=headers)
+    assert full.status_code == 200
+    import json
+    assert json.loads((server.ROOT / full.json()['id'] / 'status.json').read_text())['rerunDigest'].startswith('full:')
+
+
+def test_a_rerun_keeps_the_source_kit_order(hosted):
+    import json
+
+    server, client, submitted = hosted
+    job = 'e' * 32
+    headers = _player_load_source(server, job)
+    response = client.post(f'/jobs/{job}/rerun?mode=section&start=30&requestId={5:032x}', headers=headers)
+    saved = json.loads((server.ROOT / response.json()['id'] / 'status.json').read_text())
+    assert saved['referenceColours'] == ['#dc2626', '#22c55e'] and saved['sourceJobId'] == job
+
+
+def test_work_passes_the_reference_kits_to_the_engine(service, monkeypatch):
+    server, _ = service
+    job = '6' * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    seen = {}
+    monkeypatch.setattr(server.gpu, 'modal_enabled', lambda: False)
+    monkeypatch.setattr(server, 'run_video', lambda *a, **kw: seen.update(kw))
+    status = {'id': job, 'status': 'processing', 'createdAt': 0, 'sourceJobId': 'e' * 32, 'referenceColours': ['#dc2626', '#22c55e']}
+    server.work(directory, status, threading.Event())
+    assert seen['reference_colours'] == ['#dc2626', '#22c55e'] and seen['reference_job'] == 'e' * 32
+    # An upload has no reference.
+    seen.clear()
+    server.work(directory, {'id': job, 'status': 'processing', 'createdAt': 0}, threading.Event())
+    assert seen['reference_colours'] is None and seen['reference_job'] is None
+
+
+def test_kits_are_swapped_back_to_the_reference_order():
+    import cv2
+
+    from app.vision.engine import align_to_reference
+
+    def lab(h):
+        rgb = np.uint8([int(h[i:i + 2], 16) for i in (1, 3, 5)]).reshape(1, 1, 3)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).reshape(3).astype(float)
+
+    red, green = '#dc2626', '#d0ffd0'
+    swapped = np.array([lab(green), lab(red)])
+    centres, colours = align_to_reference(swapped, [green, red], [red, '#22c55e'])
+    assert colours == [red, green] and np.allclose(centres[0], lab(red))
+    aligned = np.array([lab(red), lab(green)])
+    centres, colours = align_to_reference(aligned, [red, green], [red, '#22c55e'])
+    assert colours == [red, green] and centres is aligned
+    centres, colours = align_to_reference(swapped, [green, red], None)
+    assert colours == [green, red] and centres is swapped
+
+
+# ── This browser's own stopped upload ─────────────────────────────────────
+def test_a_stopped_upload_from_this_browser_is_named_and_resumable(hosted):
+    server, client, _ = hosted
+    mine, theirs = 'c' * 32, 'd' * 32
+    first = '1' * 32
+    url = '/jobs?size=8&title=Match&owner={}&requestId={}'
+    job = client.post(url.format(mine, first), headers={'Content-Type': 'video/mp4'}).json()
+    assert client.put(f"/jobs/{job['id']}/video?offset=0", content=b'0123', headers={'x-pitchlens-owner': mine}).status_code == 200
+    # The page was reloaded: a new request ID from the same browser learns it is its own upload.
+    again = client.post(url.format(mine, '2' * 32), headers={'Content-Type': 'video/mp4'})
+    assert again.status_code == 409
+    body = again.json()
+    assert body['code'] == 'own-upload' and body['jobId'] == job['id'] and body['receivedBytes'] == 4 and body['expectedBytes'] == 8
+    assert '50%' in body['detail']
+    # Another browser learns nothing about it.
+    other = client.post(url.format(theirs, '3' * 32), headers={'Content-Type': 'video/mp4'})
+    assert other.status_code == 409 and 'jobId' not in other.json() and 'code' not in other.json()
+    # The same file and options under the first request ID resume the same job.
+    resumed = client.post(url.format(mine, first), headers={'Content-Type': 'video/mp4'})
+    assert resumed.status_code == 200 and resumed.json()['id'] == job['id'] and resumed.json()['receivedBytes'] == 4
+
+
+# ── Upload size limit ─────────────────────────────────────────────────────
+def test_the_size_limit_is_configurable_and_named_in_the_refusal(hosted, monkeypatch):
+    server, client, _ = hosted
+    monkeypatch.setattr(server, 'MAX_BYTES', 1024 * 1024)
+    assert client.get('/health').json()['maxBytes'] == 1024 * 1024
+    refused = client.post(f'/jobs?size={2 * 1024 * 1024}', headers={'Content-Type': 'video/mp4'})
+    assert refused.status_code == 413 and refused.json()['detail'] == 'Maximum video size is 1 MB'
+    monkeypatch.setenv('VISION_MAX_BYTES', str(2 * 1024 ** 3))
+    assert server._max_bytes() == 2 * 1024 ** 3
+    for bad in ('-5', '0', 'lots', '1.5e9'):
+        monkeypatch.setenv('VISION_MAX_BYTES', bad)
+        assert server._max_bytes() == 500 * 1024 * 1024, bad
+    monkeypatch.delenv('VISION_MAX_BYTES')
+    assert server._max_bytes() == 500 * 1024 * 1024
+
+
+# ── Retry is offered only when it can work ────────────────────────────────
+def test_retry_is_offered_only_for_a_saved_complete_upload_with_retries_left(hosted, monkeypatch):
+    server, client, _ = hosted
+    cancelled = client.post('/jobs?size=8', headers={'Content-Type': 'video/mp4'}).json()
+    client.put(f"/jobs/{cancelled['id']}/video?offset=0", content=b'0123')
+    client.post(f"/jobs/{cancelled['id']}/cancel")
+    assert client.get(f"/jobs/{cancelled['id']}").json()['retryable'] is False
+    ready, spent, old = '4' * 32, '5' * 32, '6' * 32
+    for job, attempts in ((ready, 1), (spent, 3), (old, 1)):
+        _stopped_job(server, job, attempts, status='failed')
+    server.write_status(server.ROOT / old, {**__import__('json').loads((server.ROOT / old / 'status.json').read_text()), 'createdAt': 0})
+    monkeypatch.setattr(server, 'RETENTION_HOURS', 1)
+    assert client.get(f'/jobs/{ready}').json()['retryable'] is True
+    assert client.get(f'/jobs/{spent}').json()['retryable'] is False
+    assert client.get(f'/jobs/{old}').json()['retryable'] is False
+    listed = {j['id']: j['retryable'] for j in client.get('/jobs').json()}
+    assert listed[ready] is True and listed[spent] is False and listed[cancelled['id']] is False
+    # A redeploy did not use up a retry (see retry_job).
+    _stopped_job(server, '7' * 32, 3, interruptedBy='shutdown')
+    assert client.get(f"/jobs/{'7' * 32}").json()['retryable'] is True
+
+
+def test_stage_texts_leave_the_action_to_the_buttons(service):
+    server, client = service
+    job = '8' * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    server.write_status(directory, {'id': job, 'status': 'processing', 'createdAt': 0})
+    assert client.get(f'/jobs/{job}').json()['stage'] == 'Worker stopped before the analysis finished.'
+    server.recover_after_restart()
+    assert 'Submit' not in client.get(f'/jobs/{job}').json()['stage']
+
+
+# ── Daily cap ─────────────────────────────────────────────────────────────
+def test_the_daily_cap_says_when_analysis_resumes_and_is_not_transient(hosted, monkeypatch):
+    import json
+    import time as clock
+
+    server, client, _ = hosted
+    job = 'e' * 32
+    headers = _player_load_source(server, job)
+    started = clock.time() - 3600
+    (server.ROOT / 'starts.json').write_text(json.dumps([started]))
+    monkeypatch.setenv('VISION_MAX_JOBS_PER_DAY', '1')
+    for response in (
+        client.post('/jobs?size=8', headers={'Content-Type': 'video/mp4', **headers}),
+        client.post(f'/jobs/{job}/rerun?mode=section&start=0&requestId={9:032x}', headers=headers),
+        client.post('/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ', headers=headers),
+    ):
+        assert response.status_code == 429
+        body = response.json()
+        assert body['code'] == 'daily-limit' and abs(body['resetsAt'] - (started + 86400)) <= 1
+        assert 'limit of 1 analyses' in body['detail']
+    stopped = '4' * 32
+    _stopped_job(server, stopped, 1)
+    retry = client.post(f'/jobs/{stopped}/retry')
+    assert retry.status_code == 429 and retry.json()['code'] == 'daily-limit'
+
+
+# ── Venues name the match they came from ──────────────────────────────────
+def test_venues_list_their_source_match_only_to_their_owner(service):
+    import json
+
+    server, client = service
+    mine, theirs, job = 'a' * 32, 'b' * 32, 'c' * 32
+    (server._venue_dir() / f"{'f' * 32}.json").write_text(json.dumps(
+        {'id': 'f' * 32, 'name': 'Tryzub indoor court', 'owner': mine, 'sourceJob': job, 'size': [640, 360], 'createdAt': 1}))
+    assert [v['sourceJob'] for v in client.get(f'/venues?owner={mine}').json()] == [job]
+    assert client.get(f'/venues?owner={theirs}').json() == []
+    assert 'owner' not in client.get(f'/venues?owner={mine}').json()[0]
+
+
+# ── An upload survives a worker restart ───────────────────────────────────
+def test_the_newest_upload_survives_a_restart_and_resumes(hosted, monkeypatch):
+    import json
+
+    server, client, _ = hosted
+    owner = {'x-pitchlens-owner': 'c' * 32}
+    mib = 1024 * 1024
+    newer, older = '1' * 32, '2' * 32
+    for job, created in ((newer, 200), (older, 100)):
+        directory = server.ROOT / job
+        directory.mkdir()
+        (directory / 'video').write_bytes(b'x' * (9 * mib))
+        server.write_status(directory, {'id': job, 'owner': 'c' * 32, 'status': 'uploading', 'createdAt': created,
+                                        'expectedBytes': 16 * mib, 'receivedBytes': 8 * mib})
+    server.recover_after_restart()
+    assert server.active == newer
+    assert (server.ROOT / newer / 'video').stat().st_size == 8 * mib
+    assert client.get(f'/jobs/{newer}', headers=owner).json()['status'] == 'uploading'
+    # The browser resends from where it thinks it was: a chunk it already sent is acknowledged
+    # with the server's offset, one that overlaps the end is told where to continue.
+    assert client.put(f'/jobs/{newer}/video?offset=0', content=b'y' * 10, headers=owner).json() == {'received': 8 * mib}
+    stale = client.put(f'/jobs/{newer}/video?offset={mib}', content=b'y' * (8 * mib), headers=owner)
+    assert stale.status_code == 409 and stale.json()['detail'] == f'Expected offset {8 * mib}'
+    assert client.put(f'/jobs/{newer}/video?offset={8 * mib}', content=b'y' * 10, headers=owner).json() == {'received': 8 * mib + 10}
+    assert json.loads((server.ROOT / older / 'status.json').read_text())['status'] == 'interrupted'
+    assert not (server.ROOT / older / 'video').exists()
+    # Nobody came back: the usual idle release frees the worker.
+    monkeypatch.setattr(server, 'UPLOAD_IDLE_SECONDS', 0)
+    server.sweep_stale()
+    assert server.active is None
+    assert client.get(f'/jobs/{newer}', headers=owner).json()['status'] == 'failed'

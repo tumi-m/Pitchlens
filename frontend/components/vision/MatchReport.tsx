@@ -4,15 +4,36 @@ import { motion } from "framer-motion";
 import { Info, Target, Crosshair } from "lucide-react";
 import type { Analysis, CountStat, TeamStats } from "@/lib/review/analysis";
 import { describeEvent } from "@/lib/review/analysis";
-import { clockTime } from "@/lib/review/vision";
+import { clockTime, type VisionResult } from "@/lib/review/vision";
 import { AveragePositions, Heatmap, ShotMap } from "@/components/vision/PitchGraphics";
 
 const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p-5";
 
 type Value = { value: number | null; note?: string; approx?: boolean };
 
-/** Minimum checked detections of a type before the rest are estimated (mirrors the worker). */
+/** Minimum checked detections of a type before the rest are estimated (the worker's default). */
 const MIN_CHECKED = 10;
+/** Share of in-play time the ball must be followed before possession is shown (the worker's default). */
+const POSSESSION_MIN_COVERAGE = 0.6;
+/** Observed control in a minute before its momentum bar is drawn (the worker's default). */
+const MOMENTUM_MIN_CONTROL = 5;
+const DISTANCE_HINT =
+  "How far the feet moved after the camera pan is removed, scaled by a 1.8 m player. Steps under 3 pixels, boxes far from that track's usual height, and anything over 11 m/s are dropped. Tracks are not named players. A squad 15 cm off 1.8 m moves this by about 8%.";
+
+/** Metres per kit, or "—" when the engine did not write a usable number (no step was kept: unmeasured, not 0 m). */
+function metres(load: PlayerLoad | undefined, team: 0 | 1): Value {
+  const v = load?.metres?.[team];
+  return { value: typeof v === "number" && Number.isFinite(v) && load?.steps !== 0 ? v : null };
+}
+
+type PlayerLoad = NonNullable<VisionResult["metrics"]["playerLoad"]>;
+
+/** Types estimated from a random sample (checks are pooled across both teams). */
+const SAMPLED: { type: string; key: "passes" | "interceptions" | "tackles"; one: string; many: string }[] = [
+  { type: "pass", key: "passes", one: "pass", many: "passes" },
+  { type: "interception", key: "interceptions", one: "interception", many: "interceptions" },
+  { type: "tackle", key: "tackles", one: "tackle", many: "tackles" },
+];
 
 function count(c: CountStat | null | undefined): Value {
   if (!c) return { value: null };
@@ -21,8 +42,8 @@ function count(c: CountStat | null | undefined): Value {
     // Unchecked detections counted at the rate the reviewer found them right.
     return { value: c.estimate, approx: true, note: `${c.estimateRange[0]}–${c.estimateRange[1]} · ${c.confirmed} confirmed` };
   }
-  const need = Math.max(0, MIN_CHECKED - (c.checked ?? 0));
-  return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review${need ? ` · ${need} more checks to estimate` : ""}` };
+  // How many more checks an estimate needs is a per-type figure (shown once, in the score panel).
+  return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review` };
 }
 
 function Row({
@@ -32,6 +53,7 @@ function Row({
   colours,
   format = (v) => String(v),
   hint,
+  note,
 }: {
   label: string;
   a: Value;
@@ -39,7 +61,10 @@ function Row({
   colours: [string, string];
   format?: (v: number) => string;
   hint?: string;
+  /** Always shown under the row (touch screens cannot hover for the hint). */
+  note?: string;
 }) {
+  const [open, setOpen] = useState(false);
   const known = a.value !== null && b.value !== null;
   const total = known ? (a.value as number) + (b.value as number) : 0;
   const share = (v: number | null) => (known && total > 0 ? (v as number) / total : 0);
@@ -62,13 +87,23 @@ function Row({
         <span className="text-sm text-pitch-muted text-center flex items-center gap-1.5 pt-0.5">
           {label}
           {hint && (
-            <span title={hint} className="cursor-help opacity-70">
+            // A button, not a hover tooltip: phones and keyboards can open it too.
+            <button
+              type="button"
+              title={hint}
+              aria-label={`Why: ${label}`}
+              aria-expanded={open}
+              onClick={() => setOpen((v) => !v)}
+              className="p-2 -m-2 rounded-full opacity-70 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pitch-green"
+            >
               <Info size={13} />
-            </span>
+            </button>
           )}
         </span>
         {pill(b, 1)}
       </div>
+      {note && <p className="text-[11px] text-amber-200/90 text-center mt-1">{note}</p>}
+      {open && hint && <p className="text-[11px] text-pitch-muted text-center mt-1.5">{hint}</p>}
       {known && total > 0 && (
         <div className="flex gap-1.5 mt-1.5 h-1.5">
           <div className="flex-1 flex justify-end rounded-full bg-white/5 overflow-hidden">
@@ -101,6 +136,8 @@ export function MatchReport({
   onSeek,
   onCalibrate,
   onReview,
+  videoAvailable = true,
+  playerLoad,
 }: {
   analysis: Analysis;
   names: string[];
@@ -110,10 +147,20 @@ export function MatchReport({
   onSeek: (t: number) => void;
   onCalibrate: () => void;
   onReview: () => void;
+  /** False once the footage is deleted: pitch setup is clicked on the video. */
+  videoAvailable?: boolean;
+  /** Per-kit running distance from the engine (absent on results before 2.6). */
+  playerLoad?: PlayerLoad;
 }) {
   const [heatTeam, setHeatTeam] = useState<0 | 1>(0);
   const [A, B] = analysis.stats.teams as [TeamStats, TeamStats];
   const cov = analysis.stats.coverage;
+  const minChecked = analysis.params?.minCheckedForEstimate ?? MIN_CHECKED;
+  const minCoverage = (analysis.params?.possessionMinCoverage ?? POSSESSION_MIN_COVERAGE) * 100;
+  const minMomentum = analysis.params?.minMomentumControlSeconds ?? MOMENTUM_MIN_CONTROL;
+  // Field position weights momentum only with a pitch setup and known attacking directions.
+  const momentumWeighted = analysis.calibrated && !!analysis.directions?.segments?.length;
+  const noFootage = "Pitch setup needs the footage, which was deleted after the retention period.";
   // Reviewer-confirmed goals count with or without a pitch setup.
   const goalsKnown = A.goals !== null && B.goals !== null;
   const candidates = (A.goals?.candidates ?? 0) + (B.goals?.candidates ?? 0);
@@ -126,7 +173,7 @@ export function MatchReport({
   return (
     <div className="space-y-6">
       <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
-        <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check about ten random
+        <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check a random sample of
         passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
         detections you checked were right. Moments the system never found are not included; add them in the review.
       </section>
@@ -174,19 +221,25 @@ export function MatchReport({
             <button className="text-xs underline text-pitch-green" onClick={onReview}>
               {analysis.enteredScore ? "Review" : "Enter the score and review"}
               {analysis.review.pendingKey !== undefined
-                ? ` · ${analysis.review.pendingKey} key moment${analysis.review.pendingKey === 1 ? "" : "s"} to check`
+                ? ` · ${analysis.review.pendingKey} ${analysis.review.pendingKey === 1 ? "shot or goal" : "shots and goals"} to check`
                 : ` · ${analysis.review.pending} waiting`}
             </button>
             {(() => {
+              // What each sampled type still needs, once per type (checks are pooled across teams).
               const by = analysis.review.pendingByType ?? {};
-              const found = [
-                by.pass ? `${by.pass} passes` : "",
-                by.interception ? `${by.interception} interceptions` : "",
-                by.tackle ? `${by.tackle} tackles` : "",
-              ].filter(Boolean);
-              return found.length ? (
-                <span className="text-[11px] text-pitch-muted max-w-[18rem]">
-                  {found.join(", ")} found: check a random sample of about ten of each to estimate the totals, no need to go through them all.
+              const advice = SAMPLED.map(({ type, key, one, many }) => {
+                const n = by[type] ?? 0;
+                if (!n) return "";
+                const checked = A[key]?.checked ?? 0;
+                const found = `${n} ${n === 1 ? one : many} found`;
+                // Too few to sample: checking them all gives the exact count.
+                if (n <= minChecked) return `${found}: check ${n === 1 ? "it" : `all ${n}`} for the exact count`;
+                if (checked >= minChecked) return `${found}: enough checked to estimate the rest`;
+                return `${found}: check ${checked ? `${minChecked - checked} more` : minChecked} at random to estimate the total, no need to go through them all`;
+              }).filter(Boolean);
+              return advice.length ? (
+                <span className="text-[11px] text-pitch-muted max-w-[18rem]" data-testid="sample-advice">
+                  {advice.join(". ")}.
                 </span>
               ) : null;
             })()}
@@ -202,10 +255,12 @@ export function MatchReport({
           {cov.deadBallSeconds > 0 && <span>Ball out of play {clockTime(cov.deadBallSeconds)}</span>}
           {cov.calibratedPercent > 0 ? (
             <span>Pitch mapped {cov.calibratedPercent}%</span>
-          ) : (
+          ) : videoAvailable ? (
             <button className="underline text-pitch-green" onClick={onCalibrate}>
               Pitch not set up · set it up
             </button>
+          ) : (
+            <span>Pitch not set up · {noFootage}</span>
           )}
           <span title="Pieces of player tracks after joining; one player usually appears as several.">{analysis.stats.tracks.players} track segments</span>
         </p>
@@ -215,11 +270,17 @@ export function MatchReport({
         <section className="rounded-2xl border border-pitch-green/40 bg-pitch-green/5 p-5 flex flex-wrap gap-4 items-center justify-between">
           <div>
             <p className="font-semibold">Unlock shots, heatmaps and positions</p>
-            <p className="text-sm text-pitch-muted">Click a few landmarks on one frame so Pitchlens knows where the pitch is. It takes about two minutes.</p>
+            <p className="text-sm text-pitch-muted">
+              {videoAvailable
+                ? "Click a few landmarks on one frame so Pitchlens knows where the pitch is. It takes about two minutes."
+                : noFootage}
+            </p>
           </div>
-          <button className="pitch-button-primary" onClick={onCalibrate}>
-            <Crosshair size={16} /> Set up the pitch
-          </button>
+          {videoAvailable && (
+            <button className="pitch-button-primary" onClick={onCalibrate}>
+              <Crosshair size={16} /> Set up the pitch
+            </button>
+          )}
         </section>
       )}
 
@@ -236,6 +297,20 @@ export function MatchReport({
               <span className="w-2.5 h-2.5 rounded-full" style={{ background: colours[1] }} />
             </span>
           </div>
+          {playerLoad && (
+            <Group title="Player load">
+              {/* Per kit, never speed: one estimate per team, not named players. */}
+              <Row
+                label="Distance"
+                a={metres(playerLoad, 0)}
+                b={metres(playerLoad, 1)}
+                colours={colours}
+                format={(v) => `${v.toFixed(1)} m`}
+                hint={DISTANCE_HINT}
+                note="estimate · camera pan removed · not named players"
+              />
+            </Group>
+          )}
           <Group title="Possession">
             <Row
               label="Observed control share"
@@ -246,7 +321,15 @@ export function MatchReport({
               hint={
                 possessionShown
                   ? `From winning the ball to losing it, passes in flight included, over the ${cov.possessionPercent}% of in-play time the ball could be followed. Bounds assign all missing play to either team; detector errors are not included.`
-                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (60% needed to display this estimate).`
+                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (${pct(minCoverage)} needed to display this estimate).`
+              }
+              // Why it is withheld, without a tap (rounded down so 59.6% never reads as enough).
+              note={
+                possessionShown
+                  ? undefined
+                  : cov.possessionPercent < minCoverage
+                    ? `Followed ${Math.floor(cov.possessionPercent)}% of play · ${pct(minCoverage)} needed`
+                    : "No team possession was established"
               }
             />
             <Row
@@ -257,8 +340,9 @@ export function MatchReport({
               format={pct}
               hint="Each team's share of all detected passes. Many stats sites define possession this way; it can differ from the time-based figure above."
             />
-            <Row label="Possessions" a={{ value: A.possessions }} b={{ value: B.possessions }} colours={colours} />
-            <Row label="Average possession" a={{ value: A.averagePossession }} b={{ value: B.averagePossession }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
+            {/* Counted over the same followed play as the share: withheld with it (older workers sent a 0). */}
+            <Row label="Possessions" a={{ value: possessionShown ? A.possessions : null }} b={{ value: possessionShown ? B.possessions : null }} colours={colours} />
+            <Row label="Average possession" a={{ value: possessionShown ? A.averagePossession : null }} b={{ value: possessionShown ? B.averagePossession : null }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
             <Row
               label="Field tilt"
               a={{ value: A.fieldTilt }}
@@ -285,7 +369,7 @@ export function MatchReport({
                 The pitch is mapped for {cov.calibratedPercent}% of the match, so shots cover that part only.
               </p>
             )}
-            <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up." />
+            <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up, or add the shots you saw in review." />
             <Row
               label="Shots on target"
               a={count(A.shotsOnTarget)}
@@ -337,7 +421,13 @@ export function MatchReport({
           <section className={card}>
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Attack momentum</h2>
-              <span className="text-[11px] text-pitch-muted">Per minute · control near the opponent&apos;s goal counts most</span>
+              <span className="text-[11px] text-pitch-muted text-right" data-testid="momentum-caption">
+                {momentumWeighted
+                  ? "Per minute · control near the opponent's goal counts most"
+                  : analysis.calibrated
+                    ? "Per minute · observed ball-control difference (attacking direction unknown, so field position is not weighted)"
+                    : "Per minute · observed ball-control difference (pitch not set up, so field position is not weighted)"}
+              </span>
             </div>
             <svg viewBox={`0 0 ${analysis.stats.momentum.length * 10} 80`} className="w-full h-28" preserveAspectRatio="none">
               <line x1="0" y1="40" x2={analysis.stats.momentum.length * 10} y2="40" stroke="rgba(255,255,255,0.15)" strokeWidth="0.6" />
@@ -358,6 +448,9 @@ export function MatchReport({
                 );
               })}
             </svg>
+            {analysis.stats.momentum.some((v) => v === null) && (
+              <p className="text-[11px] text-pitch-muted mt-1">A dash marks a minute with under {minMomentum} s of observed ball control.</p>
+            )}
           </section>
           {analysis.calibrated && analysis.stats.heatmaps && analysis.template && (
             <section className={card}>
@@ -391,7 +484,7 @@ export function MatchReport({
       <section className={card}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Match timeline</h2>
-          <span className="text-xs text-pitch-muted">{keyEvents.length} key moments · click to watch</span>
+          <span className="text-xs text-pitch-muted">{keyEvents.length} moment{keyEvents.length === 1 ? "" : "s"} on the timeline · click to watch</span>
         </div>
         <div className="relative h-14">
           <div className="absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-white/10" />
