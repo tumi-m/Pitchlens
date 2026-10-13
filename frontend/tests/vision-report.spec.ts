@@ -480,6 +480,9 @@ test("the ball can be labelled on frames: accept the guess, click it exactly, or
   await expect(page.getByRole("button", { name: "Train on my labels" })).toBeDisabled();
   await expect(page.getByTestId("ball-labeller")).toBeVisible();
   await expect(page.getByText("Frame 1 of 3")).toBeVisible();
+  // Focus moves into the labeller, so Enter accepts the guess instead of
+  // pressing the button that opened it.
+  await expect(page.getByTestId("ball-labeller")).toBeFocused();
   await page.keyboard.press("Enter");
   await expect.poll(() => posts.length).toBe(1);
   expect(posts[0]).toEqual({ index: 2, x: 320, y: 180 });
