@@ -188,6 +188,43 @@ def test_teleporting_fragments_are_not_stitched():
     assert len(set(mapping.values())) == 2
 
 
+def _stitch_frames(tracks):
+    """Image-only frames from [(id, team, [(t, x, y), ...]), ...] (x, y = foot point in pixels)."""
+    times = sorted({t for _, _, obs in tracks for t, _, _ in obs})
+    return [{"t": t, "scene": 0, "ball": None, "camera": [1, 0, 0, 0, 1, 0],
+             "players": [{"id": i, "team": team, "role": "player", "box": [x - 5, y - 25, x + 5, y], "confidence": 0.9}
+                         for i, team, obs in tracks for tt, x, y in obs if tt == t]} for t in times]
+
+
+def _stitch(tracks):
+    projected, _ = analytics.project(_stitch_frames(tracks), None)
+    return analytics.stitch_tracks(projected, 5)
+
+
+def test_a_start_2_5_body_heights_from_a_stationary_chain_end_is_not_joined():
+    # 2.4 s after a still fragment ends, a same-kit fragment starts 2.5 body heights away:
+    # within a running-speed radius, but the tracker had 3.5 s to join them and did not (E19).
+    m = _stitch([(1, 0, [(round(0.2 * k, 1), 300, 200) for k in range(10)]),
+                 (2, 0, [(round(4.2 + 0.2 * k, 1), 362, 200) for k in range(10)])])
+    assert m[1] != m[2]
+
+
+def test_a_player_missed_for_4_6_seconds_on_the_same_spot_is_joined():
+    m = _stitch([(1, 0, [(round(0.2 * k, 1), 300, 200) for k in range(10)]),
+                 (2, 0, [(round(6.4 + 0.2 * k, 1), 302, 200) for k in range(10)])])
+    assert m[1] == m[2]
+
+
+def test_a_calibrated_3_s_gap_20_m_away_is_not_joined():
+    frames = []
+    for k in range(40):  # still at (10, 10) until 1.8 s, nothing for 3 s, then still at (30, 10)
+        players = [player(1, 0, (10, 10))] if k < 10 else [] if k < 24 else [player(2, 0, (30, 10))]
+        frames.append({"t": round(k * 0.2, 2), "scene": 0, "players": players, "ball": None, "camera": [1, 0, 0, 0, 1, 0]})
+    projected, _ = analytics.project(frames, calibration_for(frames))
+    mapping = analytics.stitch_tracks(projected, FPS)
+    assert mapping[1] != mapping[2]
+
+
 # ------------------------------------------------------------ worker endpoints
 
 
@@ -799,6 +836,84 @@ def test_counts_are_unmeasured_not_zero_without_kit_labels():
     assert out["stats"]["teams"][0]["passes"]["value"] == 1
 
 
+TURNOVER_SCALE = 6.0  # pixels per metre on a 105 x 68 m pitch
+TURNOVER_TEMPLATE = {"length": 105.0, "width": 68.0, "goalWidth": 7.32, "centreRadius": 9.15, "areaRadius": None, "areaDepth": 16.5,
+                     "areaWidth": 40.32, "penaltySpot": 11.0, "walls": False}
+
+
+def _turnover_frame(k, ball_owner):
+    t = round(k / FPS, 3)
+    players = []
+    # Everyone jogs (3 m/s) so the stretch is in play, not a stoppage.
+    for pid, team, x0 in ((1, 0, 20.0), (2, 1, 35.0), (3, 0, 60.0), (4, 1, 70.0), (5, 0, 80.0), (6, 1, 50.0)):
+        x, y = x0, 20.0 + 3.0 * t
+        s = TURNOVER_SCALE
+        players.append({"id": pid, "team": team, "role": "player", "box": [x * s - 4, y * s - 24, x * s + 4, y * s], "confidence": 0.9})
+    ball_ = None
+    if ball_owner is not None:
+        owner = next(p for p in players if p["id"] == ball_owner)
+        bx, by = (owner["box"][0] + owner["box"][2]) / 2 + 2, owner["box"][3] - 1
+        ball_ = {"x": bx, "y": by, "box": [bx - 1.5, by - 2, bx + 1.5, by + 1], "confidence": 0.6}
+    return {"t": t, "scene": 0, "players": players, "ball": ball_}
+
+
+def _turnover_match(owners=None):
+    """Player 1 (team 0) controls, the ball is unseen, player 2 (team 1, 15 m away) controls."""
+    owners = owners or [1] * 6 + [None] * 8 + [2] * 7 + [None] * 9  # 1.6 s unseen
+    frames = [_turnover_frame(k, o) for k, o in enumerate(owners)]
+    result = {"frames": frames, "sampleFps": FPS, "analysedStart": 0.0, "analysedDuration": frames[-1]["t"], "video": {"width": 630, "height": 408}}
+    H = [1 / TURNOVER_SCALE, 0, 0, 0, 1 / TURNOVER_SCALE, 0, 0, 0, 1]
+    calibration = {"state": "ready", "template": TURNOVER_TEMPLATE, "k1": 0.0, "size": [630, 408], "rms": 0.3, "frames": [{"H": H, "d": 0} for _ in frames]}
+    return result, calibration
+
+
+def test_uncalibrated_tackles_are_unmeasured_not_zero():
+    # Without a pitch setup there is no ball travel in metres, so every won ball reads
+    # as an interception: tackles were not looked for, and 0 would be invented.
+    result, _ = _turnover_match()
+    out = analytics.analyse(result, None)
+    assert any(e["type"] == "interception" for e in out["events"])
+    for team in out["stats"]["teams"]:
+        assert team["interceptions"] is not None
+        assert team["tackles"] is None
+
+
+def test_reviewer_logged_tackle_still_counts_without_pitch():
+    result, _ = _turnover_match()
+    review = {"decisions": [{"action": "add", "id": "t1", "type": "tackle", "t": 2.0, "team": 1}]}
+    out = analytics.analyse(result, None, review)
+    assert out["stats"]["teams"][1]["tackles"]["confirmed"] == 1
+
+
+def test_interception_stamped_before_first_sighting_and_pass_after_last_control():
+    result, calibration = _turnover_match()
+    events = analytics.analyse(result, calibration)["events"]
+    interception = next(e for e in events if e["type"] == "interception")
+    lost = next(e for e in events if e["type"] == "pass" and e.get("outcome") == "intercepted")
+    assert interception["tEnd"] == 2.8  # first frame player 2 is seen with the ball
+    assert lost["t"] == 1.2  # last control 1.0 s + 0.2 s
+    assert interception["t"] == 2.3  # 0.5 s before the first sighting
+
+
+def test_a_quick_interception_is_never_before_the_pass_it_intercepts():
+    # 0.6 s unseen and ~15 m of travel: an interception, not a tackle.
+    result, calibration = _turnover_match([1] * 6 + [None] * 2 + [2] * 7 + [None] * 9)
+    events = analytics.analyse(result, calibration)["events"]
+    interceptions = [e for e in events if e["type"] == "interception"]
+    lost = next(e for e in events if e["type"] == "pass" and e.get("outcome") == "intercepted")
+    assert len(interceptions) == 1
+    assert lost["t"] == 1.2
+    assert interceptions[0]["t"] == 1.2 and interceptions[0]["t"] >= lost["t"]  # 1.6 s - 0.5 s, clamped to the release
+    assert interceptions[0]["tEnd"] == 1.6
+
+
+def test_an_image_space_interception_is_not_moved_earlier():
+    # Without a pitch setup control starts earlier (image-space rule): no shift.
+    result, _ = _turnover_match()
+    interception = next(e for e in analytics.analyse(result, None)["events"] if e["type"] == "interception")
+    assert interception["t"] == interception["tEnd"]
+
+
 def _control_summary(control, seconds=120, events=()):
     """summarise() over `seconds` of play at 5 fps; `control` maps a frame index to the team in control."""
     n = int(seconds * FPS)
@@ -830,6 +945,11 @@ def test_possession_counts_follow_the_coverage_gate_of_the_share():
     assert [t["averagePossession"] for t in stats["teams"]] == [100.0, 20.0]
     stats = _control_summary({i: 0 for i in range(600)})
     assert [t["possessions"] for t in stats["teams"]] == [1, 0]
+    # Followed for 70% of play: the share is shown, the counts (which need more) are not.
+    stats = _control_summary({i: 0 for i in range(300)} | {i: 1 for i in range(300, 420)})
+    assert stats["coverage"]["possessionShown"] is True and stats["teams"][0]["possession"] is not None
+    assert [t["possessions"] for t in stats["teams"]] == [None, None]
+    assert [t["averagePossession"] for t in stats["teams"]] == [None, None]
 
 
 def test_a_momentum_minute_needs_enough_observed_control():
@@ -997,6 +1117,81 @@ def test_possession_survives_a_long_unseen_stretch_only_between_same_team_contro
     stopped[60] = False
     owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(0, 110, 119)], stopped, fps)
     assert owner[50] is None
+    # A short unseen stretch between opposing teams changes hands in the middle:
+    # the winner's first sighted control comes after the ball was won.
+    owner, _, _, _ = an.possession_sequences(projected, [spell(0, 0, 9), spell(1, 30, 39)], in_play, fps)
+    assert owner[14] == 0 and owner[25] == 1 and all(o is not None for o in owner[:40])
+
+
+def test_a_stoppage_is_found_through_position_noise():
+    import random as _random
+
+    rng = _random.Random(3)
+    frames = []
+    t = 0.0
+
+    def jitter(xy, sigma=0.3):
+        return (xy[0] + rng.gauss(0, sigma), xy[1] + rng.gauss(0, sigma))
+
+    def add(spots, ball_xy):
+        nonlocal t
+        people = [player(pid, team, jitter(xy)) for pid, team, xy in spots]
+        frames.append({"t": round(t, 2), "scene": 0, "players": people, "ball": ball(jitter(ball_xy, 0.5)) if ball_xy else None, "camera": [1, 0, 0, 0, 1, 0]})
+        t += 0.2
+
+    for k in range(100):  # 20 s of play: everyone running at ~4 m/s
+        x = 5 + 0.8 * (k % 40)
+        add([(1, 0, (x, 5)), (2, 0, (x, 10)), (3, 0, (x, 15)), (11, 1, (x + 2, 6)), (12, 1, (x + 2, 11)), (13, 1, (x + 2, 16))], (x + 0.5, 5) if k % 4 == 0 else None)
+    for k in range(100):  # 20 s stopped: everyone walking about at ~0.8 m/s, the ball unseen
+        w = 0.16 * (k % 20 if k % 40 < 20 else 20 - k % 20)
+        add([(1, 0, (10 + w, 5)), (2, 0, (10, 10 + w)), (3, 0, (10 - w, 15)), (11, 1, (14, 6 + w)), (12, 1, (14 + w, 11)), (13, 1, (14, 16 - w))], None)
+    out = analytics.analyse(result_for(frames), calibration_for(frames))
+    coverage = out["stats"]["coverage"]
+    # From positions 0.4 s apart, 0.3 m of noise reads as running: the stoppage was missed.
+    assert coverage["deadBallSeconds"] >= 15
+    assert coverage["inPlaySeconds"] <= 25
+
+
+def test_possession_lengths_leave_out_the_stoppages_they_span():
+    import random as _random
+
+    def match(pickup):
+        rng = _random.Random(5)
+        frames = []
+
+        def add(spots, ball_xy):
+            people = [player(pid, team, (xy[0] + rng.gauss(0, 0.3), xy[1] + rng.gauss(0, 0.3))) for pid, team, xy in spots]
+            frames.append({"t": round(len(frames) * 0.2, 2), "scene": 0, "players": people, "ball": ball(ball_xy) if ball_xy else None, "camera": [1, 0, 0, 0, 1, 0]})
+
+        def play(k0):  # 10 s: team 0 runs with the ball at 4 m/s
+            for k in range(k0, k0 + 50):
+                x = 5 + 0.8 * (k % 30)
+                add([(1, 0, (x, 5)), (2, 0, (x, 10)), (3, 0, (x, 15)), (11, 1, (x + 3, 7)), (12, 1, (x + 3, 12)), (13, 1, (x + 3, 17))], (x + 0.4, 5))
+
+        play(0)
+        for k in range(50):  # 10 s stopped: players walk about at ~1 m/s, the ball unseen...
+            w = 0.22 * (k % 20 if k % 40 < 20 else 40 - k % 40)
+            hold = pickup and 20 <= k < 30  # ...or held by a team 1 player waiting to restart
+            add([(1, 0, (10 + w, 5)), (2, 0, (10, 10 + w)), (3, 0, (10 - w, 15)), (11, 1, (14, 6)), (12, 1, (14 + w, 11)), (13, 1, (14, 16 - w))], (14.3, 6) if hold else None)
+        play(50)
+        return analytics.analyse(result_for(frames), calibration_for(frames))["stats"]
+
+    # Team 0 has the ball before and after the stoppage: one possession, whose length
+    # counts live play only, like the share.
+    stats = match(pickup=False)
+    coverage, teams = stats["coverage"], stats["teams"]
+    assert coverage["deadBallSeconds"] >= 5
+    [only] = stats["possessionSequences"]
+    assert only["team"] == 0 and only["start"] == 0.0 and only["end"] == 30.0
+    assert only["seconds"] == pytest.approx(coverage["inPlaySeconds"]) == pytest.approx(teams[0]["possessionSeconds"])
+    assert only["seconds"] <= 25
+    assert teams[0]["averagePossession"] == pytest.approx(only["seconds"], abs=0.1)
+    # Team 1 holding the ball during the stoppage has no live seconds: not a possession.
+    stats = match(pickup=True)
+    held = [s for s in stats["possessionSequences"] if s["team"] == 1]
+    assert held and all(s["seconds"] == 0 for s in held)
+    assert [t["possessions"] for t in stats["teams"]] == [2, 0]
+    assert stats["teams"][1]["averagePossession"] is None
 
 
 def test_interceptions_are_estimated_from_sampled_checks_and_are_not_key_moments():

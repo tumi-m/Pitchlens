@@ -255,9 +255,9 @@ export function ReviewQueue({
               const checked = analysis.events.filter((e) => (e.original?.type ?? e.type) === type && e.status !== "proposed" && e.source !== "reviewer" && e.sampled).length;
               // With fewer than ten found, checking them all is the whole sample.
               const target = Math.min(found, analysis.params?.minCheckedForEstimate ?? 10);
-              return found ? `${type === "pass" ? "passes" : type === "interception" ? "interceptions" : "tackles"} ${Math.min(checked, target)}/${target}` : "";
+              return found ? `${type === "pass" ? "passes" : type === "interception" ? "won balls" : "tackles"} ${Math.min(checked, target)}/${target}` : "";
             }).filter(Boolean);
-            return `Random passes, interceptions and tackles in turn. Check about ten of each (all of them when there are fewer) and the report estimates their totals: ${parts.join(" · ") || "nothing to check"}.`;
+            return `Random passes, won balls and tackles in turn. Check about ten of each (all of them when there are fewer) and the report estimates their totals: ${parts.join(" · ") || "nothing to check"}.`;
           })()}
         </p>
       )}

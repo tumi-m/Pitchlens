@@ -387,8 +387,9 @@ export const EVENT_LABELS: Record<string, string> = {
   shot: "Shot",
   goal: "Goal",
   "goal-candidate": "Possible goal",
-  interception: "Interception",
-  tackle: "Tackle / ball won",
+  // Every ball won from the other team that is not a tackle: intercepted passes and loose balls alike.
+  interception: "Ball won (interception or recovery)",
+  tackle: "Tackle",
   out: "Ball out",
   save: "Save",
   foul: "Foul",

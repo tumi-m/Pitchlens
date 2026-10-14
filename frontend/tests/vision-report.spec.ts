@@ -576,6 +576,25 @@ test("passes checked in the random-sample view are marked as sampled", async ({ 
   expect(decision.sample).toBe(true);
 });
 
+test("a won ball is checked as an interception or recovery, not as an interception", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.events = [
+    { id: "i1", type: "interception", t: 1, team: 0, confidence: 0.6, status: "proposed" },
+    { id: "i2", type: "interception", t: 2, team: 1, confidence: 0.6, status: "proposed" },
+  ] as never;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: /Enter the score and review|Review/ }).first().click();
+  await page.getByRole("tab", { name: "Check a sample" }).click();
+  const progress = page.getByTestId("sample-progress");
+  await expect(progress).toContainText("Random passes, won balls and tackles in turn");
+  await expect(progress).toContainText("won balls 0/2");
+  await expect(progress).not.toContainText("interceptions");
+  // A loose-ball recovery is a right answer to this card, so it is not rejected out of the stats.
+  await expect(page.getByText("Ball won (interception or recovery)").first()).toBeVisible();
+});
+
 test("the labeller waits while the worker prepares the frames", async ({ page }) => {
   await mockReport(page, { calibrated: false });
   const empty = { value: null, n: 0, interval95: null };
@@ -670,7 +689,7 @@ test("a player-load job leads with the distance it measured, not dashes, unmeasu
   await expect(page.getByText(/Ball position coverage/)).toHaveCount(0);
   await expect(page.getByText(/Possession followed/)).toHaveCount(0);
   await expect(page.getByText(/could only be followed for 0%/)).toHaveCount(0);
-  for (const stat of ["Observed control share", "Passes", "Shots", "Interceptions", "Tackles / balls won", "Field tilt"])
+  for (const stat of ["Observed control share", "Passes", "Shots", "Interceptions & recoveries", "Tackles", "Field tilt"])
     await expect(page.locator(`[data-stat="${stat}"]`)).toHaveCount(0);
   await expect(page.getByText(/ball model not run/)).toBeVisible();
   // Score entry and manual goals still work, and the pitch setup is still offered.
@@ -1402,11 +1421,11 @@ test("review guidance asks for every check when too few moments exist to sample"
   await page.goto(`/vision/${ID}`);
   const advice = page.getByTestId("sample-advice");
   await expect(advice).toContainText("2 passes found: check all 2");
-  await expect(advice).toContainText("2 interceptions found: check all 2");
+  await expect(advice).toContainText("2 won balls found: check all 2");
   await expect(page.getByText("about ten", { exact: false })).toHaveCount(0);
   await expect(page.getByText("more checks", { exact: false })).toHaveCount(0);
   // The per-team notes no longer repeat the sampling need.
-  for (const stat of ["Passes", "Interceptions"]) await expect(page.locator(`[data-stat="${stat}"]`)).toContainText("0 confirmed · 1 to review");
+  for (const stat of ["Passes", "Interceptions & recoveries"]) await expect(page.locator(`[data-stat="${stat}"]`)).toContainText("0 confirmed · 1 to review");
   // Three different counts, each labelled for what it counts.
   await expect(page.getByText("0 shots and goals to check", { exact: false })).toBeVisible();
   await expect(page.getByText("2 moments on the timeline", { exact: false })).toBeVisible();
@@ -1538,6 +1557,45 @@ for (const possessions of [null, 1]) {
     await expect(page.getByText("A dash marks a minute with under 5 s of observed ball control.")).toBeVisible();
   });
 }
+
+test("tackles without a pitch setup read — and say how to measure them", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.stats.teams.forEach((t) => (t.tackles = null as never));
+  await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const row = page.locator('[data-stat="Tackles"]');
+  await expect(row).toContainText("—");
+  expect(await row.innerText()).not.toMatch(/\d/);
+  await expect(row).toContainText("Set up the pitch to tell tackles from other won balls.");
+  // The won-ball row says it holds the tackles until then.
+  await page.getByRole("button", { name: "Why: Interceptions & recoveries", exact: true }).click();
+  await expect(page.locator('[data-stat="Interceptions & recoveries"]')).toContainText("without the pitch set up this includes tackles");
+});
+
+test("tackles measured as none do not ask for a pitch setup", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.locator('[data-stat="Tackles"]')).toContainText("none confirmed");
+  await expect(page.getByText("Set up the pitch to tell tackles")).toHaveCount(0);
+});
+
+test("possession counts withheld under the share say when they appear", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.stats.coverage.possessionPercent = 70;
+  data.stats.teams.forEach((t) => {
+    t.possessions = null as never;
+    t.averagePossession = null as never;
+  });
+  await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.locator('[data-stat="Observed control share"]')).toContainText("75%");
+  const row = page.locator('[data-stat="Possessions"]');
+  await expect(row).toContainText("—");
+  await expect(row).toContainText("Shown once 80% of play is followed");
+  await expect(page.locator('[data-stat="Average possession"]')).toContainText("—");
+});
 
 test("momentum says field position is weighted only with a pitch setup and directions", async ({ page }) => {
   await mockReport(page, { calibrated: false });

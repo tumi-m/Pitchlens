@@ -30,7 +30,8 @@ type PlayerLoad = NonNullable<VisionResult["metrics"]["playerLoad"]>;
 /** Types estimated from a random sample (checks are pooled across both teams). */
 const SAMPLED: { type: string; key: "passes" | "interceptions" | "tackles"; one: string; many: string }[] = [
   { type: "pass", key: "passes", one: "pass", many: "passes" },
-  { type: "interception", key: "interceptions", one: "interception", many: "interceptions" },
+  // "interception" is every ball won that is not a tackle, loose-ball recoveries included.
+  { type: "interception", key: "interceptions", one: "won ball", many: "won balls" },
   { type: "tackle", key: "tackles", one: "tackle", many: "tackles" },
 ];
 
@@ -414,8 +415,14 @@ export function MatchReport({
               format={pct}
               hint="Each team's share of all detected passes. Many stats sites define possession this way; it can differ from the time-based figure above."
             />
-            {/* Counted over the same followed play as the share: withheld with it (older workers sent a 0). */}
-            <Row label="Possessions" a={{ value: possessionShown ? A.possessions : null }} b={{ value: possessionShown ? B.possessions : null }} colours={colours} />
+            {/* The worker withholds the counts below 80% of play followed, a stricter gate than the share; hidden with the share too (older workers sent a 0). */}
+            <Row
+              label="Possessions"
+              a={{ value: possessionShown ? A.possessions : null }}
+              b={{ value: possessionShown ? B.possessions : null }}
+              colours={colours}
+              note={possessionShown && A.possessions === null && B.possessions === null ? "Shown once 80% of play is followed" : undefined}
+            />
             <Row label="Average possession" a={{ value: possessionShown ? A.averagePossession : null }} b={{ value: possessionShown ? B.averagePossession : null }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
             <Row
               label="Field tilt"
@@ -465,8 +472,22 @@ export function MatchReport({
             />
           </Group>
           <Group title="Defending">
-            <Row label="Interceptions" a={count(A.interceptions)} b={count(B.interceptions)} colours={colours} />
-            <Row label="Tackles / balls won" a={count(A.tackles)} b={count(B.tackles)} colours={colours} />
+            <Row
+              label="Interceptions & recoveries"
+              a={count(A.interceptions)}
+              b={count(B.interceptions)}
+              colours={colours}
+              hint="Ball taken from the other team: an intercepted pass or a loose ball; without the pitch set up this includes tackles."
+            />
+            <Row
+              label="Tackles"
+              a={count(A.tackles)}
+              b={count(B.tackles)}
+              colours={colours}
+              hint="Ball won within 2 m and 0.8 s of the opponent losing it; needs the pitch set up."
+              // Unmeasured, not zero: without metres a tackle cannot be told from another won ball.
+              note={!A.tackles && !B.tackles && !analysis.calibrated ? "Set up the pitch to tell tackles from other won balls." : undefined}
+            />
           </Group>
           </>
           ) : (
