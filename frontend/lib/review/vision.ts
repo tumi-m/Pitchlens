@@ -484,19 +484,10 @@ export async function uploadToVision(
   }
   let starting = false;
   let offset = Math.min(file.size, Math.max(0, job.receivedBytes ?? 0));
-  // Closing or reloading the tab runs no cleanup: free the single worker with a
-  // keepalive cancel instead of leaving it reserved until the idle timeout. A
-  // reload then starts afresh: the stored request ID meets "previous upload
-  // stopped" and is renewed (a dropped connection still resumes).
-  const leave = () => {
-    fetch(`/api/vision/jobs/${job.id}/cancel`, {
-      method: "POST",
-      keepalive: true,
-      headers: visionHeaders(),
-    }).catch(() => {});
-  };
-  const listen = typeof window !== "undefined";
-  if (listen) window.addEventListener("pagehide", leave);
+  // Leaving the page does not cancel the upload: phones discard background tabs
+  // (switching apps mid-upload), and a reload resumes from the last byte the
+  // worker acknowledged. An abandoned upload frees the worker by itself after
+  // VISION_UPLOAD_IDLE_SECONDS without data.
   try {
     signal?.throwIfAborted();
     let lastAck = Date.now();
@@ -547,7 +538,6 @@ export async function uploadToVision(
     // page's "Cancel analysis") asks the worker, and only a confirmed stop is
     // reported as cancelled; the report page also offers a cancel.
     signal?.throwIfAborted();
-    if (listen) window.removeEventListener("pagehide", leave);
     starting = true;
     const started = await startAnalysis(job.id, signal);
     savePendingUpload(null);
@@ -576,8 +566,6 @@ export async function uploadToVision(
       requestCancel(job.id).then((stopped) => stopped && savePendingUpload(null));
     }
     throw e;
-  } finally {
-    if (listen) window.removeEventListener("pagehide", leave);
   }
 }
 

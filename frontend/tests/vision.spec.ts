@@ -366,10 +366,10 @@ test("an undecodable file never turns on the 20-second test, even when the serve
   expect(calls.start).toBe("0");
 });
 
-test("closing the tab mid-upload frees the worker, but never cancels a started analysis", async ({ page }) => {
-  // A request sent while a tab unloads is not reliably visible to Playwright, so
-  // the tab's pagehide event is fired in place: the same handler a close, reload
-  // or navigation runs, and the keepalive cancel it sends is intercepted as usual.
+test("leaving the page mid-upload never cancels the upload or a started analysis", async ({ page }) => {
+  // Phones discard background tabs while the user switches apps: the upload must
+  // survive so a reload can resume it. pagehide is fired in place (a request sent
+  // while a tab unloads is not reliably visible to Playwright).
   const leave = () => page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: false })));
   await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
   const calls = await mockChunkedWorker(page);
@@ -378,7 +378,6 @@ test("closing the tab mid-upload frees the worker, but never cancels a started a
     cancels.push(r.request().method());
     return r.fulfill({ json: { status: "cancelled" } });
   });
-  // The first chunk is held: the upload is in flight.
   let sending = false;
   let chunk!: () => void;
   const chunkReplied = new Promise<void>((resolve) => (chunk = resolve));
@@ -395,24 +394,18 @@ test("closing the tab mid-upload frees the worker, but never cancels a started a
     await r.fulfill({ json: { id: ID, title: "Vision test", status: "processing", stage: "Opening video", progress: 0, createdAt: 0 } }).catch(() => {});
   });
   await page.goto("/upload");
-  // Before any reservation there is nothing to cancel.
-  await leave();
   await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
   await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
   await expect.poll(() => sending).toBe(true);
   await leave();
-  await expect.poll(() => cancels).toEqual(["POST"]);
-  // Let the upload finish: once /start has been sent the analysis may be running.
   chunk();
   await expect.poll(() => calls.started).toBe(1);
   await leave();
-  await page.waitForTimeout(1000);
-  expect(cancels).toEqual(["POST"]);
+  await page.waitForTimeout(500);
+  expect(cancels).toEqual([]);
   start();
   await expect(page).toHaveURL(`/vision/${ID}`);
-  await leave();
-  await page.waitForTimeout(500);
-  expect(cancels).toEqual(["POST"]);
+  expect(cancels).toEqual([]);
 });
 
 test("analysing a saved review defaults to player load and the worker's football models", async ({ page }) => {
