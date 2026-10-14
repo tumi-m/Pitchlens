@@ -156,6 +156,20 @@ test('upload defaults: player load unless the ball model is asked for, football 
   assert.deepEqual(plain(options({ profiles: ['broadcast'] }, { playerLoadOnly: false, adaptive: true, profile: 'general' })), { profile: 'general', search: 'exhaustive' });
 });
 
+test('detail defaults: Balanced whenever the ball model runs or a GPU is present', async () => {
+  const s = setup({ respond: () => Response.json({ detail: 'Fixture: stop after the reservation.' }, { status: 400 }) });
+  const fps = s.lib.defaultVisionFps;
+  assert.equal(fps(null, true), '3');
+  assert.equal(fps({ gpu: false }, true), '3');
+  assert.equal(fps({ gpu: false }, false), '6');
+  assert.equal(fps({ gpu: true }, true), '6');
+  assert.equal(fps(null, false), '6');
+  // The reservation carries it (a missing fps would fall back to Quick).
+  await assert.rejects(s.lib.uploadToVision(new Blob(['x']), { title: 't', fps: fps(null, false) }), /stop after the reservation/);
+  const reserve = s.calls.find((c) => /\/jobs\?/.test(c.url));
+  assert.equal(new URL(reserve.url, 'https://site.example').searchParams.get('fps'), '6');
+});
+
 // ── Uploads that stall, pause or are cancelled ──────────────────────────
 const MiB = 1024 * 1024;
 const JOB = 'f'.repeat(32);

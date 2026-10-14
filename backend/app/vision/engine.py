@@ -7,6 +7,7 @@ import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -32,7 +33,7 @@ from app.vision.faint import (
 from app.vision.metrics import derive_metrics
 from app.vision.profiles import model_paths
 from app.vision.runtime import inference_device
-from app.vision.tracking import ByteTracker, MotionTracker, camera_motion
+from app.vision.tracking import ByteTracker, MotionTracker, camera_motion, small_grey
 from app.vision.trajectory import recover_near_anchors
 
 
@@ -158,8 +159,11 @@ def pitch_colour(frame, mask):
     """Median LAB colour of the detected playing surface in this frame, if any."""
     if mask is None or not mask.any():
         return None
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    return np.median(lab[mask > 0][::17], axis=0).astype(float)
+    # The conversion is per pixel: converting only the sampled pixels (every
+    # 17th surface pixel) gives the same median as converting the whole frame.
+    pixels = frame.reshape(-1, 3)[np.flatnonzero(mask.reshape(-1))[::17]]
+    lab = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3)
+    return np.median(lab, axis=0).astype(float)
 
 
 def jersey(frame, box, pitch=None):
@@ -331,7 +335,18 @@ def merge_candidates(detector, motion, limit=12):
     return detector[: limit - n_motion] + motion[:n_motion]
 
 
-def run_video(
+def run_video(*args, **kwargs):
+    """Analyse a video (see _run_video).
+
+    The tracker's Kalman filter makes thousands of tiny LAPACK calls. Each woke
+    numpy's OpenBLAS pool, whose threads then spin between calls: 3.5x the CPU
+    time of the work itself, taken from the decoder, the tracker and inference.
+    """
+    with threadpool_limits(limits=1, user_api="blas"):
+        return _run_video(*args, **kwargs)
+
+
+def _run_video(
     path,
     output,
     progress=lambda **kw: None,
@@ -501,6 +516,7 @@ def run_video(
     frame_num = first_frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
     previous_gray = None
+    previous_small = None  # the previous frame's small_grey picture (camera motion)
     previous_frame = None
     previous_boxes = []
     previous_ball = None
@@ -518,9 +534,9 @@ def run_video(
     matrices = []  # per sampled frame: affine mapping the previous frame into this one
     pending = []  # decoded frames awaiting a batched detection
 
-    def process(batch):
-        nonlocal previous_gray, previous_frame, previous_boxes, previous_ball, last_sweep
-        nonlocal scene, reported
+    def infer(batch):
+        """Model work for one batch. It needs nothing from earlier frames, so it
+        runs on a helper thread while the previous batch is tracked (below)."""
         # Calibration already detected some of these frames; only run the rest.
         # Those were read by seeking, which lands a frame late on trimmed
         # variable-frame-rate video: reuse them only for the same picture.
@@ -541,6 +557,12 @@ def run_video(
             tick = time.monotonic()
             ball_batches = ball_detector.detect_batch([b[1] for b in batch], threshold=0.05)
             timings["ballInferenceSeconds"] += time.monotonic() - tick
+        return detections, ball_batches
+
+    def process(batch, inferred):
+        nonlocal previous_gray, previous_frame, previous_boxes, previous_ball, last_sweep
+        nonlocal scene, reported, previous_small
+        detections, ball_batches = inferred
         for (t, frame, number), (boxes, scores, classes), raw_candidates in zip(
             batch, detections, ball_batches
         ):
@@ -548,7 +570,13 @@ def run_video(
             pitch = pitch_colour(frame, mask)
             gray = colour_signature(frame)
             tick = time.monotonic()
-            matrix, motion_ok = camera_motion(previous_frame, frame, previous_boxes)
+            # One grey conversion per frame serves camera motion and motion blobs.
+            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = small_grey(frame, grey)
+            matrix, motion_ok = camera_motion(
+                previous_frame, frame, previous_boxes, small=(previous_small, small)
+            )
+            previous_small = small
             timings["cameraMotionSeconds"] += time.monotonic() - tick
             # A fast pan or zoom defeats motion estimation but keeps the colour
             # make-up of the shot; a real cut changes it. Pixel differences alone
@@ -611,6 +639,7 @@ def run_video(
                 raw_candidates = fuse_ball_candidates(
                     raw_candidates, auxiliary_ball_candidates(boxes, scores, classes, ball_classes)
                 )
+                region = None
                 if mask.any():
                     # Airborne balls remain candidates. Only prolonged stillness
                     # outside this generous field margin identifies a distractor.
@@ -625,7 +654,8 @@ def run_video(
                 motion = []
                 if motion_ok and not cut:
                     motion = difference_candidates(
-                        previous_frame, frame, matrix, detected, diameter, mask=mask
+                        previous_frame, frame, matrix, detected, diameter, mask=mask,
+                        region=region, grey=grey,
                     )
                 candidates = merge_candidates(detector, motion)
                 strong = strong_candidates(candidates)
@@ -678,6 +708,28 @@ def run_video(
                     ),
                 )
 
+    # One batch in flight: while the model works on batch n (on the GPU, or
+    # ONNX Runtime/torch threads), this thread decodes and tracks batch n-1.
+    # The model call needs nothing from tracking, so results are unchanged.
+    # On by default only with CUDA: on the CPU it measured neutral, and on MPS
+    # (both models at once in adaptive mode) it is untested. VISION_PIPELINE=1
+    # forces it on, 0 runs the two one after the other (comparisons).
+    executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-inference")
+        if os.getenv("VISION_PIPELINE", "1" if device.startswith("cuda") else "0") != "0"
+        else None
+    )
+    in_flight = None  # (batch, future)
+
+    def submit(batch):
+        nonlocal in_flight
+        if executor is None:
+            process(batch, infer(batch))
+            return
+        previous, in_flight = in_flight, (batch, executor.submit(infer, batch))
+        if previous is not None:
+            process(previous[0], previous[1].result())
+
     try:
         # The frame count is only an upper guard: the window ends by decoder time (below).
         while frame_num / meta["fps"] < start_seconds + duration:
@@ -690,7 +742,7 @@ def run_video(
                 # Container frame counts are estimates: trimmed clips (edit lists)
                 # routinely declare several seconds more than they hold. The real
                 # end of the stream is the end of the analysis, reported below.
-                if frames or pending:
+                if frames or pending or in_flight:
                     break
                 raise ValueError("Video decoding stopped before the requested duration.")
             if (frame_num - first_frame) % stride:
@@ -700,7 +752,7 @@ def run_video(
             ok, frame = cap.retrieve()
             timings["decodeSeconds"] += time.monotonic() - tick
             if not ok:
-                if frames or pending:
+                if frames or pending or in_flight:
                     break
                 raise ValueError("Video decoding stopped before the end.")
             # Phone footage is often variable frame rate: use the decoder's
@@ -717,13 +769,19 @@ def run_video(
             last_t = t
             pending.append((t, frame, frame_num))
             if len(pending) >= batch_size:
-                process(pending)
+                submit(pending)
                 pending = []
             frame_num += 1
         if pending:
-            process(pending)
+            submit(pending)
             pending = []
+        if in_flight is not None:
+            batch, future = in_flight
+            in_flight = None
+            process(batch, future.result())
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         cap.release()
     if not frames or not any(f["players"] for f in frames):
         raise ValueError(

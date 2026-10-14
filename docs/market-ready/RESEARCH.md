@@ -332,7 +332,7 @@ Both figures come from the tracking summary; their source URLs were in the part 
 - a relative-speed check of 4 + 2σ m/s;
 - single-sample touches only with a ≥30° turn at ≥2 m/s;
 - bridging of up to 3 unseen samples;
-- control spells of at least 0.3 s;
+- control spells of at least 2 sightings at any sampling rate (E20);
 - possession sequences that survive 5 s of unseen or loose ball, with a 400-iteration bootstrap interval and a 0.6 coverage gate.
 
 **Change: a team-level hidden Markov model decoded with forward-backward.** This follows PathCRF's idea of one possession state per step plus forbidden transitions. It is defined over teams and the nearest detection in each frame, not over persistent player IDs, because PathCRF and Ball Radar both need complete identities that Pitchlens does not have.
@@ -442,7 +442,7 @@ The status column says where each value stands:
 | Speed-change gain check | Δv ≥ max(3, 2.5·σ_dv); σ_dv ≈ 2.5 at σ_pos 0.5 m | m/s | fact-check error propagation [derived] | proposed |
 | Heading-change gain check | ≥20°, tested only when ball speed ≥ 3σ_v | deg | [derived] | proposed (HEAD single-sample touch: ≥30° at ≥2 m/s) |
 | Acceleration features | not used at 5-6 fps (noise 18-31 m/s²) | m/s² | [derived] | proposed |
-| Minimum control dwell | 2 samples (0.3 s) | s | [derived]; HEAD `minControlSeconds` | HEAD |
+| Minimum control dwell | 2 sightings at every rate | samples | [derived]; E20; HEAD `minControlSamples` | HEAD |
 | Same-player bridging | ≤3 unseen samples (≤0.6 s) | samples | [derived]; HEAD `bridgeSamples` | HEAD |
 | How long possession survives an unseen or loose ball | 5.0 (HEAD); research: gaps >1.5 s decided by posterior or marked "unknown" | s | HEAD `maxPossessionGap`; events research | conflict (the HMM replaces it) |
 | Coverage needed to show possession % | ≥0.6 of in-play time | ratio | [derived]; HEAD | HEAD |

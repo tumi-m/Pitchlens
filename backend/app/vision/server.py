@@ -520,8 +520,14 @@ def work(directory, status, event):
 
             try:
                 update(stage="Starting a GPU", progress=0)
+                # A long or detailed run gets more than the GPU function's static 3 h.
+                timeout = gpu.gpu_timeout_seconds(
+                    status.get("video"), options["sample_fps"], options["ball_search"],
+                    options["max_seconds"], options["start_seconds"],
+                )
                 gpu.run_on_modal(
-                    job_id, directory / "result.json", TOKEN, **{**options, "progress": gpu_progress}
+                    job_id, directory / "result.json", TOKEN, **{**options, "progress": gpu_progress},
+                    timeout_seconds=timeout,
                 )
                 ran_on_gpu = True
             except gpu.GPUUnavailable as exc:
@@ -1646,7 +1652,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 11  # 10 merged rounds 1 and 2; 11 adds kit colours, span, ball search and player load
+ANALYTICS_VERSION = 12  # 10 merged rounds 1 and 2; 11 adds kit colours, span, ball search and player load; 12 counts control in sightings (E20)
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
@@ -2571,6 +2577,11 @@ def rerun_job(job_id: str, request: Request):
         release_stale_upload(contended=True)
         if active is not None:
             raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
+        sample_fps = previous.get("sampleFps", 3)
+        if search != "none" and previous.get("ballSearch") == "none" and sample_fps < 6:
+            # Turning the ball model on for a player-load job: at 3 fps pass recall
+            # roughly halves. A ball run at 3 fps was chosen (Quick) and stays.
+            sample_fps = 6
         new_id = uuid.uuid4().hex
         directory = ROOT / new_id
         status = {
@@ -2579,7 +2590,7 @@ def rerun_job(job_id: str, request: Request):
             "footageCreatedAt": previous.get("footageCreatedAt", previous.get("uploadedAt", previous["createdAt"])),
             "createdAt": time.time(), "status": "processing", "stage": "Opening saved footage",
             "progress": 0, "video": metadata, "fileSize": (source / "video").stat().st_size,
-            "profile": previous.get("profile", "general"), "sampleFps": previous.get("sampleFps", 3),
+            "profile": previous.get("profile", "general"), "sampleFps": sample_fps,
             "ballSearch": search,
             "maxSeconds": 20 if mode == "section" else None, "startSeconds": start,
             "rerunRequestId": request_id, "rerunDigest": digest,

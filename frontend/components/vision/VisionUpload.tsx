@@ -22,6 +22,7 @@ import {
   CONNECTION_LOST,
   connectionLost,
   defaultVisionOptions,
+  defaultVisionFps,
   pendingUploadFor,
   pendingUploadInfo,
   sameUploadOptions,
@@ -90,8 +91,11 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const percentText = total > 0 ? percentLabel(sent, total) : "0%";
   const eta = active && phase === "Uploading" ? etaSeconds(active.acks, total) : null;
   const [profile, setProfile] = useState("general");
-  const [fps, setFps] = useState("3");
   const [playerLoadOnly, setPlayerLoadOnly] = useState(true);
+  /** The detail picked in the select (or restored with an upload); never overridden once set. */
+  const [fpsChoice, setFpsChoice] = useState<string | null>(null);
+  // Until then: Balanced on a GPU or whenever the ball model runs, Quick for player load on a CPU.
+  const fps = fpsChoice ?? defaultVisionFps(health, playerLoadOnly);
   const [adaptive, setAdaptive] = useState(false);
   const [preflight, setPreflight] = useState<VideoPreflight | null>(null);
   const [checking, setChecking] = useState(false);
@@ -210,7 +214,6 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           setDiagnostic(x.diagnostics === true);
           // Initial choices only: reconnecting must preserve the user's options.
           setProfile(defaultVisionOptions(x, { playerLoadOnly: true }).profile);
-          if (x.gpu) setFps("6");
         }
         // Show the field whenever a code is required (pre-filled with any saved
         // one); forget a saved code when the site is open.
@@ -344,7 +347,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     setDiagnostic(query.get("diagnostic") === "true");
     setStart(Math.max(0, Number(query.get("start")) || 0));
     if (query.get("profile")) setProfile(query.get("profile")!);
-    if (query.get("fps")) setFps(query.get("fps")!);
+    if (query.get("fps")) setFpsChoice(query.get("fps")!);
     const search = query.get("search");
     if (search) {
       setPlayerLoadOnly(search === "none");
@@ -801,7 +804,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               ? "Analysis runs on a GPU (the first run of the day can take a few extra minutes to start). "
               : testOnly
                 ? ""
-                : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
+                : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage; Balanced, which ball statistics need, takes about twice as long). "}
             The report shows a live time estimate, and you can leave and come
             back.{" "}
             {/* What this job measures depends on whether the ball model runs. */}
@@ -822,8 +825,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </label>
             <label className="text-sm">Analysis detail
               <select className="pitch-input w-full mt-2" value={fps}
-                disabled={busy} onChange={(e) => setFps(e.target.value)}>
-                <option value="3">Quick · about 3 frames/sec</option>
+                disabled={busy} onChange={(e) => setFpsChoice(e.target.value)}>
+                <option value="3">Quick · about 3 frames/sec · misses many passes and shots</option>
                 <option value="6">Balanced · about 6 frames/sec</option>
                 <option value="10">Detailed · about 10 frames/sec</option>
               </select>
@@ -837,7 +840,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           ) : null}
           {source === "file" && profile !== "general" && !playerLoadOnly && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
           <p className="text-xs text-pitch-muted">
-            Detailed analysis follows fast movement more closely and takes longer.
+            Detailed takes about two-thirds more analysis time than Balanced.
             The football-trained models come from Roboflow&apos;s football example (trained on broadcast matches); try the general detector if a small indoor venue gives poor results.
           </p>
           {error && (

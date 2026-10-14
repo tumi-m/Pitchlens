@@ -2958,6 +2958,34 @@ def test_a_rerun_can_turn_the_ball_model_on_and_defaults_to_the_source(hosted):
     assert json.loads((server.ROOT / full.json()['id'] / 'status.json').read_text())['rerunDigest'].startswith('full:')
 
 
+def test_turning_the_ball_model_on_raises_a_quick_player_load_rerun_to_6_fps(hosted):
+    import json
+
+    server, client, submitted = hosted
+
+    def rerun(job, n, search=None):
+        url = f'/jobs/{job}/rerun?mode=section&start=30&requestId={n:032x}' + (f'&search={search}' if search else '')
+        response = client.post(url, headers={'x-pitchlens-owner': 'c' * 32})
+        assert response.status_code == 200, response.text
+        _free(server)
+        return json.loads((server.ROOT / response.json()['id'] / 'status.json').read_text())
+
+    def source(job, fps, search):
+        _player_load_source(server, job)
+        saved = json.loads((server.ROOT / job / 'status.json').read_text())
+        server.write_status(server.ROOT / job, {**saved, 'sampleFps': fps, 'ballSearch': search})
+
+    source('a' * 32, 3, 'none')  # a CPU worker's upload default, or an older "analyse saved video"
+    on = rerun('a' * 32, 1, 'exhaustive')
+    assert (on['sampleFps'], on['ballSearch']) == (6, 'exhaustive')
+    assert on['rerunDigest'] == 'section:30:exhaustive' and on['maxSeconds'] == 20
+    assert rerun('a' * 32, 2)['sampleFps'] == 3  # still player load: 3 is enough
+    source('b' * 32, 3, 'exhaustive')  # Quick with the ball, chosen knowingly
+    assert rerun('b' * 32, 3)['sampleFps'] == 3
+    source('d' * 32, 6, 'none')
+    assert rerun('d' * 32, 4, 'adaptive')['sampleFps'] == 6
+
+
 def test_a_rerun_keeps_the_source_kit_order(hosted):
     import json
 
@@ -3725,6 +3753,78 @@ def test_an_engine_crash_on_the_gpu_is_not_rerun_on_the_cpu(worker, monkeypatch)
         saved = _disk(directory)
         assert (saved["status"], saved["stage"]) == ("failed", "Vision processing failed. Check the worker log.")
         assert "refusedBy" not in saved
+    assert not cpu
+
+
+def test_the_gpu_time_limit_follows_the_videos_length_size_and_rate():
+    from app.vision.ball import tile_frame, tile_layout
+    from app.vision.gpu import gpu_timeout_seconds as limit
+
+    # The ball tiles the estimate counts are tile_frame's (2 at 360p, 12 at 1080p and 4K).
+    for width, height, layout in ((640, 360, (1.0, 2, 1)), (1920, 1080, (1.0, 4, 3)), (3840, 2160, (0.5, 4, 3))):
+        assert tile_layout(width, height) == layout
+        assert len(tile_frame(np.zeros((height, width, 3), np.uint8))) == layout[1] * layout[2]
+    small = {"fps": 29.97, "width": 640, "height": 360}
+    assert limit({**small, "duration": 37.5 * 60}, 6, "exhaustive") == 10800  # analyse's own 3 h
+    # 4 h at 10 fps is 143,856 frames at 87.8 ms measured on an L4: over 3 h.
+    assert limit({**small, "duration": 4 * 3600}, 10, "exhaustive") > 1.5 * 143_856 * 0.0878
+    hd = {"fps": 30, "width": 1920, "height": 1080, "duration": 90 * 60}
+    assert limit(hd, 10, "exhaustive") > 54_000 * 0.28
+    assert limit({**hd, "duration": 4 * 3600}, 10, "none") < limit({**hd, "duration": 4 * 3600}, 10, "exhaustive")
+    assert limit({**hd, "width": 3840, "height": 2160, "duration": 4 * 3600}, 15, "exhaustive") == 86400  # Modal's ceiling
+    # A 20-second section of a long video needs no more than 3 h.
+    assert limit({**small, "duration": 4 * 3600}, 10, "exhaustive", max_seconds=20, start_seconds=600) == 10800
+    for video in (None, {}, {"duration": 60}, {**small, "duration": None}, {**small, "fps": 0, "duration": 60}):
+        assert limit(video, 6, "exhaustive") is None
+
+
+def test_a_long_gpu_run_asks_modal_for_a_longer_time_limit(service, monkeypatch, tmp_path):
+    from app.vision import gpu
+
+    monkeypatch.setattr(gpu, "public_base", lambda: "https://worker.example")
+    fake = _FakeModal([RESULT])
+    limits = []
+
+    def with_options(**kw):
+        limits.append(kw)
+        return fake.analyse
+
+    fake.analyse.with_options = with_options
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+    for timeout in (None, 10800, 25362):
+        gpu.run_on_modal("e" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 10,
+                         timeout_seconds=timeout)
+    assert limits == [{"timeout": 25362}] and (tmp_path / "r.json").read_text() == '{"frames": []}'
+    # The worker computes the limit from the upload's metadata and the job's options.
+    server, _ = service
+    directory = server.ROOT / ("4" * 32)
+    directory.mkdir()
+    video = {"fps": 30, "width": 1920, "height": 1080, "duration": 90 * 60}
+    status = {"id": "4" * 32, "status": "processing", "createdAt": 0, "video": video, "sampleFps": 10, "ballSearch": "exhaustive"}
+    seen = {}
+    monkeypatch.setattr(server.gpu, "modal_enabled", lambda: True)
+    monkeypatch.setattr(server.gpu, "run_on_modal", lambda *a, **kw: seen.update(kw))
+    server.work(directory, status, threading.Event())
+    assert seen["timeout_seconds"] == gpu.gpu_timeout_seconds(video, 10, "exhaustive") > 10800
+
+
+def test_a_gpu_run_stopped_at_its_time_limit_is_not_retried_or_rerun_on_the_cpu(worker, monkeypatch):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    monkeypatch.setattr(server, "GPU_ERROR_GRACE", 0)
+    # modal.exception.FunctionTimeoutError, as the Modal client raises it from remote_gen.
+    timed_out = type("FunctionTimeoutError", (Exception,), {"__module__": "modal.exception"})
+    cpu = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    for job, fallback in (("1" * 32, "0"), ("2" * 32, "1")):  # GPU-only, then the operator's CPU fallback
+        monkeypatch.setenv("VISION_ALLOW_CPU_FALLBACK", fallback)
+        fake = _FakeModal([{"stage": "Detecting players", "progress": 40}], error=timed_out("Function timed out after 10800s"))
+        monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+        directory, status = _queued_job(server, job)
+        server.work(directory, status, threading.Event())
+        saved = _disk(directory)
+        assert saved["status"] == "failed" and "too long" in saved["stage"] and "retry" not in saved["stage"].lower()
+        assert "refusedBy" not in saved and saved["error"].startswith("GPUTimeout")  # billed: the attempt counts
     assert not cpu
 
 

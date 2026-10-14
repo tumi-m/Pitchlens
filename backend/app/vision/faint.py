@@ -29,17 +29,40 @@ def ball_size_prior(players, frame_height):
     return max(3.0, frame_height / 70)
 
 
-def difference_candidates(previous, current, matrix, players, diameter, limit=8, mask=None):
+def percentile_u8(image, q):
+    """np.percentile(image, q) (its default linear method) for uint8 pixels, bit for bit.
+
+    A 256-bin histogram replaces the partial sort of every pixel.
+    """
+    flat = image.reshape(-1)
+    n = flat.size
+    cumulative = np.cumsum(np.bincount(flat, minlength=256))
+    virtual = (n - 1) * np.true_divide(q, 100)
+    below = np.floor(virtual)
+    gamma = np.asanyarray(virtual - below)
+    # The value at sorted position k is the first bin whose cumulative count exceeds k.
+    a = np.uint8(np.searchsorted(cumulative, int(min(max(below, 0), n - 1)) + 1))
+    b = np.uint8(np.searchsorted(cumulative, int(min(max(below + 1, 0), n - 1)) + 1))
+    # numpy's _lerp, step for step, so the float result (and its truncation) agree.
+    step = np.subtract(b, a)
+    out = np.asanyarray(np.add(a, step * gamma))
+    np.subtract(b, step * (1 - gamma), out=out, where=gamma >= 0.5, casting="unsafe", dtype=type(out.dtype))
+    return out[()]
+
+
+def difference_candidates(previous, current, matrix, players, diameter, limit=8, mask=None, region=None, grey=None):
     """Small bright blobs that moved against the camera-compensated background.
 
     `mask` is the detected playing surface; candidates outside a generously
-    dilated version of it (spectators, boards, walls) are discarded.
+    dilated version of it (spectators, boards, walls) are discarded. `region`
+    (that dilated mask) and `grey` (the current frame in grey) save recomputing
+    what the caller already has.
     """
     if previous is None or matrix is None:
         return []
     h, w = current.shape[:2]
     warped = cv2.warpAffine(previous, matrix, (w, h), flags=cv2.INTER_LINEAR)
-    grey_now = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+    grey_now = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY) if grey is None else grey
     grey_prev = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     # Signed difference: where the picture got brighter. A light ball arriving
     # lights up its new position; with an absolute difference the spot it left
@@ -55,10 +78,11 @@ def difference_candidates(previous, current, matrix, players, diameter, limit=8,
         x1, y1, x2, y2 = [int(v) for v in p["box"]]
         cv2.rectangle(diff, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), 0, -1)
     if mask is not None and mask.any():
-        k = max(3, int(h * 0.08))
-        region = cv2.dilate(mask, np.ones((k, k), np.uint8))
+        if region is None:
+            k = max(3, int(h * 0.08))
+            region = cv2.dilate(mask, np.ones((k, k), np.uint8))
         diff[region == 0] = 0
-    threshold = max(24, int(np.percentile(diff, 99.5)))
+    threshold = max(24, int(percentile_u8(diff, 99.5)))
     _, binary = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
     k = max(1, int(diameter / 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))

@@ -14,6 +14,7 @@ import {
   CONNECTION_LOST,
   connectionLost,
   defaultVisionOptions,
+  defaultVisionFps,
 } from "@/lib/review/vision";
 export function AnalyseSavedVideo({
   id,
@@ -76,6 +77,7 @@ export function AnalyseSavedVideo({
       const job = await uploadToVision(video, {
         title,
         ...defaultVisionOptions(status, { playerLoadOnly: !ballModel }),
+        fps: defaultVisionFps(status, !ballModel),
         uploadIdleSeconds: status.uploadIdleSeconds,
         uploadAbandonSeconds: status.uploadAbandonSeconds,
         signal: controller.signal,

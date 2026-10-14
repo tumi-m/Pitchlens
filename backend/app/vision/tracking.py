@@ -8,15 +8,28 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-def camera_motion(previous, current, previous_boxes):
-    """Estimate background pan/zoom while masking people from feature extraction."""
+def small_grey(frame, grey=None):
+    """The 320-pixel-wide grey picture camera_motion works on."""
+    height, width = frame.shape[:2]
+    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if grey is None else grey
+    return cv2.resize(grey, (320, round(height * 320 / width)))
+
+
+def camera_motion(previous, current, previous_boxes, small=None):
+    """Estimate background pan/zoom while masking people from feature extraction.
+
+    `small`: the (previous, current) small_grey pictures when the caller already
+    has them (the previous frame's was made on the previous call)."""
     identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
     if previous is None:
         return identity, False
     height, width = current.shape[:2]
     scale = 320 / width
-    a = cv2.resize(cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY), (320, round(height * scale)))
-    b = cv2.resize(cv2.cvtColor(current, cv2.COLOR_BGR2GRAY), a.shape[::-1])
+    if small is not None and small[0] is not None and small[1] is not None:
+        a, b = small
+    else:
+        a = cv2.resize(cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY), (320, round(height * scale)))
+        b = cv2.resize(cv2.cvtColor(current, cv2.COLOR_BGR2GRAY), a.shape[::-1])
     mask = np.full_like(a, 255)
     for box in previous_boxes:
         x1, y1, x2, y2 = np.array(box) * scale
@@ -229,15 +242,20 @@ class ByteTracker:
         self.last_time = None
         self.interval = None
 
-    def _cost(self, track, obs, t, gate_scale):
-        predicted = track.kf.box()
+    def _cost(self, track, obs, t, gate_scale, cached=None):
+        # _associate passes (prediction, its centre, box array, box centre), made
+        # once per track and per detection instead of once per pair.
+        if cached is None:
+            predicted = track.kf.box()
+            cached = (predicted, centre(predicted), np.array(obs["box"]), centre(obs["box"]))
+        predicted, predicted_centre, box, box_centre = cached
         height = max(10.0, (predicted[3] - predicted[1] + obs["box"][3] - obs["box"][1]) / 2)
-        distance = np.linalg.norm(centre(predicted) - centre(obs["box"])) / height
+        distance = np.linalg.norm(predicted_centre - box_centre) / height
         gap = t - track.seen
         gate = min(3.0, (1.0 + 0.9 * gap) * gate_scale)
         if distance > gate:
             return None
-        cost = 0.65 * distance / gate + 0.35 * (1 - overlap(predicted, np.array(obs["box"])))
+        cost = 0.65 * distance / gate + 0.35 * (1 - overlap(predicted, box))
         feature = obs.get("kitFeature")
         if feature is not None and track.appearance is not None:
             delta = np.asarray(feature, float) - track.appearance
@@ -264,9 +282,12 @@ class ByteTracker:
         if not tracks or not observations:
             return {}, list(range(len(tracks))), list(range(len(observations)))
         costs = np.full((len(tracks), len(observations)), 1e6)
+        boxes = [(np.array(obs["box"]), centre(obs["box"])) for obs in observations]
         for i, tr in enumerate(tracks):
+            predicted = tr.kf.box()
+            predicted_centre = centre(predicted)
             for j, obs in enumerate(observations):
-                c = self._cost(tr, obs, t, gate_scale)
+                c = self._cost(tr, obs, t, gate_scale, (predicted, predicted_centre, *boxes[j]))
                 if c is not None:
                     costs[i, j] = c
         rows, cols = linear_sum_assignment(costs)

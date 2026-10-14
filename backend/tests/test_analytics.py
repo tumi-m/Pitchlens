@@ -761,13 +761,19 @@ def test_an_analysis_cached_by_the_previous_version_is_recomputed(tmp_path, monk
     server, client = _client(tmp_path, monkeypatch)
     job_id, directory = make_job(server, build_match())
     first = client.get(f"/jobs/{job_id}/analysis").json()
-    assert first["inputs"][0] == server.ANALYTICS_VERSION == 11 and "teams" in first
-    # A file written by version 10 for the same inputs, without the new fields.
+    assert first["inputs"][0] == server.ANALYTICS_VERSION == 12 and "teams" in first
+    # A file written by an earlier version for the same inputs, without the newer fields.
     old = {k: v for k, v in first.items() if k not in ("teams", "analysedStart", "analysedDuration", "ballSearch", "ballFrames", "playerLoad")}
     old["inputs"] = [10] + first["inputs"][1:]
     (directory / "analysis.json").write_text(json.dumps(old))
     again = client.get(f"/jobs/{job_id}/analysis").json()
-    assert again["inputs"][0] == 11 and again["analysedDuration"] == first["analysedDuration"]
+    assert again["inputs"][0] == 12 and again["analysedDuration"] == first["analysedDuration"]
+    # Version 11 counted control in seconds; its cached file is recomputed too (E20).
+    old["inputs"] = [11] + first["inputs"][1:]
+    old["params"] = {**first.get("params", {}), "minControlSeconds": 0.3}
+    (directory / "analysis.json").write_text(json.dumps(old))
+    again = client.get(f"/jobs/{job_id}/analysis").json()
+    assert again["inputs"][0] == 12 and "teams" in again
 
 
 def test_calibration_can_be_polled_without_its_frames(tmp_path, monkeypatch):
@@ -1420,3 +1426,22 @@ def test_a_single_restart_like_frame_in_open_play_is_not_a_kick_off():
     assert an.detect_kickoffs(projected, [], directions, template, FPS) == []
     out = analytics.analyse(result_for(frames), calibration_for(frames))
     assert out["kickoffs"] == []
+
+
+def _spells_at(fps, controls, around):
+    """control_spells() for one player in control at sample indices `controls`; `around` fills the rest."""
+    n = 12
+    projected = [{"t": round(i / fps, 3), "scene": 0} for i in range(n)]
+    control = {"state": "control", "player": 7, "team": 0, "fragment": 7, "ball": (10.0, 10.0), "touch": False}
+    states = [dict(control) if i in controls else dict(around) for i in range(n)]
+    return analytics.control_spells(projected, states, fps)
+
+
+def test_two_sightings_are_control_at_every_sampling_rate():
+    # E20: a seconds-based minimum asked for 3-4 sightings at 8.33-12.5 fps, so the
+    # dearer Detailed preset dropped short controls Balanced kept.
+    for fps in (5.0, 5.994, 8.333, 10.0, 12.5):
+        assert len(_spells_at(fps, {4, 5}, {"state": "unknown"})) == 1, fps
+    # One sighting with the ball seen loose on both sides is still not control.
+    for fps in (5.0, 10.0):
+        assert _spells_at(fps, {4}, {"state": "loose", "ball": (14.0, 10.0)}) == [], fps

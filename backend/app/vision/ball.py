@@ -86,18 +86,25 @@ class BallDetector:
         return found
 
 
+def tile_layout(width, height, tile=480, max_short_side=1080):
+    """(scale, cols, rows) of tile_frame for a width x height frame, without the frame
+    (the GPU timeout estimates its cost from the video's size)."""
+    short = min(width, height)
+    scale = 1.0 if short <= max_short_side else max_short_side / short
+    # cv2.resize rounds the scaled size the same way (half to even).
+    w, h = (round(width * scale), round(height * scale)) if scale < 1 else (width, height)
+    return scale, max(1, math.ceil(w / tile)), max(1, math.ceil(h / tile))
+
+
 def tile_frame(frame, tile=480, overlap=48, max_short_side=1080):
     """Overlapping tiles as the tiled ball detector sees them (training uses the same).
 
     Returns (x0, y0, scale, crop); crop coordinates map back as (x / scale, y / scale).
     """
-    short = min(frame.shape[:2])
-    scale = 1.0 if short <= max_short_side else max_short_side / short
+    scale, cols, rows = tile_layout(frame.shape[1], frame.shape[0], tile, max_short_side)
     if scale < 1:
         frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     h, w = frame.shape[:2]
-    cols = max(1, math.ceil(w / tile))
-    rows = max(1, math.ceil(h / tile))
     tw, th = math.ceil(w / cols), math.ceil(h / rows)
     out = []
     for r in range(rows):

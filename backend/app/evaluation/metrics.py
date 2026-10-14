@@ -142,9 +142,15 @@ def evaluate_events(predicted, labels, tolerance=None, types=None):
 # --------------------------------------------------------------------- possession
 
 
-def evaluate_possession(analysis, labels, step=0.2):
-    """Second-by-second team agreement and the possession-share error."""
-    sequences = (analysis.get("stats") or {}).get("possessionSequences") or []
+def evaluate_possession(analysis, labels, step=0.2, sequences=None):
+    """Second-by-second team agreement and the possession-share error.
+
+    stats.possessionSequences keeps only the last 400 possessions (the report's
+    payload): pass every sequence (analytics.prepare(...)["sequences"]) to score
+    a longer match from its start.
+    """
+    if sequences is None:
+        sequences = (analysis.get("stats") or {}).get("possessionSequences") or []
     if not labels:
         return None
     start = min(l["start"] for l in labels)
@@ -237,15 +243,15 @@ def review_metrics(analysis, review, full_review=False):
     return out
 
 
-def evaluate(result, analysis, labels, calibration=None, review=None):
-    """Everything that the labels allow, in one report."""
+def evaluate(result, analysis, labels, calibration=None, review=None, sequences=None):
+    """Everything that the labels allow, in one report (sequences: see evaluate_possession)."""
     report = {"match": labels.get("match"), "split": labels.get("split"), "note": labels.get("note")}
     if labels.get("ball"):
         report["ball"] = evaluate_ball(result, labels["ball"], labels.get("ballTolerancePixels", 3.0))
     if labels.get("events"):
         report["events"] = evaluate_events(analysis.get("events", []), labels["events"], labels.get("eventTolerance"))
     if labels.get("possession"):
-        report["possession"] = evaluate_possession(analysis, labels["possession"])
+        report["possession"] = evaluate_possession(analysis, labels["possession"], sequences=sequences)
     if labels.get("landmarks"):
         report["calibration"] = evaluate_calibration(result, calibration, labels["landmarks"])
     if review:

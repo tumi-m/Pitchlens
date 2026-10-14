@@ -56,6 +56,9 @@ image = (
             "MPLCONFIGDIR": "/tmp/matplotlib",
             "YOLO_OFFLINE": "1",
             "VISION_DEVICE": "cuda",
+            # numpy's OpenBLAS pool spins between the tracker's tiny matrix calls;
+            # torch's own CPU threads are unaffected.
+            "OPENBLAS_NUM_THREADS": "1",
         }
     )
     .add_local_python_source("app")

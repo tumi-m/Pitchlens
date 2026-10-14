@@ -135,8 +135,10 @@ Measured on the real TRYZUB vs LUNA FC recording (640×360, 29.97 fps) with the
 quick setting (3 analysed frames/second) on a 4-vCPU machine: 60 seconds of
 footage took 99 seconds. A 38-minute match therefore needs roughly an hour on
 4 vCPUs. More vCPUs (with `VISION_THREADS` set to match) shorten this; the
-6 and 10 frames/second settings take proportionally longer. Railway bills CPU
-time while an analysis runs; an idle worker costs very little.
+6 and 10 frames/second settings take proportionally longer. The quick setting
+costs ball-event accuracy: ball statistics need 6 frames/second, about twice
+the CPU time. Railway bills CPU time while an analysis runs; an idle worker
+costs very little.
 
 To run full matches on your own GPU host instead, use a CUDA build of PyTorch
 and `VISION_DEVICE=cuda`. The ball model runs through ONNX Runtime: on Modal it
@@ -265,8 +267,13 @@ Settings → Usage & billing.
   `A10G`, or `L40S` (fastest, about 2–3× the hourly price). Detectors run in
   FP16 on any GPU.
 - The upload page defaults to 6 analysed frames/second when a GPU is
-  available; 10 fps follows the ball best and costs proportionally more.
+  available. Detailed (10 frames/second) takes about two-thirds more GPU time
+  than 6; in tests on labelled tracking data it found somewhat more passes
+  (simulated, E20). The quick 3 frames/second setting misses many passes and
+  shots: use it for player load only.
 - Modal → Settings → Usage & billing shows the cost per run ("Ephemeral Apps").
+- [COST.md](COST.md): what a match costs per stage and per GPU type, and why
+  `L4` and scale-to-zero stay the defaults.
 
 ### Automatic pitch setup for fixed venue cameras
 
@@ -284,6 +291,10 @@ the footage to check against or over a setup the reviewer made.
 - `VISION_FAINT=0`: turn off track-before-detect ball recovery (default on).
 - `VISION_TRAJECTORY=0`: turn off recovery of weak candidates near strong moving-ball observations (default on).
 - `VISION_THREADS`: CPU threads for inference.
+- `VISION_PIPELINE`: overlap model inference with per-frame tracking. Default
+  on with a CUDA GPU, off on CPU and Apple MPS; `1` forces it on, `0` off.
+  Results are identical; one extra batch of frames is held in memory (about
+  200 MB at 4K with batch 8).
 - `VISION_TRACKER=legacy`: previous player tracker (default is the
   ByteTrack-style tracker from pipeline 2.2).
 - `VISION_KEEP_CANDIDATES=1`: keep every ball candidate in result.json (large;

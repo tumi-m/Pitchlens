@@ -423,6 +423,15 @@ export function defaultVisionOptions(
       : "exhaustive";
   return { profile, search };
 }
+/**
+ * The analysis detail an analyse button starts on: Balanced (6 frames/sec) on a GPU
+ * or whenever the ball model runs, since at 3 frames/sec passes and shots are missed
+ * far more often (pass recall roughly halved on labelled tracking data). Player load
+ * alone stays on Quick on a CPU worker. Only callers that omit fps fall back to 3.
+ */
+export function defaultVisionFps(health: Pick<VisionHealth, "gpu"> | null, playerLoadOnly: boolean): "3" | "6" {
+  return health?.gpu || !playerLoadOnly ? "6" : "3";
+}
 /** The worker (or the way to it) is down, not refusing: a redeploy or a dropped connection. */
 const unreachable = (e: unknown) => !(e instanceof VisionError) || [502, 503, 504].includes(e.status);
 

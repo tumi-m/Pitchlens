@@ -2,6 +2,7 @@
 
 import gzip
 import logging
+import math
 import os
 import queue
 import threading
@@ -19,6 +20,47 @@ class GPUUnavailable(Exception):
 
 class GPUEngineError(RuntimeError):
     """The engine itself failed on the GPU: the CPU would fail the same way."""
+
+
+class GPUTimeout(ValueError):
+    """Modal stopped the run at its time limit. Not GPUUnavailable: the GPU time was
+    billed, a retry would hit the same limit and the CPU would take many hours."""
+
+
+# modal_app.analyse's own timeout, and Modal's ceiling for one function call.
+MODAL_TIMEOUT = 3 * 3600
+MODAL_MAX_TIMEOUT = 24 * 3600
+
+
+def gpu_timeout_seconds(video, sample_fps, ball_search, max_seconds=None, start_seconds=0):
+    """Time limit for one GPU run: 1.5x its expected L4 cost plus 15 minutes for
+    scheduling and the video download, between MODAL_TIMEOUT and MODAL_MAX_TIMEOUT.
+    None without the upload's metadata (analyse's own 3 h then applies).
+
+    Per analysed frame: 0.06 s, 0.0135 s per ball tile (tile_layout) and 0.08 s
+    more above 720p. 640x360 (2 tiles) gives 0.087 s, against 87.8 ms measured on
+    an L4 (989 s for 11,272 frames); 1080p (12 tiles) about 0.30 s, projected.
+    """
+    from app.vision.ball import tile_layout
+
+    try:
+        fps, width, height = float(video["fps"]), int(video["width"]), int(video["height"])
+        duration, sample_fps = float(video["duration"]), float(sample_fps)
+        start_seconds, max_seconds = float(start_seconds or 0), float(max_seconds or math.inf)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) and v > 0 for v in (fps, width, height, duration, sample_fps)):
+        return None
+    stride = max(1, math.ceil(fps / sample_fps))  # the engine's rule
+    analysed = max(0.0, min(duration - start_seconds, max_seconds))
+    frames = math.ceil(analysed * fps / stride)
+    if ball_search == "none":
+        tiles = 0
+    else:
+        _, cols, rows = tile_layout(width, height)
+        tiles = cols * rows
+    per_frame = 0.06 + 0.0135 * tiles + (0.08 if width * height > 1280 * 720 else 0)
+    return min(MODAL_MAX_TIMEOUT, max(MODAL_TIMEOUT, int(1.5 * frames * per_frame + 900)))
 
 
 def start_seconds_limit():
@@ -72,6 +114,7 @@ def run_on_modal(
     ball_search="exhaustive",
     reference_colours=None,
     reference_job=None,
+    timeout_seconds=None,
 ):
     """Stream progress from the GPU function and write its result to `output`.
 
@@ -82,8 +125,10 @@ def run_on_modal(
     download), and a GPU that never arrives gives way after start_seconds_limit().
 
     Only Modal and transport failures are GPUUnavailable (the CPU may take over):
-    an engine crash is GPUEngineError, a footage problem ValueError, and errors
-    from progress() or from writing the result locally propagate unchanged.
+    an engine crash is GPUEngineError, a footage problem ValueError, Modal's time
+    limit GPUTimeout, and errors from progress() or from writing the result
+    locally propagate unchanged. timeout_seconds (gpu_timeout_seconds) raises
+    that limit above analyse's own 3 h for a long or detailed run.
     """
     base = public_base()
     if not base:
@@ -108,8 +153,12 @@ def run_on_modal(
     inner = None
     try:
         with app.run():
+            # A Modal refusal here is GPUUnavailable, like entering the app.
+            fn = analyse
+            if timeout_seconds and timeout_seconds > MODAL_TIMEOUT:
+                fn = analyse.with_options(timeout=int(timeout_seconds))
             try:
-                payload = _receive(analyse, args, progress, cancelled)
+                payload = _receive(fn, args, progress, cancelled)
             except BaseException as exc:
                 inner = exc
                 raise
@@ -172,6 +221,14 @@ def _receive(analyse, args, progress, cancelled):
         if kind == "end":
             raise GPUUnavailable("The GPU run ended without a result.")
         if kind == "error":
+            # Modal's FunctionTimeoutError (or another of its TimeoutErrors): checked
+            # by name, since modal is imported only when a GPU run starts.
+            kind_of = type(value)
+            if kind_of.__module__.startswith("modal") and "Timeout" in kind_of.__name__:
+                raise GPUTimeout(
+                    "This video is too long for one GPU run at this detail level. "
+                    "Choose 6 frames/second or analyse a section."
+                ) from value
             # A Modal error or a cut stream (requests' ConnectionError and
             # ChunkedEncodingError are OSErrors too): the GPU's, not this volume's.
             raise GPUUnavailable(_reason(value)) from value

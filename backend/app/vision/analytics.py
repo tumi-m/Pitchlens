@@ -51,7 +51,9 @@ PARAMS = {
     # A single-frame touch counts when the ball clearly changes direction there.
     "touchTurnDegrees": 30.0,
     "touchMinSpeed": 2.0,  # m/s on both sides of the turn
-    "minControlSeconds": 0.3,
+    # Control is counted in sightings at every sampling rate: a seconds-based
+    # minimum asked for 3-4 at Detailed and discarded short controls (E20).
+    "minControlSamples": 2,
     # A control spell survives this many unseen samples (ball hidden at the feet).
     "bridgeSamples": 3,
     # Passes and turnovers.
@@ -594,7 +596,7 @@ def control_states(projected, player_of, calibration_error=0.0):
 
 def control_spells(projected, states, sample_fps):
     """Runs of control by one player, bridging a few frames where the ball is hidden."""
-    minimum = max(2, math.ceil(PARAMS["minControlSeconds"] * sample_fps))
+    minimum = PARAMS["minControlSamples"]
     bridge = PARAMS["bridgeSamples"] + 1
     spells, current = [], None
     for i, (f, s) in enumerate(zip(projected, states)):

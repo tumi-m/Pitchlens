@@ -480,12 +480,14 @@ test("analysing a saved review defaults to player load and the worker's football
   await expect(page.getByText("Fixture: stop after the reservation.")).toBeVisible();
   expect(reservations[0].get("search")).toBe("none");
   expect(reservations[0].get("profile")).toBe("broadcast");
-  // Opting in to the ball model sends what the upload page sends with it on.
+  expect(reservations[0].get("fps")).toBe("3");
+  // Opting in to the ball model sends what the upload page sends with it on, Balanced included.
   await page.getByLabel(/Run the ball model/).check();
   await analyse.click();
   await expect.poll(() => reservations.length).toBe(2);
   expect(reservations[1].get("search")).toBe("exhaustive");
   expect(reservations[1].get("profile")).toBe("broadcast");
+  expect(reservations[1].get("fps")).toBe("6");
 });
 
 /** The upload finishes, then /start is answered only after 3 s (the worker checks the video). */
@@ -573,6 +575,32 @@ test("the upload copy matches the player-load default, and the ball-model copy w
   await expect(page.getByText("You get possession and passes automatically", { exact: false })).toBeVisible();
   await expect(page.getByText("Speed and xG are not measured; running distance is a per-kit estimate.", { exact: false })).toBeVisible();
   await expect(page.getByText("This job estimates how far each kit ran", { exact: false })).toHaveCount(0);
+});
+
+test("the analysis detail starts on Balanced whenever the ball model runs, and a chosen detail is kept", async ({ page }) => {
+  let gpu = false;
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true, gpu } }));
+  await page.goto("/upload");
+  const detail = page.getByLabel("Analysis detail");
+  const loadOnly = page.getByLabel(/Player load only/);
+  // A CPU server: Quick for player load, Balanced as soon as the ball model is asked for.
+  await expect(detail).toHaveValue("3");
+  await expect(detail.locator("option:checked")).toHaveText(/misses many passes and shots/);
+  await loadOnly.uncheck();
+  await expect(detail).toHaveValue("6");
+  await loadOnly.check();
+  await expect(detail).toHaveValue("3");
+  await detail.selectOption("10");
+  await loadOnly.uncheck();
+  await expect(detail).toHaveValue("10");
+  await loadOnly.check();
+  await expect(detail).toHaveValue("10");
+  // A GPU server starts on Balanced even for player load.
+  gpu = true;
+  await page.reload();
+  await expect(detail).toHaveValue("6");
+  await loadOnly.uncheck();
+  await expect(detail).toHaveValue("6");
 });
 
 test("a reloaded page resumes the same upload when the same file is chosen", async ({ page }) => {

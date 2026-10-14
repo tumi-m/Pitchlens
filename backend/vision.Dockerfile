@@ -17,7 +17,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     YOLO_OFFLINE=1 \
     VISION_DATA_DIR=/data/jobs \
     VISION_ALLOWED_HOSTS=* \
-    VISION_RETENTION_HOURS=168
+    VISION_RETENTION_HOURS=168 \
+    # numpy's OpenBLAS pool spins between the tracker's tiny matrix calls
+    # (3.5x the CPU for the same work); nothing here gains from threaded BLAS.
+    OPENBLAS_NUM_THREADS=1
 
 WORKDIR /app
 

@@ -61,6 +61,43 @@ def test_possession_agreement_and_share_error():
     assert report["shareTruth"] == 50.0 and abs(report["sharePredicted"] - 60.0) < 2.5
 
 
+def test_possession_can_be_scored_on_every_sequence_not_only_the_reports_last_400():
+    # The report keeps the last 400 possessions; a long match has more.
+    sequences = [{"team": i % 2, "start": float(i), "end": i + 1.0} for i in range(500)]
+    analysis = {"stats": {"possessionSequences": sequences[-400:]}}
+    # The first 100 s are labelled for the other team: wrong there, right after.
+    labels = [{"start": float(i), "end": i + 1.0, "team": i % 2 if i >= 100 else 1 - i % 2} for i in range(500)]
+    tail = evaluate_possession(analysis, labels)
+    assert tail["coverage"]["value"] == 0.8 and tail["agreement"]["value"] == 1.0
+    full = evaluate_possession(analysis, labels, sequences=sequences)
+    assert full["coverage"]["value"] == 1.0 and full["agreement"]["value"] == 0.8
+    report = evaluate({"frames": [], "sampleFps": 5}, analysis, {"possession": labels}, sequences=sequences)
+    assert report["possession"] == full
+
+
+def _harness():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "evaluate_on_tracking_data.py"
+    spec = importlib.util.spec_from_file_location("evaluate_on_tracking_data", path)
+    harness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness)
+    return harness
+
+
+def test_the_tracking_harness_samples_at_the_rate_it_reports_like_the_engine():
+    import math
+
+    effective_rate = _harness().effective_rate
+    expected = {5: (5, 5.0), 6: (5, 5.0), 10: (3, 25 / 3), 25 / 3: (3, 25 / 3), 8.333: (3, 25 / 3), 12.5: (2, 12.5),
+                4: (7, 25 / 7), 3: (9, 25 / 9), 25: (1, 25.0), 30: (1, 25.0)}
+    for requested, (stride, fps) in expected.items():
+        assert effective_rate(requested)[0] == stride and math.isclose(effective_rate(requested)[1], fps), requested
+    # The engine's stride on a 25 fps video (engine.run_video).
+    for requested in (3, 4, 5, 6, 10, 12.5, 15, 25):
+        assert effective_rate(requested)[0] == max(1, math.ceil(25 / requested))
+
+
 def test_review_decisions_become_precision_and_recall():
     analysis = {"events": [
         {"type": "shot", "status": "confirmed"},
@@ -103,12 +140,7 @@ def test_evaluate_combines_sections():
 
 
 def test_identity_mode_scores_each_stitched_junction_by_the_true_player():
-    import importlib.util
-
-    path = Path(__file__).resolve().parents[1] / "scripts" / "evaluate_on_tracking_data.py"
-    spec = importlib.util.spec_from_file_location("evaluate_on_tracking_data", path)
-    harness = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(harness)
+    harness = _harness()
 
     def frame(t, players):
         return {"t": t, "scene": 0, "players": [{"id": i, "gt": g} for i, g in players]}

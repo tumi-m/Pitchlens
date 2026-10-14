@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.evaluation.metrics import evaluate  # noqa: E402
-from app.vision.analytics import analyse  # noqa: E402
+from app.vision import analytics  # noqa: E402
 
 
 def load(path):
@@ -71,8 +71,11 @@ def main():
     calibration = load(args.job / "calibration.json")
     calibration = calibration if calibration and calibration.get("state") == "ready" else None
     review = load(args.job / "review.json")
-    analysis = analyse(result, calibration, review)
-    report = evaluate(result, analysis, json.loads(args.labels.read_text()), calibration, review)
+    # analytics.analyse() in two steps: possession is scored on every sequence,
+    # not only the last 400 that the report keeps.
+    base = analytics.prepare(result, calibration, analytics.direction_override(review))
+    analysis = analytics.finish(base, review)
+    report = evaluate(result, analysis, json.loads(args.labels.read_text()), calibration, review, sequences=base["sequences"])
     print(json.dumps(report, indent=2))
     if args.markdown:
         args.markdown.write_text(markdown(report))

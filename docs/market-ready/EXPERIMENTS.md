@@ -2,7 +2,82 @@
 
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked. Lines marked "held-out" (E8-E11,
-E15-E19) are Metrica game 2, run only after tuning on game 1 stopped.
+E15-E20) are Metrica game 2, run only after tuning on game 1 stopped.
+
+## E21 · Inference overlapped with tracking; fewer per-frame CPU steps (2026-10-14)
+- Problem: run_video decoded a batch, ran the player and ball models, then did
+  all of the batch's per-frame CPU work before decoding the next, so GPU and
+  CPU time added up. The owner's 37:34 match on a Modal L4 (`performance` in
+  the owner's export `pitchlens-vision (8).json`): 989.2 s = model stages
+  659.4 s (players 354.3, ball 305.1) + about 305 s of per-frame CPU work while
+  the GPU waits + about 25 s of setup and ball recovery. Three smaller costs:
+  numpy's bundled OpenBLAS (4 threads) woke its pool for each of the Kalman
+  filter's 4x4 inversions (about 15 per frame) and the threads busy-waited
+  (112.4 s of process CPU for 32.0 s of wall time; 32.3 s with one thread, same
+  output); pitch_colour converted the whole frame to LAB to keep one surface
+  pixel in 17 (4.9 ms per 360p frame, 33.3 ms per 1080p frame, single-threaded
+  as the engine runs OpenCV); and per-frame work was repeated (two grey
+  conversions, a second identical dilation, np.percentile partitioning 230k
+  pixels for one value, the tracker rebuilding boxes and centres for each of
+  126k track x detection pairs).
+- Change: the model calls for batch n run on a helper thread while batch n-1
+  is tracked (one batch in flight; adaptive ball search stays on the tracking
+  thread). `VISION_PIPELINE` is on by default only with CUDA: on the CPU it
+  measured neutral, and on Apple MPS (both models at once in adaptive mode) it
+  is untested; `1` forces it on, `0` off. run_video limits BLAS to one thread,
+  and both images set `OPENBLAS_NUM_THREADS=1`, which also covers pitch setup.
+  pitch_colour converts only the sampled pixels; one grey frame per frame and
+  the dilated surface are shared; a 256-bin histogram replaces np.percentile
+  (it mirrors numpy 1.26's `_lerp`; numpy is pinned below 2.0); the tracker
+  builds each track's and each detection's arrays once.
+- Measured on this 4-vCPU host with the owner's GPU timings emulated: Tryzub,
+  900 frames, 88.9 → 58.7 s (1 core 85.1 → 57.9 s; 2 cores 83.6 → 58.2 s). A
+  replay that holds the GIL as the real model call does, 200 real frames:
+  20.2 → 15.8 s. BLAS: process CPU 112.4 → 32.3 s for the same wall time.
+  pitch_colour 4.9 → 1.05 ms (360p) and 33.3 → 7.2 ms (1080p). result.json
+  identical in every mode (pipeline on and off, exhaustive and adaptive ball
+  search; `tests/test_engine_speed.py`), and on 60 s of the Tryzub match with
+  real CPU inference: the pre-change engine, `VISION_PIPELINE=0` and `=1`
+  agree key by key apart from `performance`.
+- Projected, not measured: the owner's match in about 685-700 s instead of
+  989 s on L4, so engine GPU time falls from about $0.234 to about $0.16 per
+  40-minute match at $0.000222/s. Confirm with one real Modal L4 run
+  (compare `performance.totalSeconds` with the summed inference seconds)
+  before quoting it elsewhere; if the real gain is clearly smaller, consider
+  reserving `cpu=2` on the Modal function. Costs: docs/COST.md.
+- Decision: adopt, on by default with CUDA.
+  `test_histogram_percentile_matches_numpy_bit_for_bit` guards the percentile.
+
+## E20 · Control needs two sightings at every sampling rate (2026-10-14)
+- Problem: control_spells asked for max(2, ceil(0.3 s x rate)) sightings: 2
+  at 5-6 fps, 3 at 8.33-10 fps and 4 at 12.5 fps. A bursty low-resolution
+  ball is seen at the feet once or twice, so the dearer Detailed preset
+  (8.33 fps on 25 fps video, about 10 on 30 fps; about two-thirds more GPU
+  time than Balanced) discarded short controls and found fewer passes. In
+  owner-like Metrica runs, paired against 5 fps, 8.33 fps scored pass F1 0.03
+  to 0.06 lower and coverage 1-3 points lower.
+- Setup: owner-like Metrica: a 40% bursty ball on a 25 Hz chain, subsampled to
+  each rate; 20% of fragments given the wrong kit; the true rate given to the
+  analytics; possession scored on all sequences, not the report's list capped
+  at 400; 3 seeds; calibrated and uncalibrated, game 1 and held-out game 2.
+- Change: `minControlSamples` = 2 at every rate (`minControlSeconds` removed).
+- Outcome, held-out game 2 calibrated: pass F1 at 8.33 fps 0.709 ± 0.011
+  against 0.644 at 5 fps (paired +0.065 ± 0.026); +0.100 at 12.5 fps.
+  Uncalibrated +0.022. Game 1: +0.060 calibrated, +0.025 uncalibrated.
+  Interceptions +0.01 to +0.07 F1, coverage +2 to +4 points, agreement roughly
+  unchanged. The gain is recall (0.45 → 0.61) at unchanged precision (0.74
+  calibrated; 0.654 → 0.643 uncalibrated).
+- Independent repro (verifier's own runs, 2 seeds): game 2 calibrated,
+  8.33 fps with two sightings against 5 fps, pass F1 +0.084 on both seeds
+  (0.586 → 0.670, 0.564 → 0.648); recall 0.45 → 0.61 and precision 0.74 against
+  8.33 fps with three.
+- No-op at or below 6.67 fps, where the minimum was already 2: every Quick and
+  Balanced rate (25 → 5, 29.97 → 5.994, 30 → 6, 24 → 6, 50 → 5.56 and
+  60 → 6 fps, and all 3 fps variants). Analyses are byte-identical on harness
+  game 2 at 5 fps and on the real Tryzub result at 5.994 fps (calibrated and
+  not), so E8-E19 still reproduce.
+- Caveat: simulated visibility only; there is no real event truth at 10 fps.
+- Decision: adopt; Detailed is kept.
 
 ## E19 · Stitching gate capped at 5 m / 0.9 body heights, rounds 0.6/1.5/3/5 s (2026-10-14)
 - Problem: stitch_tracks joined a chain end to any start within a

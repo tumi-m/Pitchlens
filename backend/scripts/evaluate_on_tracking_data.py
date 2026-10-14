@@ -24,6 +24,12 @@ This validates the event logic, not the vision pipeline: positions here are
 far better than what a 360p camera produces before degradation. Game 2 is the
 held-out match: tune on game 1, report game 2. Seeds are fixed (--seed).
 
+Sampling rate: --fps is rounded the way the engine rounds it on a 25 fps video
+(every ceil(25 / fps)-th frame: 6 -> 5.0, 10 -> 8.33, 12.5 -> 12.5); the rate
+analysed is reported as settings.effectiveFps. --visible/--run and the
+default ball drops are drawn per sample, so the occlusion timescale changes
+with the rate.
+
 Event definitions: "pass" keeps the E8 scoring (every pass event against
 Metrica's completed passes). "passAttempt" counts every BALL LOST outside
 NOT_PASS_LOSS as a failed pass, including those with an empty subtype (30 in
@@ -115,6 +121,14 @@ class BroadcastCamera:
         return (u, v, p[2]) if 0 <= u < self.w and 0 <= v < self.h else None
 
 
+def effective_rate(fps):
+    """(stride, rate) the engine would analyse on Metrica's 25 fps video when asked
+    for `fps`: every ceil(25 / fps)-th frame (the tolerance takes a typed 8.333,
+    25 / 3 rounded, as stride 3)."""
+    stride = max(1, math.ceil(25 / fps - 1e-3))
+    return stride, 25 / stride
+
+
 def markov_visible(n, visible, run, rng):
     """Bursty ball visibility: a two-state chain with mean visible run `run` samples."""
     p_off, p_on = 1 / run, visible / (run * (1 - visible))
@@ -131,11 +145,11 @@ def build(data_dir, game, fps, noise, ball_noise, drop, feet_drop, fragment, see
     _, home = read_tracking(base / f"Sample_Game_{game}_RawTrackingData_Home_Team.csv")
     _, away = read_tracking(base / f"Sample_Game_{game}_RawTrackingData_Away_Team.csv")
     events = read_events(base / f"Sample_Game_{game}_RawEventsData.csv")
+    stride, fps = effective_rate(fps)
     rng = random.Random(seed)
     # Separate streams, so the default degradation stays identical to E8.
     flip_rng, burst_rng, fp_rng = random.Random(seed + 100), random.Random(seed + 200), random.Random(seed + 300)
-    step = int(round(25 / fps))
-    n_rows = len(range(0, min(len(home), len(away)), step))
+    n_rows = len(range(0, min(len(home), len(away)), stride))
     shown = markov_visible(n_rows, visible, run, burst_rng) if visible is not None and visible < 1 else None
     cam = BroadcastCamera() if camera == "broadcast" else None
     last_seen = {}
@@ -155,7 +169,7 @@ def build(data_dir, game, fps, noise, ball_noise, drop, feet_drop, fragment, see
         return ids[name][0], ids[name][2]
 
     frames = []
-    for row, k in enumerate(range(0, min(len(home), len(away)), step)):
+    for row, k in enumerate(range(0, min(len(home), len(away)), stride)):
         period, _, t, hp = home[k]
         _, _, _, ap = away[k]
         bpos = hp.get("Ball")
@@ -313,13 +327,13 @@ def build_identity(data_dir, game, mode, fps=5.0, minutes=0, seed=1, speed_miss=
     from app.vision.engine import stabilise_roles, vote_teams
     from app.vision.tracking import ByteTracker
 
+    stride, fps = effective_rate(fps)
     width, height = FollowCamera.WIDTH, FollowCamera.HEIGHT
     rng = random.Random(seed)
     nrng = np.random.default_rng(seed)
     base = Path(data_dir) / f"Sample_Game_{game}"
     _, home = read_tracking(base / f"Sample_Game_{game}_RawTrackingData_Home_Team.csv")
     _, away = read_tracking(base / f"Sample_Game_{game}_RawTrackingData_Away_Team.csv")
-    step = int(round(25 / fps))
     cam = FollowCamera(mode)
     tracker = ByteTracker()
     target, prev_P, period_prev, scene, cutoff = L / 2, None, None, 0, None
@@ -335,7 +349,7 @@ def build_identity(data_dir, game, mode, fps=5.0, minutes=0, seed=1, speed_miss=
         return (uv[:, 0] > 0) & (uv[:, 0] < width) & (uv[:, 1] > 0) & (uv[:, 1] < height)
 
     frames = []
-    for k in range(0, min(len(home), len(away)), step):
+    for k in range(0, min(len(home), len(away)), stride):
         period, _, t, hp = home[k]
         _, _, _, ap = away[k]
         if cutoff is None:
@@ -505,14 +519,14 @@ def identity_metrics(frames, player_of, fps=5.0):
 def evaluate_identity(args):
     """Score analytics.stitch_tracks on build_identity() fragments, in image space and calibrated."""
     result = build_identity(args.data, args.game, args.identity, fps=args.fps, minutes=args.minutes, seed=args.seed, speed_miss=args.speed_miss)
-    frames = result["frames"]
-    report = {"settings": vars(args) | {"data": str(args.data)}}
+    frames, fps = result["frames"], result["sampleFps"]
+    report = {"settings": vars(args) | {"data": str(args.data), "effectiveFps": fps}}
     for name, calibration in (("image", None), ("calibrated", exact_calibration(result))):
         projected, _ = analytics.project(frames, calibration)
         report[name] = {
             # Every fragment its own player: the purity ceiling, no links.
-            "unstitched": identity_metrics(frames, {p["id"]: p["id"] for f in frames for p in f["players"]}, args.fps),
-            "stitched": identity_metrics(frames, analytics.stitch_tracks(projected, result["sampleFps"]), args.fps),
+            "unstitched": identity_metrics(frames, {p["id"]: p["id"] for f in frames for p in f["players"]}, fps),
+            "stitched": identity_metrics(frames, analytics.stitch_tracks(projected, fps), fps),
         }
     return report
 
@@ -521,7 +535,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("data", type=Path)
     parser.add_argument("--game", type=int, default=1)
-    parser.add_argument("--fps", type=float, default=5)
+    parser.add_argument("--fps", type=float, default=5,
+                        help="sampling rate, rounded like the engine's on 25 fps video (6 -> 5.0, 10 -> 8.33, 12.5 -> 12.5); "
+                             "--visible/--run count samples, so the occlusion timescale changes with it")
     parser.add_argument("--noise", type=float, default=0.3)
     parser.add_argument("--ball-noise", type=float, default=0.5)
     parser.add_argument("--drop", type=float, default=0.3)
@@ -550,7 +566,10 @@ def main():
             calibration["frames"] = calibration["frames"][: len(result["frames"])]
         result["analysedDuration"] = cutoff - result["frames"][0]["t"]
         events = [e for e in events if float(e["Start Time [s]"]) <= cutoff]
-    analysis = analytics.analyse(result, calibration)
+    # analytics.analyse() in two steps: possession is scored on every sequence,
+    # not only the last 400 that the report keeps.
+    base = analytics.prepare(result, calibration)
+    analysis = analytics.finish(base)
     truth = ground_truth(events)
     # "pass" keeps the E8 definition (every pass event, complete or intercepted,
     # against Metrica's completed passes); passAttempt and passComplete compare like with like.
@@ -564,9 +583,9 @@ def main():
     won = [{**e, "type": "turnover"} for e in analysis["events"] if e["type"] in ("interception", "tackle")]
     events_report |= evaluate_events(won, [t for t in truth if t["type"] == "turnover"], types=["turnover"])
     report = {
-        "settings": vars(args) | {"data": str(args.data)},
+        "settings": vars(args) | {"data": str(args.data), "effectiveFps": result["sampleFps"]},
         "events": {k: {kk: vv for kk, vv in v.items() if kk not in ("missed", "false")} for k, v in events_report.items()},
-        "possession": evaluate_possession(analysis, possession_truth(events)),
+        "possession": evaluate_possession(analysis, possession_truth(events), sequences=base["sequences"]),
         "coverage": analysis["stats"]["coverage"],
         "teams": [{k: t[k] for k in ("possession", "passAccuracy")} for t in analysis["stats"]["teams"]],
         "tracks": analysis["stats"]["tracks"],
