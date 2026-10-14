@@ -167,7 +167,8 @@ test('a surviving owner cookie wins over a freshly minted browser key and is nev
   assert.ok(!cookie || cookie.includes(`pitchlens-vision-owner=${OWNER};`), cookie);
   const listing = setup({}, ok);
   await listing.api.GET(listing.request({ owner: OTHER, cookie: OWNER }), listing.at('jobs'));
-  assert.equal(ownerQuery(listing.calls[0]), OWNER);
+  assert.equal(sentOwner(listing.calls[0]), OWNER);
+  assert.equal(ownerQuery(listing.calls[0]), null);
 });
 
 test('the first request sets the cookie to the browser key, and an invalid cookie is ignored', async () => {
@@ -178,6 +179,21 @@ test('the first request sets the cookie to the browser key, and an invalid cooki
     assert.equal(sentOwner(s.calls[0]), OTHER);
     assert.equal(response.headers.get('x-pitchlens-owner'), OTHER);
     assert.ok(response.headers.get('set-cookie').includes(`pitchlens-vision-owner=${OTHER};`));
+  }
+});
+
+test('the owner key travels only in a header, never in the worker URL its access log prints', async () => {
+  // A ?owner from the browser is dropped too: it can never override the cookie owner.
+  for (const [method, name] of [['GET', 'jobs'], ['POST', 'jobs'], ['POST', 'jobs/from-url'], ['GET', 'venues'], ['POST', 'venues'], ['GET', `jobs/${ID}/calibration`], ['POST', `jobs/${ID}/calibration`]]) {
+    const s = setup({}, ok);
+    const request = s.request({ method, owner: OTHER, cookie: OWNER, access: 'fixture-access', query: `?owner=${OTHER}&mode=full` });
+    const response = await s.api[method](request, s.at(name));
+    assert.equal(response.status, 200, `${method} ${name}`);
+    const url = new URL(s.calls[0].url);
+    assert.equal(url.searchParams.get('owner'), null, `${method} ${name}`);
+    assert.ok(!s.calls[0].url.includes(OWNER) && !s.calls[0].url.includes(OTHER), s.calls[0].url);
+    assert.equal(url.searchParams.get('mode'), 'full');
+    assert.equal(sentOwner(s.calls[0]), OWNER, `${method} ${name}`);
   }
 });
 
@@ -213,7 +229,8 @@ test('local mode never forwards an ownerless listing, even with a spoofed Host h
   assert.equal(s.calls.length, 0);
   // With this browser's key the worker filters the listing to its matches.
   await s.api.GET(s.request({ ...spoofed, owner: OWNER }), s.at('jobs'));
-  assert.equal(ownerQuery(s.calls[0]), OWNER);
+  assert.equal(sentOwner(s.calls[0]), OWNER);
+  assert.equal(ownerQuery(s.calls[0]), null);
   // Legacy ownerless jobs opened by link keep working: ownership is not forced locally.
   assert.equal(s.calls[0].init.headers['x-pitchlens-require-owner'], undefined);
 });

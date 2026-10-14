@@ -119,7 +119,9 @@ async function proxy(
       { detail: "Training is not available on this site. Your labels are saved for the next ball-model update." },
       { status: 403 },
     );
-  // Rebuild the query so a browser can never pick someone else's owner key.
+  // Rebuild the query so a browser can never pick someone else's owner key. The
+  // key goes only in the x-pitchlens-owner header below, never in the URL: the
+  // worker's access log prints every path with its query.
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");
   // The HttpOnly cookie outlives script storage (Safari's 7-day cap, "clear
@@ -131,20 +133,16 @@ async function proxy(
   const owner = cookieOwner || (OWNER.test(header) ? header : "");
   // Listings and new analyses are always scoped to a browser, locally too: an
   // ownerless listing would show every match on the worker.
-  if (route === "jobs" || route === "jobs/from-url" || route === "venues") {
-    if (owner) search.set("owner", owner);
-    else if (request.method === "GET") return Response.json([]);
-    else
-      return Response.json(
-        { detail: "Allow site data for this site to upload and keep your matches.", code: "storage" },
-        { status: 400 },
-      );
+  if ((route === "jobs" || route === "jobs/from-url" || route === "venues") && !owner) {
+    if (request.method === "GET") return Response.json([]);
+    return Response.json(
+      { detail: "Allow site data for this site to upload and keep your matches.", code: "storage" },
+      { status: 400 },
+    );
   }
   if (hosted && route !== "health" && !owner) {
     return Response.json({ detail: "Open this match in the browser that uploaded it.", code: "ownership" }, { status: 401 });
   }
-  // Saved venues belong to the browser that saved them.
-  if (route.endsWith("/calibration") && owner) search.set("owner", owner);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     // Relayed byte-for-byte: a compressed hop would break Content-Length/Range.

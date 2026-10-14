@@ -293,6 +293,46 @@ test("the upload page says possession and passes need the ball model", async ({ 
   await expect(page.getByText(/You get possession and passes automatically/)).toHaveCount(0);
 });
 
+test("a server without full-match analysis says so and offers only the 20-second test", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) =>
+    r.fulfill({ json: { available: true, hosted: true, diagnostics: true, gpu: false, fullMatch: false } }));
+  const calls = await mockChunkedWorker(page);
+  await page.goto("/upload");
+  await expect(page.getByTestId("test-only")).toHaveText(
+    "Full-match analysis is not set up on this server yet. You can run a 20-second test.");
+  await expect(page.getByText(/On a CPU server/)).toHaveCount(0);
+  // A YouTube link is always analysed in full.
+  await expect(page.getByRole("tab", { name: "YouTube link" })).toBeDisabled();
+  const analyse = page.getByRole("button", { name: "Analyse video automatically", exact: true });
+  // Without the decoded preview there is no test to run, so nothing is offered.
+  await page.getByLabel("Video for computer vision").setInputFiles(broken);
+  await expect(page.getByRole("alert").filter({ hasText: "cannot analyse full matches yet" })).toBeVisible();
+  await expect(analyse).toBeDisabled();
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await expect(page.getByRole("heading", { name: "Video checked on your device" })).toBeVisible();
+  const test20 = page.getByLabel(/Only analyse a 20-second test/);
+  await expect(test20).toBeChecked();
+  await expect(test20).toBeDisabled();
+  await analyse.click();
+  await expect(page.getByRole("heading", { name: "Detecting players", exact: true })).toBeVisible();
+  expect(calls.created).toBe(1);
+  expect(calls.diagnostic).toBe("true");
+});
+
+test("a server with full-match analysis keeps the upload page as it was", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) =>
+    r.fulfill({ json: { available: true, hosted: true, diagnostics: true, gpu: false, fullMatch: true } }));
+  await page.goto("/upload");
+  await expect(page.getByText(/On a CPU server/)).toBeVisible();
+  await expect(page.getByTestId("test-only")).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "YouTube link" })).toBeEnabled();
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  const test20 = page.getByLabel(/Only analyse a 20-second test/);
+  await expect(test20).toBeEnabled();
+  await test20.uncheck();
+  await expect(test20).not.toBeChecked();
+});
+
 test("once the upload is complete, waiting for the start neither offers Cancel upload nor cancels the analysis", async ({ page }) => {
   await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
   const calls = await mockChunkedWorker(page);

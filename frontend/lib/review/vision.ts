@@ -172,6 +172,8 @@ export type VisionHealth = {
   uploadAbandonSeconds?: number;
   /** Analysis runs on a Modal GPU (minutes rather than an hour). */
   gpu?: boolean;
+  /** false: this worker runs only 20-second tests (absent on older workers: full matches allowed). */
+  fullMatch?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
   configured?: boolean;
   /** The site may start ball-model training (an access code is set and the worker allows it). */
@@ -391,9 +393,12 @@ function keptFor(seconds: number) {
   return `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 // Not 429: the worker's only 429 here is its 24-hour cap (code "daily-limit"),
-// which retrying cannot lift; it only delays the message.
+// which retrying cannot lift; it only delays the message. Nor 507 (code
+// "out-of-storage"): a full disk does not free itself within seconds. Nor a 503
+// "full-match-unavailable": the worker has no GPU set up for full matches.
 const transient = (e: unknown) =>
-  !(e instanceof VisionError) || e.status >= 500;
+  !(e instanceof VisionError) ||
+  (e.status >= 500 && e.status !== 507 && e.code !== "out-of-storage" && e.code !== "full-match-unavailable");
 
 /** fetch rejects with a TypeError when the connection drops ("Failed to fetch",
  *  "Load failed", "NetworkError…"): say so in words people recognise. */

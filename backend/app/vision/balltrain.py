@@ -539,18 +539,22 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
     work = Path(root) / "training"
     work.mkdir(exist_ok=True)
     dataset = work / "dataset"
-    say("Building the training set from your labels")
-    counts = build_dataset(train_set, val_set, dataset)
-    if counts["train"]["positive"] < 20 or counts["testFrames"] < 10:
+    try:
+        say("Building the training set from your labels")
+        counts = build_dataset(train_set, val_set, dataset)
+        if counts["train"]["positive"] < 20 or counts["testFrames"] < 10:
+            raise ValueError(
+                f"Too few labels to train ({counts['train']['positive']} balls to learn from, "
+                f"{counts['testFrames']} frames to check against). Label more frames."
+            )
+        test_visible = sum(1 for f in json.loads((dataset / "test_frames.json").read_text()) if f["label"].get("visible"))
+        if test_visible < MIN_TEST_VISIBLE:
+            shutil.rmtree(dataset, ignore_errors=True)
+            return refuse(test_visible, counts)
+    except BaseException:
+        # Frame copies of customers' footage never outlive a failed build (a full volume, a bad frame).
         shutil.rmtree(dataset, ignore_errors=True)
-        raise ValueError(
-            f"Too few labels to train ({counts['train']['positive']} balls to learn from, "
-            f"{counts['testFrames']} frames to check against). Label more frames."
-        )
-    test_visible = sum(1 for f in json.loads((dataset / "test_frames.json").read_text()) if f["label"].get("visible"))
-    if test_visible < MIN_TEST_VISIBLE:
-        shutil.rmtree(dataset, ignore_errors=True)
-        return refuse(test_visible, counts)
+        raise
     try:
         if on_start:
             on_start()

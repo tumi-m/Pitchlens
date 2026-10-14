@@ -1,0 +1,60 @@
+name: Vision image
+# Builds the worker's production image (backend/vision.Dockerfile) and probes it,
+# so a broken CMD module path, a removed COPY or a mis-ordered setup step fails
+# here instead of on Railway. Not one of the Checks: unlike vision-smoke, the
+# build downloads the Hugging Face ball model, and an outage there must not turn
+# pull requests red.
+on:
+  pull_request:
+    paths:
+      - 'backend/vision.Dockerfile'
+      - 'backend/requirements-vision.txt'
+      - 'backend/scripts/setup_*.py'
+      - 'backend/.dockerignore'
+      - '.github/workflows/vision-image.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'backend/vision.Dockerfile'
+      - 'backend/requirements-vision.txt'
+      - 'backend/scripts/setup_*.py'
+      - 'backend/.dockerignore'
+      - '.github/workflows/vision-image.yml'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  vision-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # For now: a Hugging Face or GitHub download failure is not the pull request's fault.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      # The optional broadcast weights come from Google Drive, which often refuses CI.
+      - name: Build vision.Dockerfile
+        run: docker build -f backend/vision.Dockerfile --build-arg INSTALL_BROADCAST=0 -t pitchlens-vision backend
+      - name: Start the worker
+        run: docker run -d --name vision -p 8100:8100 -e VISION_SERVICE_TOKEN=ci-only-not-a-secret pitchlens-vision
+      - name: Wait for /healthz (up to 120 s)
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8100/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "/healthz did not answer within 120 s"
+          exit 1
+      - name: /health says the worker can analyse
+        run: |
+          curl -fsS -H 'Authorization: Bearer ci-only-not-a-secret' http://127.0.0.1:8100/health > health.json
+          python3 - <<'EOF'
+          import json
+          health = json.load(open("health.json"))
+          assert health.get("available") is True, health
+          print('"available": true')
+          EOF
+      - name: Worker log
+        if: failure()
+        run: docker logs vision

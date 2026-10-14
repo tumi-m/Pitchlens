@@ -375,6 +375,10 @@ def _trainable(tmp_path, monkeypatch):
 
     server, client = _client(tmp_path, monkeypatch)
     monkeypatch.setattr(server, "training", {"state": "idle"})
+    # Never resolve "auto" (that imports torch, which the Poetry CI job does not install).
+    monkeypatch.setenv("VISION_DEVICE", "cpu")
+    for name in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"):
+        monkeypatch.delenv(name, raising=False)
     (tmp_path / "ball.pt").write_bytes(b"tiled ball model")
     monkeypatch.setattr("app.vision.profiles.model_paths", lambda profile="general": (tmp_path / "p.pt", tmp_path / "ball.pt"))
     runs = []
@@ -698,3 +702,142 @@ def test_lineage_stays_on_the_server(tmp_path, monkeypatch):
     body = client.get("/ball-model").text
     assert "9" * 64 not in body and "a" * 32 not in body and "groups" not in body
     assert client.get(f"/models/{balltrain.LINEAGE}").status_code == 404
+
+
+def test_training_on_modal_never_resolves_a_local_device(tmp_path, monkeypatch):
+    import sys
+
+    from app.vision import balltrain
+
+    server, client, _, _ = _trainable(tmp_path, monkeypatch)
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-test")
+    monkeypatch.delenv("VISION_DEVICE")
+    monkeypatch.setitem(sys.modules, "torch", None)  # the worker image's Poetry twin has no torch
+    seen = {}
+
+    def fake_run_training(root, models, base, **kwargs):
+        seen.update(kwargs)
+        return {"kept": False}
+
+    monkeypatch.setattr(balltrain, "run_training", fake_run_training)
+    assert client.post("/ball-model/train", json={}).status_code == 200
+    assert _wait_for_training(server)["state"] == "done"
+    assert seen["device"] is None and callable(seen["remote"])
+
+
+def test_training_failures_are_logged_and_never_blank(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from app.vision import balltrain
+
+    server, client, _, _ = _trainable(tmp_path, monkeypatch)
+    monkeypatch.setenv("VISION_SITE_TRAINING", "1")
+    site = {"x-pitchlens-require-owner": "1", "x-pitchlens-owner": "f" * 32}
+    raised = {"error": Exception("")}  # e.g. Modal's bare TimeoutError
+
+    def failing(*args, **kwargs):
+        raise raised["error"]
+
+    monkeypatch.setattr(balltrain, "run_training", failing)
+    caplog.set_level(logging.ERROR)
+    assert client.post("/ball-model/train", json={}, headers=site).status_code == 200
+    state = _wait_for_training(server)
+    assert state["state"] == "failed" and state["stage"] == "Training failed on the GPU. Your labels are kept; try again later."
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == ["Ball-model training failed"]
+    # The operator sees what failed, never an empty box.
+    assert client.post("/ball-model/train", json={}).status_code == 200
+    assert _wait_for_training(server)["stage"] == "Exception"
+    # Label-count refusals are written for the team owner and shown as they are.
+    raised["error"] = ValueError("Too few labels to train (3 balls to learn from, 2 frames to check against). Label more frames.")
+    assert client.post("/ball-model/train", json={}, headers=site).status_code == 200
+    assert _wait_for_training(server)["stage"] == str(raised["error"])
+
+
+def test_a_restart_during_training_shows_the_run_failed(tmp_path, monkeypatch):
+    server, client, _, _ = _trainable(tmp_path, monkeypatch)
+    (tmp_path / "training-state.json").write_text(json.dumps({"state": "running", "stage": "Training on the GPU"}))
+    server.recover_after_restart()
+    state = client.get("/ball-model").json()["training"]
+    assert state == {"state": "failed", "stage": "The analysis server restarted during training. Start it again."}
+    assert json.loads((tmp_path / "training-state.json").read_text())["state"] == "failed"
+    # A finished run is shown as it was.
+    (tmp_path / "training-state.json").write_text(json.dumps({"state": "done", "stage": "Finished", "run": {"kept": True}}))
+    server.recover_after_restart()
+    assert client.get("/ball-model").json()["training"]["state"] == "done"
+
+
+def test_training_progress_is_saved_for_a_restart(tmp_path, monkeypatch):
+    import time
+
+    server, client, _, _ = _trainable(tmp_path, monkeypatch)
+    assert client.post("/ball-model/train", json={"epochs": 5}).status_code == 200
+    assert json.loads((tmp_path / "training-state.json").read_text())["state"] in ("running", "done")
+    assert _wait_for_training(server)["state"] == "done"
+    for _ in range(200):  # saved right after the in-memory state
+        if json.loads((tmp_path / "training-state.json").read_text())["state"] == "done":
+            break
+        time.sleep(0.01)
+    assert json.loads((tmp_path / "training-state.json").read_text())["state"] == "done"
+
+
+def test_a_modal_refusal_gives_the_site_start_back(tmp_path, monkeypatch):
+    import sys
+    import time
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from app.vision import balltrain
+
+    server, client, _, _ = _trainable(tmp_path, monkeypatch)
+    monkeypatch.setenv("VISION_SITE_TRAINING", "1")
+    monkeypatch.setenv("VISION_MAX_TRAINING_PER_DAY", "2")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-test")
+
+    @contextmanager
+    def refused():
+        raise RuntimeError("AuthError: Token missing or invalid")
+        yield  # pragma: no cover
+
+    monkeypatch.setitem(sys.modules, "app.vision.modal_train",
+                        SimpleNamespace(app=SimpleNamespace(run=refused), train_ball=SimpleNamespace(remote=None)))
+
+    def run_training(root, models, base, remote=None, on_start=None, **kwargs):
+        on_start()
+        return remote(b"", b"", 1)
+
+    monkeypatch.setattr(balltrain, "run_training", run_training)
+    site = {"x-pitchlens-require-owner": "1", "x-pitchlens-owner": "f" * 32}
+    for _ in range(2):
+        assert client.post("/ball-model/train", json={}, headers=site).status_code == 200
+        assert _wait_for_training(server)["state"] == "failed"
+    assert server._recent_training_starts(time.time()) == []
+    assert client.post("/ball-model/train", json={}, headers=site).status_code == 200
+    _wait_for_training(server)
+
+
+def test_a_failed_training_set_build_leaves_no_frame_copies(tmp_path, monkeypatch):
+    import errno
+    import pathlib
+
+    from app.vision import balltrain
+
+    for name in ("a" * 32, "b" * 32):
+        _labelled_job(tmp_path, name)
+    base = tmp_path / "base.pt"
+    base.write_bytes(b"w")
+    real, written = pathlib.Path.write_text, {"labels": 0}
+
+    def write_text(self, data, *args, **kwargs):
+        if self.suffix == ".txt" and "dataset" in self.parts:
+            written["labels"] += 1
+            if written["labels"] > 25:  # the volume fills while the set is being built
+                raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", write_text)
+    with pytest.raises(OSError):
+        balltrain.run_training(tmp_path, tmp_path / "models", base, remote=lambda *a: None, on_start=lambda: None)
+    assert written["labels"] > 25
+    assert not (tmp_path / "training" / "dataset").exists()

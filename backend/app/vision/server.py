@@ -5,9 +5,11 @@ The long-lived service token stays server-side (Next.js proxy -> worker).
 """
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -16,7 +18,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
@@ -29,6 +31,33 @@ from app.vision import billing, gpu
 from app.vision.access import valid_video_grant
 from app.vision.engine import probe, run_video
 from app.vision.profiles import available_profiles, player_load_profiles
+
+# Operator log lines (job start and end, a low volume). uvicorn configures only
+# its own loggers, so this one has its own handler. Never log owner keys or URLs.
+ops_log = logging.getLogger("pitchlens")
+if not ops_log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    ops_log.addHandler(_handler)
+ops_log.setLevel(logging.INFO)
+ops_log.propagate = False
+
+
+class RedactOwnerKeys(logging.Filter):
+    """uvicorn's access log prints each path with its query string, and owner keys
+    are capabilities for a browser's matches: never write one to the log."""
+
+    pattern = re.compile(r"(?i)(owner=)[^&\s]*")
+
+    def filter(self, record):
+        # uvicorn's args: (client_addr, method, full_path, http_version, status_code).
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            record.args = (*args[:2], self.pattern.sub(r"\1[redacted]", args[2]), *args[3:])
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(RedactOwnerKeys())
 
 ROOT = Path(os.getenv("VISION_DATA_DIR", ".vision")).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -128,6 +157,20 @@ class DailyLimit(Exception):
         self.cap, self.resets_at = cap, resets_at
 
 
+class StorageFull(Exception):
+    """No room on the volume: answered as JSON 507 with a code (see the handler below)."""
+
+
+class FullMatchUnavailable(Exception):
+    """A full match that this worker would only refuse later: answered as JSON 503 with a code."""
+
+
+def check_full_match():
+    # Before any bytes are read, the worker is reserved or a start is counted.
+    if not full_match_ready():
+        raise FullMatchUnavailable()
+
+
 def check_daily_budget():
     cap = daily_cap()
     recent = sorted(_recent_starts(time.time()))
@@ -137,9 +180,25 @@ def check_daily_budget():
 
 
 def record_start():
-    """Count an analysis that has started (call while holding `lock`)."""
+    """Count an analysis that has started (call while holding `lock`); returns its stamp."""
     now = time.time()
-    _write_json(ROOT / STARTS, _recent_starts(now) + [round(now, 3)])
+    stamp = round(now, 3)
+    _write_json(ROOT / STARTS, _recent_starts(now) + [stamp])
+    return stamp
+
+
+def refund_start(stamp):
+    """Give back a start that cost no compute (the GPU refused it): removes exactly that stamp."""
+    if stamp is None:
+        return
+    with lock:
+        data = _read_json(ROOT / STARTS, [])
+        if isinstance(data, list) and stamp in data:
+            data.remove(stamp)
+            try:
+                _write_json(ROOT / STARTS, data)
+            except OSError:
+                logging.exception("Could not give back the start at %s", stamp)
 
 
 # Ball-model training started from the website, per 24 hours (0 = no limit):
@@ -169,7 +228,22 @@ def check_training_budget():
 
 def record_training_start():
     now = time.time()
-    _write_json(ROOT / TRAINING_STARTS, _recent_training_starts(now) + [round(now, 3)])
+    stamp = round(now, 3)
+    _write_json(ROOT / TRAINING_STARTS, _recent_training_starts(now) + [stamp])
+    return stamp
+
+
+def refund_training_start(stamp):
+    """Give back a site training start that Modal refused (call while holding `training_lock`)."""
+    data = _read_json(ROOT / TRAINING_STARTS, [])
+    if isinstance(data, list) and stamp in data:
+        data.remove(stamp)
+        try:
+            _write_json(ROOT / TRAINING_STARTS, data)
+        except OSError:
+            logging.exception("Could not give back the training start at %s", stamp)
+
+
 # Re-entrant: stale-upload release runs while create() already holds the lock.
 lock = threading.RLock()
 active = None
@@ -179,6 +253,16 @@ upload_activity = {}
 upload_started = {}
 upload_sizes = {}  # job id -> size declared when a chunked upload reserved the worker
 pool = ThreadPoolExecutor(max_workers=1)
+# Analyses inside work(): job id -> (directory, status dict). stop_jobs records the
+# shutdown in their status before cancelling them, so every status.json write for
+# a running job happens under status_lock.
+running = {}
+status_lock = threading.Lock()
+engines = {}  # job id -> "gpu" or "cpu" while it runs (GET /ops)
+# A redeploy cuts the GPU's video download before it cancels the job: a GPU error
+# waits this long for that cancellation before it counts as the GPU's.
+GPU_ERROR_GRACE = 5
+gpu_errors = deque(maxlen=5)  # the latest GPU-unavailable messages (GET /ops)
 # Calibration and analytics are CPU post-processing of a finished result: they
 # must never queue behind (or block) an upload or a GPU analysis.
 post_pool = ThreadPoolExecutor(max_workers=1)
@@ -262,6 +346,27 @@ async def daily_limit(request: Request, exc: DailyLimit):
     )
 
 
+@app.exception_handler(StorageFull)
+async def storage_full(request: Request, exc: StorageFull):
+    # A code, so clients show the out-of-storage message instead of retrying the upload.
+    return JSONResponse(
+        status_code=507,
+        content={"detail": "The analysis server is out of storage. Try again later.", "code": "out-of-storage"},
+    )
+
+
+@app.exception_handler(FullMatchUnavailable)
+async def full_match_unavailable(request: Request, exc: FullMatchUnavailable):
+    # A code, so clients say so at once instead of retrying a 503.
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Full-match analysis is not set up on this server yet. A 20-second test still works.",
+            "code": "full-match-unavailable",
+        },
+    )
+
+
 def folder(job_id):
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
         raise HTTPException(404, "Job not found")
@@ -294,15 +399,54 @@ def with_retryable(directory, data):
         and (directory / "video").is_file()
         and bool(data.get("video"))
         and not expired(data)
-        and (data.get("attempts", 1) < 3 or data.get("interruptedBy") == "shutdown"),
+        and (data.get("attempts", 1) < 3 or not_an_attempt(data)),
     }
 
 
+def not_an_attempt(data):
+    """A redeploy, or a GPU that refused the job before any compute: Retry does not count it."""
+    return data.get("interruptedBy") == "shutdown" or bool(data.get("refusedBy"))
+
+
 def public(data):
-    """Owner keys are listing capabilities; never echo them back."""
+    """Owner keys are listing capabilities; never echo them back (nor operator-only details)."""
     return {k: v for k, v in data.items() if k not in (
-        "owner", "uploadRequestId", "uploadRequestDigest", "rerunRequestId", "rerunDigest"
+        "owner", "uploadRequestId", "uploadRequestDigest", "rerunRequestId", "rerunDigest",
+        "countedAt", "deployment", "error",
     )}
+
+
+def _mark_deployment(status):
+    """The deployment running this job: one that later finds it unfinished was a redeploy."""
+    deployment = os.getenv("RAILWAY_DEPLOYMENT_ID", "")
+    if deployment:
+        status["deployment"] = deployment
+    else:
+        status.pop("deployment", None)
+
+
+def local_full_match_ok():
+    """This machine may analyse a full match itself: a local worker, a GPU host, or
+    a hosted CPU worker whose operator accepts hours per match."""
+    return (
+        not gpu.public_base()
+        or os.getenv("VISION_DEVICE", "").startswith("cuda")
+        or os.getenv("VISION_ALLOW_CPU_FALLBACK", "0") == "1"
+    )
+
+
+def full_match_ready():
+    """A full match can run here (Modal or this machine); /health reports it as fullMatch."""
+    return gpu.modal_enabled() or local_full_match_ok()
+
+
+def _gpu_only(status):
+    """A hosted full match never falls back to hours on the CPU (unless the operator allows it)."""
+    return not status.get("maxSeconds") and not local_full_match_ok()
+
+
+OUT_OF_STORAGE = "The analysis server is out of storage. Your upload is saved; retry later."
+RESTARTED = "Worker restarted before the analysis finished."
 
 
 # Team names, a title and the match date the owner set after the upload. Kept in
@@ -331,14 +475,30 @@ def with_details(directory, data):
 
 def work(directory, status, event):
     global active
+    job_id = status["id"]
+    began = time.monotonic()
+    engine = "gpu" if gpu.modal_enabled() else "cpu"
+    gpu_sent = {"item": False}  # whether the GPU sent anything (it then cost compute)
+    refused = None  # "gpu" or "config": a hosted refusal that cost no compute
 
     def update(**kw):
-        status.update(kw)
-        write_status(directory, status)
+        # stop_jobs records a shutdown before this thread notices it: keep that
+        # record (a redeploy is not a failed attempt) unless the analysis completed.
+        with status_lock:
+            if status.get("interruptedBy") == "shutdown" and kw.get("status") != "completed":
+                return
+            status.update(kw)
+            if kw.get("status") == "completed":
+                status.pop("interruptedBy", None)
+            write_status(directory, status)
 
+    _mark_deployment(status)  # also set by begin, retry and rerun; a backstop
+    with status_lock:
+        running[job_id] = (directory, status)
+    engines[job_id] = engine
+    ops_log.info("job=%s event=start engine=%s", job_id, engine)
     try:
-        status["status"] = "processing"
-        update(stage="Opening video", progress=0)
+        update(status="processing", stage="Opening video", progress=0)
         options = dict(
             progress=update,
             cancelled=event.is_set,
@@ -353,22 +513,32 @@ def work(directory, status, event):
         )
         ran_on_gpu = False
         if gpu.modal_enabled():
+
+            def gpu_progress(**kw):
+                gpu_sent["item"] = True
+                update(**kw)
+
             try:
                 update(stage="Starting a GPU", progress=0)
                 gpu.run_on_modal(
-                    status["id"], directory / "result.json", TOKEN, **options
+                    job_id, directory / "result.json", TOKEN, **{**options, "progress": gpu_progress}
                 )
                 ran_on_gpu = True
             except gpu.GPUUnavailable as exc:
-                import logging
-
-                if gpu.public_base() and not status.get("maxSeconds") and os.getenv("VISION_ALLOW_CPU_FALLBACK", "0") != "1":
+                gpu_errors.append({"job": job_id, "at": round(time.time(), 3), "error": str(exc)[:300]})
+                # A redeploy cuts the GPU's video download before it cancels the job.
+                if event.wait(GPU_ERROR_GRACE):
+                    raise InterruptedError("Analysis cancelled") from exc
+                if _gpu_only(status):
+                    refused = None if gpu_sent["item"] else "gpu"
                     raise ValueError("GPU is unavailable. Your upload is saved; retry when GPU service returns.") from exc
                 logging.warning("GPU unavailable, using CPU: %s", exc)
                 update(stage="GPU unavailable; analysing on the CPU (slower)", progress=0)
         if not ran_on_gpu:
-            if gpu.public_base() and not status.get("maxSeconds") and os.getenv("VISION_ALLOW_CPU_FALLBACK", "0") != "1":
+            if _gpu_only(status):
+                refused = "config"
                 raise ValueError("GPU processing is not configured. Your upload is saved; contact the service owner.")
+            engine = engines[job_id] = "cpu"
             run_video(directory / "video", directory / "result.json", **options)
         update(
             status="completed",
@@ -381,41 +551,98 @@ def work(directory, status, event):
         if stopping:
             # A redeploy or restart is not the user's cancellation: allow a retry,
             # and do not count this attempt against the retry limit.
-            update(status="interrupted", stage="Worker restarted before the analysis finished.", interruptedBy="shutdown")
+            update(status="interrupted", stage=RESTARTED, interruptedBy="shutdown")
         else:
             update(status="cancelled", stage="Analysis cancelled")
     except Exception as exc:
-        import logging
-
-        logging.exception("Vision job failed")
-        update(
-            status="failed",
-            stage=str(exc)
-            if isinstance(exc, ValueError)
-            else "Vision processing failed. Check the worker log.",
-        )
+        # The GPU's own message, not the refusal shown to the user (GET /ops only).
+        cause = exc.__cause__ if isinstance(exc.__cause__, gpu.GPUUnavailable) else exc
+        error = f"{type(cause).__name__}: {cause}"[:300]
+        if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            # A full volume: never re-run on the CPU for it, and leave no partial files.
+            logging.exception("Vision job %s ran out of storage", job_id)
+            for name in ("result.tmp", "status.tmp"):
+                (directory / name).unlink(missing_ok=True)
+            try:
+                update(status="failed", stage=OUT_OF_STORAGE, error=error)
+            except OSError:
+                logging.exception("Could not record that job %s ran out of storage", job_id)
+        elif stopping:
+            # Failed because the worker is shutting down (a cut connection): a redeploy.
+            update(status="interrupted", stage=RESTARTED, interruptedBy="shutdown", error=error)
+        else:
+            logging.exception("Vision job %s failed", job_id)
+            stage = str(exc) if isinstance(exc, ValueError) else "Vision processing failed. Check the worker log."
+            if refused and status.get("interruptedBy") != "shutdown":
+                # Refused before any compute: the start and the attempt are given back.
+                with status_lock:
+                    stamp = status.pop("countedAt", None)
+                refund_start(stamp)
+                update(status="failed", stage=stage, refusedBy=refused, error=error)
+            else:
+                update(status="failed", stage=stage, error=error)
     finally:
+        with status_lock:
+            running.pop(job_id, None)
+        engines.pop(job_id, None)
         with lock:
-            if active == status["id"]:
+            if active == job_id:
                 active = None
-            cancellations.pop(status["id"], None)
+            cancellations.pop(job_id, None)
+        outcome = status.get("status")
+        ops_log.info(
+            "job=%s event=%s engine=%s seconds=%d reason=%s",
+            job_id,
+            outcome if outcome in ("completed", "interrupted", "cancelled") else "failed",
+            engine,
+            round(time.monotonic() - began),
+            str(status.get("stage", ""))[:80],
+        )
+
+
+def _shutdown_wait():
+    try:
+        return max(0.0, float(os.getenv("VISION_SHUTDOWN_WAIT_SECONDS", "10")))
+    except ValueError:
+        return 10.0
 
 
 def stop_jobs():
+    """Shutdown (a redeploy): record each running analysis as interrupted by it,
+    then cancel them and wait briefly for them to stop.
+
+    The record comes first and is written here, so it survives a process that
+    exits (or is killed) before the job thread reacts. The wait lets a GPU job
+    leave its Modal app, which stops the GPU.
+    """
     global stopping
     stopping = True
+    with status_lock:
+        for directory, status in list(running.values()):
+            status.update(status="interrupted", stage=RESTARTED, interruptedBy="shutdown")
+            try:
+                write_status(directory, status)
+            except OSError:
+                logging.exception("Could not record the interruption of job %s", status.get("id"))
     for event in list(cancellations.values()):
         event.set()
+    deadline = time.monotonic() + _shutdown_wait()
+    while running and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def recover_calibrations():
     """A calibration running when the worker stopped will never finish: say so."""
     for status in ROOT.glob("*/calibration-job.json"):
         data = _read_json(status) or {}
-        if data.get("state") == "processing" and data.get("auto"):
-            status.unlink(missing_ok=True)  # an automatic attempt simply did not happen
-        elif data.get("state") == "processing":
-            _write_json(status, {"state": "failed", "error": "The analysis server restarted. Apply the pitch setup again.", "finishedAt": time.time()})
+        try:
+            if data.get("state") == "processing" and data.get("auto"):
+                status.unlink(missing_ok=True)  # an automatic attempt simply did not happen
+            elif data.get("state") == "processing":
+                _write_json(status, {"state": "failed", "error": "The analysis server restarted. Apply the pitch setup again.", "finishedAt": time.time()})
+        except OSError:
+            # A full volume must not stop the worker from starting.
+            logging.exception("Could not record the stopped calibration %s", status)
 
 
 def recover_after_restart():
@@ -425,8 +652,21 @@ def recover_after_restart():
     reserved for it again, so a phone that was sending it through a redeploy
     resumes (append writes at receivedBytes). The idle release frees it as
     usual if that browser never comes back.
+
+    Space is freed first and no write here may stop the worker from starting:
+    on a full volume, DELETE /jobs is the only way to free space.
     """
     global active
+    for temporary in ROOT.glob("*/*.tmp"):
+        temporary.unlink(missing_ok=True)
+    # A training run killed with the process never reached its cleanup: frame
+    # copies of customers' footage must not stay behind.
+    shutil.rmtree(ROOT / "training" / "dataset", ignore_errors=True)
+    shutil.rmtree(ROOT / "training" / "runs", ignore_errors=True)
+    _recover_training()
+    # A job a previous deployment was running stopped for a redeploy (even one
+    # killed before it could record that); a crash restarts the same deployment.
+    deployment = os.getenv("RAILWAY_DEPLOYMENT_ID", "")
     uploads = []
     for path in ROOT.glob("*/status.json"):
         try:
@@ -438,36 +678,46 @@ def recover_after_restart():
         if data["status"] == "uploading" and "expectedBytes" in data and (path.parent / "video").is_file():
             uploads.append((data.get("createdAt", 0), path, data))
             continue
-        _interrupt(path, data)
+        redeployed = data["status"] == "processing" and deployment and data.get("deployment") not in (None, "", deployment)
+        _interrupt(path, data, "shutdown" if redeployed else None)
     uploads.sort(key=lambda u: u[0])
     if uploads and active is None:
         _, path, data = uploads.pop()
         video = path.parent / "video"
-        # status.json is written after each chunk: bytes past receivedBytes are unconfirmed.
-        received = min(int(data.get("receivedBytes", 0)), video.stat().st_size)
-        with video.open("r+b") as f:
-            f.truncate(received)
-        data.update(receivedBytes=received, progress=round(received / (data["expectedBytes"] or 1) * 100, 1))
-        write_status(path.parent, data)
-        with lock:
-            active = data["id"]
-            upload_activity[active] = upload_started[active] = time.monotonic()
-            upload_sizes[active] = data["expectedBytes"]
+        try:
+            # status.json is written after each chunk: bytes past receivedBytes are unconfirmed.
+            received = min(int(data.get("receivedBytes", 0)), video.stat().st_size)
+            with video.open("r+b") as f:
+                f.truncate(received)
+            data.update(receivedBytes=received, progress=round(received / (data["expectedBytes"] or 1) * 100, 1))
+            write_status(path.parent, data)
+        except OSError:
+            # Its saved receivedBytes could now exceed the file: never resume it.
+            logging.exception("Could not keep upload %s across the restart", data.get("id"))
+            _interrupt(path, data)
+        else:
+            with lock:
+                active = data["id"]
+                upload_activity[active] = upload_started[active] = time.monotonic()
+                upload_sizes[active] = data["expectedBytes"]
     for _, path, data in uploads:
         _interrupt(path, data)
-    for temporary in ROOT.glob("*/*.tmp"):
-        temporary.unlink(missing_ok=True)
-    # A training run killed with the process never reached its cleanup: frame
-    # copies of customers' footage must not stay behind (its state was in memory).
-    shutil.rmtree(ROOT / "training" / "dataset", ignore_errors=True)
-    shutil.rmtree(ROOT / "training" / "runs", ignore_errors=True)
 
 
-def _interrupt(path, data):
+def _interrupt(path, data, interrupted_by=None):
     if data["status"] == "uploading":
         (path.parent / "video").unlink(missing_ok=True)
-    data.update(status="interrupted", stage="Worker restarted before the analysis finished.")
-    write_status(path.parent, data)
+    # A YouTube download stopped by the restart (yt-dlp's download.*.part, up to 2 GB).
+    for leftover in path.parent.glob("download.*"):
+        leftover.unlink(missing_ok=True)
+    data.update(status="interrupted", stage=RESTARTED)
+    if interrupted_by:
+        data["interruptedBy"] = interrupted_by
+    try:
+        write_status(path.parent, data)
+    except OSError:
+        # load_status still reports it as interrupted (it is not the active job).
+        logging.exception("Could not record the interruption of job %s", data.get("id"))
 
 
 app.add_event_handler("shutdown", stop_jobs)
@@ -554,8 +804,10 @@ def expired(data):
 
 
 def expire_footage(directory, data):
-    """Delete every copy of the footage (video and label frames); keep the measured result."""
+    """Delete every copy of the footage (video, label frames, a stopped download); keep the measured result."""
     (directory / "video").unlink(missing_ok=True)
+    for leftover in directory.glob("download.*"):
+        leftover.unlink(missing_ok=True)
     _remove_label_frames(directory)  # balllabels.frame_cache
     data["videoDeleted"] = True
     write_status(directory, data)
@@ -619,7 +871,7 @@ SPACE_MARGIN = 256 * 1024 * 1024
 def check_space(size):
     free = shutil.disk_usage(ROOT).free
     if free < size + SPACE_MARGIN:
-        raise HTTPException(507, "The analysis server is out of storage. Try again later.")
+        raise StorageFull()
 
 
 def check_models(profile, ball_search):
@@ -631,6 +883,45 @@ def check_models(profile, ball_search):
 def download_budget():
     """Largest download that fits now: the upload limit, or the free space if smaller."""
     return min(MAX_BYTES, shutil.disk_usage(ROOT).free - SPACE_MARGIN)
+
+
+def check_volume():
+    """Warn before the volume refuses a full-size upload (results and label stills also use it)."""
+    usage = shutil.disk_usage(ROOT)
+    low = usage.free < MAX_BYTES + SPACE_MARGIN
+    if low:
+        ops_log.warning("Volume low: %d MB free of %d MB", usage.free // 2**20, usage.total // 2**20)
+    return low
+
+
+_volume_watch = None
+
+
+def start_volume_watch():
+    """At startup, then hourly (also when footage is kept forever and no sweeper runs)."""
+    global _volume_watch
+
+    def check():
+        try:
+            check_volume()
+        except OSError:
+            logging.exception("Volume check failed")
+
+    check()
+    if _volume_watch is not None and _volume_watch.is_alive():
+        return
+
+    def watch():
+        while not stopping:
+            time.sleep(3600)
+            if not stopping:
+                check()
+
+    _volume_watch = threading.Thread(target=watch, name="volume-watch", daemon=True)
+    _volume_watch.start()
+
+
+app.add_event_handler("startup", start_volume_watch)
 
 
 @app.get("/healthz")
@@ -659,6 +950,8 @@ def health():
         "uploadAbandonSeconds": UPLOAD_ABANDON_SECONDS,
         "retentionHours": RETENTION_HOURS or None,
         "gpu": gpu.modal_enabled() or os.getenv("VISION_DEVICE", "").startswith(("cuda", "mps")),
+        # False on a hosted CPU worker without Modal: only 20-second tests run there.
+        "fullMatch": full_match_ready(),
         # Pitch calibration, event detection and reviewer decisions.
         "analytics": True,
         "privateJobs": True,
@@ -666,6 +959,66 @@ def health():
         "savedVideoReruns": True,
         # Whether the website may start ball-model training (otherwise an operator action).
         "siteTraining": _site_training(),
+    }
+
+
+@app.get("/ops")
+def ops():
+    """Operator view (service token only: the site's proxy never forwards it).
+
+    What is running, today's starts, storage, GPU errors and recent problems.
+    Never owner keys, request ids, video grants or tokens.
+    """
+    now = time.time()
+    current = None
+    job = active
+    if job is not None:
+        data = _read_json(ROOT / job / "status.json", {})
+        data = data if isinstance(data, dict) else {}
+        current = {
+            "id": job, "status": data.get("status"), "stage": data.get("stage"),
+            "progress": data.get("progress"), "engine": engines.get(job) or data.get("engine"),
+        }
+    starts = sorted(_recent_starts(now))
+    cap = daily_cap()
+    usage = shutil.disk_usage(ROOT)
+    count, problems = 0, []
+    for path in ROOT.glob("*/status.json"):
+        count += 1
+        try:
+            changed = path.stat().st_mtime
+            if now - changed > 86400:
+                continue
+            data = load_status(path.parent)
+        except (OSError, ValueError, KeyError):
+            continue
+        if data.get("status") in ("failed", "interrupted"):
+            keys = ("id", "status", "stage", "attempts", "interruptedBy", "refusedBy", "error")
+            problems.append((changed, {k: data.get(k) for k in keys}))
+    problems.sort(key=lambda p: -p[0])
+    state = dict(training)
+    if "run" in state:
+        state["run"] = _private_run(state["run"])
+    return {
+        "active": current,
+        "dailyStarts": {
+            "used": len(starts), "cap": cap,
+            # When the next start frees up (rolling 24 hours), as in the 429 answer.
+            "resetsAt": round(starts[max(0, len(starts) - cap)] + 86400) if starts and cap else None,
+        },
+        "trainingStarts": {"used": len(_recent_training_starts(now)), "cap": training_cap()},
+        "training": state,
+        "storage": {
+            "freeBytes": usage.free, "totalBytes": usage.total, "low": usage.free < MAX_BYTES + SPACE_MARGIN,
+        },
+        "jobs": count,
+        "gpu": {
+            "enabled": gpu.modal_enabled(),
+            "publicUrl": bool(gpu.public_base()),
+            "recentErrors": list(gpu_errors),
+        },
+        "recentProblems": [p for _, p in problems[:10]],
+        "release": os.getenv("RAILWAY_GIT_COMMIT_SHA") or None,
     }
 
 
@@ -700,16 +1053,17 @@ def begin(directory, status, size):
         # Cancelled or released while the probe ran: never queue work for it.
         if active != job_id or job_id not in upload_activity:
             raise HTTPException(409, "This upload was cancelled. Start again.")
-        status.update(video=metadata, fileSize=size, status="processing")
+        # countedAt: the start this run used, given back if the GPU refuses it.
+        status.update(video=metadata, fileSize=size, status="processing", countedAt=record_start())
         status.pop("receivedBytes", None)
         status.pop("expectedBytes", None)
+        _mark_deployment(status)
         write_status(directory, status)
         upload_activity.pop(job_id, None)
         upload_started.pop(job_id, None)
         upload_sizes.pop(job_id, None)
         event = threading.Event()
         cancellations[job_id] = event
-        record_start()
         pool.submit(work, directory, status, event)
     return public(status)
 
@@ -765,6 +1119,8 @@ async def create(request: Request):
         not re.fullmatch(r"[a-f0-9-]{32,36}", request_id) or not owner or expected is None
     ):
         raise HTTPException(400, "A resumable upload needs a valid request ID, owner and video size")
+    if diagnostic == "false":
+        check_full_match()
     title = request.query_params.get("title", "Football match")[:200]
     digest = hashlib.sha256(json.dumps(
         [expected, title, profile, sample_fps, diagnostic, start_seconds, ball_search]
@@ -812,6 +1168,9 @@ async def create(request: Request):
             raise HTTPException(
                 409, "Another video is being analysed. Wait for it to finish or cancel it."
             )
+        # Before anything is written or reserved: a refusal leaves no failed match
+        # behind and no request ID that a resend would collide with.
+        check_space(expected or 0)
         active = job_id
     upload_activity[job_id] = upload_started[job_id] = time.monotonic()
     if expected is not None:
@@ -839,7 +1198,6 @@ async def create(request: Request):
     try:
         directory.mkdir()
         write_status(directory, status)
-        check_space(expected or 0)
         if expected is not None:
             (directory / "video").touch()
             return public(status)
@@ -907,7 +1265,7 @@ def fetch_and_work(directory, status, event, url):
         # (a blocked download costs no GPU). The worker stayed reserved for the
         # whole download, so no other start can have used the allowance meanwhile.
         with lock:
-            record_start()
+            status["countedAt"] = record_start()
         handed_over = True
         work(directory, status, event)
     except InterruptedError:
@@ -959,6 +1317,7 @@ async def create_from_url(request: Request):
         raise HTTPException(400, "Match ownership is required")
     if owner is not None and not OWNER.fullmatch(owner):
         raise HTTPException(400, "Invalid owner")
+    check_full_match()  # a link is always analysed in full
     await asyncio.to_thread(delete_expired)
     # The size is unknown until YouTube answers: the download steps down in
     # resolution to fit the space there is, so only refuse when nearly full.
@@ -1362,7 +1721,12 @@ def compute_analysis(directory, include_positions=True):
             _prepared.move_to_end(base_key)
         analysis = finish(base, review)
         analysis["inputs"] = key
-        _write_json(directory / "analysis.json", analysis)
+        try:
+            _write_json(directory / "analysis.json", analysis)
+        except OSError:
+            # Only the cache failed (a full volume): the report still opens.
+            logging.exception("Could not cache the analysis of %s", directory.name)
+            (directory / "analysis.tmp").unlink(missing_ok=True)
     return analysis
 
 
@@ -1849,6 +2213,42 @@ def frame_image(job_id: str, index: int):
 
 training = {"state": "idle"}  # one ball-model training at a time, in this process
 training_lock = threading.Lock()
+# A copy of `training` on the volume: a restart then says the run stopped instead
+# of forgetting it (the run itself is a thread of this process).
+TRAINING_STATE = "training-state.json"
+TRAINING_RESTARTED = "The analysis server restarted during training. Start it again."
+TRAINING_FAILED = "Training failed on the GPU. Your labels are kept; try again later."
+training_state_lock = threading.Lock()  # one writer of `training` and its copy at a time
+
+
+def _set_training(clear=False, **kw):
+    """Update the training state and save it (best-effort: a full volume must not stop a run)."""
+    with training_state_lock:
+        if clear:
+            training.clear()
+        training.update(kw)
+        try:
+            _write_json(ROOT / TRAINING_STATE, training)
+        except OSError:
+            logging.exception("Could not save the ball-model training state")
+
+
+def _recover_training():
+    """At startup: a run that was going when the process stopped has failed."""
+    data = _read_json(ROOT / TRAINING_STATE)
+    if not isinstance(data, dict) or data.get("state") not in ("running", "done", "failed"):
+        return
+    if data["state"] == "running":
+        _set_training(clear=True, state="failed", stage=TRAINING_RESTARTED)
+    else:
+        with training_state_lock:
+            training.clear()
+            training.update(data)
+
+
+def _private_run(run):
+    # Owner keys are capabilities for a browser's matches: never hand them out.
+    return {k: v for k, v in run.items() if k not in ("owner", "ownerHash")} if isinstance(run, dict) else run
 
 
 def _models_dir():
@@ -1865,16 +2265,12 @@ def ball_model():
     """
     from app.vision import balltrain
 
-    def private(run):
-        # Owner keys are capabilities for a browser's matches: never hand them out.
-        return {k: v for k, v in run.items() if k not in ("owner", "ownerHash")} if isinstance(run, dict) else run
-
     registry = balltrain.registry(_models_dir())
     state = dict(training)
     if "run" in state:
-        state["run"] = private(state["run"])
+        state["run"] = _private_run(state["run"])
     return {
-        **registry, "runs": [private(r) for r in registry.get("runs", [])], "training": state,
+        **registry, "runs": [_private_run(r) for r in registry.get("runs", [])], "training": state,
         # Whether the website may start a run (see train_ball_model): the page hides the button otherwise.
         "siteTraining": _site_training(),
     }
@@ -1919,41 +2315,55 @@ async def train_ball_model(request: Request):
             raise HTTPException(409, "A training run is already in progress")
         if from_site:
             check_training_budget()
-        training.clear()
-        training.update(state="running", stage="Starting", startedAt=round(time.time(), 3))
+        _set_training(clear=True, state="running", stage="Starting", startedAt=round(time.time(), 3))
+    use_remote = gpu.modal_enabled()
+    counted = {}  # the site start this run used, and whether Modal accepted the run
 
     def started():
         # Counted only once the labels passed every check and a GPU (or this
         # machine) is about to train: a "too few labels" refusal costs nothing.
         if from_site:
             with training_lock:
-                record_training_start()
+                counted["stamp"] = record_training_start()
 
     def remote(dataset_zip, base_bytes, n):
         from app.vision.modal_train import app as modal_app, train_ball
 
         with modal_app.run():
+            counted["accepted"] = True  # past auth, quota and the image build
             return train_ball.remote(dataset_zip, base_bytes, n)
 
     def run():
         try:
-            run = balltrain.run_training(
+            outcome = balltrain.run_training(
                 ROOT,
                 _models_dir(),
                 base,
                 epochs=epochs,
                 owner=owner,
-                remote=remote if gpu.modal_enabled() else None,
-                device=inference_device(),
+                remote=remote if use_remote else None,
+                # The device matters only for training here (and may import torch).
+                device=None if use_remote else inference_device(),
                 now=round(time.time(), 3),
-                progress=lambda message: training.update(stage=message),
+                progress=lambda message: _set_training(stage=message),
                 on_start=started,
                 usable=lambda d: balltrain._usable(d) and _video_path(d) is not None,
             )
             # A run refused for too few held-out balls says why (nothing was trained).
-            training.update(state="done", stage=run.get("message") or "Finished", run=run)
-        except Exception as exc:  # reported to the operator; nothing is switched
-            training.update(state="failed", stage=str(exc))
+            _set_training(state="done", stage=outcome.get("message") or "Finished", run=outcome)
+        except Exception as exc:  # nothing is switched
+            logging.exception("Ball-model training failed")
+            if isinstance(exc, ValueError):
+                stage = str(exc)  # the label-count refusals are written for the team owner
+            elif from_site:
+                stage = TRAINING_FAILED
+            else:
+                stage = str(exc) or type(exc).__name__  # the operator; never a blank reason
+            if use_remote and "stamp" in counted and not counted.get("accepted"):
+                # Modal refused the run before any GPU time: the site start is given back.
+                with training_lock:
+                    refund_training_start(counted["stamp"])
+            _set_training(state="failed", stage=stage)
 
     threading.Thread(target=run, daemon=True).start()
     return {"started": True}
@@ -2023,12 +2433,17 @@ async def create_venue(request: Request):
 @app.delete("/jobs/{job_id}")
 def delete_job(job_id: str):
     directory = folder(job_id)
-    # Never remove files beneath a live upload, inference or calibration.
-    with calibrating_lock, lock:
-        if job_id == active or job_id in calibrating:
-            raise HTTPException(409, "Cancel processing and wait for it to stop before deleting")
-        with post_lock, label_lock:
-            shutil.rmtree(directory)
+    # Analytics hold post_lock for up to half a minute: wait for it first, never
+    # while holding `lock` or calibrating_lock, which the event loop takes for
+    # upload chunks and pitch setups (every request would stall). Nothing takes
+    # post_lock or label_lock while holding those, so this order cannot deadlock.
+    with post_lock, label_lock:
+        # Never remove files beneath a live upload, inference or calibration.
+        with calibrating_lock, lock:
+            if job_id == active or job_id in calibrating:
+                raise HTTPException(409, "Cancel processing and wait for it to stop before deleting")
+            # A concurrent delete may have removed it during the wait.
+            shutil.rmtree(directory, ignore_errors=True)
             for key in list(_prepared):
                 if key[0] == job_id:
                     del _prepared[key]
@@ -2054,26 +2469,34 @@ def retry_job(job_id: str):
             return public(status)
         if status["status"] not in ("failed", "interrupted", "cancelled"):
             raise HTTPException(409, "Only stopped analyses can be retried")
+        if not status.get("maxSeconds"):
+            check_full_match()
         # A retry wants the worker like any start: a stale upload reservation gives way.
         release_stale_upload(contended=True)
         if active is not None:
             raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
         if not (directory / "video").is_file() or expired(status) or not status.get("video"):
             raise HTTPException(409, "No complete upload is available. Upload the video again.")
-        # A graceful shutdown (redeploy) is not a failed attempt. Crashes still count:
-        # a video that kills the worker must not crash-loop it at our expense.
-        shutdown = status.get("interruptedBy") == "shutdown"
-        if status.get("attempts", 1) >= 3 and not shutdown:
+        # A graceful shutdown (redeploy) or a GPU refusal before any compute is not
+        # a failed attempt. Crashes still count: a video that kills the worker must
+        # not crash-loop it at our expense.
+        free = not_an_attempt(status)
+        if status.get("attempts", 1) >= 3 and not free:
             raise HTTPException(409, "This video has stopped three times. Upload it again, or test a shorter section first.")
         check_daily_budget()
         check_models(status.get("profile", "general"), status.get("ballSearch", "exhaustive"))
         event = threading.Event()
-        status.pop("interruptedBy", None)
-        status.update(status="processing", stage="Retrying saved upload", progress=0, attempts=status.get("attempts", 1) + (0 if shutdown else 1))
+        for key in ("interruptedBy", "refusedBy", "error"):
+            status.pop(key, None)
+        # Every retry is a new run: it is counted, also after a shutdown.
+        status.update(
+            status="processing", stage="Retrying saved upload", progress=0,
+            attempts=status.get("attempts", 1) + (0 if free else 1), countedAt=record_start(),
+        )
+        _mark_deployment(status)
         write_status(directory, status)
         active = job_id
         cancellations[job_id] = event
-        record_start()
         pool.submit(work, directory, status, event)
         return public(status)
 
@@ -2095,6 +2518,8 @@ def rerun_job(job_id: str, request: Request):
     request_id = request.query_params.get("requestId", "")
     if mode not in ("section", "full") or not re.fullmatch(r"[a-f0-9-]{32,36}", request_id):
         raise HTTPException(400, "Choose a section or full match and a valid request ID")
+    if mode == "full":
+        check_full_match()
     try:
         start = int(request.query_params.get("start", "0"))
     except ValueError as exc:
@@ -2173,16 +2598,18 @@ def rerun_job(job_id: str, request: Request):
             except OSError:
                 check_space(status["fileSize"])
                 shutil.copyfile(source / "video", directory / "video")
+            status["countedAt"] = record_start()
+            _mark_deployment(status)
             write_status(directory, status)
             active = new_id
             event = threading.Event()
             cancellations[new_id] = event
-            record_start()
             pool.submit(work, directory, status, event)
         except BaseException:
             if active == new_id:
                 active = None
             cancellations.pop(new_id, None)
             shutil.rmtree(directory, ignore_errors=True)
+            refund_start(status.get("countedAt"))
             raise
         return public(status)

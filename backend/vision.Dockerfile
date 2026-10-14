@@ -30,15 +30,24 @@ RUN pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.p
     && pip install --no-deps opencv-python-headless==4.10.0.84 \
     && python -c "import cv2, torch, onnxruntime, ultralytics; print('cv2', cv2.__version__, 'torch', torch.__version__)"
 
-COPY app/ ./app/
-COPY scripts/ ./scripts/
-
+# Weights before app code: the setup scripts use only the standard library, so a
+# code change (most redeploys) reuses these cached layers instead of downloading
+# the weights again from GitHub, Hugging Face and Google Drive.
+COPY scripts/setup_vision.py scripts/setup_football.py ./scripts/
 # Indoor/small-sided profile (required): YOLO11s players + football ONNX ball model.
 RUN python scripts/setup_vision.py
 # Broadcast profile (optional): Roboflow's football weights hosted on Google Drive.
 # If Drive refuses the download the worker still starts; the UI disables that profile.
 ARG INSTALL_BROADCAST=1
 RUN if [ "$INSTALL_BROADCAST" = "1" ]; then \
+      python scripts/setup_football.py || echo "WARNING: broadcast models not installed; broadcast profile disabled"; \
+    fi
+
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+# A cached layer above may hold a refused Drive download: try again on each code
+# redeploy until the broadcast weights are there.
+RUN if [ "$INSTALL_BROADCAST" = "1" ] && { [ ! -f models/roboflow-football-player.pt ] || [ ! -f models/roboflow-football-ball.pt ]; }; then \
       python scripts/setup_football.py || echo "WARNING: broadcast models not installed; broadcast profile disabled"; \
     fi
 

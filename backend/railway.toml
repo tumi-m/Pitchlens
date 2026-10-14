@@ -5,6 +5,10 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "vision.Dockerfile"
+# Only worker changes redeploy it (a redeploy interrupts running analyses).
+# Patterns are matched from the repository root even with Root Directory
+# "backend"; the Docker build context and this file are both under backend/.
+watchPatterns = ["/backend/**"]
 
 [deploy]
 healthcheckPath = "/healthz"
@@ -13,3 +17,8 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
 # Jobs are serialised in one process and stored on one volume: never scale out.
 numReplicas = 1
+# Seconds from SIGTERM to SIGKILL (Railway's default is 0). Must exceed uvicorn's
+# --timeout-graceful-shutdown 20 (vision.Dockerfile CMD) plus stop_jobs' wait
+# for running jobs (up to 10 s) plus a margin, so a redeploy records a running
+# analysis as interrupted by the shutdown (not a failed attempt).
+drainingSeconds = 40

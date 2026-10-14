@@ -41,7 +41,11 @@ every check runs. Rounds run in isolated worktrees, two at a time.
 - Round 1 (correctness and security): 68 confirmed, 54 fixed (`c5c37ee`).
 - Round 2 (end-to-end on real footage): 33 confirmed, 28 fixed (`781a053`).
   Uploads in progress survive a redeploy, and a redeploy no longer uses up a
-  retry; Retry is offered only when it can work; the daily limit says when it
+  retry (round 5 made this hold on Railway: its 40-second drain window,
+  `drainingSeconds` in railway.toml, lets the worker record a running job as
+  interrupted by the shutdown, and each job records `RAILWAY_DEPLOYMENT_ID`, so
+  a job an earlier deployment left unfinished counts as a redeploy even when
+  that process was killed); Retry is offered only when it can work; the daily limit says when it
   lifts; reruns keep the team order and names and can switch on the ball
   search; footage and label frames expire when read, not only hourly;
   possession counts and momentum minutes are withheld on thin coverage;

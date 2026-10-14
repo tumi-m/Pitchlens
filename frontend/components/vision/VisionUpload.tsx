@@ -134,8 +134,13 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   // The worker's limit (it can be raised by the operator); 500 MB until /health answers.
   const maxBytes = health?.maxBytes && health.maxBytes > 0 ? health.maxBytes : DEFAULT_MAX_BYTES;
   const tooLarge = !!file && file.size > maxBytes;
+  // A hosted worker without a GPU for full matches (an older worker omits fullMatch):
+  // only the 20-second test, which needs the decoded preview, can run there.
+  const testOnly = health?.fullMatch === false;
   const ready =
-    source === "file" ? !!file && !checking && !rejected && !tooLarge : linkOk && rights;
+    source === "file"
+      ? !!file && !checking && !rejected && !tooLarge && (!testOnly || !!preflight)
+      : linkOk && rights && !testOnly;
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
   const codeField = useRef<HTMLInputElement>(null);
@@ -233,7 +238,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const profiles = health?.profiles ?? ["general"];
   // The short test needs the decoded preview: without one (a file this browser
   // cannot decode) its checkbox is not even shown, so it can never apply.
-  const shortTest = diagnostic && !!preflight;
+  const shortTest = (diagnostic || testOnly) && !!preflight;
   const choices = {
     title: title.trim() || file?.name || "",
     profile,
@@ -438,6 +443,11 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </button>
             </div>
           )}
+          {available && testOnly && (
+            <p role="status" className="border border-amber-500/40 bg-amber-500/10 rounded-xl p-4 text-sm" data-testid="test-only">
+              Full-match analysis is not set up on this server yet. You can run a 20-second test.
+            </p>
+          )}
           {unfinished && unfinishedQuery && !file && !busy && source === "file" && (
             <p role="status" className="border border-sky-400/40 bg-sky-400/10 rounded-xl p-4 text-sm" data-testid="unfinished-upload">
               Unfinished upload: &quot;{unfinishedQuery.get("title") || unfinished.name}&quot;
@@ -462,7 +472,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 key={value}
                 role="tab"
                 aria-selected={source === value}
-                disabled={busy}
+                disabled={busy || (value === "youtube" && testOnly)}
                 onClick={() => {
                   setSource(value);
                   setError("");
@@ -586,9 +596,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               className="border border-amber-500/40 bg-amber-500/10 rounded-xl p-4 text-sm"
             >
               This browser could not decode the video, so the footage grade and the 20-second
-              test are unavailable here. The analysis server decodes files itself (H.264 and
-              HEVC); you can still analyse the full match. If the server rejects it too, export
-              it as an H.264 MP4.
+              test are unavailable here.{" "}
+              {testOnly
+                ? "This server cannot analyse full matches yet: export the video as an H.264 MP4 and choose it again to run the test."
+                : "The analysis server decodes files itself (H.264 and HEVC); you can still analyse the full match. If the server rejects it too, export it as an H.264 MP4."}
             </p>
           )}
           <AnimatePresence>
@@ -685,14 +696,16 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 <label className="flex gap-2 text-sm">
                   <input
                     type="checkbox"
-                    checked={diagnostic}
-                    disabled={busy || !health?.diagnostics}
+                    checked={shortTest}
+                    disabled={busy || !health?.diagnostics || testOnly}
                     onChange={(e) => setDiagnostic(e.target.checked)}
                   />
                   <span>
                     Only analyse a 20-second test
                     <span className="block text-xs text-pitch-muted">
-                      After the test you can analyse the full match from its report, without uploading again.
+                      {testOnly
+                        ? "The only analysis this server offers for now."
+                        : "After the test you can analyse the full match from its report, without uploading again."}
                     </span>
                   </span>
                 </label>
@@ -702,7 +715,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                     the full video.
                   </p>
                 )}
-                {diagnostic && (
+                {shortTest && (
                   <label className="block text-sm">
                     Test start (seconds)
                     <input
@@ -730,7 +743,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 )}
                 <p className="text-xs text-pitch-muted">
                   {Math.ceil(
-                    (diagnostic ? Math.min(20, preflight.duration - start) : preflight.duration) *
+                    (shortTest ? Math.min(20, preflight.duration - start) : preflight.duration) *
                       Number(fps),
                   ).toLocaleString()}{" "}
                   frames requested. The short test still transfers the file to the analysis
@@ -786,7 +799,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           <p className="text-sm text-pitch-muted">
             {health?.gpu
               ? "Analysis runs on a GPU (the first run of the day can take a few extra minutes to start). "
-              : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
+              : testOnly
+                ? ""
+                : "On a CPU server, expect analysis to take about as long as the video or longer at the quick setting (a 4-core test took about 1.6 minutes per minute of footage). "}
             The report shows a live time estimate, and you can leave and come
             back.{" "}
             {/* What this job measures depends on whether the ball model runs. */}

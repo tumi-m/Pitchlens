@@ -95,6 +95,56 @@ test('a daily-cap refusal (429) is shown at once, not retried', async () => {
   assert.ok(Date.now() - started < 500);
 });
 
+test('an out-of-storage refusal (507) is shown at once with the worker\'s words, not retried under a new request ID', async () => {
+  const FULL = 'The analysis server is out of storage. Try again later.';
+  for (const reply of [{ status: 507, body: { detail: FULL, code: 'out-of-storage' } }, { status: 507, body: { detail: FULL } }, { status: 503, body: { detail: FULL, code: 'out-of-storage' } }]) {
+    // A resend of the same request ID would meet the released reservation's 409.
+    let posts = 0;
+    const s = setup({
+      respond: () => ++posts === 1
+        ? Response.json(reply.body, { status: reply.status })
+        : Response.json({ detail: 'The previous upload stopped. Start the upload again.' }, { status: 409 }),
+    });
+    const started = Date.now();
+    await assert.rejects(s.lib.uploadToVision(new Blob(['x']), { title: 't' }), (e) => e.message === FULL && e.status === reply.status);
+    assert.equal(s.calls.length, 1);
+    assert.ok(Date.now() - started < 500);
+  }
+});
+
+test('a worker that cannot run full matches (503 full-match-unavailable) is answered after one request', async () => {
+  const NOT_SET_UP = 'Full-match analysis is not set up on this server yet. A 20-second test still works.';
+  const refuse = () => Response.json({ detail: NOT_SET_UP, code: 'full-match-unavailable' }, { status: 503 });
+  for (const run of [
+    (lib) => lib.uploadToVision(new Blob(['x']), { title: 't' }),
+    (lib) => lib.analyseYouTube('https://youtu.be/dQw4w9WgXcQ', {}),
+    (lib) => lib.rerunSavedVision('f'.repeat(32), 'full', 0, '1'.repeat(32)),
+  ]) {
+    const s = setup({ respond: refuse });
+    const started = Date.now();
+    await assert.rejects(run(s.lib), (e) => e.message === NOT_SET_UP && e.status === 503 && e.code === 'full-match-unavailable');
+    assert.equal(s.calls.length, 1);
+    assert.ok(Date.now() - started < 500);
+  }
+});
+
+test('a 503 without a code is still retried with the same request ID', async () => {
+  let posts = 0;
+  const s = setup({
+    respond: (url) => {
+      if (/\/jobs\?/.test(url) && ++posts === 1) return Response.json({ detail: 'Busy' }, { status: 503 });
+      if (/\/jobs\?/.test(url)) return Response.json({ id: 'f'.repeat(32), status: 'uploading', receivedBytes: 0 });
+      if (url.endsWith('/start')) return Response.json({ id: 'f'.repeat(32), status: 'processing' });
+      return Response.json({ received: 1 });
+    },
+  });
+  const job = await s.lib.uploadToVision(new Blob(['x']), { title: 't' });
+  assert.equal(job.status, 'processing');
+  const ids = s.calls.filter((c) => /\/jobs\?/.test(c.url)).map((c) => new URL(c.url, 'https://site.example').searchParams.get('requestId'));
+  assert.equal(ids.length, 2);
+  assert.equal(ids[0], ids[1]);
+});
+
 test('upload defaults: player load unless the ball model is asked for, football models when available', () => {
   const s = setup();
   const options = s.lib.defaultVisionOptions;

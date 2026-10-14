@@ -65,9 +65,18 @@ training is run by the site operator and the labels are saved for the next
 ball-model update; a training request from the site is refused with the same
 explanation.
 
+`VISION_MAX_TRAINING_PER_DAY` limits the runs started from the site (default
+`2` per 24 hours, `0` = no limit; each can hold a GPU for up to two hours).
+Only site-started runs count: an operator's run from a terminal does not, and
+a run that Modal refused before any GPU time is not counted. `GET /ops` (see
+docs/DEPLOY-VISION.md, Operator checks) shows how many were used.
+
 With Modal configured on the worker, training runs on a Modal GPU in its own
 app, so it never blocks an analysis (`VISION_MODAL_TRAIN_GPU`, default L4);
-otherwise on the worker itself (slow on CPU).
+otherwise on the worker itself (slow on CPU). A worker restart during training
+(a redeploy) stops the run: it then shows as failed ("The analysis server
+restarted during training. Start it again."), nothing is switched, and its
+training-set copies of frames are deleted.
 
 What happens:
 

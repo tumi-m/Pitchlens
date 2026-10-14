@@ -218,6 +218,10 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "TOKEN", "test-token")
     monkeypatch.setattr(server, "active", None)
     monkeypatch.setattr(server, "cancellations", {})
+    monkeypatch.setattr(server, "running", {})
+    monkeypatch.setattr(server, "stopping", False)
+    # A GPU error waits this long for a shutdown's cancellation (5 s in production).
+    monkeypatch.setattr(server, "GPU_ERROR_GRACE", 0)
     client = TestClient(server.app, raise_server_exceptions=False)
     client.headers["Authorization"] = "Bearer test-token"
     return server, client
@@ -707,6 +711,7 @@ def test_shutdown_during_analysis_is_interrupted_not_user_cancelled(service, mon
 
     monkeypatch.setattr(server, "run_video", run_video)
     monkeypatch.setattr(server, "stopping", False)
+    monkeypatch.setenv("VISION_SHUTDOWN_WAIT_SECONDS", "0")  # stop_jobs runs on the job's own thread here
     event = threading.Event()
     server.cancellations[job] = event
     server.work(directory, status, event)
@@ -3309,3 +3314,905 @@ def test_deleting_a_match_deletes_its_details(hosted):
     assert client.delete(f'/jobs/{job}', headers=mine).status_code == 200
     assert not directory.exists()
     assert client.post(f'/jobs/{job}/details', headers=mine, json={'names': ['A', 'B']}).status_code == 404
+
+
+# ── Redeploys: a shutdown is recorded before the process can exit ─────────
+import errno  # noqa: E402
+import gzip  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+_NO_HOSTING = (
+    "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "VISION_USE_MODAL", "RAILWAY_PUBLIC_DOMAIN", "VISION_PUBLIC_URL",
+    "RAILWAY_DEPLOYMENT_ID", "VISION_ALLOW_CPU_FALLBACK", "VISION_GPU_START_SECONDS",
+)
+
+
+@pytest.fixture
+def worker(service, monkeypatch, tmp_path):
+    """The service with fake weights and its real inference thread; not hosted, no GPU."""
+    server, client = service
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    monkeypatch.setenv("VISION_MODEL_PATH", str(model))
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(model))
+    for name in _NO_HOSTING:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(server, "gpu_errors", __import__("collections").deque(maxlen=5))
+    return server, client
+
+
+def _hosted_gpu(monkeypatch):
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-test")
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "worker.example")
+
+
+def _queued_job(server, job="6" * 32, owner=None, **extra):
+    """A saved upload handed to the inference thread (what begin() writes)."""
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "video").write_bytes(b"saved video")
+    status = {"id": job, "title": "Match", "status": "processing", "createdAt": time.time(), "profile": "general",
+              "ballSearch": "none", "video": {"duration": 60}, **extra}
+    if owner:
+        status["owner"] = owner
+    server.write_status(directory, status)
+    return directory, status
+
+
+def _start(server, directory, status):
+    event = threading.Event()
+    with server.lock:
+        server.active = status["id"]
+        server.cancellations[status["id"]] = event
+    thread = threading.Thread(target=server.work, args=(directory, status, event), daemon=True)
+    thread.start()
+    return event, thread
+
+
+def _until(predicate, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out")
+
+
+def _disk(directory):
+    return json.loads((directory / "status.json").read_text())
+
+
+def _slow_to_notice(after=None):
+    """run_video that sees the cancellation a second late (a long inference step)."""
+
+    def run_video(path, output, progress=None, cancelled=lambda: False, **kwargs):
+        while not cancelled():
+            time.sleep(0.01)
+        time.sleep(1)
+        if after:
+            after(progress)
+        raise InterruptedError("Analysis cancelled")
+
+    return run_video
+
+
+def test_a_redeploy_is_on_disk_before_the_job_thread_reacts(worker, monkeypatch):
+    server, client = worker
+    monkeypatch.setenv("VISION_SHUTDOWN_WAIT_SECONDS", "0")
+    monkeypatch.setattr(server, "run_video", _slow_to_notice())
+    directory, status = _queued_job(server)
+    _, thread = _start(server, directory, status)
+    _until(lambda: status["id"] in server.running and _disk(directory).get("stage") == "Opening video")
+    server.stop_jobs()
+    # The process may exit (uvicorn re-raises SIGTERM) or be killed right now.
+    saved = _disk(directory)
+    assert saved["status"] == "interrupted" and saved["interruptedBy"] == "shutdown"
+    thread.join(5)
+    assert not thread.is_alive() and _disk(directory)["interruptedBy"] == "shutdown"
+    monkeypatch.setattr(server, "pool", SimpleNamespace(submit=lambda *args: None))
+    retried = client.post(f"/jobs/{status['id']}/retry")
+    assert retried.status_code == 200, retried.text
+    assert _disk(directory).get("attempts", 1) == 1
+
+
+def test_progress_after_a_shutdown_does_not_overwrite_its_record(worker, monkeypatch):
+    server, _ = worker
+    monkeypatch.setenv("VISION_SHUTDOWN_WAIT_SECONDS", "0")
+    monkeypatch.setattr(server, "run_video", _slow_to_notice(after=lambda progress: progress(stage="x", progress=50)))
+    directory, status = _queued_job(server)
+    _, thread = _start(server, directory, status)
+    _until(lambda: status["id"] in server.running)
+    server.stop_jobs()
+    thread.join(5)
+    saved = _disk(directory)
+    assert (saved["status"], saved["interruptedBy"], saved["stage"]) == ("interrupted", "shutdown", server.RESTARTED)
+
+
+def test_an_error_caused_by_the_shutdown_is_not_a_failure(worker, monkeypatch):
+    server, _ = worker
+
+    def run_video(path, output, cancelled, **kwargs):
+        while not cancelled():
+            time.sleep(0.01)
+        raise RuntimeError("Connection reset by peer")
+
+    monkeypatch.setattr(server, "run_video", run_video)
+    directory, status = _queued_job(server)
+    event, thread = _start(server, directory, status)
+    _until(lambda: status["id"] in server.running)
+    monkeypatch.setattr(server, "stopping", True)  # stop_jobs has not recorded it yet
+    event.set()
+    thread.join(5)
+    saved = _disk(directory)
+    assert saved["status"] == "interrupted" and saved["interruptedBy"] == "shutdown"
+
+
+def test_a_gpu_error_during_a_redeploy_waits_for_the_cancellation(worker, monkeypatch):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    monkeypatch.setattr(server, "GPU_ERROR_GRACE", 2)
+
+    def cut(*args, **kwargs):  # uvicorn closed the GPU's video download at its graceful timeout
+        raise server.gpu.GPUUnavailable("Connection broken: IncompleteRead")
+
+    monkeypatch.setattr(server.gpu, "run_on_modal", cut)
+    directory, status = _queued_job(server)
+    event = threading.Event()
+
+    def shutdown():  # the lifespan shutdown, a moment later
+        server.stopping = True
+        event.set()
+
+    threading.Timer(0.5, shutdown).start()
+    server.work(directory, status, event)
+    saved = _disk(directory)
+    assert saved["status"] == "interrupted" and saved["interruptedBy"] == "shutdown"
+    # Without a shutdown it is the GPU's error, after the grace.
+    monkeypatch.setattr(server, "stopping", False)
+    directory, status = _queued_job(server, "7" * 32)
+    began = time.monotonic()
+    server.work(directory, status, threading.Event())
+    saved = _disk(directory)
+    assert saved["status"] == "failed" and saved["stage"].startswith("GPU is unavailable")
+    assert time.monotonic() - began >= 2
+
+
+def test_a_job_left_by_an_earlier_deployment_was_a_redeploy(worker, monkeypatch):
+    server, client = worker
+
+    def left(job, deployment):
+        directory = server.ROOT / job
+        directory.mkdir()
+        server.write_status(directory, {"id": job, "status": "processing", "createdAt": 0,
+                                        **({"deployment": deployment} if deployment else {})})
+        return directory
+
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "new")
+    old, same, unknown = left("1" * 32, "old"), left("2" * 32, "new"), left("3" * 32, None)
+    server.recover_after_restart()
+    assert _disk(old)["interruptedBy"] == "shutdown"  # killed before it could record it
+    assert "interruptedBy" not in _disk(same)  # a crash restart of the same deployment counts
+    assert "interruptedBy" not in _disk(unknown)
+    monkeypatch.delenv("RAILWAY_DEPLOYMENT_ID")
+    unset = left("4" * 32, "old")
+    server.recover_after_restart()
+    assert _disk(unset)["status"] == "interrupted" and "interruptedBy" not in _disk(unset)
+    assert "deployment" not in client.get(f"/jobs/{'1' * 32}").json()
+    # Every start records the deployment running it.
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "next")
+    monkeypatch.setattr(server, "pool", SimpleNamespace(submit=lambda *args: None))
+    (old / "video").write_bytes(b"saved")
+    server.write_status(old, {**_disk(old), "video": {"duration": 60}, "ballSearch": "none"})
+    assert client.post(f"/jobs/{'1' * 32}/retry").status_code == 200
+    assert _disk(old)["deployment"] == "next"
+    assert "deployment" not in client.get(f"/jobs/{'1' * 32}").json()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="signal handling is checked on Linux")
+def test_sigterm_to_a_worker_that_is_not_pid_1_records_the_shutdown(tmp_path):
+    import os
+    import signal
+    import socket
+    import subprocess
+    import urllib.request
+
+    backend = Path(__file__).resolve().parents[1]
+    with socket.socket() as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        port = probe_socket.getsockname()[1]
+    launcher = tmp_path / "launch.py"
+    launcher.write_text(
+        "import time\n"
+        "import uvicorn\n"
+        "from app.vision import server\n\n"
+        "def run_video(path, output, progress=None, cancelled=lambda: False, **kwargs):\n"
+        "    while not cancelled():\n"
+        "        time.sleep(0.01)\n"
+        "    time.sleep(1)\n"
+        "    raise InterruptedError('Analysis cancelled')\n\n"
+        "server.run_video = run_video\n"
+        f"uvicorn.run(server.app, host='127.0.0.1', port={port}, timeout_graceful_shutdown=20, log_level='warning')\n"
+    )
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    env = {k: v for k, v in os.environ.items() if k not in _NO_HOSTING}
+    env.update(VISION_DATA_DIR=str(tmp_path / "data"), VISION_SERVICE_TOKEN="test-token", VISION_MODEL_PATH=str(model),
+               VISION_BALL_MODEL_PATH=str(model), VISION_USE_MODAL="0", PYTHONPATH=str(backend), YOLO_OFFLINE="1")
+    with (tmp_path / "worker.log").open("wb") as log:
+        process = subprocess.Popen([sys.executable, str(launcher)], cwd=backend, env=env, stdout=log, stderr=log)
+    base = f"http://127.0.0.1:{port}"
+    auth = {"Authorization": "Bearer test-token"}
+
+    def call(path, data=None, headers=None):
+        request = urllib.request.Request(base + path, data=data, headers={**auth, **(headers or {})})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())
+
+    try:
+        for _ in range(600):
+            try:
+                call("/healthz")
+                break
+            except OSError:
+                assert process.poll() is None, (tmp_path / "worker.log").read_text()
+                time.sleep(0.1)
+        video = (backend / "tests" / "fixtures" / "vfr-30-15.mp4").read_bytes()
+        job = call("/jobs?search=none", data=video, headers={"Content-Type": "video/mp4"})["id"]
+        _until(lambda: call(f"/jobs/{job}")["stage"] == "Opening video", 30)
+        process.send_signal(signal.SIGTERM)
+        process.wait(60)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(10)
+    saved = json.loads((tmp_path / "data" / job / "status.json").read_text())
+    assert saved["status"] == "interrupted" and saved["interruptedBy"] == "shutdown", saved
+
+
+# ── A full volume never keeps the worker from starting ────────────────────
+def test_a_full_volume_does_not_stop_the_worker_from_starting(service, monkeypatch):
+    server, _ = service
+    done, stuck, upload = "1" * 32, "2" * 32, "3" * 32
+    for job, state in ((done, "completed"), (stuck, "processing"), (upload, "uploading")):
+        directory = server.ROOT / job
+        directory.mkdir()
+        (directory / "video").write_bytes(b"partial video")
+        server.write_status(directory, {"id": job, "status": state, "createdAt": 0})
+    (server.ROOT / done / "calibration-job.json").write_text(json.dumps({"state": "processing"}))
+    (server.ROOT / stuck / "status.tmp").write_text("{")
+    resumable = server.ROOT / ("5" * 32)  # a chunked upload a phone was sending
+    resumable.mkdir()
+    (resumable / "video").write_bytes(b"x" * 100)
+    server.write_status(resumable, {"id": "5" * 32, "status": "uploading", "createdAt": 0,
+                                    "expectedBytes": 1000, "receivedBytes": 90})
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(server, "write_status", full)
+    monkeypatch.setattr(server, "_write_json", full)
+    server.recover_after_restart()
+    server.recover_calibrations()
+    # Space is freed even though nothing could be recorded.
+    assert not (server.ROOT / stuck / "status.tmp").exists()
+    assert not (server.ROOT / upload / "video").exists()
+    # An upload whose progress could not be saved is never resumed (nor the worker reserved).
+    assert server.active is None and not (resumable / "video").exists()
+    with TestClient(server.app) as client:  # the startup handlers run again
+        assert client.get("/healthz").status_code == 200
+        client.headers["Authorization"] = "Bearer test-token"
+        assert client.get(f"/jobs/{stuck}").json()["status"] == "interrupted"
+
+
+def test_a_restart_during_a_youtube_download_deletes_the_partial_download(service):
+    server, _ = service
+    job = "4" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "download.f137.mp4.part").write_bytes(b"x" * 1024)
+    server.write_status(directory, {"id": job, "status": "uploading", "createdAt": 0})
+    server.recover_after_restart()
+    assert not list(directory.glob("download.*"))
+    assert _disk(directory)["status"] == "interrupted"
+    # Retention deletes one left by an older worker too.
+    (directory / "download.f137.mp4.part").write_bytes(b"x" * 1024)
+    server.expire_footage(directory, _disk(directory))
+    assert not list(directory.glob("download.*"))
+
+
+# ── GPU runs: Cancel, shutdown and start deadline while the GPU is silent ──
+class _FakeModal:
+    """app.vision.modal_app without Modal. app.run() records enter and exit and,
+    like Modal, refuses a second app.run() while one is running; the GPU sends
+    nothing until `gate` is set."""
+
+    def __init__(self, items=(), gate=False, error=None):
+        self.items, self.error = list(items), error
+        self.gate = threading.Event()
+        if not gate:
+            self.gate.set()
+        self.running, self.entered, self.exited = False, 0, 0
+        self.app = SimpleNamespace(run=self.run)
+        self.analyse = SimpleNamespace(remote_gen=self.remote_gen)
+
+    @contextmanager
+    def run(self):
+        if self.running:
+            raise RuntimeError("App is already running")
+        self.running = True
+        self.entered += 1
+        try:
+            yield
+        finally:
+            self.running = False
+            self.exited += 1
+
+    def remote_gen(self, *args):
+        self.gate.wait()
+        for item in self.items:
+            yield dict(item)
+        if self.error:
+            raise self.error
+
+
+RESULT = {"result_gz": gzip.compress(b'{"frames": []}')}
+
+
+def test_cancel_frees_the_worker_while_the_gpu_is_still_starting(worker, monkeypatch, tmp_path):
+    server, client = worker
+    _hosted_gpu(monkeypatch)
+    fake = _FakeModal([RESULT], gate=True)  # scheduling, cold start: nothing arrives
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+    owner = "c" * 32
+    directory, status = _queued_job(server, owner=owner)
+    _, thread = _start(server, directory, status)
+    _until(lambda: fake.running and _disk(directory).get("stage") == "Starting a GPU")
+    began = time.monotonic()
+    assert client.post(f"/jobs/{status['id']}/cancel", headers={"x-pitchlens-owner": owner}).json() == {"requested": True}
+    thread.join(2)
+    assert not thread.is_alive() and time.monotonic() - began < 2
+    assert _disk(directory)["status"] == "cancelled" and server.active is None
+    assert fake.exited == 1 and not fake.running  # the ephemeral app (and so the GPU) stopped
+    other = "d" * 32
+    reserved = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4", "x-pitchlens-owner": other})
+    assert reserved.status_code == 200, reserved.text
+    fake.gate.set()
+    server.gpu.run_on_modal("e" * 32, tmp_path / "result.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+    assert fake.entered == 2 and (tmp_path / "result.json").read_text() == '{"frames": []}'
+
+
+def test_a_gpu_that_never_arrives_gives_way(worker, monkeypatch):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    monkeypatch.setenv("VISION_GPU_START_SECONDS", "1")
+    fake = _FakeModal([RESULT], gate=True)
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+    cpu = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    directory, status = _queued_job(server, "1" * 32)
+    _, thread = _start(server, directory, status)
+    thread.join(10)
+    assert not thread.is_alive(), "the worker is still waiting for a GPU"
+    saved = _disk(directory)
+    assert saved["status"] == "failed" and saved["stage"].startswith("GPU is unavailable")
+    assert "No GPU became available in time" in saved["error"] and not cpu and not fake.running
+    assert server.active is None
+    # A section (a short test) runs on the CPU instead.
+    directory, status = _queued_job(server, "2" * 32, maxSeconds=20)
+    server.work(directory, status, threading.Event())
+    assert cpu == [1] and _disk(directory)["status"] == "completed" and _disk(directory)["engine"] == "cpu"
+    fake.gate.set()
+
+
+def test_an_engine_crash_on_the_gpu_is_not_rerun_on_the_cpu(worker, monkeypatch):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    crash = {"error": "KeyError: 'ballCandidates'", "user": False, "engine": True}
+    fake = _FakeModal([{"stage": "Detecting players", "progress": p} for p in (10, 50, 93)] + [crash])
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+    cpu = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    for job, extra in (("1" * 32, {"maxSeconds": 20}), ("2" * 32, {})):
+        directory, status = _queued_job(server, job, **extra)
+        server.work(directory, status, threading.Event())
+        saved = _disk(directory)
+        assert (saved["status"], saved["stage"]) == ("failed", "Vision processing failed. Check the worker log.")
+        assert "refusedBy" not in saved
+    assert not cpu
+
+
+def test_weights_the_gpu_cannot_copy_still_fall_back_to_the_cpu(worker, monkeypatch):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    fake = _FakeModal([{"stage": "GPU: preparing football models", "progress": 1},
+                       {"error": "Model unavailable on GPU: x", "user": False}])
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+    cpu = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    directory, status = _queued_job(server, maxSeconds=20)
+    server.work(directory, status, threading.Event())
+    assert cpu == [1] and _disk(directory)["status"] == "completed"
+
+
+def _full_volume_for(monkeypatch, name):
+    """Writing `name` fails halfway with ENOSPC."""
+    real = Path.write_bytes
+
+    def write_bytes(self, data):
+        if self.name == name:
+            real(self, data[: len(data) // 2])
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+
+
+def test_a_full_volume_after_a_gpu_run_is_not_the_gpus_fault(worker, monkeypatch, tmp_path):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    monkeypatch.setenv("VISION_ALLOW_CPU_FALLBACK", "1")
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", _FakeModal([RESULT]))
+    _full_volume_for(monkeypatch, "result.tmp")
+    with pytest.raises(OSError) as raised:
+        server.gpu.run_on_modal("e" * 32, tmp_path / "result.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+    assert raised.value.errno == errno.ENOSPC and not isinstance(raised.value, server.gpu.GPUUnavailable)
+    assert not (tmp_path / "result.tmp").exists()
+    cpu = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    directory, status = _queued_job(server)
+    server.work(directory, status, threading.Event())
+    saved = _disk(directory)
+    assert (saved["status"], saved["stage"]) == ("failed", server.OUT_OF_STORAGE)
+    assert not cpu and not (directory / "result.tmp").exists()
+
+
+def test_a_full_volume_during_a_cpu_analysis_leaves_no_partial_result(worker, monkeypatch):
+    server, client = worker
+
+    def run_video(path, output, **kwargs):
+        Path(output).with_suffix(".tmp").write_text('{"frames": [')
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(server, "run_video", run_video)
+    directory, status = _queued_job(server)
+    server.work(directory, status, threading.Event())
+    saved = _disk(directory)
+    assert (saved["status"], saved["stage"]) == ("failed", server.OUT_OF_STORAGE)
+    assert not (directory / "result.tmp").exists() and server.active is None
+    body = client.get(f"/jobs/{status['id']}").json()
+    assert body["retryable"] and "error" not in body
+
+
+def test_a_cut_gpu_stream_is_still_gpu_unavailable_and_a_cancel_still_cancels(worker, monkeypatch, tmp_path):
+    requests = pytest.importorskip("requests")
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    cut = requests.ConnectionError("Connection aborted.")
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", _FakeModal([{"stage": "fetching", "progress": 1}], error=cut))
+    with pytest.raises(server.gpu.GPUUnavailable, match="Connection aborted"):
+        server.gpu.run_on_modal("e" * 32, tmp_path / "result.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+
+    def cancelled_by_user(*args, **kwargs):
+        raise InterruptedError("Analysis cancelled")
+
+    monkeypatch.setattr(server, "run_video", cancelled_by_user)
+    monkeypatch.delenv("MODAL_TOKEN_ID")
+    monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN")
+    directory, status = _queued_job(server)
+    server.work(directory, status, threading.Event())
+    assert _disk(directory)["status"] == "cancelled"
+
+
+def test_progress_errors_and_leaving_the_app_keep_their_own_meaning(tmp_path, monkeypatch):
+    from app.vision import gpu
+
+    monkeypatch.setattr(gpu, "public_base", lambda: "https://worker.example")
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", _FakeModal([{"stage": "x", "progress": 5}, RESULT]))
+
+    def broken_progress(**kw):
+        raise KeyError("stage")
+
+    with pytest.raises(KeyError):
+        gpu.run_on_modal("e" * 32, tmp_path / "r.json", "tok", broken_progress, lambda: False, "general", 3)
+    refused = _FakeModal([RESULT])
+
+    @contextmanager
+    def no_auth():
+        raise RuntimeError("Token missing or invalid")
+        yield  # pragma: no cover
+
+    refused.app = SimpleNamespace(run=no_auth)
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", refused)
+    with pytest.raises(gpu.GPUUnavailable, match="Token missing"):
+        gpu.run_on_modal("e" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+    # A Cancel stays a Cancel even when stopping the app fails.
+    stuck = _FakeModal([RESULT], gate=True)
+
+    @contextmanager
+    def failing_exit():
+        try:
+            yield
+        finally:
+            raise RuntimeError("Could not stop the app")
+
+    stuck.app = SimpleNamespace(run=failing_exit)
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", stuck)
+    with pytest.raises(InterruptedError):
+        gpu.run_on_modal("e" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: True, "general", 3)
+    stuck.gate.set()
+
+
+def test_the_gpu_reports_progress_while_it_fetches_a_large_video(tmp_path, monkeypatch):
+    import http.server
+
+    pytest.importorskip("modal")
+    from app.vision import modal_app
+
+    chunk = 4 * 1024 * 1024
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(3 * chunk))
+            self.end_headers()
+            for n in range(3):
+                if n:
+                    time.sleep(1.1)
+                self.wfile.write(b"\0" * chunk)
+                self.wfile.flush()
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    model = tmp_path / "model"
+    model.write_bytes(b"fixture")
+    monkeypatch.setenv("VISION_MODEL_PATH", str(model))
+    monkeypatch.setenv("VISION_GPU_WORKDIR", str(tmp_path / "job"))
+
+    def run_video(video, output, **kwargs):
+        Path(output).write_text('{"frames": []}')
+
+    monkeypatch.setattr("app.vision.engine.run_video", run_video)
+    try:
+        items = []
+        for item in modal_app.analyse.local(f"http://127.0.0.1:{httpd.server_port}/jobs/x/video", "tok", "general", 3,
+                                            ball_search="none"):
+            items.append(item)
+            if "result_gz" in item:
+                break
+    finally:
+        httpd.shutdown()
+    fetching = [i for i in items if str(i.get("stage", "")).startswith("GPU: fetching the video (")]
+    assert len(fetching) >= 2 and "result_gz" in items[-1]
+    assert (tmp_path / "job" / "video").stat().st_size == 3 * chunk
+
+
+# ── A GPU refusal costs neither the daily cap nor a retry ──────────────────
+def _uploaded(server, client, submitted, owner):
+    data = FIXTURE.read_bytes()
+    headers = {"x-pitchlens-owner": owner}
+    job = client.post(f"/jobs?size={len(data)}&search=none", headers={"Content-Type": "video/mp4", **headers}).json()["id"]
+    assert client.put(f"/jobs/{job}/video?offset=0", content=data, headers=headers).status_code == 200
+    assert client.post(f"/jobs/{job}/start", headers=headers).status_code == 200
+    _drain(submitted)
+    return job, headers
+
+
+def _drain(submitted):
+    while submitted:  # what the inference thread does
+        fn, *args = submitted.pop(0)
+        fn(*args)
+
+
+def test_gpu_refusals_use_neither_the_daily_cap_nor_the_retries(hosted, monkeypatch):
+    server, client, submitted = hosted
+    _hosted_gpu(monkeypatch)
+    monkeypatch.setattr(server, "GPU_ERROR_GRACE", 0)
+    monkeypatch.setenv("VISION_MAX_JOBS_PER_DAY", "3")
+
+    def outage(*args, **kwargs):  # a bad token or a spend limit: no GPU second used
+        raise server.gpu.GPUUnavailable("Workspace billing cycle spend limit reached")
+
+    monkeypatch.setattr(server.gpu, "run_on_modal", outage)
+    ran = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: ran.append(1))
+    job, headers = _uploaded(server, client, submitted, "c" * 32)
+    for attempt in range(4):
+        body = client.get(f"/jobs/{job}", headers=headers).json()
+        assert body["status"] == "failed" and body["stage"].startswith("GPU is unavailable")
+        assert body["retryable"] and body.get("attempts", 1) == 1 and "countedAt" not in body
+        assert server._recent_starts(time.time()) == []
+        if attempt < 3:
+            assert client.post(f"/jobs/{job}/retry", headers=headers).status_code == 200
+            _drain(submitted)
+    assert not ran
+    monkeypatch.setattr(server.gpu, "run_on_modal", lambda *a, **k: None)
+    other = {"x-pitchlens-owner": "d" * 32}
+    assert client.post("/jobs?size=10", headers={"Content-Type": "video/mp4", **other}).status_code == 200
+
+
+def test_a_gpu_that_sent_progress_keeps_its_start_and_counts_the_attempt(hosted, monkeypatch):
+    server, client, submitted = hosted
+    _hosted_gpu(monkeypatch)
+    monkeypatch.setattr(server, "GPU_ERROR_GRACE", 0)
+
+    def dropped(job_id, output, token, progress, **kwargs):
+        progress(stage="GPU · fetching the video", progress=1)
+        raise server.gpu.GPUUnavailable("Connection lost")
+
+    monkeypatch.setattr(server.gpu, "run_on_modal", dropped)
+    job, headers = _uploaded(server, client, submitted, "c" * 32)
+    saved = _disk(server.ROOT / job)
+    assert saved["status"] == "failed" and "refusedBy" not in saved
+    assert len(server._recent_starts(time.time())) == 1
+    assert client.post(f"/jobs/{job}/retry", headers=headers).status_code == 200
+    assert _disk(server.ROOT / job)["attempts"] == 2
+
+
+def test_a_worker_without_a_gpu_gives_the_start_back(hosted, monkeypatch):
+    server, client, submitted = hosted
+    for name in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "worker.example")
+    # Accepted before the Modal tokens were removed (a redeploy keeps an upload in
+    # progress); POST /jobs refuses a new full match here (tested below).
+    monkeypatch.setattr(server, "full_match_ready", lambda: True)
+    job, headers = _uploaded(server, client, submitted, "c" * 32)
+    saved = _disk(server.ROOT / job)
+    assert saved["stage"].startswith("GPU processing is not configured") and saved["refusedBy"] == "config"
+    assert server._recent_starts(time.time()) == []
+    # A retry after a redeploy is a new run: it is counted once.
+    stopped = {k: v for k, v in saved.items() if k != "refusedBy"}
+    server.write_status(server.ROOT / job, {**stopped, "status": "interrupted", "interruptedBy": "shutdown"})
+    assert client.post(f"/jobs/{job}/retry", headers=headers).status_code == 200
+    assert len(server._recent_starts(time.time())) == 1
+
+
+# ── A worker that cannot run full matches says so before the upload ───────
+FULL_MATCH_UNAVAILABLE = {
+    "detail": "Full-match analysis is not set up on this server yet. A 20-second test still works.",
+    "code": "full-match-unavailable",
+}
+
+
+def _cpu_only_host(monkeypatch):
+    """A Railway worker set up as DEPLOY-VISION.md section 1 alone: no Modal tokens."""
+    for name in (*_NO_HOSTING, "VISION_DEVICE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "worker.example")
+
+
+def test_a_worker_that_cannot_run_full_matches_refuses_them_before_the_upload(hosted, monkeypatch):
+    import re
+
+    server, client, submitted = hosted
+    _cpu_only_host(monkeypatch)
+    assert client.get("/health").json()["fullMatch"] is False
+    owner = "c" * 32
+    headers = {"Content-Type": "video/mp4", "x-pitchlens-owner": owner}
+    for url in (f"/jobs?size=14932048&diagnostic=false&requestId={'1' * 32}&owner={owner}", "/jobs?diagnostic=false"):
+        refused = client.post(url, headers=headers, content=b"video bytes")
+        assert (refused.status_code, refused.json()) == (503, FULL_MATCH_UNAVAILABLE)
+    youtube = client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ", headers=headers)
+    assert (youtube.status_code, youtube.json()) == (503, FULL_MATCH_UNAVAILABLE)
+    # No match, no reservation, no start counted.
+    assert not [p for p in server.ROOT.iterdir() if re.fullmatch(r"[a-f0-9]{32}", p.name)]
+    starts = server.ROOT / server.STARTS
+    assert not starts.exists() or json.loads(starts.read_text()) == []
+    assert server.active is None and not submitted
+    # A stopped full match is not retried, nor a saved match re-analysed in full.
+    full = "4" * 32
+    _stopped_job(server, full, 1, owner=owner, status="failed")
+    retried = client.post(f"/jobs/{full}/retry", headers=headers)
+    assert (retried.status_code, retried.json()) == (503, FULL_MATCH_UNAVAILABLE)
+    assert _disk(server.ROOT / full)["status"] == "failed"
+    source = "a" * 32
+    _rerun_chain_job(server, source, time.time())
+    rerun = client.post(f"/jobs/{source}/rerun?mode=full&start=0&requestId={'2' * 32}", headers=headers)
+    assert (rerun.status_code, rerun.json()) == (503, FULL_MATCH_UNAVAILABLE)
+    assert sorted(p.name for p in server.ROOT.iterdir() if re.fullmatch(r"[a-f0-9]{32}", p.name)) == [full, source]
+    assert server._recent_starts(time.time()) == [] and server.active is None and not submitted
+    # A 20-second test still runs here (on the CPU).
+    test = client.post(f"/jobs?size=10&diagnostic=true&owner={owner}", headers=headers)
+    assert test.status_code == 200 and server.active == test.json()["id"]
+
+
+def test_full_matches_are_ready_with_a_gpu_or_the_operators_cpu_choice(worker, monkeypatch):
+    server, client = worker
+    monkeypatch.delenv("VISION_DEVICE", raising=False)
+    assert client.get("/health").json()["fullMatch"] is True  # a local worker
+    for setting in (_hosted_gpu, lambda m: m.setenv("VISION_ALLOW_CPU_FALLBACK", "1"), lambda m: m.setenv("VISION_DEVICE", "cuda")):
+        with monkeypatch.context() as m:
+            _cpu_only_host(m)
+            setting(m)
+            assert client.get("/health").json()["fullMatch"] is True
+
+
+def test_a_self_hosted_cuda_worker_with_a_public_url_runs_full_matches(worker, monkeypatch):
+    server, client = worker
+    monkeypatch.setenv("VISION_DEVICE", "cuda")
+    monkeypatch.setenv("VISION_PUBLIC_URL", "https://gpu-box.example")
+
+    def run_video(path, output, **kwargs):
+        Path(output).write_text('{"frames": []}')
+
+    monkeypatch.setattr(server, "run_video", run_video)
+    directory, status = _queued_job(server)
+    server.work(directory, status, threading.Event())
+    saved = _disk(directory)
+    assert saved["status"] == "completed" and "refusedBy" not in saved
+    assert client.get("/health").json()["fullMatch"] is True
+
+
+# ── Out of storage: refused before a match is created ─────────────────────
+def test_out_of_storage_is_refused_before_a_match_is_created(hosted, monkeypatch):
+    import re
+
+    server, client, _ = hosted
+    free = {"bytes": 100 * 2**20}
+    monkeypatch.setattr(server.shutil, "disk_usage",
+                        lambda path: SimpleNamespace(total=5 * 2**30, used=5 * 2**30 - free["bytes"], free=free["bytes"]))
+    owner = "c" * 32
+    headers = {"Content-Type": "video/mp4", "x-pitchlens-owner": owner}
+    url = f"/jobs?size=1000&requestId={'1' * 32}&owner={owner}"
+    for _ in range(2):  # the browser resends with the same request ID
+        refused = client.post(url, headers=headers)
+        assert refused.status_code == 507
+        assert refused.json() == {"detail": "The analysis server is out of storage. Try again later.", "code": "out-of-storage"}
+    assert not [p for p in server.ROOT.iterdir() if re.fullmatch(r"[a-f0-9]{32}", p.name)]
+    assert client.get("/jobs").json() == [] and server.active is None
+    assert client.post("/jobs/from-url?url=https://youtu.be/dQw4w9WgXcQ").json()["code"] == "out-of-storage"
+    # The browser resuming its own reservation is never refused for the space its upload uses.
+    free["bytes"] = 5 * 2**30
+    resumable = f"/jobs?size=1000&requestId={'2' * 32}&owner={owner}"
+    job = client.post(resumable, headers=headers).json()["id"]
+    assert client.put(f"/jobs/{job}/video?offset=0", content=b"x" * 500, headers=headers).status_code == 200
+    free["bytes"] = 2**20
+    resumed = client.post(resumable, headers=headers)
+    assert resumed.status_code == 200 and resumed.json()["id"] == job
+
+
+# ── DELETE never stalls the event loop behind another match's analytics ───
+def test_delete_waits_for_analytics_without_holding_the_job_lock(hosted):
+    server, client, _ = hosted
+    other = "a" * 32
+    directory = server.ROOT / other
+    directory.mkdir()
+    server.write_status(directory, {"id": other, "status": "completed", "createdAt": 0})
+    upload = client.post("/jobs?size=20", headers={"Content-Type": "video/mp4"}).json()["id"]
+    held, release = threading.Event(), threading.Event()
+
+    def analytics():  # the first report view of a 90-minute match
+        with server.post_lock:
+            held.set()
+            release.wait(10)
+
+    threading.Thread(target=analytics, daemon=True).start()
+    held.wait(5)
+    answer = {}
+    deleting = threading.Thread(target=lambda: answer.update(r=client.delete(f"/jobs/{other}")), daemon=True)
+    deleting.start()
+    time.sleep(0.3)
+    try:
+        assert deleting.is_alive()
+        assert server.lock.acquire(timeout=0.5)
+        server.lock.release()
+        began = time.monotonic()
+        assert client.put(f"/jobs/{upload}/video?offset=0", content=b"0123456789").status_code == 200
+        assert time.monotonic() - began < 1
+    finally:
+        release.set()
+    deleting.join(5)
+    assert answer["r"].status_code == 200 and not directory.exists()
+    assert client.delete(f"/jobs/{upload}").status_code == 409
+
+
+def test_the_analysis_opens_when_only_its_cache_cannot_be_saved(service, monkeypatch):
+    server, client = service
+    job = "a" * 32
+    directory = server.ROOT / job
+    directory.mkdir()
+    (directory / "result.json").write_text('{"frames": []}')
+    server.write_status(directory, {"id": job, "status": "completed", "createdAt": 0})
+    monkeypatch.setattr("app.vision.analytics.prepare", lambda result, calibration, direction: {"base": True})
+    monkeypatch.setattr("app.vision.analytics.finish", lambda base, review: {"stats": {"possession": None}})
+    real = server._write_json
+
+    def full(path, data):
+        if path.name == "analysis.json":
+            path.with_suffix(".tmp").write_text("{")
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(path, data)
+
+    monkeypatch.setattr(server, "_write_json", full)
+    response = client.get(f"/jobs/{job}/analysis")
+    assert response.status_code == 200 and response.json()["stats"] == {"possession": None}
+    assert not (directory / "analysis.tmp").exists()
+
+
+# ── Operator view and logs ─────────────────────────────────────────────────
+@contextmanager
+def _ops_records(caplog):
+    from app.vision import server
+
+    server.ops_log.addHandler(caplog.handler)
+    try:
+        yield lambda: [r for r in caplog.records if r.name == "pitchlens"]
+    finally:
+        server.ops_log.removeHandler(caplog.handler)
+
+
+def test_the_operator_view_needs_the_token_and_reveals_no_owner_keys(worker, monkeypatch):
+    server, client = worker
+    _hosted_gpu(monkeypatch)
+    assert client.get("/ops", headers={"Authorization": ""}).status_code == 401
+
+    def outage(*args, **kwargs):
+        raise server.gpu.GPUUnavailable("Workspace spend limit reached")
+
+    monkeypatch.setattr(server.gpu, "run_on_modal", outage)
+    owner = "c" * 32
+    directory, status = _queued_job(server, owner=owner, uploadRequestId="1" * 32, uploadRequestDigest="f" * 64)
+    server.work(directory, status, threading.Event())
+    body = client.get("/ops").json()
+    assert set(body) == {"active", "dailyStarts", "trainingStarts", "training", "storage", "jobs", "gpu",
+                         "recentProblems", "release"}
+    assert body["active"] is None and body["jobs"] == 1 and body["dailyStarts"]["cap"] == 30
+    assert set(body["storage"]) == {"freeBytes", "totalBytes", "low"}
+    assert body["gpu"]["enabled"] and body["gpu"]["publicUrl"]
+    assert body["gpu"]["recentErrors"][-1]["job"] == status["id"]
+    assert "spend limit" in body["gpu"]["recentErrors"][-1]["error"]
+    problem = body["recentProblems"][0]
+    assert problem["id"] == status["id"] and problem["refusedBy"] == "gpu"
+    assert "GPUUnavailable: Workspace spend limit reached" == problem["error"]
+    text = json.dumps(body)
+    assert owner not in text and "1" * 32 not in text and "f" * 64 not in text
+    mine = {"x-pitchlens-owner": owner}
+    for entry in (client.get(f"/jobs/{status['id']}", headers=mine).json(), *client.get("/jobs", headers=mine).json()):
+        assert not {"error", "owner", "uploadRequestId", "uploadRequestDigest", "countedAt"} & set(entry)
+
+
+def test_a_low_volume_is_shown_and_logged(worker, monkeypatch, caplog):
+    server, client = worker
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda path: SimpleNamespace(total=5 * 2**30, used=5 * 2**30, free=8 * 2**20))
+    assert client.get("/ops").json()["storage"]["low"] is True
+    with _ops_records(caplog) as records:
+        server.start_volume_watch()
+        low = [r for r in records() if r.levelno == logging.WARNING]
+    assert len(low) == 1 and low[0].getMessage() == "Volume low: 8 MB free of 5120 MB"
+
+
+def test_each_job_logs_one_line_when_it_ends_without_owner_keys(worker, monkeypatch, caplog):
+    server, _ = worker
+    monkeypatch.setattr(server, "run_video", lambda path, output, **kw: Path(output).write_text("{}"))
+    owner = "c" * 32
+    directory, status = _queued_job(server, owner=owner)
+    with _ops_records(caplog) as records:
+        server.work(directory, status, threading.Event())
+        lines = [r.getMessage() for r in records()]
+    done = [line for line in lines if "event=completed" in line]
+    assert len(done) == 1 and f"job={status['id']}" in done[0] and "engine=cpu" in done[0]
+    assert any("event=start" in line for line in lines) and not any(owner in line for line in lines)
+
+
+def test_owner_keys_never_reach_the_access_log():
+    from app.vision import server
+
+    access = logging.getLogger("uvicorn.access")
+    redact = next(f for f in access.filters if isinstance(f, server.RedactOwnerKeys))
+    key = "0123456789abcdef0123456789abcdef"
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("1.2.3.4:5", "GET", f"/jobs?owner={key}&x=1", "1.1", 200), None)
+    assert redact.filter(record)
+    assert "owner=[redacted]&x=1" in record.getMessage() and key not in record.getMessage()
+    odd = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s", (f"owner={key}",), None)
+    assert redact.filter(odd) and odd.args == (f"owner={key}",)

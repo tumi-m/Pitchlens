@@ -16,8 +16,14 @@ import modal
 
 BACKEND = Path(__file__).resolve().parents[2]
 GPU = os.getenv("VISION_MODAL_GPU", "L4")
+# Files copied into the image. A missing one fails only when a GPU run starts
+# (tests/test_modal_image.py checks them).
+LOCAL_FILES = [
+    (BACKEND / "scripts" / "setup_vision.py", "/root/scripts/setup_vision.py"),
+    (BACKEND / "scripts" / "setup_football.py", "/root/scripts/setup_football.py"),
+]
 
-image = (
+_base = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "torch==2.14.0",
@@ -35,13 +41,11 @@ image = (
         "pip uninstall -y opencv-python",
         "pip install --no-deps opencv-python-headless==4.10.0.84",
     )
-    .add_local_file(
-        BACKEND / "scripts" / "setup_vision.py", "/root/scripts/setup_vision.py", copy=True
-    )
-    .add_local_file(
-        BACKEND / "scripts" / "setup_football.py", "/root/scripts/setup_football.py", copy=True
-    )
-    .run_commands(
+)
+for _source, _target in LOCAL_FILES:
+    _base = _base.add_local_file(_source, _target, copy=True)
+image = (
+    _base.run_commands(
         "python /root/scripts/setup_vision.py",
         # Football-trained player + ball models (optional: Drive may refuse).
         "python /root/scripts/setup_football.py || echo 'football models unavailable'",
@@ -80,6 +84,7 @@ def analyse(
     import gzip
     import queue
     import threading
+    import time
 
     import requests
 
@@ -94,28 +99,35 @@ def analyse(
             return
         os.environ["VISION_BALL_WEIGHTS"] = f"/root/models/{ball_weights}"
 
+    # Every yield lets the worker check Cancel and shutdown (it reads between items).
     missing = missing_models(profile, ball_search)
     if missing:
-        yield {"stage": "GPU: preparing football models", "progress": 1}
         base = video_url.split("/jobs/")[0]
         try:
             for path in missing:
+                yield {"stage": "GPU: preparing football models", "progress": 1}
                 ensure_model(path, base, token)
         except Exception as exc:
             yield {"error": f"Model unavailable on GPU: {exc}", "user": False}
             return
 
-    workdir = Path("/tmp/job")
-    workdir.mkdir(exist_ok=True)
+    # VISION_GPU_WORKDIR: tests run this function locally.
+    workdir = Path(os.getenv("VISION_GPU_WORKDIR", "/tmp/job"))
+    workdir.mkdir(parents=True, exist_ok=True)
     video = workdir / "video"
     yield {"stage": "GPU: fetching the video", "progress": 1}
     with requests.get(
         video_url, headers={"Authorization": f"Bearer {token}", "x-pitchlens-video-grant": video_grant}, stream=True, timeout=120
     ) as response:
         response.raise_for_status()
+        received, said = 0, None
         with video.open("wb") as f:
             for chunk in response.iter_content(4 * 1024 * 1024):
                 f.write(chunk)
+                received += len(chunk)
+                if said is None or time.monotonic() - said >= 1:  # at most once a second
+                    said = time.monotonic()
+                    yield {"stage": f"GPU: fetching the video ({received // (1024 * 1024)} MB)", "progress": 1}
 
     updates = queue.Queue()
     outcome = {}
@@ -137,8 +149,9 @@ def analyse(
         except ValueError as exc:  # footage problem, shown to the user as-is
             outcome["error"] = str(exc)
             outcome["user"] = True
-        except Exception as exc:  # reported to the worker, which marks the job failed
+        except Exception as exc:  # an engine crash: the worker fails the job (no CPU re-run)
             outcome["error"] = f"{type(exc).__name__}: {exc}"
+            outcome["engine"] = True
         finally:
             updates.put(None)
 
@@ -146,7 +159,7 @@ def analyse(
     while (update := updates.get()) is not None:
         yield update
     if "error" in outcome:
-        yield {"error": outcome["error"], "user": outcome.get("user", False)}
+        yield {"error": outcome["error"], "user": outcome.get("user", False), "engine": outcome.get("engine", False)}
         return
     yield {"result_gz": gzip.compress((workdir / "result.json").read_bytes())}
 
