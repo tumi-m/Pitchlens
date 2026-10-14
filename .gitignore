@@ -17,3 +17,6 @@ backend/.vision/
 backend/.ultralytics/
 backend/.vision-env/
 backend/models/*.onnx
+
+# Model weights downloaded automatically by ultralytics (e.g. its AMP check)
+/weights/
