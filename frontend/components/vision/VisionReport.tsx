@@ -9,7 +9,11 @@ import {
   VisionError,
   clockTime,
   rerunSavedVision,
+  isMatchDeleted,
+  visionErrorMessage,
 } from "@/lib/review/vision";
+import { analysedFrameTime, frameIndexAt, nearestFrame, seekTarget } from "@/lib/review/frames";
+import { buildReportExport } from "@/lib/review/reportExport";
 import { MatchCentre } from "@/components/vision/MatchCentre";
 import { AnalysisWait } from "@/components/vision/AnalysisWait";
 import { matchStats } from "@/lib/review/visionStats";
@@ -38,7 +42,11 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [retrying, setRetrying] = useState(false);
   const [rerunning, setRerunning] = useState(false);
   const [testStart, setTestStart] = useState(0);
+  /** Run the ball model on the next saved-footage run (null: as this job did). */
+  const [ballChoice, setBallChoice] = useState<boolean | null>(null);
   const rerunRequest = useRef<{ key: string; id: string } | null>(null);
+  /** This report has team names of its own (typed here); otherwise a rerun may borrow its source's. */
+  const ownNames = useRef(false);
   const [time, setTime] = useState(0);
   const [overlay, setOverlay] = useState(true);
   const [names, setNames] = useState(["Kit A", "Kit B"]);
@@ -53,9 +61,12 @@ export function VisionReport({ jobId }: { jobId: string }) {
   const [showLines, setShowLines] = useState(true);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [labelling, setLabelling] = useState(false);
+  /** The worker no longer has this match (deleted in another tab, for example). */
+  const [deleted, setDeleted] = useState(false);
   const clipEnd = useRef<number | null>(null);
   const reviewRef = useRef<HTMLDivElement>(null);
   const calibrationRef = useRef<HTMLDivElement>(null);
+  const videoBox = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let stopped = false;
     let loaded = false;
@@ -78,7 +89,9 @@ export function VisionReport({ jobId }: { jobId: string }) {
           if (stopped) return;
           setResult(data);
           setTime(data.analysedStart ?? 0);
-          setTestStart(Math.floor(data.analysedStart ?? 0));
+          // Offer the footage after this section: the same section again would repeat this run.
+          const after = Math.floor((data.analysedStart ?? 0) + data.analysedDuration);
+          setTestStart(after < Math.ceil(data.video.duration) - 1 ? after : 0);
           loaded = true;
         }
       } catch (e) {
@@ -103,8 +116,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
         Array.isArray(saved) &&
         saved.length === 2 &&
         saved.every((x) => typeof x === "string")
-      )
+      ) {
+        ownNames.current = true;
         setNames(saved);
+      }
     } catch {}
     return () => {
       stopped = true;
@@ -112,19 +127,59 @@ export function VisionReport({ jobId }: { jobId: string }) {
       clearTimeout(timer);
     };
   }, [jobId]);
-  async function rerun(mode: "section" | "full") {
+  const matchGone = useCallback(() => {
+    setDeleted(true);
+    setError("");
+    setCalibrating(false);
+    setReviewOpen(false);
+    setLabelling(false);
+  }, []);
+  // A rerun keeps Kit A / Kit B in its source's order (teamsAlignedTo): its names apply too.
+  const sourceJobId = job?.sourceJobId;
+  useEffect(() => {
+    if (ownNames.current || !sourceJobId || result?.teamsAlignedTo !== sourceJobId) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem(`vision-names-${sourceJobId}`) || "null");
+      if (Array.isArray(saved) && saved.length === 2 && saved.every((x) => typeof x === "string")) setNames(saved);
+    } catch {}
+  }, [result, sourceJobId]);
+  async function rerun(mode: "section" | "full", withBall?: boolean) {
     const start = mode === "full" ? 0 : testStart;
-    const key = `${jobId}:${mode}:${start}`;
+    // The ball model as chosen; unchanged from this job means the worker copies its settings.
+    const usedBall = result?.ballSearch !== "none";
+    const wanted = withBall ?? ballChoice ?? usedBall;
+    const search = wanted === usedBall ? undefined : wanted ? "exhaustive" : "none";
+    const key = `${jobId}:${mode}:${start}:${search ?? "same"}`;
     if (rerunRequest.current?.key !== key) rerunRequest.current = { key, id: crypto.randomUUID() };
     setRerunning(true);
     setError("");
     try {
-      const next = await rerunSavedVision(jobId, mode, start, rerunRequest.current.id);
+      const next = await rerunSavedVision(jobId, mode, start, rerunRequest.current.id, search);
       window.location.assign(`/vision/${next.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to analyse saved footage");
+      if (isMatchDeleted(e)) matchGone();
+      else setError(visionErrorMessage(e, "Unable to analyse saved footage"));
       setRerunning(false);
     }
+  }
+  /** A video that will not play may be gone rather than unsupported: ask the worker first. */
+  async function videoFailed() {
+    if (job?.videoDeleted || deleted) return;
+    try {
+      const next = await visionJson<VisionJob>(`jobs/${jobId}`);
+      if (next.videoDeleted) {
+        // Retention removed it since this page loaded: show the notice, hide what needs the video.
+        setJob(next);
+        setCalibrating(false);
+        setLabelling(false);
+        return;
+      }
+    } catch (e) {
+      if (isMatchDeleted(e)) matchGone();
+      else setError("The video could not be loaded. Check your connection and reload the page.");
+      return;
+    }
+    setError("Video playback failed. This browser may not support its codec. Use H.264 MP4.");
   }
   const loadAnalytics = useCallback(async () => {
     try {
@@ -189,17 +244,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
     };
   }, [result]);
   // Binary lookup keeps playback cheap even for a full-length match.
-  const frameIndex = useMemo(() => {
-    if (!result || !result.frames.length) return -1;
-    let l = 0,
-      r = result.frames.length - 1;
-    while (l < r) {
-      const m = Math.ceil((l + r) / 2);
-      if (result.frames[m].t <= time) l = m;
-      else r = m - 1;
-    }
-    return Math.abs(result.frames[l].t - time) <= (1 / result.sampleFps) * 1.5 ? l : -1;
-  }, [result, time]);
+  const frameIndex = useMemo(
+    () => (result ? frameIndexAt(result.frames, time, result.video.fps, result.sampleFps) : -1),
+    [result, time],
+  );
   const frame = frameIndex >= 0 && result ? result.frames[frameIndex] : null;
   // Drawn boxes glide between analysed frames; the status line and the ball stay on the held frame.
   const maps = useMemo(() => (result ? playerMaps(result.frames) : null), [result]);
@@ -207,6 +255,9 @@ export function VisionReport({ jobId }: { jobId: string }) {
     () => (result && maps && frameIndex >= 0 ? overlayAt(result.frames, frameIndex, time, result.sampleFps, maps) : null),
     [result, maps, frameIndex, time],
   );
+  // Pitch setup is anchored to the analysed frame on screen: send its stored time,
+  // not the decoder's (which can differ by a fraction of a millisecond).
+  const calibrationTime = result ? analysedFrameTime(result.frames, time, result.video.fps) ?? time : time;
   // Painted pitch lines projected through this frame's calibration (a live check of its accuracy).
   const projectedLines = useMemo(() => {
     if (!showLines || calibrating || !calibration || calibration.state !== "ready" || !calibration.template || frameIndex < 0) return null;
@@ -227,10 +278,12 @@ export function VisionReport({ jobId }: { jobId: string }) {
   // Where the page itself last moved the video: any other seek is the viewer's.
   const ownSeekTo = useRef<number | null>(null);
   const moveVideo = useCallback((video: HTMLVideoElement, t: number, play = false) => {
-    ownSeekTo.current = t;
+    // 1 ms past a stored (rounded) frame time, so the analysed frame itself is shown.
+    const target = seekTarget(t);
+    ownSeekTo.current = target;
     // readyState 0 (HAVE_NOTHING): no metadata yet.
     pendingSeek.current = video.readyState < 1 ? { t, play } : null;
-    video.currentTime = t;
+    video.currentTime = target;
   }, []);
   function seek(t: number) {
     if (player.current) {
@@ -316,25 +369,52 @@ export function VisionReport({ jobId }: { jobId: string }) {
     moveVideo(v, t);
     setTime(t);
   }
+  /** Bring a panel into view. On a phone the video is pinned under the header while
+   *  pitch setup or review is open, so its controls go just below the video. */
+  const reveal = (panel: HTMLElement | null) => {
+    if (!panel) return;
+    const pinned = videoBox.current;
+    if (!pinned || window.matchMedia("(min-width: 1024px)").matches) {
+      panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    const target = panel.querySelector("[data-reveal]") ?? panel;
+    const below = 64 + pinned.getBoundingClientRect().height + 12;
+    window.scrollTo({ top: target.getBoundingClientRect().top + window.scrollY - below, behavior: "smooth" });
+  };
   const startCalibration = () => {
+    // Pitch setup is clicked on the video: nothing to click once the footage is gone.
+    if (job?.videoDeleted || deleted) return;
     // One setup at a time: while one runs the panel shows its progress instead.
     if (setupRunning) {
-      calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      reveal(calibrationRef.current);
       return;
     }
     setCalibrating(true);
     // Adjusting a saved setup returns to the frame it was clicked on.
     const savedAt = calibration?.request?.t;
     if (result && result.frames.length) snapTo(result.frames[nearestFrame(result.frames, savedAt ?? time)].t);
-    calibrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setTimeout(() => reveal(calibrationRef.current), 50);
   };
   const openReview = () => {
     stopReel();
     // One panel with keyboard shortcuts at a time (both use Enter and arrows).
     setLabelling(false);
     setReviewOpen(true);
-    setTimeout(() => reviewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+    setTimeout(() => reveal(reviewRef.current), 50);
   };
+  function exportReport() {
+    if (!result || !analysis) return;
+    const report = buildReportExport({ jobId, title: job?.title ?? "", names, result, analysis });
+    const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `pitchlens-report-${jobId}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
   function rename(index: number, value: string) {
     const next = [...names];
     next[index] = value;
@@ -347,6 +427,21 @@ export function VisionReport({ jobId }: { jobId: string }) {
   }
   const colour = (team: number) => result?.teams[team]?.colour || "#cbd5e1";
   const stats = useMemo(() => (result ? matchStats(result) : null), [result]);
+  const footage = !job?.videoDeleted && !deleted;
+  // On a phone the video stays on screen while pitch setup clicks on it or review plays clips in it.
+  const pinVideo = footage && (calibrating || reviewOpen);
+  const perf = result?.performance;
+  // What the analysed span is: a requested test section, or a file that ends early.
+  const spanNote = (() => {
+    if (!result) return null;
+    const start = result.analysedStart ?? 0;
+    const end = clockTime(start + result.analysedDuration);
+    if ((job?.maxSeconds || start > 0) && result.analysedDuration < result.video.duration - 0.5)
+      return `Diagnostic section: ${clockTime(start)}–${end}. These results do not describe the full match.`;
+    if (!job?.maxSeconds && result.analysedDuration < 0.97 * result.video.duration)
+      return `The file ends at ${end} of a declared ${clockTime(result.video.duration)}; it may be incomplete. Re-export or re-upload it.`;
+    return null;
+  })();
   return (
     <>
       <Navbar />
@@ -370,23 +465,39 @@ export function VisionReport({ jobId }: { jobId: string }) {
               </p>
             </div>
             {result && (
-              <a
-                className="pitch-button-secondary self-start"
-                href={`/api/vision/jobs/${jobId}/result`}
-                download
-              >
-                Export detection data
-              </a>
+              <div className="flex flex-col items-start gap-2 self-start">
+                {analysis && (
+                  <button className="pitch-button-secondary" onClick={exportReport}>
+                    Export report
+                  </button>
+                )}
+                <a
+                  className={analysis ? "text-xs text-pitch-muted underline" : "pitch-button-secondary"}
+                  href={`/api/vision/jobs/${jobId}/result`}
+                  download
+                >
+                  Export detection data
+                </a>
+              </div>
             )}
           </header>
-          {result?.performance && <div className="glass-card p-4 text-sm space-y-2">
-            <p data-testid="processing-times">{processingTimes(result)}</p>
-            {typeof result.performance.totalSeconds === "number" && result.analysedDuration > 0 && (
-              <p>{(result.performance.totalSeconds / result.analysedDuration).toFixed(1)} seconds processing per second of footage. Full matches may take a different amount of time.</p>
-            )}
-            {result.analysedDuration < result.video.duration - .5 && <p className="text-amber-200">Diagnostic section: {clockTime(result.analysedStart ?? 0)}–{clockTime((result.analysedStart ?? 0) + result.analysedDuration)}. These results do not describe the full match.</p>}
+          {deleted && (
+            <section role="alert" className="glass-card border-red-400/40 p-5 space-y-2">
+              <h2 className="font-semibold">This match was deleted</h2>
+              <p className="text-sm text-pitch-muted">
+                It is no longer on the analysis server, so it cannot be reviewed, replayed or analysed again.
+              </p>
+              <Link href="/dashboard" className="pitch-button-secondary">
+                Back to your matches
+              </Link>
+            </section>
+          )}
+          {result && (perf || spanNote) && <div className="glass-card p-4 text-sm space-y-2">
+            {perf && <p data-testid="processing-times">{processingTimes(result)}</p>}
+            {perf && typeof perf.totalSeconds === "number" && result.analysedDuration > 0 && <p>{(perf.totalSeconds / result.analysedDuration).toFixed(1)} seconds processing per second of footage. Full matches may take a different amount of time.</p>}
+            {spanNote && <p className="text-amber-200">{spanNote}</p>}
           </div>}
-          {result && !job?.videoDeleted && (
+          {result && footage && (
             <section className="glass-card p-4 space-y-3" aria-label="Analyse saved footage">
               <p className="text-sm text-pitch-muted">Test a section with visible play or analyse the full match. Your saved video is reused; this report stays available.</p>
               <div className="flex flex-wrap items-center gap-3">
@@ -404,6 +515,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
                 <button className="pitch-button-primary text-sm" disabled={rerunning} onClick={() => rerun("full")}>Analyse full match</button>
                 {rerunning && <span role="status" className="text-sm">Starting from saved footage…</span>}
               </div>
+              <label className="flex gap-2 text-sm">
+                <input type="checkbox" disabled={rerunning} checked={ballChoice ?? result.ballSearch !== "none"} onChange={(e) => setBallChoice(e.target.checked)} />
+                Run the ball model (possession, passes, shots)
+              </label>
             </section>
           )}
           {error && (
@@ -421,17 +536,25 @@ export function VisionReport({ jobId }: { jobId: string }) {
               }
             />
           )}
-          {job && ["failed", "interrupted", "cancelled"].includes(job.status) && !job.videoDeleted && (
-            <button className="pitch-button-primary" disabled={retrying} onClick={async () => {
-              setRetrying(true);
-              try {
-                await visionJson(`jobs/${jobId}/retry`, { method: "POST" });
-                window.location.reload();
-              } catch (e) {
-                setError(e instanceof Error ? e.message : "Retry failed");
-                setRetrying(false);
-              }
-            }}>{retrying ? "Starting retry…" : "Retry saved upload"}</button>
+          {job && ["failed", "interrupted", "cancelled"].includes(job.status) && (
+            // Retry only when the worker can: a complete saved upload with retries left.
+            // Older workers do not say; a decoded, undeleted upload is the best guess there.
+            (job.retryable ?? (!!job.video && !job.videoDeleted)) ? (
+              <button className="pitch-button-primary" disabled={retrying} onClick={async () => {
+                setRetrying(true);
+                try {
+                  await visionJson(`jobs/${jobId}/retry`, { method: "POST" });
+                  window.location.reload();
+                } catch (e) {
+                  setError(visionErrorMessage(e, "Retry failed"));
+                  setRetrying(false);
+                }
+              }}>{retrying ? "Starting retry…" : "Retry saved upload"}</button>
+            ) : (
+              <Link href="/upload" className="pitch-button-primary">
+                Upload again
+              </Link>
+            )
           )}
           {result && (
             <>
@@ -443,6 +566,11 @@ export function VisionReport({ jobId }: { jobId: string }) {
                     Possession, passes and shots are not part of this job. Turn the ball
                     model on only if you need them, and check a short section first.
                   </p>
+                  {footage && (
+                    <button className="pitch-button-secondary text-sm" disabled={rerunning} onClick={() => rerun("section", true)}>
+                      Test 20 seconds with the ball model
+                    </button>
+                  )}
                 </section>
               )}
               {result.metrics.ballFrames === 0 && result.ballSearch !== "none" && (
@@ -475,6 +603,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   onSeek={seek}
                   onCalibrate={startCalibration}
                   onReview={openReview}
+                  videoAvailable={footage}
                   playerLoad={result.metrics.playerLoad}
                   ballTracked={result.ballSearch !== "none"}
                 />
@@ -492,8 +621,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   Match analytics could not be loaded ({analysisError}). The classic report is shown.
                 </p>
               )}
-              <div className="grid lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)] gap-6">
-                <div className="space-y-4">
+              <div className="grid grid-cols-[minmax(0,1fr)] lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)] gap-4 lg:gap-6">
+                {/* Below lg this column's children join the grid, so a pinned video
+                    stays on screen over the panels that follow it. */}
+                <div className="max-lg:contents lg:space-y-4">
                   {job?.videoDeleted && (
                     <p className="glass-card p-4 text-sm text-pitch-muted" role="status">
                       The uploaded footage was deleted by the server&apos;s retention
@@ -501,7 +632,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       overlays need the video.
                     </p>
                   )}
-                  {analysis && highlights.length > 0 && !job?.videoDeleted && (
+                  {analysis && highlights.length > 0 && footage && (
                     <div
                       className="flex flex-wrap items-center gap-2 text-sm"
                       data-testid="highlights"
@@ -534,10 +665,15 @@ export function VisionReport({ jobId }: { jobId: string }) {
                     </div>
                   )}
                   <div
-                    className="relative bg-black rounded-2xl overflow-hidden"
+                    ref={videoBox}
+                    className={`relative bg-black rounded-2xl overflow-hidden ${
+                      // Pinned under the 4rem header; a tall (portrait) video is capped at 40% of the screen.
+                      pinVideo ? "max-lg:sticky max-lg:top-16 max-lg:z-20 max-lg:mx-auto max-lg:w-full max-lg:max-w-[calc(40vh*var(--video-ratio))]" : ""
+                    }`}
                     style={{
                       aspectRatio: `${result.video.width}/${result.video.height}`,
-                      display: job?.videoDeleted ? "none" : undefined,
+                      display: footage ? undefined : "none",
+                      ["--video-ratio" as string]: result.video.width / result.video.height,
                     }}
                   >
                     <video
@@ -553,8 +689,10 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         } else if (v.currentTime === 0 && (result.analysedStart ?? 0) > 0) moveVideo(v, result.analysedStart ?? 0);
                       }}
                       onSeeking={(e) => {
+                        const v = e.currentTarget;
                         const target = ownSeekTo.current;
-                        if (target !== null && Math.abs(e.currentTarget.currentTime - target) < 0.25) return;
+                        // The browser clamps a seek past the end to the duration.
+                        if (target !== null && Math.abs(v.currentTime - Math.min(target, v.duration || target)) < 0.25) return;
                         // The viewer moved the video with its own controls: the reel and
                         // any clip end stop, so dragging past a clip end does not jump on.
                         clipEnd.current = null;
@@ -564,7 +702,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       playsInline
                       preload="metadata"
                       className="w-full h-full"
-                      src={job?.videoDeleted ? undefined : `/api/vision/jobs/${jobId}/video`}
+                      src={footage ? `/api/vision/jobs/${jobId}/video` : undefined}
                       onTimeUpdate={(e) => {
                         const v = e.currentTarget;
                         setTime(v.currentTime);
@@ -576,12 +714,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                         }
                       }}
                       onSeeked={(e) => setTime(e.currentTarget.currentTime)}
-                      onError={() =>
-                        !job?.videoDeleted &&
-                        setError(
-                          "Video playback failed. This browser may not support its codec. Use H.264 MP4.",
-                        )
-                      }
+                      onError={videoFailed}
                     />
                     {(calibrating || projectedLines) && (
                       <svg
@@ -709,20 +842,21 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   </p>
                   <DetectionTimeline result={result} onSeek={seek} />
                 </div>
-                <aside className="space-y-4">
+                <aside className="space-y-4 min-w-0">
                   {analysis !== null && (
                     <div ref={calibrationRef}>
                       <PitchCalibration
                         jobId={jobId}
                         videoSize={[result.video.width, result.video.height]}
-                        time={time}
+                        time={calibrationTime}
                         click={calClick}
                         active={calibrating}
                         onActive={(on) => (on ? startCalibration() : setCalibrating(false))}
                         onOverlay={setCalOverlay}
                         calibration={calibration}
                         onApplied={loadAnalytics}
-                        videoAvailable={!job?.videoDeleted}
+                        videoAvailable={footage}
+                        onDeleted={matchGone}
                         onStep={(delta) => {
                           // Step between analysed frames: calibration is anchored to one of them.
                           const step = Math.sign(delta) * Math.max(1, Math.round(Math.abs(delta) * result.sampleFps));
@@ -736,7 +870,8 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   {analysis?.calibrated && (
                     <section className="glass-card p-4 space-y-2">
                       <h2 className="text-sm font-semibold">Pitch view</h2>
-                      <MiniPitch analysis={analysis} time={time} colours={[colour(0), colour(1)]} />
+                      {/* The analysed frame the overlay shows (its stored time), not the decoder's time. */}
+                      <MiniPitch analysis={analysis} time={frame?.t ?? time} colours={[colour(0), colour(1)]} />
                     </section>
                   )}
                   <section className="glass-card p-5 space-y-4">
@@ -762,45 +897,48 @@ export function VisionReport({ jobId }: { jobId: string }) {
                     ))}
                   </section>
                 </aside>
+                {/* Inside the grid (full width) so a pinned video stays over the review on a phone. */}
+                {analysis && !deleted && (
+                  <div ref={reviewRef} className="lg:col-span-2 min-w-0">
+                    {reviewOpen ? (
+                      <ReviewQueue
+                        jobId={jobId}
+                        analysis={analysis}
+                        names={names}
+                        colours={[colour(0), colour(1)]}
+                        time={time}
+                        onWatch={reviewWatch}
+                        onAnalysis={(next) =>
+                          // Review responses leave out the per-frame positions (unchanged).
+                          setAnalysis((prev) => ({ ...next, positions: next.positions ?? prev?.positions ?? null }))
+                        }
+                        onDeleted={matchGone}
+                      />
+                    ) : (
+                      <section className="glass-card p-5 flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h2 className="text-xl font-semibold">Review moments</h2>
+                          <p className="text-sm text-pitch-muted">
+                            {analysis.review.pending} automatic moment{analysis.review.pending === 1 ? "" : "s"} to check. Confirmed goals set the score.
+                          </p>
+                        </div>
+                        <button className="pitch-button-primary" onClick={openReview}>
+                          Start reviewing
+                        </button>
+                      </section>
+                    )}
+                  </div>
+                )}
               </div>
-              {analysis && (
-                <div ref={reviewRef}>
-                  {reviewOpen ? (
-                    <ReviewQueue
-                      jobId={jobId}
-                      analysis={analysis}
-                      names={names}
-                      colours={[colour(0), colour(1)]}
-                      time={time}
-                      onWatch={reviewWatch}
-                      onAnalysis={(next) =>
-                        // Review responses leave out the per-frame positions (unchanged).
-                        setAnalysis((prev) => ({ ...next, positions: next.positions ?? prev?.positions ?? null }))
-                      }
-                    />
-                  ) : (
-                    <section className="glass-card p-5 flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <h2 className="text-xl font-semibold">Review moments</h2>
-                        <p className="text-sm text-pitch-muted">
-                          {analysis.review.pending} automatic moments wait for a quick check. Confirmed goals set the score.
-                        </p>
-                      </div>
-                      <button className="pitch-button-primary" onClick={openReview}>
-                        Start reviewing
-                      </button>
-                    </section>
-                  )}
-                </div>
-              )}
-              {analysis && !job?.videoDeleted && (
+              {analysis && footage && (
                 <section className="glass-card p-5 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h2 className="text-xl font-semibold">Ball accuracy and training</h2>
                       <p className="text-sm text-pitch-muted max-w-2xl">
-                        Show Pitchlens where the ball is on frames from across this match. It measures how often the
-                        ball was found, and the answers train a better ball finder for footage like yours.
+                        {result.ballSearch === "none"
+                          ? "Show Pitchlens where the ball is on frames from across this match. The ball model did not run on this job, so nothing is measured here; the answers train a better ball finder for footage like yours."
+                          : "Show Pitchlens where the ball is on frames from across this match. It measures how often the ball was found, and the answers train a better ball finder for footage like yours."}
                       </p>
                     </div>
                     <button className="pitch-button-secondary" onClick={() => {
@@ -810,7 +948,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       {labelling ? "Close" : "Label the ball"}
                     </button>
                   </div>
-                  {labelling && <BallLabeller jobId={jobId} />}
+                  {labelling && <BallLabeller jobId={jobId} onDeleted={matchGone} ballModel={result.ballSearch !== "none"} />}
                 </section>
               )}
               {!analysis && (
@@ -936,18 +1074,6 @@ function splitAtGaps(lines: (([number, number] | null)[] | undefined)[] | null |
     if (run.length > 1) out.push(run);
   }
   return out;
-}
-
-function nearestFrame(frames: { t: number }[], t: number) {
-  let l = 0;
-  let r = frames.length - 1;
-  while (l < r) {
-    const m = Math.floor((l + r) / 2);
-    if (frames[m].t < t) l = m + 1;
-    else r = m;
-  }
-  if (l > 0 && Math.abs(frames[l - 1].t - t) <= Math.abs(frames[l].t - t)) return l - 1;
-  return l;
 }
 
 function DetectionTimeline({

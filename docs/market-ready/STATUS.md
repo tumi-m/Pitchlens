@@ -25,8 +25,12 @@ A match now produces a Sofascore-style report:
 - **Highlights:** goals, possible goals and shots played back to back.
 - **Open test site:** the access code is optional (unset = open to anyone with
   the link); the worker caps analyses at `VISION_MAX_JOBS_PER_DAY` (30).
-- **Original recordings:** uploads up to `VISION_MAX_UPLOAD_MB` (2 GB); YouTube
-  links step down 1080p → 720p → 480p to fit. Size the Railway volume to match.
+- **Original recordings:** uploads up to `VISION_MAX_BYTES` /
+  `VISION_MAX_UPLOAD_MB` (2 GB); YouTube links step down 1080p → 720p → 480p
+  to fit. Size the Railway volume to match.
+- **Player load (the upload default, no ball model):** per-kit running
+  distance estimate (camera pan removed, 1.8 m player scale), unvalidated.
+- **Not offered:** player identities, per-player distance/speed, xG, PPDA.
 
 ## Improvement rounds (owner asked for 20, 13 October)
 
@@ -34,7 +38,13 @@ Each round: independent finders per area reproduce problems, a verifier tries
 to refute each, then fixers apply the confirmed ones with regression tests and
 every check runs. Rounds run in isolated worktrees, two at a time.
 - Round 1 (correctness and security): 68 confirmed, 54 fixed (`c5c37ee`).
-- Round 2 (end-to-end on real footage): in progress.
+- Round 2 (end-to-end on real footage): 33 confirmed, 28 fixed (`781a053`).
+  Uploads in progress survive a redeploy, and a redeploy no longer uses up a
+  retry; Retry is offered only when it can work; the daily limit says when it
+  lifts; reruns keep the team order and names and can switch on the ball
+  search; footage and label frames expire when read, not only hourly;
+  possession counts and momentum minutes are withheld on thin coverage;
+  reviewer-logged shots count without a pitch setup.
 - Round 3 (measured accuracy): in progress.
 
 ## Owner's 37-minute match (pipeline 2.5, 640x360 YouTube copy)

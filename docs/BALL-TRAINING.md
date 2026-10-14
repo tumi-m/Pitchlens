@@ -55,12 +55,15 @@ curl "$VISION_SERVICE_URL/ball-model" -H "Authorization: Bearer $VISION_SERVICE_
 
 On a deployment with a single owner, set `VISION_SITE_TRAINING=1` on the
 worker to enable **Label the ball → Train on my labels** in the app (needs
-about 150 labelled frames in the match; uses only the matches uploaded from
-that browser). The site refuses it while `VISION_ACCESS_CODE` is unset, so an
-open test site can never retrain the model everyone uses. Leave it off when
-other people use the site. Without both settings the app shows "Training is
-run by the site operator." instead of the button (the worker reports
-`siteTraining` in `/health`).
+about 150 labelled frames in the match being labelled; uses only the matches
+uploaded from that browser). The site refuses it while `VISION_ACCESS_CODE` is
+unset, so an open test site can never retrain the model everyone uses. Leave it
+off when other people use the site. The worker reports `siteTraining` in
+`/health` and in `GET /ball-model` (the site forces it to false while no access
+code is set). When it is false the app shows no training button, only that
+training is run by the site operator and the labels are saved for the next
+ball-model update; a training request from the site is refused with the same
+explanation.
 
 With Modal configured on the worker, training runs on a Modal GPU in its own
 app, so it never blocks an analysis (`VISION_MODAL_TRAIN_GPU`, default L4);

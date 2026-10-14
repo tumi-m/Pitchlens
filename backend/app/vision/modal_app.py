@@ -73,6 +73,8 @@ def analyse(
     ball_search="exhaustive",
     video_grant="",
     ball_weights="",
+    reference_colours=None,
+    reference_job=None,
 ):
     """Generator: yields progress dicts, then {"result_gz": bytes}."""
     import gzip
@@ -129,6 +131,8 @@ def analyse(
                 max_seconds=max_seconds,
                 start_seconds=start_seconds,
                 ball_search=ball_search,
+                reference_colours=reference_colours,
+                reference_job=reference_job,
             )
         except ValueError as exc:  # footage problem, shown to the user as-is
             outcome["error"] = str(exc)

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.vision import billing, gpu
 from app.vision.access import valid_video_grant
@@ -34,19 +34,58 @@ TOKEN = os.getenv("VISION_SERVICE_TOKEN", "")
 # Original recordings, not reduced copies: at 360p the ball is a few pixels. A
 # 40-minute 1080p phone recording is 2-5 GB; size the volume to match
 # (check_space refuses an upload that would not fit).
-MAX_BYTES = max(50, int(os.getenv("VISION_MAX_UPLOAD_MB", "2048"))) * 1024 * 1024
+DEFAULT_MAX_BYTES = 2048 * 1024 * 1024
+
+
+def _max_bytes():
+    """Largest upload (and YouTube download) in bytes, default 2 GiB.
+
+    VISION_MAX_BYTES (bytes) takes precedence over VISION_MAX_UPLOAD_MB (MiB,
+    at least 50). A value that is not a positive whole number is ignored with a
+    warning, so a typo cannot stop the worker from starting.
+    """
+    import logging
+
+    value = os.getenv("VISION_MAX_BYTES", "").strip()
+    if value:
+        try:
+            if int(value) > 0:
+                return int(value)
+        except ValueError:
+            pass
+        logging.warning("VISION_MAX_BYTES must be a positive whole number of bytes; using 2 GiB")
+        return DEFAULT_MAX_BYTES
+    value = os.getenv("VISION_MAX_UPLOAD_MB", "").strip()
+    if value:
+        try:
+            if int(value) > 0:
+                return max(50, int(value)) * 1024 * 1024
+        except ValueError:
+            pass
+        logging.warning("VISION_MAX_UPLOAD_MB must be a positive whole number of MiB; using 2048")
+    return DEFAULT_MAX_BYTES
+
+
+MAX_BYTES = _max_bytes()
 
 
 def max_size_text():
+    """The upload limit in words ("2.0 GB", "500 MB")."""
     gb = MAX_BYTES / 1024**3
-    return f"{gb:.1f} GB" if gb >= 1 else f"{MAX_BYTES // 1024**2} MB"
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    mb = MAX_BYTES / 1024**2
+    return f"{mb:.0f} MB" if mb >= 10 or mb == int(mb) else f"{mb:.1f} MB"
+
+
 # Chunked uploads keep every request small enough for serverless proxies (Vercel: 4.5 MB).
 MAX_CHUNK = 8 * 1024 * 1024
 # A chunked upload that stops sending data releases the worker after this long.
 UPLOAD_IDLE_SECONDS = int(os.getenv("VISION_UPLOAD_IDLE_SECONDS", "300"))
-# Even a trickling upload cannot hold the single worker longer than this. A
-# large declared upload gets longer, at a 2 Mbit/s floor (2 GB: about 2.4 h),
-# up to UPLOAD_SIZED_MAX_SECONDS.
+# Even a trickling upload cannot hold the single worker longer than this once
+# another start is waiting for it (a lone slow upload may finish). A large
+# declared upload gets longer, at a 2 Mbit/s floor (2 GB: about 2.4 h), up to
+# UPLOAD_SIZED_MAX_SECONDS.
 UPLOAD_MAX_SECONDS = int(os.getenv("VISION_UPLOAD_MAX_SECONDS", "3600"))
 UPLOAD_FLOOR_BYTES_PER_SECOND = 250_000
 UPLOAD_SIZED_MAX_SECONDS = 4 * 3600
@@ -75,10 +114,20 @@ def _recent_starts(now):
     return [t for t in data if isinstance(t, (int, float)) and 0 <= now - t < 86400] if isinstance(data, list) else []
 
 
+class DailyLimit(Exception):
+    """The 24-hour start cap: answered as JSON 429 with when a start frees up (see the handler below)."""
+
+    def __init__(self, cap, resets_at):
+        super().__init__(cap)
+        self.cap, self.resets_at = cap, resets_at
+
+
 def check_daily_budget():
     cap = daily_cap()
-    if cap and len(_recent_starts(time.time())) >= cap:
-        raise HTTPException(429, f"This server has reached its limit of {cap} analyses in 24 hours. Try again later.")
+    recent = sorted(_recent_starts(time.time()))
+    if cap and len(recent) >= cap:
+        # The window is rolling: a start frees up when enough of the oldest ones leave it.
+        raise DailyLimit(cap, recent[len(recent) - cap] + 86400)
 
 
 def record_start():
@@ -194,6 +243,19 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 app.include_router(billing.router(lambda: ROOT))
 
 
+@app.exception_handler(DailyLimit)
+async def daily_limit(request: Request, exc: DailyLimit):
+    # A code, so clients do not retry it like a transient 429, and the time it lifts.
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": f"This server has reached its limit of {exc.cap} analyses in 24 hours.",
+            "code": "daily-limit",
+            "resetsAt": round(exc.resets_at),
+        },
+    )
+
+
 def folder(job_id):
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
         raise HTTPException(404, "Job not found")
@@ -212,8 +274,22 @@ def write_status(directory, data):
 def load_status(directory):
     data = json.loads((directory / "status.json").read_text())
     if data["status"] in ("uploading", "processing") and data["id"] != active:
-        data.update(status="interrupted", stage="Worker stopped. Submit the video again to retry.")
+        data.update(status="interrupted", stage="Worker stopped before the analysis finished.")
     return data
+
+
+def with_retryable(directory, data):
+    """Whether Retry can work (the checks retry_job makes): a stopped job whose complete
+    upload is still saved, with retries left. The page offers it only then."""
+    return {
+        **data,
+        "retryable": data.get("status") in ("failed", "interrupted", "cancelled")
+        and data.get("id") != active
+        and (directory / "video").is_file()
+        and bool(data.get("video"))
+        and not expired(data)
+        and (data.get("attempts", 1) < 3 or data.get("interruptedBy") == "shutdown"),
+    }
 
 
 def public(data):
@@ -241,6 +317,9 @@ def work(directory, status, event):
             max_seconds=status.get("maxSeconds"),
             start_seconds=status.get("startSeconds", 0),
             ball_search=status.get("ballSearch", "exhaustive"),
+            # A rerun keeps the source job's Kit A / Kit B order (and so its team names).
+            reference_colours=status.get("referenceColours"),
+            reference_job=status.get("sourceJobId") if status.get("referenceColours") else None,
         )
         ran_on_gpu = False
         if gpu.modal_enabled():
@@ -270,8 +349,9 @@ def work(directory, status, event):
         threading.Thread(target=_auto_venue, args=(directory, dict(status)), daemon=True).start()
     except InterruptedError:
         if stopping:
-            # A redeploy or restart is not the user's cancellation: allow a retry.
-            update(status="interrupted", stage="Worker restarted. Submit the video again to retry.")
+            # A redeploy or restart is not the user's cancellation: allow a retry,
+            # and do not count this attempt against the retry limit.
+            update(status="interrupted", stage="Worker restarted before the analysis finished.", interruptedBy="shutdown")
         else:
             update(status="cancelled", stage="Analysis cancelled")
     except Exception as exc:
@@ -309,7 +389,15 @@ def recover_calibrations():
 
 
 def recover_after_restart():
-    """Persist what load_status infers: work in flight when the process died is interrupted."""
+    """Persist what load_status infers: work in flight when the process died is interrupted.
+
+    One exception: the newest unfinished chunked upload is kept and the worker
+    reserved for it again, so a phone that was sending it through a redeploy
+    resumes (append writes at receivedBytes). The idle release frees it as
+    usual if that browser never comes back.
+    """
+    global active
+    uploads = []
     for path in ROOT.glob("*/status.json"):
         try:
             data = json.loads(path.read_text())
@@ -317,16 +405,39 @@ def recover_after_restart():
             continue
         if data.get("status") not in ("uploading", "processing") or data.get("id") == active:
             continue
-        if data["status"] == "uploading":
-            (path.parent / "video").unlink(missing_ok=True)
-        data.update(status="interrupted", stage="Worker restarted. Submit the video again to retry.")
+        if data["status"] == "uploading" and "expectedBytes" in data and (path.parent / "video").is_file():
+            uploads.append((data.get("createdAt", 0), path, data))
+            continue
+        _interrupt(path, data)
+    uploads.sort(key=lambda u: u[0])
+    if uploads and active is None:
+        _, path, data = uploads.pop()
+        video = path.parent / "video"
+        # status.json is written after each chunk: bytes past receivedBytes are unconfirmed.
+        received = min(int(data.get("receivedBytes", 0)), video.stat().st_size)
+        with video.open("r+b") as f:
+            f.truncate(received)
+        data.update(receivedBytes=received, progress=round(received / (data["expectedBytes"] or 1) * 100, 1))
         write_status(path.parent, data)
+        with lock:
+            active = data["id"]
+            upload_activity[active] = upload_started[active] = time.monotonic()
+            upload_sizes[active] = data["expectedBytes"]
+    for _, path, data in uploads:
+        _interrupt(path, data)
     for temporary in ROOT.glob("*/*.tmp"):
         temporary.unlink(missing_ok=True)
     # A training run killed with the process never reached its cleanup: frame
     # copies of customers' footage must not stay behind (its state was in memory).
     shutil.rmtree(ROOT / "training" / "dataset", ignore_errors=True)
     shutil.rmtree(ROOT / "training" / "runs", ignore_errors=True)
+
+
+def _interrupt(path, data):
+    if data["status"] == "uploading":
+        (path.parent / "video").unlink(missing_ok=True)
+    data.update(status="interrupted", stage="Worker restarted before the analysis finished.")
+    write_status(path.parent, data)
 
 
 app.add_event_handler("shutdown", stop_jobs)
@@ -347,16 +458,24 @@ def release(job_id, directory, status, stage):
             active = None
 
 
-def upload_deadline(job_id):
+def upload_deadline(job_id=None, size=None):
     """Seconds an upload may hold the worker: longer for a large declared size."""
-    size = upload_sizes.get(job_id)
+    size = upload_sizes.get(job_id) if size is None else size
     if not size:
         return UPLOAD_MAX_SECONDS
     return max(UPLOAD_MAX_SECONDS, min(UPLOAD_SIZED_MAX_SECONDS, size / UPLOAD_FLOOR_BYTES_PER_SECOND))
 
 
-def release_stale_upload():
-    """A browser that closed mid-upload must not block the worker forever."""
+def upload_minutes(job_id=None, size=None):
+    return max(1, round(upload_deadline(job_id, size) / 60))
+
+
+def release_stale_upload(contended=False):
+    """A browser that closed mid-upload must not block the worker forever.
+
+    The overall time limit (upload_deadline) only matters when another start
+    wants the worker (contended): a lone slow upload is allowed to finish.
+    """
     job_id = active
     if job_id is None or job_id in cancellations:
         return
@@ -365,7 +484,7 @@ def release_stale_upload():
         return
     now = time.monotonic()
     idle = now - last >= UPLOAD_IDLE_SECONDS
-    overdue = now - upload_started.get(job_id, now) >= upload_deadline(job_id)
+    overdue = contended and now - upload_started.get(job_id, now) >= upload_deadline(job_id)
     if not (idle or overdue):
         return
     directory = ROOT / job_id
@@ -373,8 +492,15 @@ def release_stale_upload():
         status = json.loads((directory / "status.json").read_text())
     except (OSError, ValueError):
         status = {"id": job_id, "createdAt": time.time()}
-    if status.get("status", "uploading") == "uploading":
+    if status.get("status", "uploading") != "uploading":
+        return
+    if idle:
         release(job_id, directory, status, "Upload stopped before the video was complete.")
+    else:
+        status["releasedReason"] = "overdue"
+        # The limit this upload had (it grows with the declared size; see upload_deadline).
+        minutes = upload_minutes(job_id, status.get("expectedBytes"))
+        release(job_id, directory, status, f"Upload took longer than the {minutes}-minute limit.")
 
 
 def sweep_stale():
@@ -383,14 +509,34 @@ def sweep_stale():
 
 
 def expired(data):
-    # From when the footage arrived: a re-analysis links the same file, so it
-    # expires with the original upload and a chain of reruns cannot extend it.
-    uploaded = data.get("uploadedAt", data.get("createdAt", time.time()))
+    # From when the footage arrived: a rerun links the same file, so it shares the
+    # upload's clock (footageCreatedAt) and a chain of reruns cannot extend it.
+    # "uploadedAt" is the same clock under its earlier name.
+    created = data.get("footageCreatedAt", data.get("uploadedAt", data.get("createdAt", time.time())))
     return (
         RETENTION_HOURS > 0
         and data.get("id") != active
-        and uploaded < time.time() - RETENTION_HOURS * 3600
+        and created < time.time() - RETENTION_HOURS * 3600
     )
+
+
+def expire_footage(directory, data):
+    """Delete every copy of the footage (video and label frames); keep the measured result."""
+    (directory / "video").unlink(missing_ok=True)
+    _remove_label_frames(directory)  # balllabels.frame_cache
+    data["videoDeleted"] = True
+    write_status(directory, data)
+
+
+def expire_if_due(directory, data):
+    """Apply retention when a job is read, not only at the hourly sweep."""
+    if expired(data) and ((directory / "video").exists() or (directory / "labelframes").exists()):
+        expire_footage(directory, data)
+    elif data.get("videoDeleted") and (directory / "labelframes").exists():
+        # Label stills are full-resolution pictures of the footage: they go with
+        # it (also on deployments that expired footage before stills were swept).
+        _remove_label_frames(directory)
+    return data
 
 
 def delete_expired():
@@ -403,18 +549,7 @@ def delete_expired():
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if not expired(data) and not data.get("videoDeleted"):
-            continue
-        # Label stills are full-resolution pictures of the footage: they go with
-        # it (also on deployments that expired footage before stills were swept).
-        _remove_label_frames(path.parent)
-        if not expired(data):
-            continue
-        video_path = path.parent / "video"
-        if video_path.exists():
-            video_path.unlink(missing_ok=True)
-            data["videoDeleted"] = True
-            write_status(path.parent, data)
+        expire_if_due(path.parent, data)
 
 
 def _remove_label_frames(directory):
@@ -493,7 +628,7 @@ def health():
         "reviewIdempotency": True,
         "savedVideoReruns": True,
         # Whether the website may start ball-model training (otherwise an operator action).
-        "siteTraining": os.getenv("VISION_SITE_TRAINING", "0") == "1",
+        "siteTraining": _site_training(),
     }
 
 
@@ -508,13 +643,13 @@ def jobs(request: Request):
     entries = []
     for p in ROOT.glob("*/status.json"):
         try:
-            data = load_status(p.parent)
+            data = expire_if_due(p.parent, load_status(p.parent))
         except (OSError, ValueError, KeyError):
             continue
         # Ownerless legacy jobs are visible only to a local, unscoped listing.
         if owner is not None and data.get("owner") != owner:
             continue
-        entries.append(public(data))
+        entries.append(public(with_retryable(p.parent, data)))
     return sorted(entries, key=lambda x: x["createdAt"], reverse=True)[:100]
 
 
@@ -600,7 +735,7 @@ async def create(request: Request):
     await asyncio.to_thread(delete_expired)
     job_id = uuid.uuid4().hex
     with lock:
-        release_stale_upload()
+        release_stale_upload(contended=True)
         if request_id:
             # The first response may have been lost after reserving the worker.
             # Persisted IDs also prevent a restart from silently creating a second job.
@@ -616,6 +751,11 @@ async def create(request: Request):
                     return public(previous)
                 raise HTTPException(409, "The previous upload stopped. Start the upload again.")
         if active is not None:
+            # This browser's own stopped upload (a reload, a closed tab): say so, and
+            # how to free it. It is not released here: another tab may be sending it.
+            mine = own_upload(active, owner)
+            if mine:
+                return JSONResponse(status_code=409, content=mine)
             raise HTTPException(
                 409, "Another video is being analysed. Wait for it to finish or cancel it."
             )
@@ -666,6 +806,26 @@ async def create(request: Request):
         if isinstance(exc, ValueError):
             raise HTTPException(400, str(exc)) from exc
         raise
+
+
+def own_upload(job_id, owner):
+    """The 409 body for an unfinished chunked upload that belongs to this owner, else None."""
+    if not owner or job_id not in upload_activity or job_id in cancellations:
+        return None
+    data = _read_json(ROOT / job_id / "status.json", {})
+    if not isinstance(data, dict) or data.get("status") != "uploading" or "expectedBytes" not in data:
+        return None
+    if not data.get("owner") or not hmac.compare_digest(data["owner"], owner):
+        return None
+    received, expected = data.get("receivedBytes", 0), data["expectedBytes"]
+    return {
+        "detail": f"This browser's earlier upload is still reserved ({int(100 * received / (expected or 1))}%). "
+        "Choose the same file to resume, or cancel it.",
+        "code": "own-upload",
+        "jobId": job_id,
+        "receivedBytes": received,
+        "expectedBytes": expected,
+    }
 
 
 def fetch_and_work(directory, status, event, url):
@@ -752,7 +912,7 @@ async def create_from_url(request: Request):
     check_space(100 * 1024 * 1024)
     job_id = uuid.uuid4().hex
     with lock:
-        release_stale_upload()
+        release_stale_upload(contended=True)
         if active is not None:
             raise HTTPException(
                 409, "Another video is being analysed. Wait for it to finish or cancel it."
@@ -785,6 +945,15 @@ def receiving(job_id):
     directory = folder(job_id)
     status = json.loads((directory / "status.json").read_text())
     if job_id != active or status.get("status") != "uploading" or "expectedBytes" not in status:
+        if status.get("releasedReason") == "overdue":
+            # Say why: the time limit, not a dropped connection, ended this upload.
+            percent = int(100 * status.get("receivedBytes", 0) / (status.get("expectedBytes") or 1))
+            minutes = upload_minutes(size=status.get("expectedBytes"))
+            raise HTTPException(
+                409,
+                f"Uploads must finish within {minutes} minute{'' if minutes == 1 else 's'}; "
+                f"this one stopped at {percent}%. Use Wi-Fi or a smaller export.",
+            )
         raise HTTPException(409, "This upload is no longer accepting data. Start again.")
     return directory, status
 
@@ -846,7 +1015,8 @@ async def start(job_id: str):
 @app.get("/jobs/{job_id}")
 def status(job_id: str):
     sweep_stale()
-    return public(load_status(folder(job_id)))
+    directory = folder(job_id)
+    return public(with_retryable(directory, expire_if_due(directory, load_status(directory))))
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -897,10 +1067,7 @@ def video(job_id: str, request: Request):
         raise HTTPException(404, "Video is unavailable")
     data = json.loads((directory / "status.json").read_text())
     if expired(data):
-        path.unlink(missing_ok=True)
-        _remove_label_frames(directory)
-        data["videoDeleted"] = True
-        write_status(directory, data)
+        expire_footage(directory, data)
         raise HTTPException(404, "Video is unavailable")
     size = path.stat().st_size
     start = 0
@@ -995,7 +1162,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 9
+ANALYTICS_VERSION = 10  # rounds 1 and 2 each used 9 for different analytics; 10 is the merge
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
@@ -1535,8 +1702,9 @@ def frame_image(job_id: str, index: int):
     from app.vision import balllabels
 
     directory, _ = _finished_result(job_id)
-    # Footage gone (expired or deleted): its stills go too, before any is served.
-    # This also catches a background extraction that wrote after the sweep.
+    # A frame is a copy of the footage: it goes with it (expired or deleted), even
+    # if a file is left behind, before any is served. This also catches a
+    # background extraction that wrote after the sweep.
     data = _read_json(directory / "status.json", {})
     if not isinstance(data, dict) or expired(data) or data.get("videoDeleted") or _video_path(directory) is None:
         _remove_label_frames(directory)
@@ -1573,7 +1741,15 @@ def ball_model():
     state = dict(training)
     if "run" in state:
         state["run"] = private(state["run"])
-    return {**registry, "runs": [private(r) for r in registry.get("runs", [])], "training": state}
+    return {
+        **registry, "runs": [private(r) for r in registry.get("runs", [])], "training": state,
+        # Whether the website may start a run (see train_ball_model): the page hides the button otherwise.
+        "siteTraining": _site_training(),
+    }
+
+
+def _site_training():
+    return os.getenv("VISION_SITE_TRAINING", "0") == "1"
 
 
 @app.post("/ball-model/train")
@@ -1597,8 +1773,9 @@ async def train_ball_model(request: Request):
     # terminal request with the service token carries neither, even on a hosted
     # worker (where require_owner() is always true).
     from_site = request.headers.get("x-pitchlens-require-owner") == "1" or bool(request.headers.get("x-pitchlens-owner"))
-    if from_site and os.getenv("VISION_SITE_TRAINING", "0") != "1":
-        raise HTTPException(403, "Training is an operator action on this server (see docs/BALL-TRAINING.md).")
+    if from_site and not _site_training():
+        # Shown to a team owner: say what happens to their labels, not how to configure the server.
+        raise HTTPException(403, "Training is not available on this site. Your labels are saved for the next ball-model update.")
     if from_site:
         owner = _owner(request)
         epochs = min(epochs, SITE_TRAINING_EPOCHS)
@@ -1676,7 +1853,9 @@ def venues(request: Request):
     for path in sorted(_venue_dir().glob("*.json")):
         data = _read_json(path) or {}
         if data.get("id") and (data.get("owner", "") == owner):
-            out.append({k: data.get(k) for k in ("id", "name", "template", "size", "static", "createdAt")})
+            # sourceJob: deleting that match deletes this venue (the page names it first).
+            # The listing is this owner's own, so no other browser's job ids appear.
+            out.append({k: data.get(k) for k in ("id", "name", "template", "size", "static", "createdAt", "sourceJob")})
     return out
 
 
@@ -1747,18 +1926,31 @@ def retry_job(job_id: str):
             raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
         if not (directory / "video").is_file() or expired(status) or not status.get("video"):
             raise HTTPException(409, "No complete upload is available. Upload the video again.")
-        if status.get("attempts", 1) >= 3:
-            raise HTTPException(409, "Retry limit reached. Contact support before another attempt.")
+        # A graceful shutdown (redeploy) is not a failed attempt. Crashes still count:
+        # a video that kills the worker must not crash-loop it at our expense.
+        shutdown = status.get("interruptedBy") == "shutdown"
+        if status.get("attempts", 1) >= 3 and not shutdown:
+            raise HTTPException(409, "This video has stopped three times. Upload it again, or test a shorter section first.")
         check_daily_budget()
         check_models(status.get("profile", "general"), status.get("ballSearch", "exhaustive"))
         event = threading.Event()
-        status.update(status="processing", stage="Retrying saved upload", progress=0, attempts=status.get("attempts", 1) + 1)
+        status.pop("interruptedBy", None)
+        status.update(status="processing", stage="Retrying saved upload", progress=0, attempts=status.get("attempts", 1) + (0 if shutdown else 1))
         write_status(directory, status)
         active = job_id
         cancellations[job_id] = event
         record_start()
         pool.submit(work, directory, status, event)
         return public(status)
+
+
+def kit_colours(path):
+    """A finished result's two kit colours (Kit A first), or None."""
+    teams = (_read_json(path, {}) or {}).get("teams")
+    colours = [t.get("colour") for t in teams if isinstance(t, dict)] if isinstance(teams, list) else []
+    if len(colours) == 2 and all(isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c) for c in colours):
+        return colours
+    return None
 
 
 @app.post("/jobs/{job_id}/rerun")
@@ -1773,24 +1965,35 @@ def rerun_job(job_id: str, request: Request):
         start = int(request.query_params.get("start", "0"))
     except ValueError as exc:
         raise HTTPException(400, "Test start must be a whole number of seconds") from exc
-    digest = f"{mode}:{start}"
+    # Same choices as an upload (create): a player-load job can be rerun with the ball model.
+    search = request.query_params.get("search")
+    if search is not None and search not in ("exhaustive", "adaptive", "none"):
+        raise HTTPException(400, "Invalid ball search mode")
+    # Read before taking the lock: a full match's result is large.
+    reference = kit_colours(folder(job_id) / "result.json")
     with lock:
         source = folder(job_id)
         previous = load_status(source)
+        search = search or previous.get("ballSearch", "exhaustive")
+        digest = f"{mode}:{start}:{search}"
         # Owner authorization runs before this endpoint, including retry replies.
         for path in ROOT.glob("*/status.json"):
             existing = _read_json(path, {})
             if not isinstance(existing, dict):
                 continue
             if existing.get("sourceJobId") == job_id and existing.get("rerunRequestId") == request_id:
-                if existing.get("rerunDigest") != digest:
+                # Reruns started before the search option stored "mode:start".
+                legacy = existing.get("rerunDigest") == f"{mode}:{start}" and existing.get("ballSearch") == search
+                if existing.get("rerunDigest") != digest and not legacy:
                     raise HTTPException(409, "Rerun request ID already used for different options")
                 return public(load_status(path.parent))
         if previous["status"] not in ("completed", "failed", "interrupted", "cancelled"):
             raise HTTPException(409, "Wait for this analysis to finish before starting another")
+        # Limits cover the whole chain from the upload: a rerun of a rerun does not reset them.
+        root = previous.get("rootJobId") or previous.get("sourceJobId") or job_id
         earlier = [
             e for e in (_read_json(p, {}) for p in ROOT.glob("*/status.json"))
-            if isinstance(e, dict) and e.get("sourceJobId") == job_id
+            if isinstance(e, dict) and (e.get("rootJobId") or e.get("sourceJobId")) == root
         ]
         full = sum(1 for e in earlier if str(e.get("rerunDigest", "")).startswith("full:"))
         sections = len(earlier) - full
@@ -1804,24 +2007,29 @@ def rerun_job(job_id: str, request: Request):
             raise HTTPException(409, "Saved footage is no longer available. Upload the video again.")
         if not 0 <= start < metadata["duration"] or (mode == "full" and start != 0):
             raise HTTPException(400, "Test start must be inside the video; full matches start at zero")
-        check_models(previous.get("profile", "general"), previous.get("ballSearch", "exhaustive"))
-        release_stale_upload()
+        # The chosen search decides which weights the rerun needs.
+        check_models(previous.get("profile", "general"), search)
+        release_stale_upload(contended=True)
         if active is not None:
             raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
         new_id = uuid.uuid4().hex
         directory = ROOT / new_id
         status = {
-            "id": new_id, "sourceJobId": job_id, "title": previous["title"],
-            "createdAt": time.time(), "uploadedAt": previous.get("uploadedAt", previous["createdAt"]),
-            "status": "processing", "stage": "Opening saved footage",
+            "id": new_id, "sourceJobId": job_id, "rootJobId": root, "title": previous["title"],
+            # Same bytes, same retention clock: a rerun never extends how long footage is kept.
+            "footageCreatedAt": previous.get("footageCreatedAt", previous.get("uploadedAt", previous["createdAt"])),
+            "createdAt": time.time(), "status": "processing", "stage": "Opening saved footage",
             "progress": 0, "video": metadata, "fileSize": (source / "video").stat().st_size,
             "profile": previous.get("profile", "general"), "sampleFps": previous.get("sampleFps", 3),
-            "ballSearch": previous.get("ballSearch", "exhaustive"),
+            "ballSearch": search,
             "maxSeconds": 20 if mode == "section" else None, "startSeconds": start,
             "rerunRequestId": request_id, "rerunDigest": digest,
         }
         if previous.get("owner"):
             status["owner"] = previous["owner"]
+        if reference:
+            # Kit A / Kit B follow the source report, so its team names carry over.
+            status["referenceColours"] = reference
         try:
             directory.mkdir()
             # Both jobs are read-only consumers; deleting either link preserves

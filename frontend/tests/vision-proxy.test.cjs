@@ -25,6 +25,8 @@ function setup(env = {}, worker) {
       if (worker) return worker(url, init);
       assert.equal(init.headers['x-pitchlens-require-owner'], '1');
       if (init.headers['x-pitchlens-owner'] !== OWNER) return Response.json({ detail: 'Job not found' }, { status: 404 });
+      // A worker that allows site training (VISION_SITE_TRAINING=1).
+      if (new URL(url).pathname === '/ball-model') return Response.json({ active: null, runs: [], siteTraining: true });
       return Response.json({ ok: true });
     },
   };
@@ -272,4 +274,21 @@ test('only known per-match paths are forwarded', async () => {
     assert.equal((await s.api.GET(s.request({ owner: OWNER }), s.route(suffix))).status, 404);
   }
   assert.equal(s.calls.length, 0);
+});
+
+test('an open site tells the page up front that training is unavailable, in words for a team owner', async () => {
+  const model = { params: Promise.resolve({ path: ['ball-model'] }) };
+  const open = setup({ VISION_ACCESS_CODE: '' });
+  const status = await open.api.GET(open.request({ owner: OWNER }), model);
+  assert.equal(status.status, 200);
+  const body = await status.json();
+  assert.equal(body.siteTraining, false);
+  assert.deepEqual(body.runs, []);
+  const refused = await open.api.POST(open.request({ method: 'POST', owner: OWNER }), { params: Promise.resolve({ path: ['ball-model', 'train'] }) });
+  const detail = (await refused.json()).detail;
+  assert.equal(refused.status, 403);
+  assert.ok(!detail.includes('VISION_ACCESS_CODE') && !detail.includes('terminal'), detail);
+  // With a code, the worker's own answer is passed through.
+  const closed = setup();
+  assert.equal((await (await closed.api.GET(closed.request({ owner: OWNER }), model)).json()).siteTraining, true);
 });

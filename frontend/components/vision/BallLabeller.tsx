@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, EyeOff, SkipForward, ChevronLeft, ZoomIn } from "lucide-react";
 import type { BallLabelState, BallModelState, Rate } from "@/lib/review/analysis";
 import { fetchBallLabels, fetchBallModel, frameImageUrl, sendBallLabel, trainBallModel } from "@/lib/review/analysis";
-import { clockTime, VisionError, visionJson } from "@/lib/review/vision";
+import { clockTime, isMatchDeleted, VisionError, visionJson } from "@/lib/review/vision";
 import type { VisionHealth } from "@/lib/review/vision";
 
 const ZOOM = 5; // magnification of the precise-click view
@@ -23,7 +23,17 @@ function range(rate: Rate) {
  * visible. The answers measure the ball finder on this match and become
  * training data for a better one.
  */
-export function BallLabeller({ jobId }: { jobId: string }) {
+export function BallLabeller({
+  jobId,
+  onDeleted,
+  ballModel = true,
+}: {
+  jobId: string;
+  /** The worker no longer has this match. */
+  onDeleted?: () => void;
+  /** False on a player-load job: no ball model ran, so there is no accuracy to measure. */
+  ballModel?: boolean;
+}) {
   const [state, setState] = useState<BallLabelState | null>(null);
   const [position, setPosition] = useState(0);
   const [zoom, setZoom] = useState<{ x: number; y: number } | null>(null);
@@ -44,6 +54,9 @@ export function BallLabeller({ jobId }: { jobId: string }) {
   }, [ready]);
   const positionRef = useRef(0);
   positionRef.current = position;
+  // Latest callback without restarting the label polling when the page re-renders.
+  const gone = useRef(onDeleted);
+  gone.current = onDeleted;
 
   useEffect(() => {
     let stop = false;
@@ -68,6 +81,10 @@ export function BallLabeller({ jobId }: { jobId: string }) {
         })
         .catch((e) => {
           if (stop) return;
+          if (isMatchDeleted(e) && gone.current) {
+            gone.current();
+            return;
+          }
           setError(e instanceof Error ? e.message : "Labels could not be loaded");
           // A refusal (not found, forbidden) stays; a restarting worker (network
           // error, 5xx, 429) comes back, so keep asking with a growing pause.
@@ -126,7 +143,8 @@ export function BallLabeller({ jobId }: { jobId: string }) {
           setPosition(target);
         }
       } catch (e) {
-        setError(e instanceof Error ? e.message : "The label could not be saved");
+        if (isMatchDeleted(e) && gone.current) gone.current();
+        else setError(e instanceof Error ? e.message : "The label could not be saved");
       } finally {
         setSaving(false);
       }
@@ -217,8 +235,9 @@ export function BallLabeller({ jobId }: { jobId: string }) {
       </div>
     );
   const m = state.metrics;
-  // A player-load job never ran the ball model: nothing to score, labels still train.
-  const unmeasured = m.measured === false;
+  // A player-load job never ran the ball model (the job says so, or the worker's
+  // metrics do): nothing to score, so "—" rather than 0%; labels still train.
+  const unmeasured = !ballModel || m.measured === false;
   const circle = (x: number, y: number, colour: string) => (
     <span
       className="absolute rounded-full pointer-events-none"
@@ -366,22 +385,30 @@ export function BallTraining({ labelled }: { labelled: number }) {
   }
 
   const last = model?.training.run ?? model?.runs[model.runs.length - 1];
+  // Most sites cannot start a run (an open site never can): no button that only
+  // leads to a refusal. The site (/health) and the worker's status must both allow it.
+  const allowed = siteTraining === true && model?.siteTraining !== false;
+  const refused = siteTraining === false || model?.siteTraining === false;
   return (
     <div className="rounded-lg border border-white/10 p-4 space-y-2 text-sm" data-testid="ball-training">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="font-semibold">Train a better ball finder</p>
-          <p className="text-pitch-muted text-xs max-w-xl">
-            Uses the frames you labelled in every match from this browser. Part of them is held back to check the
-            result; the new finder is switched on only if it finds more balls there without more false ones.
-            {` One match is enough (about ${MIN_TRAINING_LABELS} labelled frames); more matches give a fairer check (${labelled} labelled here).`}
-          </p>
+          {allowed ? (
+            <p className="text-pitch-muted text-xs max-w-xl">
+              Uses the frames you labelled in every match from this browser. Part of them is held back to check the
+              result; the new finder is switched on only if it finds more balls there without more false ones.
+              {` One match is enough (about ${MIN_TRAINING_LABELS} labelled frames); more matches give a fairer check (${labelled} labelled here).`}
+            </p>
+          ) : refused ? (
+            <p className="text-pitch-muted text-xs max-w-xl">Your labels are saved and will be used in the next ball-model update.</p>
+          ) : null}
         </div>
-        {siteTraining === true ? (
+        {allowed ? (
           <button className="pitch-button-primary" onClick={start} disabled={running || labelled < MIN_TRAINING_LABELS}>
             {running ? "Training…" : "Train on my labels"}
           </button>
-        ) : siteTraining === false ? (
+        ) : refused ? (
           <p className="text-xs text-pitch-muted max-w-[14rem]" data-testid="training-operator">
             Training is run by the site operator.
           </p>

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -220,6 +221,33 @@ def train_colours(features, n_clusters=4):
     return centres, colours
 
 
+def align_to_reference(centres, colours, reference_hex):
+    """Keep Kit A and Kit B in the order of an earlier run of the same footage.
+
+    train_colours orders kits by how many players each cluster has, which
+    changes from one section to the next. The two kits are swapped when the
+    reference colours (hex, Kit A first) sit closer to them crosswise.
+    """
+    if reference_hex is None or centres is None or len(centres) != 2 or len(colours) != 2:
+        return centres, colours
+    if len(reference_hex) != 2 or not all(isinstance(h, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", h) for h in reference_hex):
+        return centres, colours
+    reference = [
+        cv2.cvtColor(np.uint8([int(h[i : i + 2], 16) for i in (1, 3, 5)]).reshape(1, 1, 3), cv2.COLOR_RGB2LAB)
+        .reshape(3)
+        .astype(float)
+        for h in reference_hex
+    ]
+    c = np.asarray(centres, dtype=float)
+
+    def d(a, b):
+        return float(np.linalg.norm(a - b))
+
+    if d(c[0], reference[1]) + d(c[1], reference[0]) < d(c[0], reference[0]) + d(c[1], reference[1]):
+        return np.asarray(centres)[::-1].copy(), list(colours)[::-1]
+    return centres, colours
+
+
 def assign_team(feature, centres, use_hue=True):
     if feature is None:
         return -1
@@ -274,6 +302,27 @@ def _frame_time(position, last_t, index_time, fps, stride, state):
     return index_time if last_t < index_time <= last_t + window else last_t + 1 / fps
 
 
+def limitations(kit_warning, declared_seconds, analysed_seconds, requested_seconds):
+    """What a result does not measure, listed under every report."""
+    notes = ([kit_warning] if kit_warning else []) + [
+        "Ball confidence scores are not calibrated probabilities.",
+        "Faint ball candidates require temporal and neural support; "
+        "short gaps on the same track are camera-compensated and marked inferred.",
+        "Possession is estimated from observed ball control and the passes between; it is not official match possession.",
+        "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
+        "Track IDs change after occlusion and cuts; they are not player identities.",
+        "Positions are image coordinates until the pitch is set up; speed and xG are not measured; "
+        "running distance is a per-kit estimate scaled by a 1.8 m player, and goals count only when a person confirms them.",
+        "Green-surface filtering can include sideline players or miss players near boundaries.",
+    ]
+    if analysed_seconds < requested_seconds * 0.97:
+        notes.append(
+            f"The file declares {declared_seconds:.0f} s but decoding ended at "
+            f"{analysed_seconds:.0f} s; results cover the decodable part."
+        )
+    return notes
+
+
 def merge_candidates(detector, motion, limit=12):
     """Keep at most `limit` candidates per frame without letting motion blobs
     (which all saturate at the same low confidence) push out the faint detector
@@ -292,7 +341,11 @@ def run_video(
     profile="general",
     start_seconds=0,
     ball_search="exhaustive",
+    reference_colours=None,
+    reference_job=None,
 ):
+    """Analyse a video. reference_colours (two hex colours, Kit A first) keeps the
+    kit order of the earlier run reference_job of the same footage."""
     total_started = time.monotonic()
     timings = Counter()
     if ball_search not in ("exhaustive", "adaptive", "none"):
@@ -429,8 +482,12 @@ def run_video(
     # Four clusters otherwise split one striped kit and discard part of that team.
     role_aware = "player" in [name.lower() for name in names.values()]
     kit_warning = None
+    aligned_to = None
     try:
         centres, colours = train_colours(features, n_clusters=2 if role_aware else 4)
+        if reference_colours:
+            centres, colours = align_to_reference(centres, colours, reference_colours)
+            aligned_to = reference_job
     except ValueError as exc:
         centres, colours = None, []
         kit_warning = str(exc) + " Team assignments and possession are unavailable."
@@ -761,27 +818,11 @@ def run_video(
         "analysedStart": analysed_start,
         "sampleFps": effective_fps,
         "teams": [{"id": i, "label": f"Kit {'AB'[i]}", "colour": c} for i, c in enumerate(colours)],
+        # The job whose Kit A / Kit B order these kits follow (the report reuses its team names).
+        **({"teamsAlignedTo": aligned_to} if aligned_to else {}),
         "metrics": metrics,
         "frames": frames,
-        "limitations": ([kit_warning] if kit_warning else [])
-        + [
-            "Ball confidence scores are not calibrated probabilities.",
-            "Faint ball candidates require temporal and neural support; "
-            "short gaps on the same track are camera-compensated and marked inferred.",
-            "Possession is estimated from observed ball control and the passes between; it is not official match possession.",
-            "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
-            "Track IDs change after occlusion and cuts; they are not player identities.",
-            "Positions are image coordinates until the pitch is set up; speed, distance and xG are not measured, and goals count only when a person confirms them.",
-            "Green-surface filtering can include sideline players or miss players near boundaries.",
-        ]
-        + (
-            [
-                f"The file declares {meta['duration']:.0f} s but decoding ended at "
-                f"{analysed_duration:.0f} s; results cover the decodable part."
-            ]
-            if analysed_duration < duration * 0.97
-            else []
-        ),
+        "limitations": limitations(kit_warning, meta["duration"], analysed_duration, duration),
     }
     result["performance"]["totalSeconds"] = round(time.monotonic() - total_started, 3)
     output = Path(output)
