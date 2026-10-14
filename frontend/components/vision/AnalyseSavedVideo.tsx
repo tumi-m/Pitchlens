@@ -9,6 +9,11 @@ import {
   uploadToVision,
   visionAccessCode,
   setVisionAccessCode,
+  cleanAccessCode,
+  ACCESS_CODE_CHARACTERS,
+  CONNECTION_LOST,
+  connectionLost,
+  defaultVisionOptions,
 } from "@/lib/review/vision";
 export function AnalyseSavedVideo({
   id,
@@ -22,10 +27,14 @@ export function AnalyseSavedVideo({
   const [percent, setPercent] = useState(0);
   const [error, setError] = useState("");
   const upload = useRef<AbortController | null>(null);
+  const left = useRef(false);
   const [health, setHealth] = useState<VisionHealth | null>(null);
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
+  // Same default as the upload page: player load, the ball model only on request.
+  const [ballModel, setBallModel] = useState(false);
   useEffect(() => {
+    left.current = false;
     fetch("/api/vision/health", { cache: "no-store" })
       .then((r) => r.json().catch(() => ({})))
       .then((x: VisionHealth) => {
@@ -35,7 +44,11 @@ export function AnalyseSavedVideo({
         else if (x.available) setVisionAccessCode("");
       })
       .catch(() => setHealth({ available: false }));
-    return () => upload.current?.abort();
+    return () => {
+      left.current = true;
+      // Stops an unfinished upload; an analysis already started is never cancelled.
+      upload.current?.abort();
+    };
   }, []);
   async function run() {
     setBusy(true);
@@ -52,20 +65,22 @@ export function AnalyseSavedVideo({
             : "Start the local vision worker first.",
         );
       if (status.accessRequired) {
-        if (!code.trim()) {
+        if (!cleanAccessCode(code)) {
           setNeedsCode(true);
           throw new Error("Enter the access code first.");
         }
-        setVisionAccessCode(code.trim());
+        if (!setVisionAccessCode(code)) throw new Error(ACCESS_CODE_CHARACTERS);
       }
       const video = await loadVideo(id);
       if (!video) throw new Error("Reconnect the original video first.");
       const job = await uploadToVision(video, {
         title,
+        ...defaultVisionOptions(status, { playerLoadOnly: !ballModel }),
         signal: controller.signal,
         onProgress: setPercent,
       });
-      router.push(`/vision/${job.id}`);
+      // Left the page meanwhile: the analysis runs on and is listed on the dashboard.
+      if (!left.current) router.push(`/vision/${job.id}`);
     } catch (e) {
       if (e instanceof VisionError && e.code === "access") {
         setVisionAccessCode("");
@@ -75,9 +90,11 @@ export function AnalyseSavedVideo({
       setError(
         e instanceof DOMException && e.name === "AbortError"
             ? "Upload cancelled."
-            : e instanceof Error
-              ? e.message
-              : "Unable to start analysis",
+            : connectionLost(e)
+              ? CONNECTION_LOST
+              : e instanceof Error
+                ? e.message
+                : "Unable to start analysis",
       );
       setBusy(false);
     } finally {
@@ -101,6 +118,10 @@ export function AnalyseSavedVideo({
           disabled={busy}
         />
       )}
+      <label className="flex gap-2 text-sm max-w-sm">
+        <input type="checkbox" checked={ballModel} disabled={busy} onChange={(e) => setBallModel(e.target.checked)} />
+        Run the ball model (possession and passes; a costlier job). Without it, Pitchlens measures how far each kit ran.
+      </label>
       <button
         disabled={busy || !health.available}
         onClick={run}
@@ -108,10 +129,13 @@ export function AnalyseSavedVideo({
         title={health.available ? undefined : "The analysis server is not responding"}
       >
         {busy
-          ? `Sending video for analysis · ${percent}%`
+          ? percent < 100
+            ? `Sending video for analysis · ${percent}%`
+            : "Starting the analysis…"
           : "Analyse this video automatically"}
       </button>
-      {busy && (
+      {/* From 100% the analysis may already be running: its report page can cancel it. */}
+      {busy && percent < 100 && (
         <button
           onClick={() => upload.current?.abort()}
           className="pitch-button-secondary text-sm"

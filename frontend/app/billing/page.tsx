@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Navbar } from "@/components/ui/Navbar";
-import { setVisionAccessCode, visionAccessCode, visionJson } from "@/lib/review/vision";
+import { ACCESS_CODE_CHARACTERS, setVisionAccessCode, visionAccessCode, visionJson } from "@/lib/review/vision";
 
 type Summary = {
   mode: "test";
@@ -20,6 +20,7 @@ export default function BillingPage() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [email, setEmail] = useState("");
   const [access, setAccess] = useState("");
+  const [accessProblem, setAccessProblem] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -128,9 +129,12 @@ export default function BillingPage() {
         <details className="glass-card p-5" open={!!error}>
           <summary className="cursor-pointer text-sm font-medium">Pilot access code</summary>
           <label className="block text-sm text-pitch-muted mt-3">Needed only when this site uses an access code
-            <input type="password" autoComplete="off" value={access} onChange={(e) => { setAccess(e.target.value); setVisionAccessCode(e.target.value); }}
+            {/* Saved trimmed and without invisible marks; a code that cannot be sent is not kept. */}
+            <input type="password" autoComplete="off" value={access}
+              onChange={(e) => { setAccess(e.target.value); setAccessProblem(setVisionAccessCode(e.target.value) ? "" : ACCESS_CODE_CHARACTERS); }}
               className="pitch-input w-full mt-2" aria-label="Pilot access code" />
           </label>
+          {accessProblem && <p role="alert" className="text-xs text-red-300 mt-1">{accessProblem}</p>}
         </details>
         {returnedReference && <button disabled={busy || !summary.configured} onClick={() => void verify(returnedReference)} className="pitch-button-primary">Check returned payment</button>}
         <section className="glass-card p-6 space-y-4">

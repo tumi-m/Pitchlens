@@ -188,7 +188,8 @@ export type TeamStats = {
   passShare?: number | null;
   shots: CountStat | null;
   shotsOnTarget: CountStat | null;
-  goals: { value: number; candidates: number } | null;
+  /** candidates is null when possible goals were not looked for (no pitch setup). */
+  goals: { value: number; candidates: number | null } | null;
   interceptions: CountStat | null;
   tackles: CountStat | null;
   /** Share of both teams' attacking-third control that was this team's. */
@@ -204,6 +205,8 @@ export type AnalysisEvent = {
   confidence: number;
   status: "proposed" | "confirmed" | "rejected";
   outcome?: string;
+  /** "reviewer" when a person set the outcome (not the automatic reading). */
+  outcomeBy?: string;
   onTarget?: boolean;
   x?: number | null;
   y?: number | null;
@@ -230,6 +233,15 @@ export type Analysis = {
   schemaVersion: 1;
   calibrated: boolean;
   template: PitchTemplate | null;
+  /** The worker's thresholds (absent on older workers). */
+  params?: {
+    /** Share of in-play time the ball must be followed before possession is shown (0-1). */
+    possessionMinCoverage?: number;
+    /** Checked detections of a type before the unchecked ones are estimated. */
+    minCheckedForEstimate?: number;
+    /** Observed control seconds in a minute before its momentum is shown. */
+    minMomentumControlSeconds?: number;
+  };
   directions: { segments: { start: number; end: number | null; team0Attacks: "left" | "right" }[]; confidence: number; source: string } | null;
   events: AnalysisEvent[];
   stats: {
@@ -250,6 +262,9 @@ export type Analysis = {
       contestedSeconds: number;
       looseSeconds: number;
       unknownSeconds: number;
+      /** Why shots are not measured: no ball in the footage (player-load job), no
+       *  pitch setup, or no attacking direction. null when they are measured. */
+      shotsBasis?: "no-ball" | "no-pitch" | "no-direction" | null;
     };
     momentum: (number | null)[];
     heatmaps: Record<string, number[][] | null> | null;
@@ -372,13 +387,22 @@ export const EVENT_LABELS: Record<string, string> = {
   shot: "Shot",
   goal: "Goal",
   "goal-candidate": "Possible goal",
-  interception: "Interception",
-  tackle: "Tackle / ball won",
+  // Every ball won from the other team that is not a tackle: intercepted passes and loose balls alike.
+  interception: "Ball won (interception or recovery)",
+  tackle: "Tackle",
   out: "Ball out",
   save: "Save",
   foul: "Foul",
   note: "Note",
 };
+
+/** A goal a person stands behind: their goal, a possible goal they confirmed, or
+ *  a confirmed shot whose goal outcome they set themselves. */
+export function isConfirmedGoal(e: AnalysisEvent): boolean {
+  if (e.status !== "confirmed") return false;
+  if (e.type === "goal" || e.type === "goal-candidate") return true;
+  return e.type === "shot" && (e.outcome === "goal" || e.outcome === "goal-candidate") && e.outcomeBy === "reviewer";
+}
 
 export function describeEvent(e: AnalysisEvent): string {
   const base = EVENT_LABELS[e.type] || e.type;
@@ -397,6 +421,8 @@ export type BallLabelState = {
     labelled: number;
     visible: number;
     tolerancePixels: number;
+    /** false on a player-load job: the ball model never ran, so its rates are not measured. */
+    measured?: boolean;
     recall: Rate;
     precision: Rate;
     falseDetections: Rate;
@@ -431,6 +457,8 @@ export type BallModelState = {
   active: string | null;
   runs: BallModelRun[];
   training: { state: "idle" | "running" | "done" | "failed"; stage?: string; run?: BallModelRun };
+  /** True only when this site may start a training run (absent on older workers: treat as no). */
+  siteTraining?: boolean;
 };
 
 export const fetchBallModel = () => visionJson<BallModelState>("ball-model");

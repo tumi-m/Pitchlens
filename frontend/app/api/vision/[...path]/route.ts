@@ -77,10 +77,13 @@ async function proxy(
   // group); set it again to require the code. Each browser still only sees its
   // own matches.
   const accessCode = (process.env.VISION_ACCESS_CODE || "").trim();
-  const writes = request.method !== "GET";
+  const writes = !["GET", "HEAD"].includes(request.method);
   if (writes) {
     const origin = request.headers.get("origin");
-    if (hosted && !origin)
+    // Browsers send Origin on same-origin POST/PUT/DELETE. Locally a same-origin
+    // fetch metadata header also passes; a request with neither (another device
+    // spoofing Host: localhost) is refused.
+    if (!origin && (hosted || request.headers.get("sec-fetch-site") !== "same-origin"))
       return Response.json({ detail: "Missing origin." }, { status: 403 });
     let originHost: string | null = null;
     try {
@@ -110,29 +113,38 @@ async function proxy(
       );
   }
   // Training switches the ball model every browser uses: never from an open site.
+  // The person reading this is a team owner, not the operator: no settings named.
   if (route === "ball-model/train" && request.method !== "GET" && !accessCode)
     return Response.json(
-      { detail: "Training from the site needs an access code. Set VISION_ACCESS_CODE, or train from a terminal." },
+      { detail: "Training is not available on this site. Your labels are saved for the next ball-model update." },
       { status: 403 },
     );
   // Rebuild the query so a browser can never pick someone else's owner key.
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");
-  const owner = request.headers.get("x-pitchlens-owner") || request.cookies.get(OWNER_COOKIE)?.value;
-  if (hosted && route !== "health" && (!owner || !OWNER.test(owner))) {
-    return Response.json({ detail: "Open this match in the browser that uploaded it.", code: "ownership" }, { status: 401 });
-  }
+  // The HttpOnly cookie outlives script storage (Safari's 7-day cap, "clear
+  // website data"), so a valid cookie wins: a freshly minted browser key must
+  // never hide this browser's matches or replace the only surviving copy.
+  const cookie = request.cookies.get(OWNER_COOKIE)?.value || "";
+  const header = request.headers.get("x-pitchlens-owner") || "";
+  const cookieOwner = OWNER.test(cookie) ? cookie : "";
+  const owner = cookieOwner || (OWNER.test(header) ? header : "");
+  // Listings and new analyses are always scoped to a browser, locally too: an
+  // ownerless listing would show every match on the worker.
   if (route === "jobs" || route === "jobs/from-url" || route === "venues") {
-    if (owner && OWNER.test(owner)) search.set("owner", owner);
-    else if (hosted && request.method === "GET") return Response.json([]);
-    else if (hosted)
+    if (owner) search.set("owner", owner);
+    else if (request.method === "GET") return Response.json([]);
+    else
       return Response.json(
-        { detail: "Browser storage is required to track your analyses." },
+        { detail: "Allow site data for this site to upload and keep your matches.", code: "storage" },
         { status: 400 },
       );
   }
+  if (hosted && route !== "health" && !owner) {
+    return Response.json({ detail: "Open this match in the browser that uploaded it.", code: "ownership" }, { status: 401 });
+  }
   // Saved venues belong to the browser that saved them.
-  if (route.endsWith("/calibration") && owner && OWNER.test(owner)) search.set("owner", owner);
+  if (route.endsWith("/calibration") && owner) search.set("owner", owner);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     // Relayed byte-for-byte: a compressed hop would break Content-Length/Range.
@@ -140,7 +152,7 @@ async function proxy(
   };
   // The media element cannot set a custom header; its HttpOnly cookie is
   // established by the authenticated status/result request before playback.
-  if (owner && OWNER.test(owner)) headers["x-pitchlens-owner"] = owner;
+  if (owner) headers["x-pitchlens-owner"] = owner;
   if (hosted) headers["x-pitchlens-require-owner"] = "1";
   for (const name of ["content-type", "range"]) {
     const value = request.headers.get(name);
@@ -188,13 +200,20 @@ async function proxy(
   if (route === "health") {
     const data = await upstream.json().catch(() => ({}));
     return Response.json(
-      { ...data, hosted, accessRequired: !!accessCode },
+      // Training from the site needs both an access code here (see above) and
+      // the worker's VISION_SITE_TRAINING=1; otherwise its button could only fail.
+      { ...data, hosted, accessRequired: !!accessCode, siteTraining: !!accessCode && data?.siteTraining === true },
       { status: upstream.status, headers: { "Cache-Control": "no-store" } },
     );
   }
   const out = new Headers({ "Cache-Control": "private, no-store" });
-  if (upstream.ok && owner && OWNER.test(owner)) {
-    out.append("Set-Cookie", `${OWNER_COOKIE}=${owner}; Path=/api/vision; Max-Age=31536000; HttpOnly; SameSite=Strict${hosted ? "; Secure" : ""}`);
+  if (owner) {
+    // The page copies this back into its storage, so both copies converge.
+    out.set("x-pitchlens-owner", owner);
+    // Set only when there is no valid cookie or it already holds this key: the
+    // durable copy is refreshed, never replaced by a different header key.
+    if (upstream.ok && (!cookieOwner || cookieOwner === owner))
+      out.append("Set-Cookie", `${OWNER_COOKIE}=${owner}; Path=/api/vision; Max-Age=31536000; HttpOnly; SameSite=Strict${hosted ? "; Secure" : ""}`);
   }
   for (const name of [
     "content-type",
@@ -205,6 +224,16 @@ async function proxy(
   ]) {
     const value = upstream.headers.get(name);
     if (value) out.set(name, value);
+  }
+  if (route === "ball-model" && request.method === "GET" && !accessCode && upstream.ok) {
+    // An open site refuses training above, whatever the worker allows: say so up front.
+    const data = await upstream.json().catch(() => null);
+    out.delete("content-length");
+    out.set("content-type", "application/json");
+    return new Response(JSON.stringify(data && typeof data === "object" ? { ...data, siteTraining: false } : data), {
+      status: upstream.status,
+      headers: out,
+    });
   }
   return new Response(upstream.body, {
     status: upstream.status,

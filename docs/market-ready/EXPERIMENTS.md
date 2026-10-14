@@ -1,7 +1,171 @@
 # Experiments
 
 Hypothesis, data, configuration, outcome, decision. Newest first.
-Development data only unless marked; none of these is a held-out result.
+Development data only unless marked. Lines marked "held-out" (E8-E11,
+E15-E19) are Metrica game 2, run only after tuning on game 1 stopped.
+
+## E19 · Stitching gate capped at 5 m / 0.9 body heights, rounds 0.6/1.5/3/5 s (2026-10-14)
+- Problem: stitch_tracks joined a chain end to any start within a
+  running-speed radius (8.5 m/s × gap + 1.5 m, so 27 m at 3 s; 1.2 × gap + 0.8
+  body heights without a pitch setup), for gaps up to 3 s. The tracker already
+  bridges 3.5 s with camera-compensated prediction, so fragments still apart
+  are often ones it had reason to refuse. A player missed for 4-5 s on one spot
+  was never rejoined.
+- Harness: the event harness cannot measure stitching (its fragments change ID
+  with no gap, so any stitcher rejoins everything: 24495 fragments → 49 players
+  on game 2). New identity mode: `evaluate_on_tracking_data.py DATA --game 2
+  --identity fixed|pan [--speed-miss 2]` films Metrica's known players with a
+  640x360 camera (fixed, or panning after the ball), adds bursty detector
+  misses, occlusion and box noise, runs the real ByteTracker, then stitch_tracks
+  in image space and with the exact calibration.
+- Change: a start must lie within min(running-speed radius, 5 m) of where the
+  chain ended or where its motion predicts (0.9 body heights without a pitch
+  setup); rounds of 0.6, 1.5, 3 and 5 s. Tuned on game 1 (~70 settings).
+- Main metric, held-out game 2: correct / wrong junction links on tracker-made
+  fragments (link precision), production → capped: fixed image 480/731 (0.40)
+  → 706/196 (0.78); pan image 674/1192 (0.36) → 854/510 (0.63); fixed
+  calibrated 502/1108 (0.31) → 904/270 (0.77); pan calibrated 715/1611 (0.31)
+  → 1204/558 (0.68). Misses rising with player speed (`--speed-miss 2`), same
+  order: 513/779 → 673/225, 678/1348 → 867/511, 536/1214 → 928/348,
+  709/1803 → 1215/626. Purity (no-stitching ceiling 0.949 fixed, 0.911 pan):
+  0.898 → 0.929, 0.833 → 0.878, 0.857 → 0.922, 0.797 → 0.866; on tracks of
+  20 s or more (the average-position dots) fixed image 0.872 → 0.909, pan
+  calibrated 0.753 → 0.834.
+- Rejected: an 8 s round. Its links were only 56-63% correct and it cost 1.6-2.6
+  purity points on tracks of 20 s or more. The 8 s variant still beat
+  production on both counts in 8 robustness runs (new seeds, game 1, heavier
+  occlusion and box noise, longer and speed-related misses); the 5 s version is
+  the same minus its last round.
+- Purity and IDF1 alone mislead: no stitching scores the best purity (0.949),
+  and an uncapped 8 s stitcher the best IDF1 (0.075 at 41% link precision, in
+  the round's simulation). In the harness IDF1 reads ~0.03 for every stitcher
+  (each true player matches one stitched track), so it is reported last.
+- Events and possession unchanged: the event harness output is identical, and
+  so are the Tryzub clip's events and possession with this change alone. The
+  report's "track segments" count rises because fewer different players are
+  merged: Tryzub 199 → 241, owner's match 1417 → 1638 (its 235 passes and 119
+  interceptions unchanged).
+- Decision: adopt, stopping at 5 s: a missed link is preferred to a wrong one.
+
+## E18 · Possession changes hands mid-way between opposing controls (2026-10-14)
+- Problem: between a control by one team and the next by the other, the whole
+  unseen stretch went to the first team; with a bursty ball the winner's first
+  sighted control comes well after it won the ball.
+- Change: the hand-over is put at the middle of the stretch (same-team and
+  long gaps unchanged). Tuned on game 1 (25/40/50/60/100% of the stretch to the
+  winner; 50% best or equal-best in every condition).
+- Data: Metrica, 5 fps, ball dropped in bursts (two-state Markov, mean sighting
+  2 frames, 25% visible), 0.3 m / 0.5 m noise, a new ID every ~5 s, whole
+  fragments given the wrong kit (10-30%); calibrated, uncalibrated top-down
+  and a panning broadcast-style perspective camera.
+- Outcome, held-out game 2, agreement at unchanged coverage: calibrated 83.9% →
+  84.8% (10% kit errors), 66.7% → 66.9% (30%); uncalibrated top-down 79.2% →
+  80.5%; perspective 79.6% → 81.4%; 16% visible 85.5% → 86.5% (calibrated),
+  80.3% → 81.5% (perspective); 40% visible with 20% kit errors 75.3% → 77.3%;
+  ball always seen 91.2% → 92.4%. Game 1: +0.8 to +3.4 points. Share error
+  worse by at most 0.5 points, better by up to 1.7; events and possession
+  counts unchanged. Owner's match: 59.6% → 59.5%.
+- Repository harness, held-out game 2 at E8 defaults
+  (`evaluate_on_tracking_data.py DATA --game 2`): agreement 89.4% → 92.3% at
+  unchanged coverage (89.3%); share error 0.1 → 0.8 points (52.8 vs true
+  52.0). Game 1: 88.9% → 91.7% (share error 0.4 → 0.9). Events identical.
+- Decision: adopt.
+
+## E17 · In-play time from stoppages measured over 2 s (2026-10-14)
+- Problem: dead_ball() read speeds from positions 0.4 s apart; 0.3 m of
+  position noise alone reads ~1.3 m/s. On Metrica with 0.3 m noise it found 7%
+  (game 1) and 5% (game 2) of 2459 s / 2250 s of stoppages (last action to
+  restart, from the event data, goal kicks included); without noise 85% / 82%.
+  In-play time therefore included the stoppages: on game 2 (25% ball visible)
+  "possession followed" read 53.8% while 80.4% of live play was followed, and
+  the share was withheld.
+- Change: stoppages() applies the same rule to speeds measured over 2 s and
+  sets the in-play time only (coverage, bounds, in-play and dead-ball seconds;
+  possession seconds count live moments). Sequence lengths (average possession,
+  the share's interval) also count live frames only, and a possession lying
+  wholly inside a stoppage is not counted. Found 83% / 82% of stoppages at
+  84% / 83% precision (0.3 m noise); 80% / 80% at 0.5 m noise (old: 0%).
+- Not adopted: also cutting possessions and passes at these stoppages (game 2
+  coverage 83.7% → 70.9%, pass F1 0.50 → 0.47; stoppages of 12 s or more
+  only: coverage -2.8 points for +0.3 agreement).
+- Outcome, held-out game 2 (calibrated): followed 53.8% → 75.0% (true 80.4%),
+  share now shown (error 1.4 points with E18), unseen-play bounds 26.6-72.9% →
+  38.0-62.9% (true share 52.0%). Game 1: 55.7% → 77.7% (true 80.5%), bounds
+  29.9-74.2% → 41.5-63.8%. Agreement, coverage and events unchanged. On 45
+  overlapping 37-minute windows of both games the true share stayed inside the
+  bounds in 45 of 45 (mean width 48 → 36 points); the share was shown in 26
+  windows instead of 13, with one over 5 points off in each case.
+- Repository harness, held-out game 2 at E8 defaults
+  (`evaluate_on_tracking_data.py DATA --game 2`): dead-ball time 123 → 1964 s,
+  possession followed 57.4% → 79.8%, share now shown at 52.7 with E18 (51.8
+  without; true 52.0), unseen-play bounds 28.9-71.5 → 42.1-62.3. Game 1:
+  followed 61.7% → 84.5%. Pass, shot, interception and goal scores identical.
+- Possession counts and average length keep a stricter gate (80% followed): with
+  10% kit errors at 75-78% followed they were off by 17-32% and 35-49%. The
+  gate is a conservative hide, not a validated threshold: game 2 with a 40%
+  bursty ball and 10% kit errors reads 85% followed, yet possessions are 17%
+  low and the average possession 42% off.
+- Uncalibrated footage is unchanged (no stoppage detection without the pitch).
+  The owner's match (76% followed) now shows its share but no possession counts.
+
+## E16 · Event times when the ball is mostly unseen (2026-10-14)
+- Problem: with the ball seen in 25% of frames in bursts of ~2 samples, the
+  first sighted control after an unseen stretch comes after the real gain
+  (calibrated: median 0.52 s, 90th percentile 1.75 s late), and the passer's
+  last sighted control comes before the release. Correct interceptions fell
+  outside the 1 s matching window, and the review timeline showed them late.
+- Change: a calibrated interception is stamped 0.5 s before the first sighted
+  control, never before the release (the clamp is to the release, so an
+  interception never precedes the pass it intercepts); a pass 0.2 s after the
+  last control, never after the reception. Image-space gains are unchanged
+  (control there starts earlier). Tackles unchanged. Tuned on game 1:
+  interception shifts of 0.4/0.5/0.6 s identical; pass 0.1/0.2/0.3 s, 0.2
+  chosen; image space 0/0.2/0.5 s, 0 chosen.
+- Data: Metrica game 1 (tuning) and game 2 (held out); bursty Markov ball,
+  0.3/0.5 m noise, IDs every ~5 s, whole-fragment kit flips 0-30%, calibrated
+  and uncalibrated broadcast-perspective input; also 15% visible, a second
+  seed, 20% false ball detections.
+- Held-out game 2 (precision/recall, round-3 simulation), calibrated, correct
+  kits: passes 0.86/0.51 → 0.88/0.52; interceptions 0.22/0.21 → 0.31/0.30.
+  With 20% kit flips: interceptions 0.067/0.145 → 0.087/0.186. Uncalibrated:
+  passes slightly better, interceptions unchanged. Shots, tackles and
+  possession identical everywhere. (Measured with the gain clamped to the
+  passer's last control; the clamp to the release scores the same at 25%
+  visibility and at E8 defaults, and better with the ball always seen:
+  interceptions matched 69 → 71 of 145.)
+- Repository harness, held-out game 2 at E8 defaults
+  (`evaluate_on_tracking_data.py DATA --game 2`): interception F1 0.21 → 0.27
+  (matched 33 → 42 of 145), pass F1 0.62 → 0.64 (matched 504 → 520); shots,
+  goals and possession unchanged. Game 1: interception F1 0.34 → 0.36, pass
+  F1 0.62 → 0.65.
+- The harness gained owner-like degradations (`--visible`/`--run` bursty
+  ball, `--team-flip` whole-fragment kit errors, `--camera broadcast` panning
+  uncalibrated 640x360 view, `--ball-fp` boots taken for the ball, `--seed`)
+  and metrics that compare like with like: `turnover` (interceptions and
+  tackles against every recovery), `passAttempt` (every pass against completed
+  passes plus pass-like ball losses) and `passComplete`; `pass` keeps the E8
+  scoring. Game 2 at E8 defaults: passAttempt F1 0.61 → 0.63, turnover F1
+  0.27 → 0.33. Owner-like (`--game 2 --visible 0.4 --run 2 --team-flip 0.2
+  --camera broadcast`): passAttempt F1 0.63, interception precision 0.09
+  (recall 0.26), turnover precision 0.16.
+- Interception false positives under kit-label noise (game 2 calibrated,
+  before): 78/87/93/96% at 0/10/20/30% flips; 138 → 353 detections for 145
+  real interceptions.
+- Also measured, not adopted:
+  - Dropping a ≤2-sample opponent control between two controls of one team
+    within 3 s: precision up, but held-out recall -1 to -4.5 points (it does
+    halve interceptions when 20% of ball detections are false).
+  - A two-state HMM over spell teams: interception recall -45%.
+  - Flipping kit labels from ball exchanges: 102 of 174 flips wrong.
+  - An image-space "contested" state: pass recall -30%.
+  - Minimum control duration, ball travel and minimum gap: no separation
+    under kit noise; single-sample gains were the most precise.
+- Owner's match: the same-team share of exchanges is ~50% at every gap and in
+  every slice (kit agreement, ball confidence, detected vs recovered, spell
+  length), so its interception count is not something the event rules can
+  tighten. Its counts are unchanged (235 passes, 119 interceptions); passes
+  move 0.2 s.
+- Decision: adopt.
 
 ## E15 · Possession across long unseen stretches (2026-10-13)
 - Problem: the owner's 37-minute 360p match had the ball in 25% of frames

@@ -396,6 +396,10 @@ def _look_at(position, target, fov, size):
 def test_camera_geometry_is_stable_for_a_camera_facing_straight_across():
     size = (1280, 720)
     G = _look_at(np.array([20.0, 40.0, 8.0]), [20.0, 10.0, 0.0], 70.0, size)  # side-on, level with halfway
+    # _look_at's world is right-handed with z up: seen from the near side its x
+    # grows to the left. Re-express it in pitch axes (x grows to the right).
+    G = G @ np.array([[-1, 0, TEMPLATE["length"]], [0, 1, 0], [0, 0, 1.0]])
+    assert pitch.camera_pose(G, size, [[20.0, 10.0]])[2] is False
     world = np.array([p for p in pitch.landmarks(TEMPLATE).values()], float)
     image = pitch.apply(G, world)
     inside = (image[:, 0] > 0) & (image[:, 0] < size[0]) & (image[:, 1] > 0) & (image[:, 1] < size[1])
@@ -423,3 +427,318 @@ def test_malformed_calibration_values_are_input_errors():
     ):
         with pytest.raises(ValueError):
             calibrate.validate_request(request, SIZE)
+
+
+# ── Line masks, re-acquisition, mirrored names, resolution, fit checks ─────
+def test_bright_adverts_do_not_hide_faint_painted_lines():
+    h, w = 360, 640
+    frame = np.full((h, w, 3), (40, 140, 40), np.uint8)
+    lines = np.zeros((h, w), np.uint8)
+    for y in (120, 250, 340):
+        cv2.line(lines, (20, y), (620, y), 255, 2)
+    for x in (40, 320, 600):
+        cv2.line(lines, (x, 110), (x, 345), 255, 2)
+    frame[lines > 0] = (120, 170, 120)  # faint, low-saturation paint (top-hat about 36)
+    # Advert boards above the pitch: bright lettering on a dark panel, 4% of the frame.
+    frame[10:60, :] = (30, 30, 30)
+    for x in range(0, w, 8):
+        frame[15:55, x:x + 3] = (250, 250, 250)
+    mask = pitch.line_mask(frame)
+    assert (mask[lines > 0] > 0).mean() >= 0.6
+    # Without the adverts the mask is the same as before.
+    clean = frame.copy()
+    clean[10:60, :] = (40, 140, 40)
+    assert (pitch.line_mask(clean)[lines > 0] > 0).mean() >= 0.6
+
+
+def test_re_acquisition_needs_a_score_close_to_the_clicked_views_own():
+    from app.vision import calibrate
+
+    assert calibrate.reacquire_threshold(0.70) <= 0.69  # real lines: a correct 0.69 lock is kept
+    assert calibrate.reacquire_threshold(1.0) > 0.65  # a crisp court: a 0.65 false lock is not
+    assert calibrate.reacquire_threshold(None) == 0.6 and calibrate.reacquire_threshold(0.5) == 0.6
+
+
+def test_a_zoomed_re_aim_is_found_again_and_never_locked_onto_the_wrong_lines():
+    from app.vision import calibrate
+
+    H0 = camera_homography()
+    cal = {"H": np.linalg.inv(H0).tolist(), "k1": 0.0, "size": list(SIZE)}
+    own = pitch.line_mask(render(H0), restrict_to_grass=False)
+    _, self_score = pitch.align_to_lines(np.dstack([own] * 3), cal, np.linalg.inv(H0), TEMPLATE, precomputed=own)
+    threshold = calibrate.reacquire_threshold(self_score)
+    probe = np.array([[x, y] for x in np.linspace(2, 38, 10) for y in np.linspace(2, 18, 5)])
+    c = np.array([SIZE[0] / 2, SIZE[1] / 2])
+    # The shift-only search locked onto the wrong lines (2-7 m off) for the first seven at score 0.61-0.65.
+    re_aims = [(1.2, 80, -20), (1.15, 40, -20), (1.15, -40, -20), (1.15, 40, 0), (1.15, 80, 0), (1.15, -80, 0), (0.85, 80, 20),
+               (1.0, 0, 0), (0.9, -40, 20), (1.1, 80, -20), (0.85, -80, -20)]
+    for zoom, dx, dy in re_aims:
+        Z = np.array([[zoom, 0, c[0] * (1 - zoom)], [0, zoom, c[1] * (1 - zoom)], [0, 0, 1]])
+        moved = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]]) @ Z @ H0
+        mask = pitch.line_mask(render(moved), restrict_to_grass=False)
+        refined, score = pitch.align_to_lines(np.dstack([mask] * 3), cal, np.linalg.inv(H0), TEMPLATE, precomputed=mask, search=int(min(SIZE) * 0.3))
+        image = pitch.apply(moved, probe)
+        inside = (image[:, 0] > 0) & (image[:, 0] < SIZE[0]) & (image[:, 1] > 0) & (image[:, 1] < SIZE[1])
+        assert refined is not None and score >= threshold, (zoom, dx, dy, score)
+        assert np.linalg.norm(pitch.apply(refined, image[inside]) - probe[inside], axis=1).max() < 1.0, (zoom, dx, dy)
+
+
+def _pitch_camera(template, back=8.0, height=6.0, fov=80.0, size=SIZE):
+    """A camera behind the near touchline, in pitch axes (x grows to the right)."""
+    L, W = template["length"], template["width"]
+    G = _look_at(np.array([L / 2, W + back, height]), [L / 2, W / 2 - 2, 0.0], fov, size)
+    return G @ np.array([[-1, 0, L], [0, 1, 0], [0, 0, 1.0]])
+
+
+def _visible_names(G, marks, size=SIZE):
+    out = []
+    for name, xy in marks.items():
+        x, y = pitch.apply(G, [xy])[0]
+        if np.isfinite(x) and 2 < x < size[0] - 2 and 2 < y < size[1] - 2:
+            out.append(name)
+    return out
+
+
+def test_left_and_right_swapped_is_rated_poor_with_a_warning():
+    five = pitch.normalise_template("five-a-side")
+    G = _pitch_camera(five)
+    marks = pitch.landmarks(five)
+    names = _visible_names(G, marks)
+    world = np.array([marks[n] for n in names])
+    clicks = pitch.apply(G, world) + np.random.default_rng(0).normal(0, 0.7, world.shape)
+    right = pitch.fit(clicks, world, SIZE, "auto")
+    assert right["quality"] == "good" and not any("swapped" in w for w in right["warnings"])
+    swap = {"left": "right", "right": "left"}
+    mirrored = np.array([marks["-".join(swap.get(part, part) for part in n.split("-"))] for n in names])
+    wrong = pitch.fit(clicks, mirrored, SIZE, "auto")
+    assert wrong["rmsPixels"] == pytest.approx(right["rmsPixels"], abs=0.05)  # the same pixels fit just as well
+    assert wrong["quality"] == "poor" and any(w.startswith("Left and right, or near and far, are swapped") for w in wrong["warnings"])
+    assert wrong["cameraHeight"] > 0  # still printed as a height
+
+
+def test_near_and_far_swapped_behind_a_goal_is_rated_poor_with_a_warning():
+    five = pitch.normalise_template("five-a-side")
+    L, W = five["length"], five["width"]
+    # Behind the left goal, facing along the pitch: the near touchline is on the right.
+    G = _look_at(np.array([-6.0, W / 2, 5.0]), [L * 0.45, W / 2, 0.0], 85.0, SIZE) @ np.array([[1, 0, 0], [0, -1, W], [0, 0, 1.0]])
+    marks = pitch.landmarks(five)
+    names = _visible_names(G, marks)
+    world = np.array([marks[n] for n in names])
+    clicks = pitch.apply(G, world) + np.random.default_rng(1).normal(0, 0.7, world.shape)
+    right = pitch.fit(clicks, world, SIZE, "auto")
+    assert right["quality"] != "poor" and not any("swapped" in w for w in right["warnings"])
+    swap = {"near": "far", "far": "near"}
+    flipped = np.array([marks["-".join(swap.get(part, part) for part in n.split("-"))] for n in names])
+    wrong = pitch.fit(clicks, flipped, SIZE, "auto")
+    assert wrong["quality"] == "poor" and any("swapped" in w for w in wrong["warnings"])
+
+
+def test_top_down_clicks_are_never_called_mirrored():
+    marks = pitch.landmarks(TEMPLATE)
+    names = ["corner-far-left", "corner-far-right", "corner-near-right", "corner-near-left", "centre-spot", "halfway-far"]
+    world = np.array([marks[n] for n in names])
+    clicks = world * 12 + [80, 60]  # an affine (top-down) view: no camera height to read
+    cal = pitch.fit(clicks, world, SIZE, "none")
+    assert pitch.camera_pose(np.linalg.inv(np.asarray(cal["H"])), SIZE, world)[2] is None
+    assert cal["quality"] == "good" and not any("swapped" in w for w in cal["warnings"])
+
+
+def _fixed_camera_motion(width, frames=167, seed=4):
+    """Motion noise of a fixed 1080p stadium camera (p95 about 0.6 px), at another width."""
+    rng = np.random.default_rng(seed)
+    scale = width / 1920
+    return [
+        {"t": i / 2.78, "scene": 0, "camera": None if i == 0 else [1, 0, float(rng.normal(0, 0.23) * scale), 0, 1, float(rng.normal(0, 0.15) * scale)]}
+        for i in range(frames)
+    ]
+
+
+def test_a_fixed_4k_camera_is_static_and_a_panning_one_is_not():
+    frames = _fixed_camera_motion(3840)
+    assert not pitch.static_camera(frames)  # the 640-px limits read 4K noise as movement
+    assert pitch.static_camera(frames, width=3840)
+    H = np.linalg.inv(camera_homography())
+    homographies, _ = pitch.propagate(frames, {80: H}, width=3840)
+    assert all(h is not None and np.allclose(h, H) for h in homographies)
+    panning = [{"t": i / 5, "scene": 0, "camera": None if i == 0 else [1, 0, -3.0, 0, 1, 0]} for i in range(100)]
+    assert not pitch.static_camera(panning)
+    assert not pitch.static_camera([{**f, "camera": None if f["camera"] is None else [1, 0, -18.0, 0, 1, 0]} for f in panning], width=3840)
+
+
+def _loop_residuals(G, k1, size, image_points, pitch_points, line_clicks):
+    """The previous per-click loop, kept as the reference for the vectorised one."""
+    out = []
+    if len(image_points):
+        out.append((pitch.distort(pitch.apply(G, pitch_points), k1, size) - image_points).ravel())
+    if line_clicks:
+        clicks = pitch.undistort(np.array([c[0] for c in line_clicks]), k1, size)
+        for (a, b), click in zip([c[1] for c in line_clicks], clicks):
+            pa, pb = pitch.apply(G, [a, b])
+            direction = pb - pa
+            norm = np.linalg.norm(direction)
+            if not np.isfinite(norm) or norm < 1e-9:
+                out.append(np.array([1e3]))
+                continue
+            normal = np.array([-direction[1], direction[0]]) / norm
+            out.append(np.array([float(np.dot(click - pa, normal))]))
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def test_vectorised_residuals_equal_the_per_click_loop():
+    rng = np.random.default_rng(1)
+    lines = list(pitch.straight_lines(TEMPLATE).values())
+    for trial in range(200):
+        G = np.append(rng.normal(0, 1, 8), 1).reshape(3, 3)
+        if trial % 7 == 0:
+            G[2, :2] = 0  # affine
+        if trial % 11 == 0:
+            G[:, :2] = 0  # every line projects to a point
+        k1 = float(rng.choice([0, -0.1, -0.5]))
+        image, world = rng.uniform(0, 640, (6, 2)), rng.uniform(0, 40, (6, 2))
+        clicks = [((float(rng.uniform(0, 640)), float(rng.uniform(0, 360))), lines[rng.integers(len(lines))]) for _ in range(rng.integers(0, 12))]
+        a = _loop_residuals(G, k1, SIZE, image, world, clicks)
+        b = pitch._residuals(G, k1, SIZE, image, world, clicks)
+        assert np.array_equal(np.isfinite(a), np.isfinite(b))
+        finite = np.isfinite(a)
+        assert np.allclose(a[finite], b[finite], rtol=1e-12, atol=1e-9)
+
+
+def test_correct_clicks_are_not_called_wrong_and_a_wrong_click_is_named():
+    rng = np.random.default_rng(3)
+    for name in ("futsal", "five-a-side", "seven-a-side"):
+        template = pitch.normalise_template(name)
+        G = _pitch_camera(template, back=6.0, height=7.0, fov=90.0)
+        marks = pitch.landmarks(template)
+        names = _visible_names(G, marks)
+        world = np.array([marks[n] for n in names])
+        assert len(world) >= 6, name
+        for _ in range(5):
+            clicks = pitch.apply(G, world) + rng.normal(0, 0.7, world.shape)
+            cal = pitch.fit(clicks, world, SIZE, "none")
+            assert not any("disagrees" in w for w in cal["warnings"]), (name, cal["warnings"])
+            assert cal["leaveOneOut"] == [None] * len(world) and len(cal["z"]) == len(world)
+        wrong = int(rng.integers(len(world)))
+        clicks = pitch.apply(G, world) + rng.normal(0, 0.7, world.shape)
+        clicks[wrong] += [32, -24]  # 40 px off
+        cal = pitch.fit(clicks, world, SIZE, "none")
+        assert any(w.startswith(f"Landmark {wrong + 1} disagrees") for w in cal["warnings"]), (name, wrong, cal["warnings"])
+
+
+def test_a_landmark_nothing_else_checks_is_not_rated_good():
+    five = pitch.normalise_template("five-a-side")
+    G = _pitch_camera(five)
+    marks = pitch.landmarks(five)
+    names = ["corner-far-left", "corner-far-right", "halfway-near", "centre-spot"]
+    world = np.array([marks[n] for n in names])
+    clicks = pitch.apply(G, world)
+    clicks[2] += [0, -80]  # halfway-near clicked 80 px too high (positions up to 10 m off)
+    lines = pitch.straight_lines(five)
+    a, b = np.array(lines["far-touchline"])
+    rng = np.random.default_rng(3)
+    line_clicks = [(tuple(pitch.apply(G, [a + (b - a) * s])[0] + rng.normal(0, 0.5, 2)), lines["far-touchline"]) for s in np.linspace(0.15, 0.85, 4)]
+    cal = pitch.fit(clicks, world, SIZE, "auto", line_clicks)
+    assert cal["quality"] != "good"
+    assert any(w.startswith("Nothing else checks landmark") for w in cal["warnings"])
+
+
+def test_a_worst_case_preview_is_several_times_cheaper(monkeypatch):
+    import time
+
+    from app.vision import calibrate
+
+    size = (1920, 1080)
+    template = pitch.normalise_template("eleven-a-side")
+    marks = pitch.landmarks(template)
+    G, _ = cv2.findHomography(np.array([[0, 0], [105, 0], [105, 68], [0, 68]], float), np.array([[200, 250], [1720, 250], [1900, 1000], [20, 1000]], float))
+    rng = np.random.default_rng(0)
+    points = [{"name": n, "x": float(x + rng.normal(0, 1)), "y": float(y + rng.normal(0, 1))} for n, (x, y) in ((n, pitch.apply(G, [marks[n]])[0]) for n in marks)]
+    lines = pitch.straight_lines(template)
+    clicks = []
+    for k in range(80):
+        name = list(lines)[k % len(lines)]
+        a, b = np.array(lines[name])
+        x, y = pitch.apply(G, [a + (b - a) * rng.uniform(0.05, 0.95)])[0]
+        clicks.append({"line": name, "x": float(x + rng.normal(0, 1)), "y": float(y + rng.normal(0, 1))})
+    result = {"frames": [{"t": 0.0}], "video": {"width": size[0], "height": size[1]}}
+    request = {"template": "eleven-a-side", "points": points, "lines": clicks, "distortion": "auto"}
+    assert len(points) == 23
+    started = time.process_time()
+    fast = calibrate.preview(result, request)
+    now = time.process_time() - started
+    # Before: residuals looped over the line clicks, and every landmark was left out in turn once more.
+    monkeypatch.setattr(pitch, "_residuals", _loop_residuals)
+    started = time.process_time()
+    slow = calibrate.preview(result, request)
+    template_, image, world, _, _, _, line_clicks, _ = calibrate.validate_request(request, size)
+    pitch._leave_one_out(image, world, line_clicks, size, [slow["fit"]["k1"]], False)
+    before = time.process_time() - started
+    assert fast["fit"]["quality"] == slow["fit"]["quality"] == "good"
+    assert before >= 3 * now, (before, now)
+
+
+def test_lens_term_does_not_absorb_a_mis_clicked_corner():
+    marks = pitch.landmarks(TEMPLATE)
+    lines = pitch.straight_lines(TEMPLATE)
+    H = camera_homography()
+    world = np.array([marks[n] for n in ("corner-far-left", "corner-far-right", "corner-near-right", "corner-near-left")])
+
+    def fit(off, k1=0.0):
+        rng = np.random.default_rng(0)
+        clicks = pitch.distort(pitch.apply(H, world), k1, SIZE) + rng.normal(0, 0.5, world.shape)
+        clicks[2] += [off, -off / 2]
+        touchline_clicks = []
+        for name in ("far-touchline", "near-touchline"):
+            a, b = np.array(lines[name])
+            for s in (0.15, 0.3, 0.5, 0.7, 0.85):
+                touchline_clicks.append((tuple(pitch.distort(pitch.apply(H, [a + (b - a) * s]), k1, SIZE)[0] + rng.normal(0, 0.5, 2)), lines[name]))
+        return pitch.fit(clicks, world, SIZE, "auto", touchline_clicks)
+
+    thirty = fit(30)
+    assert thirty["k1"] == 0 and thirty["quality"] == "check"
+    assert fit(45)["quality"] == "poor"
+    lens = fit(0, k1=-0.15)
+    assert abs(lens["k1"] + 0.15) < 0.03
+
+
+def test_degenerate_clicks_get_a_clear_message():
+    from app.vision import calibrate
+
+    frames = [{"t": round(i / 3, 3), "scene": 0, "players": [], "ball": None, "camera": [1, 0, 0, 0, 1, 0] if i else None} for i in range(30)]
+    result = {"frames": frames, "sampleFps": 3, "video": {"width": SIZE[0], "height": SIZE[1], "fps": 30}}
+    names = ["corner-far-left", "corner-far-right", "corner-near-right", "corner-near-left", "centre-spot"]
+    pairs = [{"name": n, "x": [100, 100, 500, 500, 300][k], "y": [100, 100, 300, 300, 200][k]} for k, n in enumerate(names)]
+    in_a_line = [{"name": n, "x": 100 + 50 * k, "y": 100 + 20 * k} for k, n in enumerate(names)]
+    for points in (pairs, in_a_line):
+        with pytest.raises(ValueError, match="same spot or all clicks are in a line"):
+            calibrate.preview(result, {"template": "futsal", "points": points})
+        with pytest.raises(ValueError, match="same spot or all clicks are in a line"):
+            calibrate.build(result, {"template": "futsal", "points": points, "t": 0})
+
+
+def test_a_telephoto_camera_is_not_called_unreal():
+    template = pitch.normalise_template("eleven-a-side")
+    size = (1920, 1080)
+    G = _look_at(np.array([30.0, 68 + 50.0, 22.0]), [16.0, 30.0, 0.0], 21.0, size) @ np.array([[-1, 0, 105], [0, 1, 0], [0, 0, 1.0]])
+    marks = pitch.landmarks(template)
+    names = _visible_names(G, marks, size)
+    world = np.array([marks[n] for n in names])
+    assert len(world) >= 5
+    cal = pitch.fit(pitch.apply(G, world) + np.random.default_rng(2).normal(0, 1.0, world.shape), world, size, "none")
+    assert cal["fieldOfView"] == pytest.approx(21, abs=3) and cal["cameraHeight"] == pytest.approx(22, abs=4)
+    assert not any("real camera" in w for w in cal["warnings"])
+
+
+def test_a_mirrored_setup_is_refused_with_the_reason():
+    from app.vision import calibrate
+
+    five = pitch.normalise_template("five-a-side")
+    G = _pitch_camera(five)
+    marks = pitch.landmarks(five)
+    names = _visible_names(G, marks)
+    swap = {"left": "right", "right": "left"}
+    points = [{"name": "-".join(swap.get(part, part) for part in n.split("-")), "x": float(x), "y": float(y)}
+              for n, (x, y) in ((n, pitch.apply(G, [marks[n]])[0]) for n in names)]
+    frames = [{"t": round(i / 3, 3), "scene": 0, "players": [], "ball": None, "camera": [1, 0, 0, 0, 1, 0] if i else None} for i in range(30)]
+    result = {"frames": frames, "sampleFps": 3, "video": {"width": SIZE[0], "height": SIZE[1], "fps": 30}}
+    with pytest.raises(ValueError, match="are swapped"):
+        calibrate.build(result, {"template": "five-a-side", "points": points, "t": 0})

@@ -171,19 +171,25 @@ function Ring({ value, label, colour }: { value: number; label: string; colour: 
 
 const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p-5";
 
+export const DISTANCE_HINT =
+  "How far the feet moved after the camera pan is removed, scaled by a 1.8 m player. Movement counts once a foot is 3 pixels from where its last counted step ended, so slow walking adds up and jitter does not; missed detections up to 1 s are bridged. Boxes far from that track's usual height and anything over 11 m/s are left out. — means that kit could not be measured. Tracks are not named players. A squad 15 cm off 1.8 m moves this by about 8%.";
+
 export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
   const [hover, setHover] = useState<number | null>(null);
   const duration = result.analysedDuration || 1;
   const start = result.analysedStart ?? 0;
   // A share built on a sliver of the match is noise: withhold it below 20%.
+  // Coverage is null on a player-load job (the ball was not looked for).
+  const coverage = stats.controlCoverage;
   const shareKnown =
-    stats.controlCoverage >= 20 &&
+    coverage !== null &&
+    coverage >= 20 &&
     stats.controlShare[0] !== null &&
     stats.controlShare[1] !== null;
   const shareValues: [number | null, number | null] = shareKnown
     ? stats.controlShare
     : [null, null];
-  const lowEvidence = stats.controlCoverage < 50 && result.ballSearch !== "none";
+  const lowEvidence = coverage !== null && coverage < 50 && result.ballSearch !== "none";
   const events = result.metrics.events;
   return (
     <div className="space-y-6">
@@ -219,14 +225,16 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
             {result.ballSearch === "none" && result.metrics.playerLoad ? (
               <>
                 <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">Distance</span>
-                <div className="text-4xl sm:text-5xl font-black tabular-nums flex items-baseline gap-2">
-                  <span style={{ color: colours[0] }}>
-                    <CountUp value={result.metrics.playerLoad.metres[0]} decimals={1} format={(v) => v.toFixed(1)} />
-                  </span>
-                  <span className="text-pitch-muted text-3xl">–</span>
-                  <span style={{ color: colours[1] }}>
-                    <CountUp value={result.metrics.playerLoad.metres[1]} decimals={1} format={(v) => v.toFixed(1)} />
-                  </span>
+                <div className="text-4xl sm:text-5xl font-black tabular-nums flex items-baseline gap-2" data-testid="centre-distance">
+                  {result.metrics.playerLoad.metres.map((m, i) => (
+                    <span key={i} className="flex items-baseline gap-2">
+                      {i === 1 && <span className="text-pitch-muted text-3xl">–</span>}
+                      {/* A kit without a usable track was not measured: a dash, never 0. */}
+                      <span style={{ color: colours[i] }}>
+                        {typeof m === "number" ? <CountUp value={m} decimals={1} format={(v) => v.toFixed(1)} /> : "—"}
+                      </span>
+                    </span>
+                  ))}
                 </div>
                 <span className="text-xs text-pitch-muted">metres, camera pan removed · not named players</span>
               </>
@@ -287,7 +295,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
         </div>
         {lowEvidence && (
           <p className="relative border-t border-white/10 px-5 py-3 text-xs text-amber-200/90 bg-amber-400/5">
-            The ball was tracked near a player for only {stats.controlCoverage}% of the video, so control and pass figures describe that part only.
+            The ball was tracked near a player for only {coverage}% of the video, so control and pass figures describe that part only.
             A higher camera and more pixels on the ball may help, but cannot guarantee complete stats.
           </p>
         )}
@@ -314,7 +322,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
                 values={result.metrics.playerLoad.metres}
                 colours={colours}
                 format={(v) => `${v.toFixed(1)} m`}
-                hint="How far the feet moved after the camera pan is removed, scaled by a 1.8 m player. Steps under 3 pixels, boxes far from that track's usual height, and anything over 11 m/s are dropped. Tracks are not named players. A squad 15 cm off 1.8 m moves this by about 8%."
+                hint={DISTANCE_HINT}
               />
             )}
             {result.ballSearch !== "none" && (
@@ -445,7 +453,7 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
             <div className="grid grid-cols-3 gap-2">
               <Ring value={stats.playerCoverage} label="Frames with players" colour="#22c55e" />
               <Ring value={stats.ballCoverage} label="Frames with the ball" colour="#38bdf8" />
-              <Ring value={stats.controlCoverage} label="Time with ball control" colour="#a78bfa" />
+              <Ring value={coverage ?? 0} label="Time with ball control" colour="#a78bfa" />
             </div>
             )}
           </section>

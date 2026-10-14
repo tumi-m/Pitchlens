@@ -122,3 +122,60 @@ def test_ball_search_does_not_follow_an_uncorroborated_player_model_mark():
     assert focus is not None and abs(focus[0] - 210) < 1e-6
     assert search_focus(real, cut=False, motion_ok=True, since_sweep=0.5, matrix=matrix) is None
     assert search_focus(real, cut=True, motion_ok=True, since_sweep=0.1, matrix=matrix) is None
+
+
+def _ball_stages(candidate, players, every, seconds=10, fps=6.0):
+    """Replay engine.run_video's ball stages in order on synthetic frames (still
+    camera): online tracker with the aboveHeads flag, reject_static_candidates,
+    reassociation, recover_near_anchors, recover_ball (static drop, bridge).
+    Returns the published balls."""
+    import math
+
+    from app.vision.ball_tracking import BallTracker
+    from app.vision.faint import recover_ball, reject_static_candidates, strong_candidates
+
+    shape = (360, 640)
+    diagonal = math.hypot(640, 360)
+    tracker = BallTracker()
+    frames, matrices = [], []
+    for i in range(int(seconds * fps)):
+        t = i / fps
+        candidates = [dict(candidate)] if i % every == 0 else []
+        strong = strong_candidates(candidates)
+        ceiling = min(p['box'][1] for p in players) - 4
+        for c in strong:
+            if c['y'] < ceiling:
+                c['aboveHeads'] = True
+        ball = tracker.update(strong, t, np.eye(2, 3), shape, cut=False)
+        frames.append({'t': t, 'frame': i, 'scene': 0, 'players': copy.deepcopy(players), 'ball': ball, 'ballCandidates': candidates})
+        matrices.append(None if i == 0 else np.eye(2, 3))
+    if reject_static_candidates(frames, matrices, diagonal, fps):
+        tracker = BallTracker()
+        for i, f in enumerate(frames):
+            f['ball'] = tracker.update(strong_candidates(f['ballCandidates']), f['t'], np.eye(2, 3), shape, cut=False)
+    recover_near_anchors(frames, matrices, diagonal, fps)
+    recover_ball(frames, matrices, diagonal, fps)
+    return [f['ball'] for f in frames]
+
+
+HEADS = [{'id': k + 1, 'team': k % 2, 'role': 'player', 'box': [200 + 60 * k, 137, 216 + 60 * k, 177]} for k in range(6)]
+FAR_PLAYERS = [{'id': k + 1, 'team': k % 2, 'role': 'player', 'box': [300 + 40 * k, 100, 316 + 40 * k, 140]} for k in range(6)]
+
+
+def test_a_scoreboard_the_detector_sees_on_alternate_frames_is_never_the_ball():
+    graphic = {'x': 77.2, 'y': 51.6, 'box': [75, 49, 79, 54], 'outsidePitch': False}
+    for every, confidence in ((2, 0.5), (2, 0.82), (3, 0.5)):
+        balls = _ball_stages({**graphic, 'confidence': confidence}, HEADS, every)
+        at_graphic = [b for b in balls if b is not None and abs(b['x'] - 77.2) < 3 and abs(b['y'] - 51.6) < 3]
+        assert at_graphic == [], (every, confidence)
+
+
+def test_a_weak_unattended_spot_seen_on_alternate_frames_is_dropped():
+    spot = {'x': 120.0, 'y': 300.0, 'box': [118, 298, 122, 302], 'confidence': 0.2, 'outsidePitch': False}
+    assert all(b is None for b in _ball_stages(spot, FAR_PLAYERS, every=2))
+
+
+def test_a_confident_dead_ball_on_the_pitch_is_kept_even_when_seen_on_alternate_frames():
+    ball = {'x': 120.0, 'y': 300.0, 'box': [118, 298, 122, 302], 'confidence': 0.5, 'outsidePitch': False}
+    assert sum(b is not None for b in _ball_stages(ball, FAR_PLAYERS, every=1)) == 60
+    assert sum(b is not None for b in _ball_stages(ball, FAR_PLAYERS, every=2)) >= 58

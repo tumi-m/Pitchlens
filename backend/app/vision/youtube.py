@@ -155,9 +155,9 @@ def download(url, directory, max_bytes, progress=lambda **kw: None, cancelled=la
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
         raise ValueError(friendly("live not finished"))
     if not files:
-        limit = max_bytes / 1024**3
+        limit = f"{max_bytes / 1024**3:.1f} GB" if max_bytes >= 1024**3 else f"{max_bytes / 1024**2:.0f} MB"
         raise ValueError(
-            f"This video is larger than {limit:.1f} GB even at {HEIGHTS[-1]}p. Trim it or upload a shorter clip."
+            f"This video is larger than {limit} even at {HEIGHTS[-1]}p. Trim it or upload a shorter clip."
         )
     return remux(files[0]), {
         "title": info.get("title"),

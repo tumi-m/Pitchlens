@@ -38,9 +38,16 @@ distinguishable kits.
 
 ## Gate 3 · Advanced player analytics
 
-Player identity, distances, speeds: not offered. Requires persistent
+Player identity, per-player distances, speeds: not offered. Requires persistent
 identity (not feasible from shirt numbers at 20-25 px) and validated
 calibration. Revisit after tracker and stitching work plus user naming.
+
+Clarification: the report shows a per-kit running distance estimate (one
+total per team, camera pan removed, scaled by a 1.8 m player). It is
+unvalidated and it is not a per-player stat. This gate was written before
+player load became the upload default (3d17148, ba9e2af). **Owner: confirm
+this wording, and decide whether a per-kit distance needs its own accuracy
+target.**
 
 
 ## Hardening verification after `1b51ffb`

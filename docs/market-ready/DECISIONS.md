@@ -2,6 +2,35 @@
 
 Each entry: the decision, what else was considered, and why. Newest first.
 
+## 2026-10-14 · Stricter possession counts, tackles need the pitch, fewer stitching links
+
+- Possession counts and average possession now need 80% of play followed;
+  the share still needs 60%. Counts drift further than the share as unseen
+  gaps grow (E17). 80% is a conservative hide, not a validated threshold: one
+  labelled case read 85% followed with possessions 17% low.
+- Tackles are null ("—") without a pitch setup. A tackle is told from an
+  interception by the ball's travel in metres, so without it every won ball
+  reads as an interception or recovery. Reviewer-logged tackles still count.
+- Track stitching prefers a missed link to a wrong one: a join must start
+  within 5 m (0.9 body heights) of where the track ended or where its motion
+  predicts, over gaps of at most 5 s (E19). An uncapped running-speed radius
+  joined different players more often than the same one.
+
+## 2026-10-13 · Low-coverage possession counts and momentum are withheld
+
+- Possession counts and average possession follow the same 60% coverage gate
+  as the possession share (raised to 80% on 2026-10-14). Below it they are
+  null ("—"). A real job that followed 1.7% of play showed "Possessions 1 – 0",
+  and that 0 covered 98% of unseen play.
+- A momentum minute needs at least 5 s of observed ball control
+  (`minMomentumControlSeconds`). Otherwise it is a gap. The chart scales to its
+  peak, so 2.3 s against 0.3 s used to draw a full-height bar. Without a pitch
+  setup and attacking directions, momentum is the plain control difference,
+  and the report says so instead of claiming field position is weighted.
+- Shots a reviewer logged count without a pitch setup. A reviewer goal alone
+  does not count, because it would show "0 shots" next to a 1–0 score.
+  Possible goals still need the pitch and an attacking direction.
+
 ## 2026-09-28 · South Africa: prepare Paystack in ZAR, sandbox only
 
 The owner confirmed South Africa and approved Paystack preparation without an
@@ -75,9 +104,11 @@ The brief (prepared by another assistant) was treated as input, not a script.
 ## 2026-09-28 · Possession is team possession, not control time
 
 - Chosen: possession runs from one team's won ball to the other team's,
-  including the flight of passes, excluding dead-ball time; the share is shown
-  only when possession can be followed for at least 60% of in-play time, with
-  a bootstrap 95% interval.
+  including the flight of passes. In-play time excludes stoppages found from
+  player and ball speeds measured over 2 s (E17; needs the pitch set up). The
+  share is shown only when possession can be followed for at least 60% of
+  in-play time, with a bootstrap 95% interval. Possession counts and average
+  length need 80% of play followed, a stricter gate than the share.
 - Why: player-on-ball control is only ~18 of ~56 minutes of team possession
   per match (Link & Hoernig 2017), and it is exactly the part a 3-6 px ball at
   5 fps loses most. A control-time share was biased and noisy.
@@ -104,8 +135,10 @@ The brief (prepared by another assistant) was treated as input, not a script.
   the new analysis reads that moment differently the reviewer's reading
   stands. A stale "accept" can therefore never confirm a goal nobody saw.
 - Unmeasured is null, never zero: passes, tackles, interceptions and
-  possessions need kit labels; shots need an attacking direction (automatic
-  or set by the reviewer). Reviewer-logged events still count.
+  possessions need kit labels; tackles also need the pitch set up, because
+  without it every won ball reads as an interception/recovery and tackles are
+  null; shots need an attacking direction (automatic or set by the reviewer).
+  Reviewer-logged events still count.
 - A fixed camera is judged on its whole motion chain (no 5-second window may
   drift 8 px or more), and a moment where motion was not measured is only
   bridged when the player tracks show the camera held still. Otherwise the

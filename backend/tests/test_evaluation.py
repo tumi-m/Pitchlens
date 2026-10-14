@@ -100,3 +100,24 @@ def test_evaluate_combines_sections():
     report = evaluate({"frames": [], "sampleFps": 5}, analysis, {"match": "m", "possession": [{"start": 0, "end": 1, "team": 0}]})
     assert report["match"] == "m" and report["possession"]["coverage"]["value"] == 0.0
     assert np.isfinite(report["possession"]["shareTruth"])
+
+
+def test_identity_mode_scores_each_stitched_junction_by_the_true_player():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "evaluate_on_tracking_data.py"
+    spec = importlib.util.spec_from_file_location("evaluate_on_tracking_data", path)
+    harness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness)
+
+    def frame(t, players):
+        return {"t": t, "scene": 0, "players": [{"id": i, "gt": g} for i, g in players]}
+
+    # Fragments 1 and 2 are player A; fragment 3 is player B.
+    frames = [frame(0.0, [(1, "A"), (3, "B")]), frame(0.2, [(1, "A"), (3, "B")]), frame(0.4, [(2, "A")]), frame(0.6, [(2, "A")])]
+    assert harness.junction_links(frames, {1: 1, 2: 1, 3: 2}) == (1, 0)
+    assert harness.junction_links(frames, {1: 1, 3: 1, 2: 2}) == (0, 1)
+    assert harness.junction_links(frames, {1: 1, 2: 2, 3: 3}) == (0, 0)
+    metrics = harness.identity_metrics(frames, {1: 1, 3: 1, 2: 2})
+    assert metrics["wrongLinks"] == 1 and metrics["linkPrecision"] == 0.0
+    assert metrics["purity"] == round(4 / 6, 4)

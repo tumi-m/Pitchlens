@@ -27,6 +27,8 @@ import type { Match } from "@/lib/types";
 export default function DashboardIndexPage() {
   const { user, loading: authLoading } = useAuthContext();
   const { matches, loading } = useUserMatches(user?.uid ?? "guest");
+  // Vision analyses count as matches too: null until their list has been read.
+  const [visionCount, setVisionCount] = useState<number | null>(null);
 
   if (authLoading) return <LoadingScreen />;
 
@@ -54,7 +56,7 @@ export default function DashboardIndexPage() {
           </div>
 
           <LegacyPurgedNotice />
-          <VisionJobs />
+          <VisionJobs onCount={setVisionCount} />
           {loading ? (
             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {Array.from({ length: 3 }).map((_, i) => (
@@ -62,7 +64,7 @@ export default function DashboardIndexPage() {
               ))}
             </div>
           ) : matches.length === 0 ? (
-            <EmptyState />
+            visionCount === 0 ? <EmptyState /> : null
           ) : (
             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {matches.map((match, i) => (

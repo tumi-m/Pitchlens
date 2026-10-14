@@ -10,6 +10,18 @@ export type VisionJob = {
   video?: { duration: number };
   /** Hosted retention removed the footage; the measured result remains. */
   videoDeleted?: boolean;
+  /** Where the analysis started in the file, in seconds. */
+  startSeconds?: number;
+  /** Set for a short test section (seconds analysed); null for a full run. */
+  maxSeconds?: number | null;
+  /** Set when this run re-analysed another job's saved footage. */
+  sourceJobId?: string | null;
+  /** Ball model used: "none" is a player-load job. */
+  ballSearch?: string;
+  /** Bytes the worker holds of an upload in progress. */
+  receivedBytes?: number;
+  /** The worker can retry this stopped job from its saved upload (absent on older workers). */
+  retryable?: boolean;
 };
 export type VisionPlayer = {
   id: number;
@@ -44,34 +56,50 @@ export type VisionResult = {
   video: { duration: number; width: number; height: number; fps: number };
   analysedDuration: number;
   analysedStart?: number;
+  /** Timings as the engine measured them, written only for the steps that ran
+   *  (a player-load job has no ball timing); any may be missing from older results. */
   performance?: {
-    totalSeconds: number;
-    playerInferenceSeconds: number;
-    ballInferenceSeconds: number;
-    device: string;
+    totalSeconds?: number;
+    playerInferenceSeconds?: number;
+    playerInferenceCalls?: number;
+    /** null (or absent, before 2.7) on player-load jobs: the ball model was not run. */
+    ballInferenceSeconds?: number | null;
+    setupSeconds?: number;
+    decodeSeconds?: number;
+    cameraMotionSeconds?: number;
+    ballRecoverySeconds?: number;
+    device?: string;
+    batchSize?: number;
+    analysedFrames?: number;
   };
   sampleFps: number;
   teams: { id: number; label: string; colour: string }[];
+  /** A rerun whose Kit A / Kit B were put in this job's order (its team names apply). */
+  teamsAlignedTo?: string;
   metrics: {
     sampledFrames: number;
     playerFrames: number;
     ballFrames: number;
     ballFramesInferred?: number;
-    teamSeconds: number[];
+    /** Possession figures are null on player-load jobs: the ball was not looked for. */
+    teamSeconds: number[] | null;
     unknownSeconds: number;
     possessionShare: (number | null)[];
-    possessionCoverage: number;
+    possessionCoverage: number | null;
     trackCount: number;
-    /** Metres each kit ran, with the camera removed. Absent on results from before 2.6. */
+    /** Metres each kit ran, with the camera removed. Absent on results from before 2.6.
+     *  A kit with no usable track has null (not measured), never 0. */
     playerLoad?: {
-      metres: [number, number];
-      maxSpeed: number;
+      metres: [number | null, number | null];
+      maxSpeed: number | null;
       steps: number;
+      /** Samples per kit that passed the scene, camera, height and gap checks. */
+      measuredSamples?: [number, number];
       method: string;
       playerHeightM: number;
       footNoisePx: number;
     };
-    /** Added in pipeline 1.5; older results do not have it. */
+    /** Added in pipeline 1.5; older results do not have it; null on player-load jobs. */
     possessions?: {
       teams: {
         count: number;
@@ -87,7 +115,7 @@ export type VisionResult = {
         controlSeconds: number;
         passes: number;
       }[];
-    };
+    } | null;
     events: {
       id: string;
       type: string;
@@ -117,8 +145,13 @@ export type VisionHealth = {
   gpu?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
   configured?: boolean;
+  /** The site may start ball-model training (an access code is set and the worker allows it). */
+  siteTraining?: boolean;
   detail?: string;
 };
+
+/** The worker's default upload limit, used when /health does not say. */
+export const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 export const clockTime = (seconds: number) =>
   `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 
@@ -127,19 +160,47 @@ export class VisionError extends Error {
     message: string,
     readonly status: number,
     readonly code?: string,
+    /** The parsed error body (for example resetsAt, or the jobId of this browser's earlier upload). */
+    readonly data?: Record<string, unknown>,
   ) {
     super(message);
   }
 }
 
+/** What to show for a failed request. The daily cap says when analysis resumes. */
+export function visionErrorMessage(e: unknown, fallback: string): string {
+  if (e instanceof VisionError && e.code === "daily-limit") {
+    const at = Number(e.data?.resetsAt);
+    if (Number.isFinite(at) && at > 0) {
+      const when = new Date(at * 1000);
+      const time = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const day = when.toDateString() === new Date().toDateString() ? "" : "tomorrow ";
+      return `Analysis is paused until ${day}${time} (this server's daily limit).`;
+    }
+  }
+  return e instanceof Error ? e.message : fallback;
+}
+
+/** The worker no longer has this match: deleted here, in another tab, or by retention. */
+export const isMatchDeleted = (e: unknown) =>
+  e instanceof VisionError && e.status === 404 && /job not found/i.test(e.message);
+
+/** A cancel came after /start and the worker did not stop the analysis: it runs on. */
+export class VisionStartedError extends Error {
+  constructor(readonly jobId: string) {
+    super("The analysis had already started.");
+  }
+}
+
 const OWNER_KEY = "pitchlens-vision-owner";
 const ACCESS_KEY = "pitchlens-vision-access";
+const OWNER = /^[a-f0-9]{32}$/;
 
 /** Random per-browser key: the hosted worker only lists this browser's analyses. */
 export function visionOwner(): string {
   try {
     const saved = localStorage.getItem(OWNER_KEY);
-    if (saved && /^[a-f0-9]{32}$/.test(saved)) return saved;
+    if (saved && OWNER.test(saved)) return saved;
     const bytes = crypto.getRandomValues(new Uint8Array(16));
     const created = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
     localStorage.setItem(OWNER_KEY, created);
@@ -149,9 +210,30 @@ export function visionOwner(): string {
   }
 }
 
+/** The proxy answers with the key it used: its HttpOnly cookie wins over a key
+ *  minted after script storage was cleared, so copy that one back. */
+function adoptOwner(response: Response) {
+  const used = response.headers.get("x-pitchlens-owner");
+  if (!used || !OWNER.test(used)) return;
+  try {
+    if (localStorage.getItem(OWNER_KEY) !== used) localStorage.setItem(OWNER_KEY, used);
+  } catch {}
+}
+
+/** Zero-width, bidi and BOM marks ride along with pasted codes; they are never part of one. */
+export function cleanAccessCode(code: string): string {
+  return code.replace(/\p{Cf}/gu, "").trim();
+}
+
+/** Request headers carry Latin-1 only: a code with ’, — or emoji cannot be sent at all. */
+export const accessCodeSendable = (code: string) =>
+  Array.from(code).every((c) => (c.codePointAt(0) ?? 0) <= 0xff);
+
+export const ACCESS_CODE_CHARACTERS = "Codes use letters, numbers and symbols only.";
+
 export function visionAccessCode(): string {
   try {
-    return localStorage.getItem(ACCESS_KEY) || "";
+    return cleanAccessCode(localStorage.getItem(ACCESS_KEY) || "");
   } catch {
     return "";
   }
@@ -168,11 +250,16 @@ function accessRejected() {
   } catch {}
 }
 
-export function setVisionAccessCode(code: string) {
+/** Saves the code as it will be sent. Returns false (and keeps nothing) for a
+ *  code that cannot be sent; the field then says which characters work. */
+export function setVisionAccessCode(code: string): boolean {
+  const clean = cleanAccessCode(code);
+  const sendable = accessCodeSendable(clean);
   try {
-    if (code) localStorage.setItem(ACCESS_KEY, code);
+    if (clean && sendable) localStorage.setItem(ACCESS_KEY, clean);
     else localStorage.removeItem(ACCESS_KEY);
   } catch {}
+  return sendable;
 }
 
 function visionHeaders(extra?: HeadersInit): Headers {
@@ -180,7 +267,13 @@ function visionHeaders(extra?: HeadersInit): Headers {
   const owner = visionOwner();
   if (owner) headers.set("x-pitchlens-owner", owner);
   const access = visionAccessCode();
-  if (access) headers.set("x-pitchlens-access", access);
+  try {
+    if (access) headers.set("x-pitchlens-access", access);
+  } catch {
+    // A code saved before it was checked (’ or — pasted in): drop it and ask
+    // again, rather than failing every request with a TypeError.
+    accessRejected();
+  }
   return headers;
 }
 
@@ -192,6 +285,7 @@ export async function visionJson<T>(
     ...init,
     headers: visionHeaders(init?.headers),
   });
+  adoptOwner(response);
   let data: { detail?: string; code?: string } = {};
   try {
     data = await response.json();
@@ -208,6 +302,7 @@ export async function visionJson<T>(
       data.detail || "Vision request failed",
       response.status,
       data.code,
+      data && typeof data === "object" ? (data as Record<string, unknown>) : undefined,
     );
   }
   return data as T;
@@ -217,8 +312,16 @@ export async function visionJson<T>(
 export const UPLOAD_CHUNK = 4 * 1024 * 1024;
 
 /** A lost reply must navigate to the same run, not launch paid inference twice. */
-export async function rerunSavedVision(id: string, mode: "section" | "full", start: number, requestId: string) {
+export async function rerunSavedVision(
+  id: string,
+  mode: "section" | "full",
+  start: number,
+  requestId: string,
+  /** Ball model for the new run; omitted = the same as the source job. */
+  search?: "exhaustive" | "none",
+) {
   const query = new URLSearchParams({ mode, start: String(start), requestId });
+  if (search) query.set("search", search);
   for (let attempt = 0; ; attempt++) {
     try {
       return await visionJson<VisionJob>(`jobs/${id}/rerun?${query}`, { method: "POST" });
@@ -246,8 +349,59 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 /** Network drops shorter than this resume where they left off. It stays under
  *  the worker's 5-minute idle release (VISION_UPLOAD_IDLE_SECONDS). */
 const RESUME_WINDOW_MS = 240_000;
+// Not 429: the worker's only 429 here is its 24-hour cap (code "daily-limit"),
+// which retrying cannot lift; it only delays the message.
 const transient = (e: unknown) =>
-  !(e instanceof VisionError) || e.status >= 500 || e.status === 429;
+  !(e instanceof VisionError) || e.status >= 500;
+
+/** fetch rejects with a TypeError when the connection drops ("Failed to fetch",
+ *  "Load failed", "NetworkError…"): say so in words people recognise. */
+export const CONNECTION_LOST =
+  "Connection lost. Check your signal and press Analyse again; your file is still selected.";
+export const connectionLost = (e: unknown) => e instanceof TypeError;
+
+/**
+ * Choices shared by every analyse button: the football-trained models when the
+ * worker has them, and player load unless the ball model is asked for (it costs
+ * about 55% more GPU and followed a graphic on real tape).
+ */
+export function defaultVisionOptions(
+  health: Pick<VisionHealth, "profiles"> | null,
+  choice: { playerLoadOnly: boolean; adaptive?: boolean; profile?: string },
+): { profile: string; search: "none" | "adaptive" | "exhaustive" } {
+  const profile = choice.profile ?? (health?.profiles?.includes("broadcast") ? "broadcast" : "general");
+  const search = choice.playerLoadOnly
+    ? "none"
+    : choice.adaptive && profile !== "general"
+      ? "adaptive"
+      : "exhaustive";
+  return { profile, search };
+}
+/** The worker (or the way to it) is down, not refusing: a redeploy or a dropped connection. */
+const unreachable = (e: unknown) => !(e instanceof VisionError) || [502, 503, 504].includes(e.status);
+
+/** The upload this browser last started, so a reloaded page can resume it (same file, same options). */
+const PENDING_KEY = "pitchlens-vision-pending-upload";
+type PendingUpload = { requestId: string; name: string; size: number; lastModified: number; optionsDigest: string };
+
+function pendingUpload(): PendingUpload | null {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PENDING_KEY) || "null");
+    return saved && typeof saved.requestId === "string" ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+function savePendingUpload(entry: PendingUpload | null) {
+  try {
+    if (entry) localStorage.setItem(PENDING_KEY, JSON.stringify(entry));
+    else localStorage.removeItem(PENDING_KEY);
+  } catch {}
+}
+
+/** The upload stopped on the way (connection or worker gone); the worker keeps what it received. */
+export class UploadInterruptedError extends Error {}
 
 /**
  * Resumable chunked upload: reserve the worker, send 4 MB pieces (each retried
@@ -275,12 +429,32 @@ export async function uploadToVision(
     diagnostic: String(options.diagnostic ?? false),
     start: String(options.start ?? 0),
     search: options.search ?? "exhaustive",
-    requestId: crypto.randomUUID(),
   });
+  // The same file with the same options reuses the stored request ID: after a
+  // reload or a long drop the worker answers with the upload it already holds.
+  const optionsDigest = JSON.stringify([...query.entries()]);
+  const named = file as Partial<File>;
+  const entry = (requestId: string): PendingUpload => ({
+    requestId,
+    name: named.name ?? "",
+    size: file.size,
+    lastModified: named.lastModified ?? 0,
+    optionsDigest,
+  });
+  const previous = pendingUpload();
+  const same =
+    previous &&
+    previous.name === (named.name ?? "") &&
+    previous.size === file.size &&
+    previous.lastModified === (named.lastModified ?? 0) &&
+    previous.optionsDigest === optionsDigest;
+  query.set("requestId", same ? previous.requestId : crypto.randomUUID());
+  savePendingUpload(entry(query.get("requestId")!));
   signal?.throwIfAborted();
   // Never abort the reservation mid-flight: the worker would stay reserved
   // under an id this browser never learns. Cancellation is checked just after.
   let job: VisionJob;
+  let renewed = false;
   for (let attempt = 0; ; attempt++) {
     try {
       job = await visionJson<VisionJob>(`jobs?${query}`, {
@@ -289,17 +463,36 @@ export async function uploadToVision(
       });
       break;
     } catch (e) {
-      if (signal?.aborted || !transient(e) || attempt >= 4) throw e;
+      // The stored upload was released meanwhile: start a new one, once.
+      if (!renewed && e instanceof VisionError && e.status === 409 && /previous upload stopped|already used for different options/i.test(e.message)) {
+        renewed = true;
+        query.set("requestId", crypto.randomUUID());
+        savePendingUpload(entry(query.get("requestId")!));
+        continue;
+      }
+      // Another file holds the worker: keep the entry that can still resume it.
+      if (e instanceof VisionError && e.code === "own-upload") savePendingUpload(previous);
+      if (signal?.aborted || !transient(e) || attempt >= 4) {
+        // A raw "Failed to fetch" / "Load failed" says nothing; the worker's own 503s keep their words.
+        if (!signal?.aborted && !(e instanceof VisionError))
+          throw new UploadInterruptedError(CONNECTION_LOST);
+        throw e;
+      }
       // Reuse the request ID: a lost reply must not strand a reserved worker.
       await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
     }
   }
   let starting = false;
+  let offset = Math.min(file.size, Math.max(0, job.receivedBytes ?? 0));
+  // Leaving the page does not cancel the upload: phones discard background tabs
+  // (switching apps mid-upload), and a reload resumes from the last byte the
+  // worker acknowledged. An abandoned upload frees the worker by itself after
+  // VISION_UPLOAD_IDLE_SECONDS without data.
   try {
     signal?.throwIfAborted();
-    let offset = 0;
     let lastAck = Date.now();
-    onProgress?.(0);
+    // Rounded down, as below: 100% means every byte arrived.
+    onProgress?.(Math.floor((offset / file.size) * 100));
     while (offset < file.size) {
       const piece = file.slice(offset, Math.min(file.size, offset + UPLOAD_CHUNK));
       for (let attempt = 0; ; attempt++) {
@@ -327,39 +520,87 @@ export async function uploadToVision(
             offset = Number(resync[1]);
             break;
           }
-          // Lost connection (phone switching networks, Wi-Fi blip): keep trying
-          // until the worker would give up on us. Server errors: a few retries.
-          const network = !(e instanceof VisionError);
-          const giveUp = network
+          // Lost connection (phone switching networks, Wi-Fi blip) or a worker
+          // redeploying (the site answers 502-504; the worker keeps the upload):
+          // keep trying until the worker would give up on us. Server errors: a few retries.
+          const giveUp = unreachable(e)
             ? Date.now() - lastAck > RESUME_WINDOW_MS
             : !transient(e) || attempt >= 4;
           if (giveUp) throw e;
           await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
         }
       }
-      onProgress?.(Math.round((offset / file.size) * 100));
+      // Rounded down: 100% means every byte arrived and the analysis is starting.
+      onProgress?.(Math.floor((offset / file.size) * 100));
     }
+    // From here the server may already be analysing (paid GPU time): closing the
+    // tab or leaving the page must not cancel it. An explicit cancel (the upload
+    // page's "Cancel analysis") asks the worker, and only a confirmed stop is
+    // reported as cancelled; the report page also offers a cancel.
+    signal?.throwIfAborted();
     starting = true;
-    return await startAnalysis(job.id, signal);
+    const started = await startAnalysis(job.id, signal);
+    savePendingUpload(null);
+    return started;
   } catch (e) {
+    if (signal?.aborted) {
+      // The user cancelled. After /start the worker may be analysing already:
+      // only a confirmed stop may be reported as cancelled.
+      const stopped = await requestCancel(job.id);
+      if (stopped) savePendingUpload(null);
+      if (starting && !stopped) throw new VisionStartedError(job.id);
+      throw e instanceof DOMException && e.name === "AbortError"
+        ? e
+        : new DOMException("Upload cancelled.", "AbortError");
+    }
     // Once /start has been sent the server may already be analysing, and a
     // cancel would stop it; the worker releases unstarted uploads by itself.
-    if (!starting)
+    if (!starting) {
+      // Out of reach: keep the reservation and the stored request ID, so pressing
+      // Analyse with the same file continues from what the worker received.
+      if (unreachable(e))
+        throw new UploadInterruptedError(
+          `Connection lost at ${Math.round((offset / file.size) * 100)}%. Press Analyse with the same file to resume.`,
+        );
       // Free the worker straight away instead of waiting for the idle timeout.
-      visionJson(`jobs/${job.id}/cancel`, { method: "POST" }).catch(() => {});
+      requestCancel(job.id).then((stopped) => stopped && savePendingUpload(null));
+    }
     throw e;
   }
 }
 
-/** /start is retried: a lost response must not throw away a complete upload. */
+/** Free the worker from this browser's earlier upload (the 409 "own-upload" answer). */
+export async function cancelEarlierUpload(jobId: string): Promise<boolean> {
+  const stopped = await requestCancel(jobId);
+  if (stopped) savePendingUpload(null);
+  return stopped;
+}
+
+/** Ask the worker to stop a job. No reply within a few seconds counts as not stopped. */
+async function requestCancel(id: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const reply = await visionJson<{ requested?: boolean }>(`jobs/${id}/cancel`, {
+      method: "POST",
+      signal: controller.signal,
+    });
+    return reply.requested === true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** /start is retried: a lost response must not throw away a complete upload.
+ *  Only an explicit cancel aborts it (leaving the upload page does not), and the
+ *  worker is then asked whether it stopped: the analysis may already be running. */
 async function startAnalysis(id: string, signal?: AbortSignal): Promise<VisionJob> {
   for (let attempt = 0; ; attempt++) {
     signal?.throwIfAborted();
     try {
-      return await visionJson<VisionJob>(`jobs/${id}/start`, {
-        method: "POST",
-        signal,
-      });
+      return await visionJson<VisionJob>(`jobs/${id}/start`, { method: "POST", signal });
     } catch (e) {
       if (signal?.aborted) throw e;
       // An earlier attempt may have started it and only the reply was lost.

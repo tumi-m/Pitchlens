@@ -2,7 +2,9 @@
 
 1. split: labelled matches are divided by match into a training part and a
    test part (the test part needs about 30 frames with a visible ball). With
-   one usable match, by time: the last 30% is the test part.
+   one usable match, by time: the last 30% is the test part. Jobs on the same
+   footage (re-runs, re-uploads) are one match, and nothing the active model
+   (or the models it was fine-tuned from) trained on is ever a test frame.
 2. build_dataset: every training frame is cut into the same overlapping tiles
    the detector sees at inference (ball.tile_frame), with a YOLO box around
    the labelled ball; empty tiles (boots, socks, lights, line crossings) are
@@ -12,11 +14,12 @@
 3. train: Ultralytics fine-tuning from the current ball weights.
 4. score_detector: frame-level ball recall/precision on the test frames, for
    the current and the new weights. The new weights are kept only when they
-   find more balls without more false ones (see `better`).
+   find more balls without more false ones, by more than chance (see `better`).
 """
 
 import json
 import math
+import os
 import random
 import shutil
 from pathlib import Path
@@ -31,6 +34,7 @@ from app.vision.faint import ball_size_prior
 MIN_TEST_VISIBLE = 30
 MIN_TRAIN_VISIBLE = 20
 MIN_MATCH_LABELS = 10
+NOT_ENOUGH_HELD_OUT = "not enough held-out balls"
 
 
 def _usable(directory):
@@ -68,40 +72,150 @@ def _frames_of(directory):
 
 
 def _visible(items):
-    return sum(1 for _, label in items if label.get("visible"))
+    """Labels with a visible ball among (directory, index, label, source frame) items."""
+    return sum(1 for item in items if item[2].get("visible"))
 
 
-def _time_split(directory, items, fraction):
-    indices = [i for i, _ in items]
-    cut = int(len(indices) * (1 - fraction))
-    return (directory, set(indices[:cut])), (directory, set(indices[cut:]))
+def _chain_root(directory):
+    """The upload a re-run was made from (re-runs of re-runs included)."""
+    seen, current = set(), directory.name
+    while current not in seen:
+        seen.add(current)
+        try:
+            source = json.loads((directory.parent / current / "status.json").read_text()).get("sourceJobId")
+        except (OSError, ValueError):
+            break  # the original was deleted: its id still names the footage
+        if not isinstance(source, str) or not source:
+            break
+        current = source
+    return current
 
 
-def split(jobs, test_fraction=0.3):
-    """(train, test, how): lists of (directory, indices or None).
+def _footage_groups(jobs):
+    """Jobs grouped by footage: the same video hash, re-run chain or hard-linked file.
+
+    Each group is one match: its labels are merged, one per source frame (a
+    re-run labels the same pictures again), and each item stays tied to the
+    job whose frame cache holds it. Returns [{"keys", "items": [(directory,
+    index, label, source frame)]}] with items in source-frame order.
+    """
+    parent = list(range(len(jobs)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    owners, keys, items = {}, [], []
+    for n, directory in enumerate(jobs):
+        result, labelled = _frames_of(directory)
+        own = {f"root:{_chain_root(directory)}"}
+        if isinstance(result.get("videoSha256"), str) and result["videoSha256"]:
+            own.add(f"sha:{result['videoSha256']}")
+        try:
+            stat = os.stat(directory / "video")
+            inode = f"inode:{stat.st_dev}:{stat.st_ino}"  # matching only, never recorded
+            own.add(inode)
+        except OSError:
+            pass
+        keys.append(own)
+        items.append([(directory, i, label, balllabels.source_frame(result, i)) for i, label in labelled])
+        for key in own:
+            if key in owners:
+                parent[find(n)] = find(owners[key])
+            else:
+                owners[key] = n
+    groups = {}
+    for n in range(len(jobs)):
+        group = groups.setdefault(find(n), {"keys": set(), "items": {}})
+        group["keys"] |= {k for k in keys[n] if not k.startswith("inode:")}
+        for item in items[n]:
+            group["items"].setdefault(item[3], item)  # first job (by folder name) wins a duplicate
+    return [
+        {"keys": sorted(g["keys"]), "items": [g["items"][f] for f in sorted(g["items"])]}
+        for g in groups.values()
+    ]
+
+
+def _per_job(items):
+    """[(directory, indices)] for build_dataset, one entry per job folder."""
+    by_job = {}
+    for directory, i, _, _ in items:
+        by_job.setdefault(directory, set()).add(i)
+    return [(directory, by_job[directory]) for directory in sorted(by_job)]
+
+
+def _trained(group, trained):
+    """(whole group trained, source frames trained) by the active model's lineage."""
+    whole, frames = False, set()
+    for key in group["keys"]:
+        if key in trained:
+            if trained[key] is None:
+                whole = True
+            else:
+                frames |= trained[key]
+    return whole, frames
+
+
+def plan(jobs, test_fraction=0.3, trained=None):
+    """The split with what it trains on: {"train", "test", "how", "trainedGroups"}.
+
+    trained: {group key: None (the whole match) or set of source frames} that
+    the active model or its ancestors trained on; never put in the test part.
+    """
+    trained = trained or {}
+    groups = []
+    for group in _footage_groups(jobs):
+        whole, frames = _trained(group, trained)
+        eligible = [] if whole else [item for item in group["items"] if item[3] not in frames]
+        groups.append({**group, "eligible": eligible})
+    ranked = sorted(
+        (g for g in groups if len(g["items"]) >= MIN_MATCH_LABELS),
+        key=lambda g: (_visible(g["items"]), len(g["items"])),
+    )
+    if not ranked:
+        return {"train": [], "test": [], "how": "none", "trainedGroups": []}
+    if len(ranked) >= 2:
+        test, seen = [], 0
+        for group in sorted(ranked[:-1], key=lambda g: (_visible(g["eligible"]), len(g["eligible"]))):
+            if seen >= MIN_TEST_VISIBLE:
+                break
+            if not group["eligible"]:
+                continue
+            test.append(group)
+            seen += _visible(group["eligible"])
+        train = [g for g in ranked if not any(g is t for t in test)]
+        train_visible = sum(_visible(g["items"]) for g in train)
+        if seen >= MIN_TEST_VISIBLE and train_visible >= MIN_TRAIN_VISIBLE:
+            return {
+                "train": [entry for g in train for entry in _per_job(g["items"])],
+                # A test match's frames that an earlier model trained on are left out.
+                "test": [entry for g in test for entry in _per_job(g["eligible"])],
+                "how": "by-match",
+                "trainedGroups": [{"keys": g["keys"], "frames": None} for g in train],
+            }
+    largest = ranked[-1]
+    cut = int(len(largest["items"]) * (1 - test_fraction))
+    early, late = largest["items"][:cut], largest["items"][cut:]
+    allowed = {item[3] for item in largest["eligible"]}
+    return {
+        "train": _per_job(early),
+        "test": _per_job([item for item in late if item[3] in allowed]),
+        "how": "by-time-within-one-match",
+        "trainedGroups": [{"keys": largest["keys"], "frames": sorted(item[3] for item in early)}],
+    }
+
+
+def split(jobs, test_fraction=0.3, trained=None):
+    """(train, test, how): lists of (directory, indices).
 
     By match when the smaller matches can supply enough visible-ball test
     frames while the largest stays for training; otherwise by time inside the
     largest match (a weaker check, reported as such).
     """
-    ranked = sorted(((_visible(_frames_of(d)[1]), len(_frames_of(d)[1]), d) for d in jobs), key=lambda x: (x[0], x[1]))
-    ranked = [r for r in ranked if r[1] >= MIN_MATCH_LABELS]
-    if not ranked:
-        return [], [], "none"
-    if len(ranked) >= 2:
-        test, seen = [], 0
-        for visible, _, directory in ranked[:-1]:
-            if seen >= MIN_TEST_VISIBLE:
-                break
-            test.append(directory)
-            seen += visible
-        train = [d for _, _, d in ranked if d not in test]
-        train_visible = sum(v for v, _, d in ranked if d in train)
-        if seen >= MIN_TEST_VISIBLE and train_visible >= MIN_TRAIN_VISIBLE:
-            return [(d, None) for d in train], [(d, None) for d in test], "by-match"
-    largest = ranked[-1][2]
-    train, test = _time_split(largest, _frames_of(largest)[1], test_fraction)
-    return [train], [test], "by-time-within-one-match"
+    out = plan(jobs, test_fraction, trained)
+    return out["train"], out["test"], out["how"]
 
 
 def _box(label, scale, x0, y0, diameter, tile_w, tile_h):
@@ -112,14 +226,14 @@ def _box(label, scale, x0, y0, diameter, tile_w, tile_h):
     return (cx / tile_w, cy / tile_h, min(1.0, d / tile_w), min(1.0, d / tile_h))
 
 
-def _load_frames(directory, result, indices):
-    """Label frames decoded exactly as the engine numbered them (shared cache with the labelling screen)."""
-    cache = balllabels.prepare_frames(directory, result, indices, directory / "video")
-    return {i: cv2.imread(str(cache / f"{i}.jpg")) for i in indices if (cache / f"{i}.jpg").is_file()}
-
-
 def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.15, seed=0):
-    """Write a YOLO dataset to `out`; returns counts. Test frames are only kept whole, for scoring."""
+    """Write a YOLO dataset to `out`; returns counts. Test frames are only kept whole, for scoring.
+
+    Frames are read one at a time from the label cache (shared with the
+    labelling screen, numbered exactly as the engine numbered them) and dropped
+    after use: decoded 1080p frames are 6 MB each, and this runs inside the
+    worker. Empty tiles wait on disk until the negatives are sampled.
+    """
     out = Path(out)
     if out.exists():
         shutil.rmtree(out)
@@ -128,6 +242,8 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
     for part in ("train", "val"):
         (out / "images" / part).mkdir(parents=True)
         (out / "labels" / part).mkdir(parents=True)
+    staging = out / "staging"
+    staging.mkdir()
     empties = {"train": [], "val": []}
 
     def write(part, name, crop, box):
@@ -140,9 +256,9 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
         items = [(i, l) for i, l in items if indices is None or i in indices]
         cut = int(len(items) * (1 - val_fraction))  # the latest frames choose the epoch
         height = float((result.get("video") or {}).get("height") or 360)
-        frames = _load_frames(directory, result, [i for i, _ in items])
+        cache = balllabels.prepare_frames(directory, result, [i for i, _ in items], directory / "video")
         for k, (i, label) in enumerate(items):
-            frame = frames.get(i)
+            frame = cv2.imread(str(cache / f"{i}.jpg"))
             if frame is None:
                 continue
             part = "train" if k < cut else "val"
@@ -152,14 +268,19 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
                 box = _box(label, scale, x0, y0, diameter, tw, th) if label.get("visible") else None
                 name = f"{directory.name[:8]}-{i}-{t}"
                 if box is None:
-                    empties[part].append((name, crop))
+                    cv2.imwrite(str(staging / f"{name}.jpg"), crop)
+                    empties[part].append(name)
                 else:
                     write(part, name, crop, box)
+            del frame
     # Negatives at a fixed ratio to the positives (at least a few per part).
     for part, pool in empties.items():
         keep = min(len(pool), max(5, int(round(counts[part]["positive"] * negatives_per_positive))))
-        for name, crop in rng.sample(pool, keep):
-            write(part, name, crop, None)
+        for name in rng.sample(pool, keep):
+            (staging / f"{name}.jpg").replace(out / "images" / part / f"{name}.jpg")
+            (out / "labels" / part / f"{name}.txt").write_text("")
+            counts[part]["negative"] += 1
+    shutil.rmtree(staging)
 
     whole = []
     (out / "test_frames").mkdir()
@@ -167,12 +288,13 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
         result, items = _frames_of(directory)
         items = [(i, l) for i, l in items if indices is None or i in indices]
         video = result.get("video") or {}
-        frames = _load_frames(directory, result, [i for i, _ in items])
+        cache = balllabels.prepare_frames(directory, result, [i for i, _ in items], directory / "video")
         for i, label in items:
-            if i not in frames or frames[i] is None:
+            source = cache / f"{i}.jpg"
+            if not source.is_file():
                 continue
             name = f"{directory.name[:8]}-{i}.jpg"
-            cv2.imwrite(str(out / "test_frames" / name), frames[i])
+            shutil.copyfile(source, out / "test_frames" / name)  # already a JPEG: no re-encode
             whole.append({"image": name, "label": label, "width": video.get("width"), "height": video.get("height")})
     (out / "test_frames.json").write_text(json.dumps(whole))
     counts["testFrames"] = len(whole)
@@ -186,11 +308,14 @@ def score_detector(detector, dataset):
     """Frame-level ball recall/precision of a detector on the dataset's held-out test frames.
 
     The top-scoring detection of each frame counts (the tracker sees more, so
-    this is a conservative proxy for what the engine will retain).
+    this is a conservative proxy for what the engine will retain). `hits` (one
+    per visible test frame) and `falsePositives` (one per absent frame), in
+    test_frames.json order, let two detectors be compared frame by frame.
     """
     dataset = Path(dataset)
     frames = json.loads((dataset / "test_frames.json").read_text())
     hit = visible = absent = false = detections = 0
+    hits, false_positives = [], []
     for item in frames:
         image = cv2.imread(str(dataset / "test_frames" / item["image"]))
         found = detector.detect_batch([image], threshold=0.15)[0]
@@ -201,11 +326,13 @@ def score_detector(detector, dataset):
             detections += 1
         if label.get("visible"):
             visible += 1
-            if best and math.dist((best["x"], best["y"]), (label["x"], label["y"])) <= tol:
-                hit += 1
+            found_it = bool(best and math.dist((best["x"], best["y"]), (label["x"], label["y"])) <= tol)
+            hit += found_it
+            hits.append(int(found_it))
         else:
             absent += 1
             false += bool(best)
+            false_positives.append(int(bool(best)))
     return {
         "frames": len(frames),
         "recall": round(hit / visible, 3) if visible else None,
@@ -213,17 +340,44 @@ def score_detector(detector, dataset):
         "falseDetections": round(false / absent, 3) if absent else None,
         "visible": visible,
         "absent": absent,
+        "hits": hits,
+        "falsePositives": false_positives,
     }
 
 
-def better(candidate, baseline, min_gain=0.03, max_precision_loss=0.02):
-    """Keep new weights only if they find clearly more balls without more false ones."""
+def paired_test(candidate, baseline):
+    """Exact one-sided McNemar (sign) test on the visible test frames.
+
+    b: frames only the candidate found; c: frames only the baseline found;
+    p = P(X >= b) for X ~ Binomial(b + c, 1/2). None without frame-level hits.
+    """
+    new, old = candidate.get("hits"), baseline.get("hits")
+    if not isinstance(new, list) or not isinstance(old, list) or len(new) != len(old):
+        return None
+    b = sum(1 for x, y in zip(new, old) if x and not y)
+    c = sum(1 for x, y in zip(new, old) if y and not x)
+    n = b + c
+    p = sum(math.comb(n, k) for k in range(b, n + 1)) / 2**n if n else 1.0
+    return {"b": b, "c": c, "p": round(p, 6)}
+
+
+def better(candidate, baseline, min_gain=0.03, max_precision_loss=0.02, alpha=0.05):
+    """Keep new weights only if they find clearly more balls without more false ones.
+
+    "Clearly": on top of the gain and precision guards, the extra balls must
+    not be chance. On 30 test balls, one more found is +3.3 points; a model no
+    better than the old one passed the gain guard alone about a third of the
+    time, and every later run fine-tunes from whatever was switched on.
+    """
     if not candidate.get("visible") or candidate.get("recall") is None:
         return False
     if baseline.get("recall") is None:
         return True
     precision_ok = (candidate.get("precision") or 0) >= (baseline.get("precision") or 0) - max_precision_loss
-    return candidate["recall"] >= baseline["recall"] + min_gain and precision_ok
+    if not (candidate["recall"] >= baseline["recall"] + min_gain and precision_ok):
+        return False
+    test = paired_test(candidate, baseline)
+    return test is not None and test["p"] < alpha
 
 
 def train(dataset, base_weights, out, epochs=60, imgsz=640, device="cpu", batch=16):
@@ -289,11 +443,56 @@ def registry(models):
         return {"active": None, "runs": []}
 
 
-def run_training(root, models, base_weights, epochs=60, owner=None, remote=None, device="cpu", now=0.0, progress=None, usable=_usable):
+# Server-side only (never returned by GET /ball-model): which footage each kept
+# model trained on, so a later run never tests on it. It names footage by
+# video hash and job id, so it stays out of the public registry.
+LINEAGE = "ball-lineage.json"
+
+
+def _write(path, data, indent=None):
+    temporary = Path(path).with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=indent))
+    temporary.replace(path)
+
+
+def lineage(models):
+    try:
+        data = json.loads((Path(models) / LINEAGE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def trained_on(models, weights):
+    """{group key: None (whole match) or set of source frames} that `weights` and
+    the models it was fine-tuned from trained on."""
+    records, out, seen = lineage(models), {}, set()
+    while isinstance(weights, str) and weights in records and weights not in seen:
+        seen.add(weights)
+        record = records[weights] if isinstance(records[weights], dict) else {}
+        for group in record.get("groups") or []:
+            frames = group.get("frames")
+            for key in group.get("keys") or []:
+                if frames is None or out.get(key, set()) is None:
+                    out[key] = None
+                else:
+                    out[key] = out.get(key, set()) | set(frames)
+        weights = record.get("base")
+    return out
+
+
+def _public_score(score):
+    """Scores as recorded in the registry: frame-level lists left out."""
+    return {k: v for k, v in (score or {}).items() if k not in ("hits", "falsePositives")}
+
+
+def run_training(root, models, base_weights, epochs=60, owner=None, remote=None, device="cpu", now=0.0, progress=None, usable=_usable, on_start=None):
     """Build the dataset from every labelled match, fine-tune, validate, keep if better.
 
     `remote(dataset_zip, base_bytes, epochs)` runs training on a GPU (Modal) and
     returns the same dict as modal_app.train_ball; without it, training runs here.
+    `on_start()` is called once the labels passed every check, right before the
+    GPU (or this machine) starts training: the moment a run costs compute.
     """
     import hashlib
 
@@ -303,9 +502,40 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
     jobs = labelled_jobs(root, usable)
     if owner:
         jobs = [d for d in jobs if json.loads((d / "status.json").read_text()).get("owner") == owner]
-    train_set, val_set, how = split(jobs)
-    if not train_set or not val_set:
+    base_name = Path(base_weights).name
+    # The base is the model in use (or the stock one): neither it nor its
+    # ancestors may be judged on frames they trained on.
+    planned = plan(jobs, trained=trained_on(models, base_name))
+    train_set, val_set, how = planned["train"], planned["test"], planned["how"]
+    if not train_set:
         raise ValueError("Label the ball in at least one match first (about 150 frames).")
+    record = {
+        "at": now,
+        "base": base_name,
+        "matches": len(jobs),
+        # A one-way fingerprint: the raw key would give access to that browser's matches.
+        "ownerHash": hashlib.sha256(owner.encode()).hexdigest()[:16] if owner else None,
+        "split": how,
+        "epochs": epochs,
+    }
+
+    def refuse(visible, counts=None):
+        # Too few held-out balls to tell a better model from luck: nothing is
+        # trained or switched, and the registry is left as it is.
+        return {
+            **record,
+            "counts": counts,
+            "testVisible": visible,
+            "kept": False,
+            "reason": NOT_ENOUGH_HELD_OUT,
+            "message": (
+                f"Not enough held-out balls to judge a new model ({visible} visible in frames no model has "
+                f"trained on, {MIN_TEST_VISIBLE} needed). Label the ball in a new match."
+            ),
+        }
+
+    if not val_set:
+        return refuse(0)
     work = Path(root) / "training"
     work.mkdir(exist_ok=True)
     dataset = work / "dataset"
@@ -317,7 +547,13 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
             f"Too few labels to train ({counts['train']['positive']} balls to learn from, "
             f"{counts['testFrames']} frames to check against). Label more frames."
         )
+    test_visible = sum(1 for f in json.loads((dataset / "test_frames.json").read_text()) if f["label"].get("visible"))
+    if test_visible < MIN_TEST_VISIBLE:
+        shutil.rmtree(dataset, ignore_errors=True)
+        return refuse(test_visible, counts)
     try:
+        if on_start:
+            on_start()
         if remote:
             say("Training on the GPU")
             out = remote(_zip(dataset), Path(base_weights).read_bytes(), epochs)
@@ -336,26 +572,24 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
     Path(models).mkdir(parents=True, exist_ok=True)
     (Path(models) / name).write_bytes(weights_bytes)
     kept = better(candidate, baseline)
+    if kept:
+        records = lineage(models)
+        records[name] = {"base": base_name, "groups": planned["trainedGroups"]}
+        _write(Path(models) / LINEAGE, records)
     reg = registry(models)
     reg["runs"].append(
         {
-            "at": now,
+            **record,
             "weights": name,
-            "base": Path(base_weights).name,
-            "matches": len(jobs),
-            # A one-way fingerprint: the raw key would give access to that browser's matches.
-            "ownerHash": hashlib.sha256(owner.encode()).hexdigest()[:16] if owner else None,
-            "split": how,
             "counts": counts,
-            "baseline": baseline,
-            "candidate": candidate,
+            "testVisible": test_visible,
+            "baseline": _public_score(baseline),
+            "candidate": _public_score(candidate),
+            "pairedTest": paired_test(candidate, baseline),
             "kept": kept,
-            "epochs": epochs,
         }
     )
     if kept:
         reg["active"] = name
-    temporary = _registry_path(models).with_suffix(".tmp")
-    temporary.write_text(json.dumps(reg, indent=1))
-    temporary.replace(_registry_path(models))
+    _write(_registry_path(models), reg, indent=1)
     return reg["runs"][-1]

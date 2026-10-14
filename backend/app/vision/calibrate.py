@@ -79,14 +79,27 @@ def validate_request(request, size):
 def preview(result, request):
     size = (result["video"]["width"], result["video"]["height"])
     template, image, world, t, distortion, used, line_clicks, _ = validate_request(request, size)
-    cal = pitchlib.fit(image, world, size, distortion, line_clicks)
-    # Points behind the camera come back NaN: send null (JSON has no NaN) so the
-    # browser splits the line there.
-    lines = [
-        [[round(float(x), 1), round(float(y), 1)] if math.isfinite(x) and math.isfinite(y) else None for x, y in pitchlib.pitch_to_image(cal, line)]
-        for line in pitchlib.line_segments(template, step=0.5)
-    ]
+    try:
+        cal = pitchlib.fit(image, world, size, distortion, line_clicks)
+        # Points behind the camera come back NaN: send null (JSON has no NaN) so the
+        # browser splits the line there.
+        lines = [
+            [[round(float(x), 1), round(float(y), 1)] if math.isfinite(x) and math.isfinite(y) else None for x, y in pitchlib.pitch_to_image(cal, line)]
+            for line in pitchlib.line_segments(template, step=0.5)
+        ]
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(pitchlib.DEGENERATE) from exc
     return {"fit": _public_fit(cal, used), "template": template, "lines": lines}
+
+
+def poor_fit_message(fit):
+    """Why a pitch setup is refused (a mirrored naming fits the pixels well)."""
+    if pitchlib.MIRRORED in (fit.get("warnings") or []):
+        return pitchlib.MIRRORED
+    return (
+        f"These clicks do not fit a flat pitch (error {fit['rmsPixels']:.1f} px). "
+        "Check each landmark is the right one and the pitch size."
+    )
 
 
 def _public_fit(cal, used):
@@ -102,8 +115,9 @@ def _public_fit(cal, used):
         "cameraHeight": cal["cameraHeight"],
         "lineResiduals": cal["lineResiduals"],
         "residuals": [
-            {"name": n, "metres": m, "pixels": p, "leftOut": o}
-            for n, m, p, o in zip(used, cal["residuals"], cal["pixelResiduals"], cal["leaveOneOut"])
+            # z: the residual standardised by how well the other clicks check it.
+            {"name": n, "metres": m, "pixels": p, "leftOut": o, "z": z}
+            for n, m, p, o, z in zip(used, cal["residuals"], cal["pixelResiduals"], cal["leaveOneOut"], cal["z"])
         ],
     }
 
@@ -179,6 +193,50 @@ def line_masks(video_path, frames, indices, progress=None):
     return out
 
 
+def reacquire_threshold(self_score):
+    """Line score a wide-search re-acquisition needs, relative to how well the
+    clicked view itself scores on its own frame (real stadium lines score about
+    0.7 even where correct; a false lock on a synthetic court scored 0.61-0.65
+    against a correct 0.93+). Never looser than the fixed 0.6."""
+    return max(0.6, 0.9 * self_score) if self_score else 0.6
+
+
+def _seek_mask(video_path, frame):
+    """Line mask of one analysed frame of a fixed camera, read by seeking (the
+    view does not change, so a frame either side is the same picture)."""
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        number = frame.get("frame")
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, number)
+        else:
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(frame.get("t") or 0) * 1000)
+        ok, image = cap.read()
+    finally:
+        cap.release()
+    if not ok:
+        return None
+    ok, png = cv2.imencode(".png", pitchlib.line_mask(image, restrict_to_grass=False))
+    return png.tobytes() if ok else None
+
+
+def _self_score(mask_png, cal, H, template):
+    if mask_png is None:
+        return None
+    _, score = _align(mask_png, cal, H, template, 0)
+    return float(score)
+
+
+def _check_mapping(cal, image):
+    """Refuse a homography that maps the clicked area to infinity (degenerate clicks)."""
+    H = np.asarray(cal["H"], float)
+    lo, hi = image.min(axis=0), image.max(axis=0)
+    area = np.array([[x, y] for x in np.linspace(lo[0], hi[0], 5) for y in np.linspace(lo[1], hi[1], 5)])
+    mapped = pitchlib.image_to_pitch(cal, area)
+    if not np.isfinite(np.linalg.cond(H)) or np.linalg.cond(H) > 1e12 or not np.isfinite(mapped).all() or np.abs(mapped).max() > 1e4:
+        raise ValueError(pitchlib.DEGENERATE)
+
+
 def _align(mask_png, calibration, H, template, search=0):
     mask = cv2.imdecode(np.frombuffer(mask_png, np.uint8), cv2.IMREAD_GRAYSCALE)
     if mask is None:
@@ -193,14 +251,15 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
     frames = result["frames"]
     size = (result["video"]["width"], result["video"]["height"])
     template, image, world, t, distortion, used, line_clicks, clean = validate_request(request, size)
-    cal = pitchlib.fit(image, world, size, distortion, line_clicks)
+    try:
+        cal = pitchlib.fit(image, world, size, distortion, line_clicks)
+        _check_mapping(cal, image)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(pitchlib.DEGENERATE) from exc
     if cal["quality"] == "poor":
-        raise ValueError(
-            "These clicks do not fit a flat pitch (error "
-            f"{cal['rmsPixels']:.1f} px). Check each landmark is the right one and the pitch size."
-        )
+        raise ValueError(poor_fit_message(cal))
     anchor = nearest_frame(frames, t)
-    static = pitchlib.static_camera(frames)
+    static = pitchlib.static_camera(frames, width=size[0])
     fps = result.get("sampleFps") or 5
     # The clicks must be on an analysed frame itself (to within one video frame):
     # a moving camera is somewhere else a fraction of a second later.
@@ -213,6 +272,9 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
     anchors = {anchor: np.asarray(cal["H"], float)}
     aligned = 0
     reacquired = 0
+    # How well the clicked view scores on its own frame's painted lines: the
+    # yardstick for re-acquiring it elsewhere (and for a saved venue).
+    self_score = None
     if static and video_path and Path(video_path).is_file():
         # A fixed camera keeps one view, except where it may have been re-aimed
         # (motion lost with the tracks broken) or the recording cut: find the
@@ -221,9 +283,11 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
         own = max(i for i in breaks if i <= anchor)  # the clicked frame covers its own stretch
         breaks = [i for i in breaks if i != own]
         masks = line_masks(video_path, frames, breaks, progress=(lambda p: progress(p * 0.8)) if progress else None)
+        self_score = _self_score(_seek_mask(video_path, frames[anchor]), cal, anchors[anchor], template)
+        threshold = reacquire_threshold(self_score)
         for i in sorted(masks):
             refined, score = _align(masks[i], cal, anchors[anchor], template, int(min(size) * 0.3))
-            if refined is not None and score >= 0.6:
+            if refined is not None and score >= threshold:
                 anchors[i] = refined
                 reacquired += 1
     if not static and video_path and Path(video_path).is_file():
@@ -232,14 +296,16 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
         scene_starts = [i for i in range(len(frames)) if i == 0 or frames[i]["scene"] != frames[i - 1]["scene"]]
         # Frames where motion estimation failed break the chain: align there too.
         motion_gaps = [i for i in range(1, len(frames)) if frames[i].get("camera") is None]
-        indices = list(range(0, len(frames), stride)) + scene_starts + motion_gaps
+        indices = list(range(0, len(frames), stride)) + scene_starts + motion_gaps + [anchor]
         # Re-acquisition (a wide search) is expensive: only at shot starts,
         # motion failures and every ~5 s of uncovered footage.
         reacquire_at = set(scene_starts) | set(motion_gaps) | set(range(0, len(frames), stride * 5))
         masks = line_masks(video_path, frames, indices, progress=(lambda p: progress(p * 0.6)) if progress else None)
+        self_score = _self_score(masks.get(anchor), cal, anchors[anchor], template)
+        strict_threshold = reacquire_threshold(self_score)
         for round_ in range(4):
             new = 0
-            homographies, _ = pitchlib.propagate(frames, anchors, static)
+            homographies, _ = pitchlib.propagate(frames, anchors, static, width=size[0])
             for i in sorted(masks):
                 if i in anchors:
                     continue
@@ -261,7 +327,7 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
                 # Re-acquiring: the camera moved while unobserved, search wider.
                 search = int(min(size) * 0.3) if strict else 0
                 refined, score = _align(masks[i], cal, start, template, search)
-                if refined is not None and score >= (0.6 if strict else 0.45):
+                if refined is not None and score >= (strict_threshold if strict else 0.45):
                     anchors[i] = refined
                     new += 1
                     aligned += 0 if strict else 1
@@ -270,7 +336,7 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
                 progress(0.6 + 0.1 * (round_ + 1))
             if not new:
                 break
-    homographies, distance = pitchlib.propagate(frames, anchors, static)
+    homographies, distance = pitchlib.propagate(frames, anchors, static, width=size[0])
     per_frame = [
         {"H": np.asarray(H, float).round(9).reshape(-1).tolist(), "d": d} if H is not None else None
         for H, d in zip(homographies, distance)
@@ -290,6 +356,8 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
         "anchors": len(anchors),
         "lineAligned": aligned,
         "reacquired": reacquired,
+        # Line score of the clicked view on its own frame (None without footage).
+        "selfScore": None if self_score is None else round(self_score, 3),
         "coverage": round(covered / max(1, len(frames)) * 100, 1),
         "frames": per_frame,
     }
@@ -314,6 +382,9 @@ def venue_from_calibration(calibration, name):
         "H": entry["H"],
         "static": bool(calibration.get("static")),
         "rms": calibration.get("rms"),
+        # How well the clicked view matched its own painted lines: a later match
+        # must come close to it before the venue is applied automatically.
+        "selfScore": calibration.get("selfScore"),
     }
 
 
@@ -333,7 +404,11 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
     template = venue["template"]
     H = np.asarray(venue["H"], float).reshape(3, 3)
     cal = {"H": H, "k1": venue.get("k1", 0.0), "size": list(size)}
-    static = pitchlib.static_camera(frames)
+    static = pitchlib.static_camera(frames, width=size[0])
+    # Per-pick line score that verifies the venue: close to the venue's own
+    # score where it was saved with one (real lines score ~0.7 even when right).
+    own = venue.get("selfScore")
+    needed = max(0.45, 0.85 * own) if isinstance(own, (int, float)) and own > 0 else 0.45
     # A fixed camera may still have been re-aimed where motion was lost, or the
     # recording cut: each stretch between such breaks is checked on its own.
     breaks = pitchlib.static_breaks(frames) if static else []
@@ -348,7 +423,7 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
             refined, score = _align(png, cal, H, template, search=int(min(size) * 0.05))
             if i in picks:
                 scores.append(score)
-            if refined is not None and score >= 0.45:
+            if refined is not None and score >= needed:
                 anchors[i] = refined
         verified = round(float(np.median(scores)), 2) if scores else None
         if not scores or sum(1 for i in anchors if i in picks) < max(2, len(scores) // 2):
@@ -378,7 +453,7 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
                     homographies[i], distance[i] = fixed[first], i - first
         anchors = fixed
     else:
-        homographies, distance = pitchlib.propagate(frames, anchors, static)
+        homographies, distance = pitchlib.propagate(frames, anchors, static, width=size[0])
     per_frame = [
         {"H": np.asarray(h, float).round(9).reshape(-1).tolist(), "d": d} if h is not None else None
         for h, d in zip(homographies, distance)

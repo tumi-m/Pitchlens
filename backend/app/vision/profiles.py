@@ -75,9 +75,27 @@ def model_paths(profile="general"):
     raise ValueError("Unknown footage profile")
 
 
+PROFILES = ("general", "broadcast", "small-ball")
+
+
+def ready(profile, ball=True):
+    """The weights a job needs are installed: player load (ball=False) never loads the ball model."""
+    player, ball_path = model_paths(profile)
+    return player.is_file() and (not ball or ball_path.is_file())
+
+
+def missing_models(profile, ball_search="exhaustive"):
+    """Weight files a job still needs on this machine (the GPU copies these in)."""
+    player, ball_path = model_paths(profile)
+    needed = [player] if ball_search == "none" else [player, ball_path]
+    return [p for p in needed if not p.is_file()]
+
+
 def available_profiles():
-    return [
-        name
-        for name in ("general", "broadcast", "small-ball")
-        if all(p.is_file() for p in model_paths(name))
-    ]
+    """Profiles that can run every mode (player and ball weights installed)."""
+    return [name for name in PROFILES if ready(name)]
+
+
+def player_load_profiles():
+    """Profiles that can run player load (ball search 'none'): player weights installed."""
+    return [name for name in PROFILES if ready(name, ball=False)]

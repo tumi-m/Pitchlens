@@ -1,33 +1,79 @@
 # Status
 
-Read this first after any break. Updated 2026-10-03.
+Read this first after any break. Updated 2026-10-14.
 
 ## Where things stand
 
-Claude implementation merged to main in `1b51ffb`. Commercial-hardening changes are recorded below; check current Git HEAD before resuming.
+`main` includes everything up to PR #21 (`dfd3e3d`). Branch
+`claude/pitchlens-mvp-8qhpP` carries later rounds; open a pull request to
+deploy them. CI runs on pull requests and on `main` only.
 
 A match now produces a Sofascore-style report:
-- **Automatic, with coverage shown:** observed control share (with missing-time sensitivity bounds, withheld under
-  60% estimated coverage), candidate pass share, field tilt and attack momentum.
-  Event counts are confirmed-only in the report; reviewed pass accuracy needs
-  20+ confirmed attempts. Automatic proposals remain in the review queue.
-- **After a two-minute pitch setup** (click landmarks on one frame, or reuse a
-  saved venue): shots, shots on target, shot map, possible goals, heatmaps,
-  average positions, a top-down live view, pitch lines drawn on the video.
-- **Human-confirmed:** goals (never automatic), shot outcomes, anything the
-  reviewer adds; the final score typed by the reviewer sets the scoreline.
-- **Not offered:** player identities, distance/speed, xG, PPDA.
+- **Automatic, with coverage shown:** possession (shown above 60% of play
+  followed, with unseen-play bounds; possession counts above 80%; possession
+  now carries across unseen stretches between same-team controls, E15), field
+  tilt, attack momentum.
+- **Estimated from a random sample of checks:** passes, interceptions and
+  tackles. Check about ten of each ("Check a sample") and the report shows
+  ≈N with a 95% range; only shots and possible goals are key moments.
+- **After pitch setup** (clicks once, a saved venue, or automatically when a
+  saved venue's lines match a new match from the same fixed camera): shots,
+  shot map, possible goals, heatmaps, average positions, live pitch view.
+- **Human-confirmed:** goals, shot outcomes, the final score.
+- **Ball accuracy and training:** label the ball on 150 frames per match; the
+  report measures ball recall/precision; a Modal GPU job fine-tunes the ball
+  model and keeps it only if held-out results improve (docs/BALL-TRAINING.md).
+- **Highlights:** goals, possible goals and shots played back to back.
+- **Open test site:** the access code is optional (unset = open to anyone with
+  the link); the worker caps analyses at `VISION_MAX_JOBS_PER_DAY` (30).
+- **Original recordings:** uploads up to `VISION_MAX_BYTES` /
+  `VISION_MAX_UPLOAD_MB` (2 GB); YouTube links step down 1080p → 720p → 480p
+  to fit. Size the Railway volume to match.
+- **Player load (the upload default, no ball model):** per-kit running
+  distance estimate (camera pan removed, 1.8 m player scale), unvalidated.
+- **Not offered:** player identities, per-player distance/speed, xG, PPDA.
+
+## Improvement rounds (owner asked for 20, 13 October)
+
+Each round: independent finders per area reproduce problems, a verifier tries
+to refute each, then fixers apply the confirmed ones with regression tests and
+every check runs. Rounds run in isolated worktrees, two at a time.
+- Round 1 (correctness and security): 68 confirmed, 54 fixed (`c5c37ee`).
+- Round 2 (end-to-end on real footage): 33 confirmed, 28 fixed (`781a053`).
+  Uploads in progress survive a redeploy, and a redeploy no longer uses up a
+  retry; Retry is offered only when it can work; the daily limit says when it
+  lifts; reruns keep the team order and names and can switch on the ball
+  search; footage and label frames expire when read, not only hourly;
+  possession counts and momentum minutes are withheld on thin coverage;
+  reviewer-logged shots count without a pitch setup.
+- Round 3 (measured accuracy): in progress.
+
+## Owner's 37-minute match (pipeline 2.5, 640x360 YouTube copy)
+
+Ball observed in 25% of frames (median continuous sighting 2 frames); 2171
+track fragments; 21 scene cuts; no pitch setup. Now: possession followed 76%
+(shown, 60/40, bounds 45-69%; possession counts hidden below 80%, E17);
+tackles "—" without a pitch setup; 0 key moments plus ~20 sample checks
+instead of 354 moments. The root limit is the input: upload the original
+recording.
 
 ## Evidence so far (see EXPERIMENTS.md)
 
 - Event logic on human-labelled open tracking data (Metrica), held-out match,
-  degraded like one 360p camera: pass F1 0.62, possession share error
-  0.1 points, possession agreement 89.6% on 85% of play; shot recall 67%
-  (precision 34%, all shots go to review).
+  degraded like one 360p camera, with correct kit labels: pass F1 0.64,
+  possession share error 0.8 points, possession agreement 92.3% on 89% of
+  play; shot recall 67% (precision 34%, all shots go to review).
+  Owner-like degradation (`--visible 0.4 --run 2 --team-flip 0.2 --camera
+  broadcast`: ball seen in short bursts, 20% of track fragments with the wrong
+  kit, panning uncalibrated view): pass attempt F1 0.63, interception
+  precision 0.09 (E16).
   This validates the rules, not the vision; vision accuracy is unmeasured.
 - Calibration: synthetic panning video with motion gaps stays within 0.5 m.
 - Tracking: track IDs on a 3-minute clip 329 → 199 (97.5% of observations
-  kept); 151-199 player tracks after stitching.
+  kept). The current engine result for that clip (336 fragments) gives 241
+  player tracks after stitching (199 before E19, which joins fewer different
+  players). On tracker-made fragments with known players, 63-78% of stitching
+  links join the same player (31-40% before E19).
 - Owner's 20 s GPU diagnostic of the night 5-a-side: ball in 91% of frames,
   possession followed for 54% of play (pre-calibration).
 
@@ -74,6 +120,10 @@ cd backend && .venv312/bin/python -m pytest tests -q -p no:cacheprovider \
 # event logic against labelled tracking data (clone metrica-sports/sample-data)
 .venv312/bin/python scripts/evaluate_on_tracking_data.py PATH/sample-data/data --game 2 \
   --noise 0.3 --ball-noise 0.5 --drop 0.3 --feet-drop 0.3 --fragment 5
+# owner-like footage; track stitching on simulated tracker fragments (~6 min)
+.venv312/bin/python scripts/evaluate_on_tracking_data.py PATH/sample-data/data --game 2 \
+  --visible 0.4 --run 2 --team-flip 0.2 --camera broadcast
+.venv312/bin/python scripts/evaluate_on_tracking_data.py PATH/sample-data/data --game 2 --identity pan
 # score a real analysed match against labels
 .venv312/bin/python scripts/evaluate_match.py JOB_DIR labels.json --markdown report.md
 # frontend

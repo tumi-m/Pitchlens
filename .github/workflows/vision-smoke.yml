@@ -1,0 +1,57 @@
+name: Vision smoke
+# The production vision stack (vision.Dockerfile: Python 3.12, CPU torch,
+# ultralytics, onnxruntime, headless OpenCV), which the Poetry backend job never
+# installs: engine paths such as player load are run for real here.
+on:
+  pull_request:
+    paths: ['backend/**', '.github/workflows/vision-smoke.yml']
+  push:
+    branches: [main]
+    paths: ['backend/**', '.github/workflows/vision-smoke.yml']
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  vision-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements-vision.txt
+      - name: Install the vision stack as vision.Dockerfile does
+        working-directory: backend
+        run: |
+          pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-vision.txt pytest
+          # The GUI build of OpenCV needs libGL; the image uses the headless build.
+          pip uninstall -y opencv-python
+          pip install --no-deps opencv-python-headless==4.10.0.84
+          python -c "import cv2, torch, onnxruntime, ultralytics; print('cv2', cv2.__version__, 'torch', torch.__version__)"
+      # Player weights only, checked against the hash the worker trusts. The
+      # Hugging Face ball model is never downloaded here.
+      - name: Download and verify yolo11s.pt
+        working-directory: backend
+        run: |
+          mkdir -p models
+          curl -fsSL --retry 3 -o models/yolo11s.pt https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt
+          python - <<'EOF'
+          import hashlib, sys
+          from app.vision.profiles import KNOWN_SHA256
+          got = hashlib.sha256(open("models/yolo11s.pt", "rb").read()).hexdigest()
+          if got != KNOWN_SHA256["yolo11s.pt"]:
+              sys.exit(f"yolo11s.pt checksum mismatch: {got}")
+          print("yolo11s.pt verified")
+          EOF
+      - name: Backend tests
+        working-directory: backend
+        # The two legacy pipeline suites need the Poetry environment (the backend job runs them).
+        run: python -m pytest tests -q --ignore=tests/test_contracts.py --ignore=tests/test_pipeline.py
+      - name: Player-load smoke run
+        run: python backend/scripts/smoke_player_load.py
+        env:
+          YOLO_OFFLINE: '1'
+          YOLO_CONFIG_DIR: ${{ runner.temp }}/ultralytics

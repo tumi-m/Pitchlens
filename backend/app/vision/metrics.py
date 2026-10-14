@@ -16,6 +16,11 @@ PLAYER_HEIGHT_M = 1.8
 MAX_PLAYER_SPEED = 11
 HEIGHT_LO = 0.55
 HEIGHT_HI = 1.8
+# A missed detection up to this long is bridged (at 2-3 fps one miss is ~0.7 s).
+LOAD_MAX_GAP = 1.0
+# Steps are measured over at least this long, so foot jitter at 10 fps does not
+# add up and a fast sampler measures the same path as a slow one.
+LOAD_MIN_INTERVAL = 0.3
 
 
 def _median(values):
@@ -81,32 +86,19 @@ def _team_of(votes):
     return -1
 
 
-def _step_metres(prev, nxt, frames, median, max_dt):
-    t0, x0, y0, scale0, height0, scene0, index0 = prev
-    t1, x1, y1, scale1, height1, scene1, index1 = nxt
-    dt = t1 - t0
-    if dt <= 0 or dt > max_dt or scene0 != scene1:
-        return None
-    if median <= 0 or not (HEIGHT_LO <= height0 / median <= HEIGHT_HI and HEIGHT_LO <= height1 / median <= HEIGHT_HI):
-        return None
-    warped = apply_camera(x0, y0, camera_span(frames, index0, index1))
-    if warped is None:
-        return None
-    pixels = math.hypot(x1 - warped[0], y1 - warped[1])
-    if pixels < FOOT_NOISE_PX:
-        return None
-    metres = pixels * (scale0 + scale1) / 2
-    if metres / dt > MAX_PLAYER_SPEED:
-        return None
-    return metres
-
-
 def player_load(frames):
     """Metres each kit ran. The camera is removed. The ball is not used.
 
-    A step is dropped when the camera could not be estimated, the box is far
-    from that track's own height, the foot moved under 3 pixels, or the
-    implied speed is over 11 m/s. Track ids are not player names.
+    Each track keeps an anchor: where its last counted step ended. Distance is
+    added once the foot (camera-compensated) is 3 pixels from the anchor and at
+    least 0.3 s has passed, so slow walking adds up instead of being dropped
+    step by step, while jitter inside the band adds nothing. A box far from
+    that track's own height is skipped; a scene cut, a missing camera estimate
+    or a gap over 1 s starts a new anchor; a step implying over 11 m/s is not
+    counted. Track ids are not player names.
+
+    A kit with no measured sample (kits not separated, no camera estimate,
+    sampling too sparse) is None, not 0; a measured kit that stood still is 0.
     """
     heights = {}
     votes = {}
@@ -124,10 +116,13 @@ def player_load(frames):
             votes.setdefault(pid, {})
             votes[pid][team] = votes[pid].get(team, 0) + 1
     medians = {pid: _median(values) for pid, values in heights.items()}
+    teams = {pid: _team_of(v) for pid, v in votes.items()}
     metres = [0.0, 0.0]
+    measured = [0, 0]  # samples past the scene, camera, height and gap checks
     max_speed = 0.0
     kept = 0
-    previous = {}
+    anchor = {}  # pid -> (t, x, y, metres per pixel, scene, frame index)
+    last_seen = {}  # pid -> t of its last usable box
     for index, frame in enumerate(frames):
         seen = set()
         for player in frame.get("players") or []:
@@ -136,32 +131,42 @@ def player_load(frames):
             if pid is None or pid in seen or not box or len(box) < 4:
                 continue
             seen.add(pid)
+            team = teams.get(pid, -1)
             height = max(float(box[3]) - float(box[1]), 1.0)
-            here = (
-                float(frame.get("t", index)),
-                (float(box[0]) + float(box[2])) / 2,
-                float(box[3]),
-                PLAYER_HEIGHT_M / height,
-                height,
-                frame.get("scene", 0),
-                index,
-            )
-            earlier = previous.get(pid)
-            if earlier is not None:
-                moved = _step_metres(earlier, here, frames, medians.get(pid, 0), 0.45)
-                team = _team_of(votes.get(pid, {}))
-                if moved is not None and team in (0, 1):
-                    metres[team] += moved
-                    kept += 1
-                    speed = moved / max(here[0] - earlier[0], 1e-6)
-                    if speed > max_speed:
-                        max_speed = speed
-            previous[pid] = here
+            median = medians.get(pid, 0)
+            if team not in (0, 1) or median <= 0 or not HEIGHT_LO <= height / median <= HEIGHT_HI:
+                continue  # a partial box is not a scale
+            t = float(frame.get("t", index))
+            here = (t, (float(box[0]) + float(box[2])) / 2, float(box[3]), PLAYER_HEIGHT_M / height, frame.get("scene", 0), index)
+            start = anchor.get(pid)
+            previous = last_seen.get(pid)
+            last_seen[pid] = t
+            if start is None or previous is None or t - previous > LOAD_MAX_GAP or start[4] != here[4]:
+                anchor[pid] = here
+                continue
+            warped = apply_camera(start[1], start[2], camera_span(frames, start[5], index))
+            if warped is None:
+                anchor[pid] = here
+                continue
+            measured[team] += 1
+            pixels = math.hypot(here[1] - warped[0], here[2] - warped[1])
+            if pixels < FOOT_NOISE_PX or t - start[0] < LOAD_MIN_INTERVAL - 1e-6:
+                continue  # keep the anchor: slow movement accumulates
+            moved = pixels * (start[3] + here[3]) / 2
+            dt = max(t - start[0], 1e-6)
+            if moved / dt <= MAX_PLAYER_SPEED:
+                metres[team] += moved
+                kept += 1
+                # Top speed only over short steps: a long one averages a sprint away.
+                if dt <= 1.0:
+                    max_speed = max(max_speed, moved / dt)
+            anchor[pid] = here
     return {
-        "metres": [round(value, 1) for value in metres],
-        "maxSpeed": round(max_speed, 2),
+        "metres": [round(value, 1) if measured[team] else None for team, value in enumerate(metres)],
+        "maxSpeed": round(max_speed, 2) if any(measured) else None,
         "steps": kept,
-        "method": "player-height-camera-compensated",
+        "measuredSamples": measured,
+        "method": "player-height-camera-compensated-dead-band",
         "playerHeightM": PLAYER_HEIGHT_M,
         "footNoisePx": FOOT_NOISE_PX,
     }

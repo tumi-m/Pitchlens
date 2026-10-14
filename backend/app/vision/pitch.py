@@ -286,7 +286,8 @@ def _residuals(G, k1, size, image_points, pitch_points, line_clicks):
     G maps pitch metres to undistorted image pixels. Point residuals are
     measured in the observed (distorted) image, which is the maximum-likelihood
     criterion for click noise; line residuals are measured in the undistorted
-    image, where the painted line is straight.
+    image, where the painted line is straight. Vectorised over the line clicks:
+    a preview evaluates this thousands of times.
     """
     out = []
     if len(image_points):
@@ -294,15 +295,16 @@ def _residuals(G, k1, size, image_points, pitch_points, line_clicks):
         out.append((projected - image_points).ravel())
     if line_clicks:
         clicks = undistort(np.array([c[0] for c in line_clicks]), k1, size)
-        for (a, b), click in zip([c[1] for c in line_clicks], clicks):
-            pa, pb = apply(G, [a, b])
-            direction = pb - pa
-            norm = np.linalg.norm(direction)
-            if not np.isfinite(norm) or norm < 1e-9:
-                out.append(np.array([1e3]))
-                continue
-            normal = np.array([-direction[1], direction[0]]) / norm
-            out.append(np.array([float(np.dot(click - pa, normal))]))
+        ends = np.array([c[1] for c in line_clicks], float).reshape(-1, 2, 2)
+        pa, pb = apply(G, ends[:, 0]), apply(G, ends[:, 1])
+        direction = pb - pa
+        norm = np.linalg.norm(direction, axis=1)
+        degenerate = ~np.isfinite(norm) | (norm < 1e-9)  # the line projects to a point
+        with np.errstate(divide="ignore", invalid="ignore"):
+            normal = np.stack([-direction[:, 1], direction[:, 0]], axis=1) / norm[:, None]
+            distance = np.einsum("ij,ij->i", clicks - pa, normal)
+        distance[degenerate] = 1e3
+        out.append(distance)
     return np.concatenate(out) if out else np.zeros(0)
 
 
@@ -342,7 +344,7 @@ def _solve(image_points, pitch_points, line_clicks, size, k1_grid, refine_k1):
         x0,
         loss="soft_l1",
         f_scale=2.0,
-        max_nfev=3000,
+        max_nfev=500,  # the same quality and k1 as 3000 on the test geometries; bounds scattered clicks
     )
     G, k1 = unpack(solution.x)
     if refine_k1 and (not -1.5 < k1 < 0.2 or 1 + k1 * radius2 < 0.25):
@@ -369,18 +371,22 @@ def _leave_one_out(image_points, pitch_points, line_clicks, size, k1_grid, refin
     return out
 
 
-def camera_geometry(G, size):
-    """Field of view (deg) and camera height (m) implied by a pitch->image homography.
+def camera_pose(G, size, pitch_points=None):
+    """Field of view (deg), camera height (m) and whether the fit is mirrored.
 
     Assumes square pixels and the principal point at the image centre. Returns
-    (None, None) when the homography is not consistent with a real camera.
+    (None, None, None) when the homography is not consistent with a real camera.
+    The pose is chosen so the clicked pitch points are in front of the camera;
+    then a real camera is above the pitch. Below it means the naming is
+    mirrored (left and right, or near and far, swapped): the same pixels and
+    error, but every position reflected. `mirrored` is None without clicks.
     """
     w, h = size
     shift = np.array([[1, 0, -w / 2], [0, 1, -h / 2], [0, 0, 1.0]])
     g = shift @ np.asarray(G, float)
     norm = np.linalg.norm(g[:, :2])
     if not np.isfinite(norm) or norm <= 0:
-        return None, None
+        return None, None, None
     g = g / norm
     g1, g2, g3 = g[:, 0], g[:, 1], g[:, 2]
     # Both rotation constraints (r1.r2 = 0, |r1| = |r2|) are linear in f^2:
@@ -391,22 +397,59 @@ def camera_geometry(G, size):
     B = np.array([g1[0] * g2[0] + g1[1] * g2[1], g1[0] ** 2 + g1[1] ** 2 - g2[0] ** 2 - g2[1] ** 2])
     den = float(A @ A)
     if den <= 1e-18:
-        return None, None
+        return None, None, None
     f2 = -float(A @ B) / den
     if not math.isfinite(f2) or f2 <= 0:
-        return None, None
+        return None, None, None
     f = math.sqrt(f2)
     K_inv = np.diag([1 / f, 1 / f, 1.0])
     r1, r2, t = K_inv @ g1, K_inv @ g2, K_inv @ g3
     scale = (np.linalg.norm(r1) + np.linalg.norm(r2)) / 2
     if scale <= 0:
-        return None, None
+        return None, None, None
     r1, r2, t = r1 / scale, r2 / scale, t / scale
+    mirrored = None
+    if pitch_points is not None and len(pitch_points):
+        x, y = np.mean(np.asarray(pitch_points, float).reshape(-1, 2), axis=0)
+        if r1[2] * x + r2[2] * y + t[2] < 0:  # the clicked points must be in front
+            r1, r2, t = -r1, -r2, -t
     r3 = np.cross(r1, r2)
     R = np.column_stack([r1, r2, r3])
     centre = -R.T @ t
+    if pitch_points is not None and len(pitch_points):
+        # Pitchlens axes (x to the right, y towards the camera) make r1 x r2
+        # point into the ground: a real camera has a negative z here.
+        mirrored = bool(centre[2] > 0)
     fov = math.degrees(2 * math.atan(w / (2 * f)))
-    return round(fov, 1), round(abs(float(centre[2])), 2)
+    return round(fov, 1), round(abs(float(centre[2])), 2), mirrored
+
+
+def camera_geometry(G, size):
+    """Field of view (deg) and camera height (m) implied by a pitch->image homography."""
+    fov, height, _ = camera_pose(G, size)
+    return fov, height
+
+
+DEGENERATE = "Two landmarks are at the same spot or all clicks are in a line. Click each landmark where it is in the picture."
+
+
+def _check_clicks(image_points, size):
+    """Clicks a homography cannot come from: two at one spot, or all on one line.
+
+    Such a set can fit "exactly" (0 px) and map the picture to infinity.
+    """
+    scale = size[1] / 360.0
+    pts = np.asarray(image_points, float)
+    gaps = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+    gaps[np.diag_indices(len(pts))] = np.inf
+    if float(gaps.min()) <= 3 * scale:
+        raise ValueError(DEGENERATE)
+    # Area of every triangle of clicks (vertex j; n is at most 30).
+    a = pts[:, None, None, :] - pts[None, :, None, :]
+    b = pts[None, None, :, :] - pts[None, :, None, :]
+    areas = np.abs(a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]) / 2
+    if float(areas.max()) <= 25 * scale**2:
+        raise ValueError(DEGENERATE)
 
 
 def fit(image_points, pitch_points, size, distortion="auto", line_clicks=None):
@@ -416,7 +459,8 @@ def fit(image_points, pitch_points, size, distortion="auto", line_clicks=None):
     keep it only if held-out clicks agree better), or "on".
     line_clicks: [((x, y), ((ax, ay), (bx, by)))] image click and its pitch line.
     Residuals are image pixels (the natural unit of click error); each landmark
-    is also reported in metres and as a leave-one-out residual.
+    is also reported in metres and standardised by how well the other clicks
+    check it (z).
     """
     image_points = np.asarray(image_points, float).reshape(-1, 2)
     pitch_points = np.asarray(pitch_points, float).reshape(-1, 2)
@@ -431,35 +475,103 @@ def fit(image_points, pitch_points, size, distortion="auto", line_clicks=None):
             "At least four of the landmarks must not share a line (for example, not all on the halfway line). "
             "Add a corner, a goal post or a point on another line."
         )
+    _check_clicks(image_points, size)
     constraints = 2 * n + len(line_clicks)
     # With fewer constraints than this the lens term is not identifiable: it
     # would absorb click error and invent a fisheye.
     use_distortion = distortion in ("on", "auto") and constraints >= 12
-    plain = _solve(image_points, pitch_points, line_clicks, size, [0.0], False)
-    G, k1 = plain
-    if use_distortion:
-        grid = list(np.arange(-1.2, 0.051, 0.05))
-        warped = _solve(image_points, pitch_points, line_clicks, size, grid, True)
-        if distortion == "on":
-            G, k1 = warped
-        elif n >= 6:
-            # Keep the lens term only if it predicts held-out clicks >= 10% better.
-            loo_plain = [r for r in _leave_one_out(image_points, pitch_points, line_clicks, size, [0.0], False) if r is not None]
-            loo_warped = [
-                r for r in _leave_one_out(image_points, pitch_points, line_clicks, size, [warped[1]], True) if r is not None
-            ]
-            if loo_plain and loo_warped and np.sqrt(np.mean(np.square(loo_warped))) < 0.9 * np.sqrt(np.mean(np.square(loo_plain))):
+    try:
+        plain = _solve(image_points, pitch_points, line_clicks, size, [0.0], False)
+        G, k1 = plain
+        if use_distortion:
+            grid = list(np.arange(-1.2, 0.051, 0.05))
+            warped = _solve(image_points, pitch_points, line_clicks, size, grid, True)
+            if distortion == "on":
                 G, k1 = warped
-        elif len(line_clicks) >= 6:
-            r0 = _residuals(*plain, size, image_points, pitch_points, line_clicks)
-            r1 = _residuals(*warped, size, image_points, pitch_points, line_clicks)
-            if np.sqrt(np.mean(r1**2)) < 0.7 * np.sqrt(np.mean(r0**2)):
-                G, k1 = warped
-    H = np.linalg.inv(G)
+            elif n >= 6:
+                # Keep the lens term only if it predicts held-out clicks >= 10% better.
+                loo_plain = [r for r in _leave_one_out(image_points, pitch_points, line_clicks, size, [0.0], False) if r is not None]
+                loo_warped = [
+                    r for r in _leave_one_out(image_points, pitch_points, line_clicks, size, [warped[1]], True) if r is not None
+                ]
+                if loo_plain and loo_warped and np.sqrt(np.mean(np.square(loo_warped))) < 0.9 * np.sqrt(np.mean(np.square(loo_plain))):
+                    G, k1 = warped
+            elif len(line_clicks) >= 6:
+                # Few landmarks: the lens term can absorb a mis-click instead of
+                # a real lens. Keep it only when it straightens the clicked lines
+                # (RMS down 30%) without pulling the landmarks off their clicks
+                # (RMS up at most 0.5 px at 360p).
+                m = 2 * n
+                r0 = _residuals(*plain, size, image_points, pitch_points, line_clicks)
+                r1 = _residuals(*warped, size, image_points, pitch_points, line_clicks)
+
+                def landmark_rms(r):
+                    return float(np.sqrt(np.mean(np.sum(r[:m].reshape(-1, 2) ** 2, axis=1))))
+
+                straighter = np.sqrt(np.mean(r1[m:] ** 2)) < 0.7 * np.sqrt(np.mean(r0[m:] ** 2))
+                if straighter and landmark_rms(r1) <= landmark_rms(r0) + 0.5 * size[1] / 360:
+                    G, k1 = warped
+        H = np.linalg.inv(G)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(DEGENERATE) from exc
     H = H / H[2, 2]
     calibration = {"H": H.tolist(), "k1": k1, "size": list(size)}
-    loo = _leave_one_out(image_points, pitch_points, line_clicks, size, [k1], False) if n >= 5 else [None] * n
-    return describe(calibration, image_points, pitch_points, line_clicks, G, loo)
+    return describe(calibration, image_points, pitch_points, line_clicks, G)
+
+
+MIRRORED = (
+    "Left and right, or near and far, are swapped. Seen from the camera, the left goal is on the left and the far "
+    "touchline is further away. For a camera behind a goal, the near touchline is the one on your right when you "
+    "face the pitch from behind the left goal."
+)
+
+
+def _jacobian(G, k1, size, image_points, pitch_points, line_clicks, lens):
+    """Derivatives of every residual by the 8 homography terms (and k1 when fitted)."""
+    G = np.asarray(G, float) / G[2, 2]
+    x0 = np.append(G.ravel()[:8], [k1] if lens else [])
+
+    def residuals(x):
+        return _residuals(np.append(x[:8], 1).reshape(3, 3), x[8] if lens else k1, size, image_points, pitch_points, line_clicks)
+
+    columns = []
+    for j in range(len(x0)):
+        step = np.zeros(len(x0))
+        step[j] = 1e-7 * max(1.0, abs(x0[j]))
+        columns.append((residuals(x0 + step) - residuals(x0 - step)) / (2 * step[j]))
+    return np.column_stack(columns), x0
+
+
+def _snooping(J, residuals):
+    """Redundancy numbers and least-squares residuals for outlier tests.
+
+    Redundancy of each residual, 1 - diag(J (J'J)^-1 J'), is the share of an
+    error there that shows in the residuals: near 0, nothing else checks it.
+    The residuals are projected off the fit's column space (one Gauss-Newton
+    step to the least-squares fit): the robust fit can share one bad click's
+    error with its neighbours, which made the wrong one stand out.
+    """
+    scaled = J / np.maximum(np.linalg.norm(J, axis=0), 1e-300)  # same column space
+    u, singular, _ = np.linalg.svd(scaled, full_matrices=False)
+    u = u[:, singular > singular.max() * 1e-10]
+    redundancy = np.clip(1 - np.sum(u**2, axis=1), 0.0, 1.0)
+    return redundancy, residuals - u @ (u.T @ residuals)
+
+
+def _moves_positions(G, k1, size, image_points, J, x0, row, delta, lens):
+    """Metres the fit moves positions over the clicked area for a `delta` px error at one click coordinate."""
+    shift = np.linalg.pinv(J) @ (np.eye(J.shape[0])[row] * delta)
+    x = x0 + shift
+    moved = np.append(x[:8], 1).reshape(3, 3)
+    lo, hi = image_points.min(axis=0), image_points.max(axis=0)
+    area = np.array([[x_, y_] for x_ in np.linspace(lo[0], hi[0], 6) for y_ in np.linspace(lo[1], hi[1], 4)])
+    try:
+        before = apply(np.linalg.inv(G / G[2, 2]), undistort(area, k1, size))
+        after = apply(np.linalg.inv(moved), undistort(area, x[8] if lens else k1, size))
+    except np.linalg.LinAlgError:
+        return math.inf
+    distance = np.linalg.norm(after - before, axis=1)
+    return float(np.max(distance)) if np.isfinite(distance).all() else math.inf
 
 
 def describe(calibration, image_points, pitch_points, line_clicks=(), G=None, loo=None):
@@ -468,45 +580,71 @@ def describe(calibration, image_points, pitch_points, line_clicks=(), G=None, lo
     size = calibration["size"]
     if G is None:
         G = np.linalg.inv(H)
+    line_clicks = list(line_clicks)
     scale = size[1] / 360.0  # pixel thresholds are for 360p; scale with height
-    pixel = _residuals(G, k1, size, image_points, pitch_points, [])
-    pixel = np.linalg.norm(pixel.reshape(-1, 2), axis=1)
-    lines = np.abs(_residuals(G, k1, size, np.zeros((0, 2)), np.zeros((0, 2)), list(line_clicks))) if line_clicks else np.zeros(0)
+    offsets = _residuals(G, k1, size, image_points, pitch_points, [])
+    pixel = np.linalg.norm(offsets.reshape(-1, 2), axis=1)
+    lines = np.abs(_residuals(G, k1, size, np.zeros((0, 2)), np.zeros((0, 2)), line_clicks)) if line_clicks else np.zeros(0)
     everything = np.concatenate([pixel, lines])
     rms_px = float(np.sqrt(np.mean(everything**2))) if len(everything) else 0.0
     metres = np.linalg.norm(apply(H, undistort(image_points, k1, size)) - pitch_points, axis=1)
     warnings = []
     n = len(image_points)
+    verifiable = n > 4 or len(line_clicks) > 0
     if n == 4 and not len(line_clicks):
         warnings.append(
             "Four points fit exactly, so their error cannot be measured. Add a fifth landmark or click along a line to check the fit."
         )
-    loo = loo or [None] * n
-    known = [r for r in loo if r is not None]
-    if known:
-        median = float(np.median(known))
-        for i, r in enumerate(loo):
-            if r is not None and r > max(3 * scale, 3 * median):
-                warnings.append(f"Landmark {i + 1} disagrees with the others ({r:.1f} px when left out); it may be the wrong point.")
+    # How well the other clicks check each landmark (redundancy numbers from
+    # the fit's Jacobian), and its residual standardised by that: a weakly
+    # checked correct landmark has a small residual for a reason, so the old
+    # leave-one-out residual blamed it (and missed real mistakes).
+    lens = bool(k1)
+    z = np.zeros(n)
+    unchecked = np.zeros((n, 2), bool)
+    J, x0 = _jacobian(G, k1, size, image_points, pitch_points, line_clicks, lens)
+    if n and np.isfinite(J).all():
+        redundancy, least_squares = _snooping(J, _residuals(G, k1, size, image_points, pitch_points, line_clicks))
+        redundancy, least_squares = redundancy[: 2 * n], least_squares[: 2 * n]
+        sigma = 1.0 * scale  # click noise, px
+        standard = np.abs(least_squares) / (sigma * np.sqrt(np.maximum(redundancy, 1e-6)))
+        z = np.sqrt(np.mean(standard.reshape(-1, 2) ** 2, axis=1))
+        unchecked = redundancy.reshape(-1, 2) < 0.01
+    capped = False
+    if verifiable and n:
+        if float(z.max()) > 4:
+            warnings.append(f"Landmark {int(np.argmax(z)) + 1} disagrees with the others; it may be the wrong point.")
+        for i in range(n):
+            if unchecked[i].all():
+                capped = True
+            elif not unchecked[i].any() or _moves_positions(G, k1, size, image_points, J, x0, 2 * i + int(np.argmax(unchecked[i])), 10 * scale, lens) <= 1.0:
+                continue
+            warnings.append(f"Nothing else checks landmark {i + 1}; add a point off its lines.")
     folded = not horizon_ok(calibration, image_points, pitch_points)
     if folded:
         warnings.append("The pitch folds over itself with these clicks; two landmarks are probably swapped.")
-    fov, height = camera_geometry(G, size)
-    if fov is None or not 30 <= fov <= 175:
+    fov, height, mirrored = camera_pose(G, size, pitch_points)
+    if mirrored:
+        warnings.append(MIRRORED)
+    # Warnings only: zoomed venue and stadium cameras are narrow, drones high.
+    if fov is None or not 10 <= fov <= 175:
         warnings.append("The fit does not look like a real camera; check the landmarks and the pitch dimensions.")
-    elif height is not None and not 1.0 <= height <= 30:
+    elif height is not None and not 1.0 <= height <= 150:
         warnings.append(f"The fit puts the camera {height:.0f} m above the pitch; check the pitch dimensions.")
-    verifiable = n > 4 or len(line_clicks) > 0
     quality = "good" if rms_px <= 2 * scale else "check" if rms_px <= 4 * scale else "poor"
-    if folded:
+    if folded or mirrored:
         quality = "poor"
     elif not verifiable:
         quality = "unverified"
+    elif capped and quality == "good":
+        quality = "check"
     return {
         **calibration,
         "residuals": [round(float(r), 3) for r in metres],
         "pixelResiduals": [round(float(r), 2) for r in pixel],
-        "leaveOneOut": [None if r is None else round(float(r), 2) for r in loo],
+        # Kept for older clients (a null hides the column); see "z".
+        "leaveOneOut": [None] * n,
+        "z": [round(float(v), 2) for v in z],
         "lineResiduals": [round(float(r), 2) for r in lines],
         "rmsPixels": round(rms_px, 2),
         "rms": round(float(np.sqrt(np.mean(metres**2))), 3),
@@ -574,16 +712,19 @@ def pitch_to_image(calibration, points, H=None):
 IDENTITY = np.eye(3)
 
 
-def _affine(frame):
+def _affine(frame, width=640):
     m = frame.get("camera")
     if m is None:
         return None
     a = np.asarray(m, float).reshape(2, 3)
     # Deadband: a fixed camera's motion estimate is noise around identity.
     # Composing thousands of noisy near-identities drifts; treat them as exact.
+    # Motion is measured on a 320-px-wide copy and scaled up, so its noise in
+    # native pixels grows with the video width: so does the deadband.
+    deadband = 0.25 * width / 640
     if (
-        abs(a[0, 2]) < 0.25
-        and abs(a[1, 2]) < 0.25
+        abs(a[0, 2]) < deadband
+        and abs(a[1, 2]) < deadband
         and abs(a[0, 0] - 1) < 0.002
         and abs(a[1, 1] - 1) < 0.002
         and abs(a[0, 1]) < 0.002
@@ -593,19 +734,23 @@ def _affine(frame):
     return np.vstack([a, [0, 0, 1]])
 
 
-def static_camera(frames, window_seconds=5.0, max_drift=8.0):
+def static_camera(frames, window_seconds=5.0, max_drift=8.0, width=640):
     """True when the recorded camera motion is negligible (a fixed venue camera).
 
     Judged on the motion chain, not frame by frame: a slow re-aim of 2-3 px per
     frame looks like noise in any one frame but adds up within seconds. Frames
-    whose motion is unknown are handled by static_breaks().
+    whose motion is unknown are handled by static_breaks(). Pixel limits are
+    for 640-px-wide video and scale with `width` (motion is measured on a
+    320-px copy, so its noise in native pixels grows with resolution: a fixed
+    4K camera read as moving).
     """
+    scale = width / 640
     moved = [(f.get("t"), np.asarray(f["camera"], float).reshape(2, 3)[:, 2]) for f in frames if f.get("camera") is not None]
     if len(moved) < max(5, len(frames) * 0.5):
         return False
     moves = [float(np.hypot(*shift)) for _, shift in moved]
     # A fixed camera that was bumped or re-aimed moves for a moment: not static.
-    if float(np.percentile(moves, 95)) >= 0.6 or float(np.max(moves)) >= 3.0:
+    if float(np.percentile(moves, 95)) >= 0.6 * scale or float(np.max(moves)) >= 3.0 * scale:
         return False
     times = [t if t is not None else k for k, (t, _) in enumerate(moved)]
     total = np.vstack([[0.0, 0.0], np.cumsum([shift for _, shift in moved], axis=0)])
@@ -613,7 +758,7 @@ def static_camera(frames, window_seconds=5.0, max_drift=8.0):
     for last in range(len(moved)):
         while times[last] - times[first] > window_seconds:
             first += 1
-        if float(np.hypot(*(total[last + 1] - total[first]))) >= max_drift:
+        if float(np.hypot(*(total[last + 1] - total[first]))) >= max_drift * scale:
             return False
     return True
 
@@ -654,16 +799,16 @@ def _elapsed(frames, earlier, later):
     return 0.0 if a is None or b is None else b - a
 
 
-def _step(frames, i, static):
+def _step(frames, i, static, width=640):
     """Camera motion from frame i-1 to frame i, or None where it is unknown."""
     if not static:
-        return _affine(frames[i])
+        return _affine(frames[i], width)
     # A fixed camera does not move, but where motion could not be measured it
     # may have been re-aimed: carry on only if the player tracks say it held still.
     return IDENTITY if frames[i].get("camera") is not None or _held_still(frames, i) else None
 
 
-def propagate(frames, anchors, static=None, max_seconds=12.0):
+def propagate(frames, anchors, static=None, max_seconds=12.0, width=640):
     """Per-frame image->pitch homographies (in undistorted-pixel terms) from anchors.
 
     anchors: {frame index: 3x3 image->pitch homography} for frames that were
@@ -671,11 +816,12 @@ def propagate(frames, anchors, static=None, max_seconds=12.0):
     forwards and backwards through the camera motion inside its scene until the
     next anchor or a cut. Returns (list of H or None, list of steps from anchor).
     Camera motion is estimated on raw frames, so with lens distortion this is an
-    approximation that the line re-alignment corrects.
+    approximation that the line re-alignment corrects. `width`: the video's
+    width in pixels (motion noise scales with it).
     """
     n = len(frames)
     if static is None:
-        static = static_camera(frames)
+        static = static_camera(frames, width=width)
     homographies = [None] * n
     distance = [None] * n
     for index, H in sorted(anchors.items()):
@@ -691,7 +837,7 @@ def propagate(frames, anchors, static=None, max_seconds=12.0):
             # painted lines, stop trusting it after max_seconds.
             if not static and _elapsed(frames, index, i) > max_seconds:
                 break
-            a = _step(frames, i, static)
+            a = _step(frames, i, static, width)
             if a is None:
                 break
             to_anchor = to_anchor @ np.linalg.inv(a)
@@ -704,7 +850,7 @@ def propagate(frames, anchors, static=None, max_seconds=12.0):
                 break
             if not static and _elapsed(frames, i, index) > max_seconds:
                 break
-            a = _step(frames, i + 1, static)
+            a = _step(frames, i + 1, static, width)
             if a is None:
                 break
             to_anchor = to_anchor @ a
@@ -729,7 +875,10 @@ def line_mask(frame, pitch_colour=None, restrict_to_grass=True):
     k = max(5, int(h * 0.025) | 1)
     tophat = cv2.morphologyEx(lightness, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    bright = (tophat >= max(18, np.percentile(tophat, 97))) & (hsv[:, :, 1] < 90)
+    # The frame's 97th percentile adapts to noise and texture, but capped:
+    # bright advert boards in view pushed it to ~73 on a stadium camera, far
+    # above faint painted lines (median ~33), and the lines vanished.
+    bright = (tophat >= max(18, min(np.percentile(tophat, 97), 30))) & (hsv[:, :, 1] < 90)
     mask = bright.astype(np.uint8) * 255
     if restrict_to_grass:
         # Only markings on the playing surface: grass-coloured surroundings.
@@ -761,7 +910,14 @@ def _chamfer_field(mask, cap):
     return np.minimum(field, cap)
 
 
-def align_to_lines(frame, calibration, H, template, max_nfev=200, precomputed=None, search=0, max_shift=None):
+def _apart(a, b):
+    """Median pixel distance between two projections of the same line samples."""
+    d = np.linalg.norm(a - b, axis=1)
+    d = d[np.isfinite(d)]
+    return float(np.median(d)) if len(d) else math.inf
+
+
+def align_to_lines(frame, calibration, H, template, max_nfev=200, precomputed=None, search=0, max_shift=None, ambiguity=0.03):
     """Refine an image->pitch homography so projected lines sit on painted lines.
 
     Staged to avoid false locks on a partial, symmetric view of the lines:
@@ -769,7 +925,10 @@ def align_to_lines(frame, calibration, H, template, max_nfev=200, precomputed=No
     re-acquiring after the camera moved unobserved), then a pan/tilt/zoom
     (similarity) fit, then a lightly regularised full homography correction.
     The result is refused when it moves the lines implausibly far
-    (`max_shift`), changes scale by more than ~20%, or does not improve the fit.
+    (`max_shift`), changes scale by more than ~20%, or does not improve the fit;
+    and, when re-acquiring (a search wider than 10% of the frame), when a
+    clearly different view fits the lines within `ambiguity` of the best (a
+    false lock on a repeating pattern of lines).
 
     Returns (H or None, score): score is the fraction of visible template
     samples lying within 2 px of a detected marking.
@@ -839,60 +998,82 @@ def align_to_lines(frame, calibration, H, template, max_nfev=200, precomputed=No
     if keep.sum() < 60:
         return None, 0.0
     score_before, _ = score_of(identity)
+    distinct = max(8.0, h * 0.03)  # px: two locks this far apart are different views
 
-    # Stage 0: coarse search over image shifts.
-    M0 = identity
+    # Stage 0: coarse search over image shifts. Re-acquiring a view after the
+    # camera moved unobserved (a wide search) also tries two zoom levels (a
+    # re-aimed camera is often zoomed too; a shift-only search then settled on
+    # the wrong lines) and refines the best clearly different start as well.
+    starts = [identity]
+    wide = bool(search) and search > 0.1 * min(h, w)
     if search:
         step = max(2, int(search / 12))
-        best = None
-        for dx in range(-search, search + 1, step):
-            for dy in range(-search // 2, search // 2 + 1, step):
-                T = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1.0]])
-                cost = float(values(T, keep).mean())
-                if best is None or cost < best[0]:
-                    best = (cost, T)
-        M0 = best[1]
+        coarse = []
+        for zoom in (0.87, 1.0, 1.15) if wide else (1.0,):
+            Z = shift_c @ np.diag([zoom, zoom, 1.0]) @ unshift_c
+            for dx in range(-search, search + 1, step):
+                for dy in range(-search // 2, search // 2 + 1, step):
+                    T = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1.0]]) @ Z
+                    coarse.append((float(values(T, keep).mean()), T))
+        coarse.sort(key=lambda c: c[0])
+        starts = [coarse[0][1]]
+        # The best start of a clearly different view, refined too: when both
+        # fit the lines about as well, the view is ambiguous.
+        best_points = project(starts[0])[keep]
+        for _, T in coarse[1:] if wide else []:
+            if _apart(project(T)[keep], best_points) > distinct:
+                starts.append(T)
+                break
 
     # Stage 1: similarity (zoom, rotation, shift) around the image centre.
-    def similarity(q):
+    def similarity(q, M0):
         a = 1 + q[0] * 1e-2
         r = q[1] * 1e-2
         S = np.array([[a * math.cos(r), -a * math.sin(r), q[2]], [a * math.sin(r), a * math.cos(r), q[3]], [0, 0, 1.0]])
         return shift_c @ S @ unshift_c @ M0
 
-    sol1 = least_squares(lambda q: values(similarity(q), keep), np.zeros(4), loss="soft_l1", f_scale=2.0, max_nfev=max_nfev, diff_step=1e-3)
-    M1 = similarity(sol1.x)
-
     # Stage 2: full correction, regularised towards the similarity solution.
     scale = np.array([1e-2, 1e-2, 5.0, 1e-2, 1e-2, 5.0, 5e-5, 5e-5])
 
-    def full(p):
+    def full(p, M1):
         p = p * scale
         D = np.array([[1 + p[0], p[1], p[2]], [p[3], 1 + p[4], p[5]], [p[6], p[7], 1.0]])
         return shift_c @ D @ unshift_c @ M1
 
     prior = 0.5 * math.sqrt(keep.sum())
-    sol2 = least_squares(
-        lambda p: np.concatenate([values(full(p), keep), prior * p / 10]),
-        np.zeros(8),
-        loss="soft_l1",
-        f_scale=2.0,
-        max_nfev=max_nfev,
-        diff_step=1e-3,
-    )
-    M = full(sol2.x)
-    score, count = score_of(M)
-    if score < max(0.35, score_before) or count < 60:
-        return None, score_before
-    # Plausibility: the correction must look like camera motion, not a warp.
-    linear = M[:2, :2] / M[2, 2]
-    zoom = math.sqrt(abs(np.linalg.det(linear)))
-    if not 0.8 < zoom < 1.25:
-        return None, score_before
-    moved = project(M)[keep] - base[keep]
-    finite = np.isfinite(moved).all(axis=1)
     limit = max_shift if max_shift is not None else (search + 40 if search else 60)
-    if not finite.any() or float(np.median(np.linalg.norm(moved[finite], axis=1))) > limit:
+
+    def refine(M0):
+        sol1 = least_squares(lambda q: values(similarity(q, M0), keep), np.zeros(4), loss="soft_l1", f_scale=2.0, max_nfev=max_nfev, diff_step=1e-3)
+        M1 = similarity(sol1.x, M0)
+        sol2 = least_squares(
+            lambda p: np.concatenate([values(full(p, M1), keep), prior * p / 10]),
+            np.zeros(8),
+            loss="soft_l1",
+            f_scale=2.0,
+            max_nfev=max_nfev,
+            diff_step=1e-3,
+        )
+        M = full(sol2.x, M1)
+        score, count = score_of(M)
+        if score < max(0.35, score_before) or count < 60:
+            return None
+        # Plausibility: the correction must look like camera motion, not a warp.
+        linear = M[:2, :2] / M[2, 2]
+        zoom = math.sqrt(abs(np.linalg.det(linear)))
+        if not 0.8 < zoom < 1.25:
+            return None
+        moved = project(M)[keep] - base[keep]
+        finite = np.isfinite(moved).all(axis=1)
+        if not finite.any() or float(np.median(np.linalg.norm(moved[finite], axis=1))) > limit:
+            return None
+        return score, M
+
+    locks = sorted((lock for lock in map(refine, starts) if lock is not None), key=lambda lock: -lock[0])
+    if not locks:
         return None, score_before
+    score, M = locks[0]
+    if len(locks) > 1 and score - locks[1][0] < ambiguity and _apart(project(M)[keep], project(locks[1][1])[keep]) > distinct:
+        return None, score_before  # two different views fit the lines about equally well
     refined = np.linalg.inv(M @ to_image)
     return refined / refined[2, 2], score

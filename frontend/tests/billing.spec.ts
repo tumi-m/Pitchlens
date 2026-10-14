@@ -45,7 +45,7 @@ test("verified return refreshes durable balance and clears callback", async ({ p
   await page.goto(`/billing?reference=${REFERENCE}`);
   await expect(page.getByText(/Test payment verified/)).toBeVisible();
   await expect(page.getByTestId("sandbox-balance")).toHaveText("1 test credit");
-  await expect(page.getByText(/R\s*15,00 · Verified test payment/)).toBeVisible();
+  await expect(page.getByText(/R\s*15[.,]00 · Verified test payment/)).toBeVisible();
   await expect(page).toHaveURL(/\/billing$/);
 });
 
@@ -59,7 +59,7 @@ test("checkout displays ZAR and retries lost responses with the same request ID"
     return route.fulfill({ status: 502, json: { detail: "Temporary payment error" } });
   });
   await page.goto("/billing");
-  await expect(page.getByText(/One sandbox credit/)).toContainText(/R\s*15,00/);
+  await expect(page.getByText(/One sandbox credit/)).toContainText(/R\s*15[.,]00/);
   await page.getByLabel("Test email").fill("operator@example.com");
   await page.getByRole("button", { name: "Open Paystack test checkout" }).click();
   await expect(page.getByRole("main").getByRole("alert")).toHaveText("Temporary payment error");

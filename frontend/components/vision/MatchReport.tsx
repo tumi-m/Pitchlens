@@ -2,17 +2,38 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { Info, Target, Crosshair } from "lucide-react";
-import type { Analysis, CountStat, TeamStats } from "@/lib/review/analysis";
-import { describeEvent } from "@/lib/review/analysis";
+import type { Analysis, AnalysisEvent, CountStat, TeamStats } from "@/lib/review/analysis";
+import { describeEvent, isConfirmedGoal } from "@/lib/review/analysis";
 import { clockTime } from "@/lib/review/vision";
+import type { VisionResult } from "@/lib/review/vision";
 import { AveragePositions, Heatmap, ShotMap } from "@/components/vision/PitchGraphics";
+import { DISTANCE_HINT } from "@/components/vision/MatchCentre";
 
 const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p-5";
 
 type Value = { value: number | null; note?: string; approx?: boolean };
 
-/** Minimum checked detections of a type before the rest are estimated (mirrors the worker). */
+/** Minimum checked detections of a type before the rest are estimated (the worker's default). */
 const MIN_CHECKED = 10;
+/** Share of in-play time the ball must be followed before possession is shown (the worker's default). */
+const POSSESSION_MIN_COVERAGE = 0.6;
+/** Observed control in a minute before its momentum bar is drawn (the worker's default). */
+const MOMENTUM_MIN_CONTROL = 5;
+/** Metres per kit, or "—" when the engine did not write a usable number (no step was kept: unmeasured, not 0 m). */
+function metres(load: PlayerLoad | undefined, team: 0 | 1): Value {
+  const v = load?.metres?.[team];
+  return { value: typeof v === "number" && Number.isFinite(v) && load?.steps !== 0 ? v : null };
+}
+
+type PlayerLoad = NonNullable<VisionResult["metrics"]["playerLoad"]>;
+
+/** Types estimated from a random sample (checks are pooled across both teams). */
+const SAMPLED: { type: string; key: "passes" | "interceptions" | "tackles"; one: string; many: string }[] = [
+  { type: "pass", key: "passes", one: "pass", many: "passes" },
+  // "interception" is every ball won that is not a tackle, loose-ball recoveries included.
+  { type: "interception", key: "interceptions", one: "won ball", many: "won balls" },
+  { type: "tackle", key: "tackles", one: "tackle", many: "tackles" },
+];
 
 function count(c: CountStat | null | undefined): Value {
   if (!c) return { value: null };
@@ -21,8 +42,14 @@ function count(c: CountStat | null | undefined): Value {
     // Unchecked detections counted at the rate the reviewer found them right.
     return { value: c.estimate, approx: true, note: `${c.estimateRange[0]}–${c.estimateRange[1]} · ${c.confirmed} confirmed` };
   }
-  const need = Math.max(0, MIN_CHECKED - (c.checked ?? 0));
-  return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review${need ? ` · ${need} more checks to estimate` : ""}` };
+  // How many more checks an estimate needs is a per-type figure (shown once, in the score panel).
+  return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review` };
+}
+
+/** Possible goals still to check; null when they were not looked for (no pitch setup). */
+function possibleGoals(team: TeamStats, open: number): Value {
+  if (!team.goals || team.goals.candidates === null || team.goals.candidates === undefined) return { value: null };
+  return { value: open, note: team.goals.value ? `${team.goals.value} confirmed` : undefined };
 }
 
 function Row({
@@ -32,6 +59,7 @@ function Row({
   colours,
   format = (v) => String(v),
   hint,
+  note,
 }: {
   label: string;
   a: Value;
@@ -39,7 +67,10 @@ function Row({
   colours: [string, string];
   format?: (v: number) => string;
   hint?: string;
+  /** Always shown under the row (touch screens cannot hover for the hint). */
+  note?: string;
 }) {
+  const [open, setOpen] = useState(false);
   const known = a.value !== null && b.value !== null;
   const total = known ? (a.value as number) + (b.value as number) : 0;
   const share = (v: number | null) => (known && total > 0 ? (v as number) / total : 0);
@@ -62,13 +93,23 @@ function Row({
         <span className="text-sm text-pitch-muted text-center flex items-center gap-1.5 pt-0.5">
           {label}
           {hint && (
-            <span title={hint} className="cursor-help opacity-70">
+            // A button, not a hover tooltip: phones and keyboards can open it too.
+            <button
+              type="button"
+              title={hint}
+              aria-label={`Why: ${label}`}
+              aria-expanded={open}
+              onClick={() => setOpen((v) => !v)}
+              className="p-2 -m-2 rounded-full opacity-70 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pitch-green"
+            >
               <Info size={13} />
-            </span>
+            </button>
           )}
         </span>
         {pill(b, 1)}
       </div>
+      {note && <p className="text-[11px] text-amber-200/90 text-center mt-1">{note}</p>}
+      {open && hint && <p className="text-[11px] text-pitch-muted text-center mt-1.5">{hint}</p>}
       {known && total > 0 && (
         <div className="flex gap-1.5 mt-1.5 h-1.5">
           <div className="flex-1 flex justify-end rounded-full bg-white/5 overflow-hidden">
@@ -81,6 +122,32 @@ function Row({
       )}
     </div>
   );
+}
+
+/** Why shots were not counted (stats.coverage.shotsBasis), in words; null when they were. */
+function shotsMissing(basis: Analysis["stats"]["coverage"]["shotsBasis"], ballTracked: boolean): string | null {
+  if (basis === "no-ball")
+    return ballTracked
+      ? "The ball was not found in this footage, so shots were not looked for; add any you saw in the review."
+      : "Shots are not looked for in a player-load job; add any you saw in the review.";
+  if (basis === "no-direction") return "Shots need to know which way each team attacks. Set the direction in the review, or add shots you saw.";
+  if (basis === "no-pitch") return "Set up the pitch to find shots, or add shots you saw in the review.";
+  return null;
+}
+
+/** Possible goals per team still waiting for a decision (one already confirmed
+ *  within 3 s for the same team is the same goal). */
+function pendingGoals(events: AnalysisEvent[]): [number, number] {
+  const confirmed = events.filter(isConfirmedGoal);
+  const open = (team: number) =>
+    events.filter(
+      (e) =>
+        e.type === "goal-candidate" &&
+        e.status === "proposed" &&
+        e.team === team &&
+        !confirmed.some((g) => g.team === team && Math.abs(g.t - e.t) <= 3),
+    ).length;
+  return [open(0), open(1)];
 }
 
 function Group({ title, children }: { title: string; children: React.ReactNode }) {
@@ -101,6 +168,9 @@ export function MatchReport({
   onSeek,
   onCalibrate,
   onReview,
+  videoAvailable = true,
+  playerLoad,
+  ballTracked = true,
 }: {
   analysis: Analysis;
   names: string[];
@@ -110,26 +180,55 @@ export function MatchReport({
   onSeek: (t: number) => void;
   onCalibrate: () => void;
   onReview: () => void;
+  /** False once the footage is deleted: pitch setup is clicked on the video. */
+  videoAvailable?: boolean;
+  /** Per-kit running distance, measured for every job with or without the ball model (absent on results before 2.6). */
+  playerLoad?: PlayerLoad;
+  /** False for a player-load job: the ball model was not run, so nothing about the ball was measured. */
+  ballTracked?: boolean;
 }) {
   const [heatTeam, setHeatTeam] = useState<0 | 1>(0);
   const [A, B] = analysis.stats.teams as [TeamStats, TeamStats];
   const cov = analysis.stats.coverage;
+  const minChecked = analysis.params?.minCheckedForEstimate ?? MIN_CHECKED;
+  const minCoverage = (analysis.params?.possessionMinCoverage ?? POSSESSION_MIN_COVERAGE) * 100;
+  const minMomentum = analysis.params?.minMomentumControlSeconds ?? MOMENTUM_MIN_CONTROL;
+  // Field position weights momentum only with a pitch setup and known attacking directions.
+  const momentumWeighted = analysis.calibrated && !!analysis.directions?.segments?.length;
+  const noFootage = "Pitch setup needs the footage, which was deleted after the retention period.";
   // Reviewer-confirmed goals count with or without a pitch setup.
   const goalsKnown = A.goals !== null && B.goals !== null;
-  const candidates = (A.goals?.candidates ?? 0) + (B.goals?.candidates ?? 0);
   const reviewedGoals = (A.goals?.value ?? 0) + (B.goals?.value ?? 0);
+  // A team's 0 is only a measured 0 once its possible goals have been checked.
+  const pending = pendingGoals(analysis.events);
+  const pendingTotal = pending[0] + pending[1];
+  // Unmeasured kits (no usable step) are null, shown as "—", never 0 m.
+  const kitMetres = [metres(playerLoad, 0).value, metres(playerLoad, 1).value];
+  const metre = (v: number | null) => (v === null ? "—" : v.toFixed(1));
   const possessionShown = cov.possessionShown;
   const range = cov.possessionMissingBounds;
   const pct = (v: number) => `${Math.round(v)}%`;
   const events = analysis.events.filter((e) => e.status !== "rejected" && ["shot", "goal", "goal-candidate", "interception", "tackle", "pass"].includes(e.type));
   const keyEvents = events.filter((e) => e.type !== "pass");
+  const scoreShown = !!analysis.enteredScore || (goalsKnown && reviewedGoals > 0);
+  // Older analyses have no shotsBasis: unmeasured shots there meant no direction.
+  const shotsNote =
+    cov.shotsBasis !== undefined
+      ? shotsMissing(cov.shotsBasis, ballTracked)
+      : A.shots === null
+        ? shotsMissing(analysis.calibrated ? "no-direction" : "no-pitch", ballTracked)
+        : null;
+  // Player-load job without a score: what was measured (distance) leads instead of "– : –".
+  const distanceHero = !ballTracked && !scoreShown && kitMetres.some((v) => v !== null);
   return (
     <div className="space-y-6">
-      <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
-        <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check about ten random
-        passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
-        detections you checked were right. Moments the system never found are not included; add them in the review.
-      </section>
+      {ballTracked && (
+        <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
+          <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check a random sample of
+          passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
+          detections you checked were right. Moments the system never found are not included; add them in the review.
+        </section>
+      )}
       <motion.section
         initial={{ opacity: 0, y: 14 }}
         animate={{ opacity: 1, y: 0 }}
@@ -142,8 +241,8 @@ export function MatchReport({
             <span className="font-bold text-lg text-center break-words">{names[0]}</span>
           </div>
           <div className="flex flex-col items-center gap-2 text-center">
-            <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">Score</span>
-            <div className="text-5xl font-black tabular-nums">
+            <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">{distanceHero ? "Distance" : "Score"}</span>
+            <div className={`${distanceHero ? "text-4xl sm:text-5xl" : "text-5xl"} font-black tabular-nums`} data-testid="report-hero">
               {analysis.enteredScore ? (
                 <>
                   <span style={{ color: colours[0] }}>{analysis.enteredScore[0]}</span>
@@ -156,6 +255,12 @@ export function MatchReport({
                   <span className="text-pitch-muted text-3xl mx-2">–</span>
                   <span style={{ color: colours[1] }}>{B.goals?.value}</span>
                 </>
+              ) : distanceHero ? (
+                <>
+                  <span style={{ color: colours[0] }}>{metre(kitMetres[0])}</span>
+                  <span className="text-pitch-muted text-3xl mx-2">–</span>
+                  <span style={{ color: colours[1] }}>{metre(kitMetres[1])}</span>
+                </>
               ) : (
                 <span className="text-pitch-muted text-3xl">– : –</span>
               )}
@@ -164,29 +269,41 @@ export function MatchReport({
               {analysis.enteredScore
                 ? `Score entered by you · ${reviewedGoals} of ${analysis.enteredScore[0] + analysis.enteredScore[1]} goals located in the video`
                 : reviewedGoals > 0
-                ? "Goals confirmed by review"
-                : !analysis.calibrated
-                  ? "Enter the score, or set up the pitch to find shots and possible goals"
-                  : candidates
-                    ? `${candidates} possible goal${candidates === 1 ? "" : "s"} to confirm`
-                    : "No goal confirmed yet. Add goals you saw in the review."}
+                ? pendingTotal
+                  ? `${reviewedGoals} confirmed · ${pendingTotal} possible goal${pendingTotal === 1 ? "" : "s"} still to check`
+                  : "Goals confirmed by review"
+                : distanceHero
+                  ? "metres, camera pan removed · not named players · enter the score in the review"
+                  : !ballTracked
+                    ? "The ball was not tracked: enter the score in the review"
+                    : !analysis.calibrated
+                      ? "Enter the score, or set up the pitch to find shots and possible goals"
+                      : pendingTotal
+                        ? `${pendingTotal} possible goal${pendingTotal === 1 ? "" : "s"} to confirm`
+                        : "No goal confirmed yet. Add goals you saw in the review."}
             </span>
             <button className="text-xs underline text-pitch-green" onClick={onReview}>
               {analysis.enteredScore ? "Review" : "Enter the score and review"}
               {analysis.review.pendingKey !== undefined
-                ? ` · ${analysis.review.pendingKey} key moment${analysis.review.pendingKey === 1 ? "" : "s"} to check`
+                ? ` · ${analysis.review.pendingKey} ${analysis.review.pendingKey === 1 ? "shot or goal" : "shots and goals"} to check`
                 : ` · ${analysis.review.pending} waiting`}
             </button>
             {(() => {
+              // What each sampled type still needs, once per type (checks are pooled across teams).
               const by = analysis.review.pendingByType ?? {};
-              const found = [
-                by.pass ? `${by.pass} passes` : "",
-                by.interception ? `${by.interception} interceptions` : "",
-                by.tackle ? `${by.tackle} tackles` : "",
-              ].filter(Boolean);
-              return found.length ? (
-                <span className="text-[11px] text-pitch-muted max-w-[18rem]">
-                  {found.join(", ")} found: check a random sample of about ten of each to estimate the totals, no need to go through them all.
+              const advice = SAMPLED.map(({ type, key, one, many }) => {
+                const n = by[type] ?? 0;
+                if (!n) return "";
+                const checked = A[key]?.checked ?? 0;
+                const found = `${n} ${n === 1 ? one : many} found`;
+                // Too few to sample: checking them all gives the exact count.
+                if (n <= minChecked) return `${found}: check ${n === 1 ? "it" : `all ${n}`} for the exact count`;
+                if (checked >= minChecked) return `${found}: enough checked to estimate the rest`;
+                return `${found}: check ${checked ? `${minChecked - checked} more` : minChecked} at random to estimate the total, no need to go through them all`;
+              }).filter(Boolean);
+              return advice.length ? (
+                <span className="text-[11px] text-pitch-muted max-w-[18rem]" data-testid="sample-advice">
+                  {advice.join(". ")}.
                 </span>
               ) : null;
             })()}
@@ -197,15 +314,26 @@ export function MatchReport({
           </div>
         </div>
         <p className="relative border-t border-white/10 px-5 py-2.5 text-xs text-pitch-muted flex flex-wrap gap-x-4 gap-y-1 justify-center">
-          <span title="Retained detector and inferred positions; this is coverage, not verified accuracy.">Ball position coverage {cov.ballStatePercent}%</span>
-          <span>Possession followed {cov.possessionPercent}% of play</span>
-          {cov.deadBallSeconds > 0 && <span>Ball out of play {clockTime(cov.deadBallSeconds)}</span>}
+          {/* Stoppage time is not shown: against labelled matches the detector found
+              only a few percent of real stoppages, and most of what it flagged was live play. */}
+          {ballTracked ? (
+            <>
+              <span title="Retained detector and inferred positions; this is coverage, not verified accuracy.">Ball position coverage {cov.ballStatePercent}%</span>
+              <span title="Breaks in play are only partly detected, so the true share of live play followed can be higher.">
+                Possession followed at least {cov.possessionPercent}% of play
+              </span>
+            </>
+          ) : (
+            <span>Ball not tracked (player-load job)</span>
+          )}
           {cov.calibratedPercent > 0 ? (
             <span>Pitch mapped {cov.calibratedPercent}%</span>
-          ) : (
+          ) : videoAvailable ? (
             <button className="underline text-pitch-green" onClick={onCalibrate}>
               Pitch not set up · set it up
             </button>
+          ) : (
+            <span>Pitch not set up · {noFootage}</span>
           )}
           <span title="Pieces of player tracks after joining; one player usually appears as several.">{analysis.stats.tracks.players} track segments</span>
         </p>
@@ -214,12 +342,18 @@ export function MatchReport({
       {!analysis.calibrated && (
         <section className="rounded-2xl border border-pitch-green/40 bg-pitch-green/5 p-5 flex flex-wrap gap-4 items-center justify-between">
           <div>
-            <p className="font-semibold">Unlock shots, heatmaps and positions</p>
-            <p className="text-sm text-pitch-muted">Click a few landmarks on one frame so Pitchlens knows where the pitch is. It takes about two minutes.</p>
+            <p className="font-semibold">{ballTracked ? "Unlock shots, heatmaps and positions" : "Unlock heatmaps and positions"}</p>
+            <p className="text-sm text-pitch-muted">
+              {videoAvailable
+                ? "Click a few landmarks on one frame so Pitchlens knows where the pitch is. It takes about two minutes."
+                : noFootage}
+            </p>
           </div>
-          <button className="pitch-button-primary" onClick={onCalibrate}>
-            <Crosshair size={16} /> Set up the pitch
-          </button>
+          {videoAvailable && (
+            <button className="pitch-button-primary" onClick={onCalibrate}>
+              <Crosshair size={16} /> Set up the pitch
+            </button>
+          )}
         </section>
       )}
 
@@ -236,6 +370,22 @@ export function MatchReport({
               <span className="w-2.5 h-2.5 rounded-full" style={{ background: colours[1] }} />
             </span>
           </div>
+          {playerLoad && (
+            <Group title="Player load">
+              {/* Per kit, never speed: one estimate per team, not named players. */}
+              <Row
+                label="Distance"
+                a={metres(playerLoad, 0)}
+                b={metres(playerLoad, 1)}
+                colours={colours}
+                format={(v) => `${v.toFixed(1)} m`}
+                hint={DISTANCE_HINT}
+                note="estimate · camera pan removed · not named players"
+              />
+            </Group>
+          )}
+          {ballTracked ? (
+          <>
           <Group title="Possession">
             <Row
               label="Observed control share"
@@ -246,7 +396,15 @@ export function MatchReport({
               hint={
                 possessionShown
                   ? `From winning the ball to losing it, passes in flight included, over the ${cov.possessionPercent}% of in-play time the ball could be followed. Bounds assign all missing play to either team; detector errors are not included.`
-                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (60% needed to display this estimate).`
+                  : `Withheld: the ball could only be followed for ${cov.possessionPercent}% of in-play time (${pct(minCoverage)} needed to display this estimate).`
+              }
+              // Why it is withheld, without a tap (rounded down so 59.6% never reads as enough).
+              note={
+                possessionShown
+                  ? undefined
+                  : cov.possessionPercent < minCoverage
+                    ? `Followed ${Math.floor(cov.possessionPercent)}% of play · ${pct(minCoverage)} needed`
+                    : "No team possession was established"
               }
             />
             <Row
@@ -257,8 +415,15 @@ export function MatchReport({
               format={pct}
               hint="Each team's share of all detected passes. Many stats sites define possession this way; it can differ from the time-based figure above."
             />
-            <Row label="Possessions" a={{ value: A.possessions }} b={{ value: B.possessions }} colours={colours} />
-            <Row label="Average possession" a={{ value: A.averagePossession }} b={{ value: B.averagePossession }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
+            {/* The worker withholds the counts below 80% of play followed, a stricter gate than the share; hidden with the share too (older workers sent a 0). */}
+            <Row
+              label="Possessions"
+              a={{ value: possessionShown ? A.possessions : null }}
+              b={{ value: possessionShown ? B.possessions : null }}
+              colours={colours}
+              note={possessionShown && A.possessions === null && B.possessions === null ? "Shown once 80% of play is followed" : undefined}
+            />
+            <Row label="Average possession" a={{ value: possessionShown ? A.averagePossession : null }} b={{ value: possessionShown ? B.averagePossession : null }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
             <Row
               label="Field tilt"
               a={{ value: A.fieldTilt }}
@@ -285,7 +450,12 @@ export function MatchReport({
                 The pitch is mapped for {cov.calibratedPercent}% of the match, so shots cover that part only.
               </p>
             )}
-            <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up." />
+            <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up, or add the shots you saw in review." />
+            {shotsNote && (
+              <p className="text-[11px] text-pitch-muted pb-1" data-testid="shots-note">
+                {shotsNote}
+              </p>
+            )}
             <Row
               label="Shots on target"
               a={count(A.shotsOnTarget)}
@@ -295,16 +465,36 @@ export function MatchReport({
             />
             <Row
               label="Possible goals"
-              a={{ value: A.goals ? A.goals.candidates : null }}
-              b={{ value: B.goals ? B.goals.candidates : null }}
+              a={possibleGoals(A, pending[0])}
+              b={possibleGoals(B, pending[1])}
               colours={colours}
-              hint="The ball appeared to cross the goal line between the posts. A person must confirm each goal."
+              hint="Still to check: the ball appeared to cross the goal line between the posts. A person must confirm each goal."
             />
           </Group>
           <Group title="Defending">
-            <Row label="Interceptions" a={count(A.interceptions)} b={count(B.interceptions)} colours={colours} />
-            <Row label="Tackles / balls won" a={count(A.tackles)} b={count(B.tackles)} colours={colours} />
+            <Row
+              label="Interceptions & recoveries"
+              a={count(A.interceptions)}
+              b={count(B.interceptions)}
+              colours={colours}
+              hint="Ball taken from the other team: an intercepted pass or a loose ball; without the pitch set up this includes tackles."
+            />
+            <Row
+              label="Tackles"
+              a={count(A.tackles)}
+              b={count(B.tackles)}
+              colours={colours}
+              hint="Ball won within 2 m and 0.8 s of the opponent losing it; needs the pitch set up."
+              // Unmeasured, not zero: without metres a tackle cannot be told from another won ball.
+              note={!A.tackles && !B.tackles && !analysis.calibrated ? "Set up the pitch to tell tackles from other won balls." : undefined}
+            />
           </Group>
+          </>
+          ) : (
+            <p className="text-sm text-pitch-muted pt-3">
+              Possession, passes, shots, interceptions and tackles need the ball model, which this job did not run.
+            </p>
+          )}
           <p className="text-xs text-pitch-muted mt-4">
             — means not measured or nothing confirmed yet, not zero. ≈ marks an estimate from the moments you checked:
             confirmed events plus unchecked detections at the rate you found them right, with a 95% range. Moments the
@@ -325,19 +515,31 @@ export function MatchReport({
               </div>
               {analysis.stats.shotMap?.length ? (
                 <ShotMap analysis={analysis} colours={colours} names={names} onSeek={onSeek} />
-              ) : A.shots === null ? (
-                <p className="text-sm text-pitch-muted py-6 text-center">
-                  Shots need to know which way each team attacks. Set the direction in the review, or add shots you saw.
+              ) : shotsNote ? (
+                <p className="text-sm text-pitch-muted py-6 text-center" data-testid="shot-map-empty">
+                  {shotsNote}
+                </p>
+              ) : (A.shots?.value ?? 0) + (B.shots?.value ?? 0) > 0 ? (
+                <p className="text-sm text-pitch-muted py-6 text-center" data-testid="shot-map-empty">
+                  The shots counted here have no position on the pitch to draw.
                 </p>
               ) : (
-                <p className="text-sm text-pitch-muted py-6 text-center">No shots detected. Add any you saw in the review.</p>
+                <p className="text-sm text-pitch-muted py-6 text-center" data-testid="shot-map-empty">No shots detected. Add any you saw in the review.</p>
               )}
             </section>
           )}
+          {/* Momentum is built from ball control: nothing to draw without the ball model. */}
+          {ballTracked && (
           <section className={card}>
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Attack momentum</h2>
-              <span className="text-[11px] text-pitch-muted">Per minute · control near the opponent&apos;s goal counts most</span>
+              <span className="text-[11px] text-pitch-muted text-right" data-testid="momentum-caption">
+                {momentumWeighted
+                  ? "Per minute · control near the opponent's goal counts most"
+                  : analysis.calibrated
+                    ? "Per minute · observed ball-control difference (attacking direction unknown, so field position is not weighted)"
+                    : "Per minute · observed ball-control difference (pitch not set up, so field position is not weighted)"}
+              </span>
             </div>
             <svg viewBox={`0 0 ${analysis.stats.momentum.length * 10} 80`} className="w-full h-28" preserveAspectRatio="none">
               <line x1="0" y1="40" x2={analysis.stats.momentum.length * 10} y2="40" stroke="rgba(255,255,255,0.15)" strokeWidth="0.6" />
@@ -358,7 +560,11 @@ export function MatchReport({
                 );
               })}
             </svg>
+            {analysis.stats.momentum.some((v) => v === null) && (
+              <p className="text-[11px] text-pitch-muted mt-1">A dash marks a minute with under {minMomentum} s of observed ball control.</p>
+            )}
           </section>
+          )}
           {analysis.calibrated && analysis.stats.heatmaps && analysis.template && (
             <section className={card}>
               <div className="flex items-center justify-between mb-3">
@@ -391,7 +597,7 @@ export function MatchReport({
       <section className={card}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Match timeline</h2>
-          <span className="text-xs text-pitch-muted">{keyEvents.length} key moments · click to watch</span>
+          <span className="text-xs text-pitch-muted">{keyEvents.length} moment{keyEvents.length === 1 ? "" : "s"} on the timeline · click to watch</span>
         </div>
         <div className="relative h-14">
           <div className="absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-white/10" />

@@ -302,8 +302,8 @@ The evidence here is the tracking summary only; the detailed findings did not ar
 
 ### 2.8 Tracklet stitching
 
-**HEAD** stitches offline with multi-pass optimal matching, tightest gaps first (0.6 s, 1.5 s, 3.0 s). A join needs:
-- a start where the ending track's recent motion predicts it (at most 8.5 m/s + 1.5 m);
+**HEAD** stitches offline with multi-pass optimal matching, tightest gaps first (0.6 s, 1.5 s, 3 s, 5 s). A join needs:
+- a start within min(running-speed radius, 5 m / 0.9 body heights) of where the ending track ended or where its recent motion predicts (running-speed radius 8.5 m/s × gap + 1.5 m; the cap is E19: uncapped, it joined different players more often than the same one);
 - no clear kit disagreement;
 - no overlap in time.
 
@@ -533,8 +533,8 @@ The status column says where each value stands:
 | Confirmation | 2 sightings within 0.8 s (research: 2-3 frames) | sightings, s | HEAD; tracking summary | HEAD |
 | Kit disagreement | +0.35 soft cost | cost | HEAD | HEAD |
 | Association gate | min(3, 1 + 0.9·gap) | body heights | HEAD | HEAD |
-| Stitching passes | gaps of 0.6, 1.5, 3.0 | s | HEAD `stitch_tracks` | HEAD |
-| Stitching speed limit | 8.5 m/s + 1.5 m | m/s, m | HEAD `maxPlayerSpeed` | HEAD |
+| Stitching passes | gaps of 0.6, 1.5, 3, 5 | s | HEAD `stitchRounds` (E19) | HEAD |
+| Stitching radius | min(running-speed radius 8.5 m/s × gap + 1.5 m, 5 m / 0.9 body heights) | m, body heights | HEAD `maxPlayerSpeed`, `stitchRadius`, `stitchRadiusHeights` (E19) | HEAD |
 | Cannot-link | any overlap in time forbids a merge | – | tracking summary | HEAD (per pair); extend to a global solve |
 | Team cap | ≤ on-pitch roster per team per frame | players | tracking summary | proposed |
 | Human review | gaps >3 s and ambiguous joins | s | [derived] | proposed |

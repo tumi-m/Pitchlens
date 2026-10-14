@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -220,6 +221,33 @@ def train_colours(features, n_clusters=4):
     return centres, colours
 
 
+def align_to_reference(centres, colours, reference_hex):
+    """Keep Kit A and Kit B in the order of an earlier run of the same footage.
+
+    train_colours orders kits by how many players each cluster has, which
+    changes from one section to the next. The two kits are swapped when the
+    reference colours (hex, Kit A first) sit closer to them crosswise.
+    """
+    if reference_hex is None or centres is None or len(centres) != 2 or len(colours) != 2:
+        return centres, colours
+    if len(reference_hex) != 2 or not all(isinstance(h, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", h) for h in reference_hex):
+        return centres, colours
+    reference = [
+        cv2.cvtColor(np.uint8([int(h[i : i + 2], 16) for i in (1, 3, 5)]).reshape(1, 1, 3), cv2.COLOR_RGB2LAB)
+        .reshape(3)
+        .astype(float)
+        for h in reference_hex
+    ]
+    c = np.asarray(centres, dtype=float)
+
+    def d(a, b):
+        return float(np.linalg.norm(a - b))
+
+    if d(c[0], reference[1]) + d(c[1], reference[0]) < d(c[0], reference[0]) + d(c[1], reference[1]):
+        return np.asarray(centres)[::-1].copy(), list(colours)[::-1]
+    return centres, colours
+
+
 def assign_team(feature, centres, use_hue=True):
     if feature is None:
         return -1
@@ -240,6 +268,61 @@ def assign_team(feature, centres, use_hue=True):
     )
 
 
+def _fingerprint(frame):
+    """A 32x18 thumbnail: tells two decoded pictures apart cheaply."""
+    return cv2.resize(frame, (32, 18), interpolation=cv2.INTER_AREA)
+
+
+def _frame_time(position, last_t, index_time, fps, stride, state):
+    """Presentation time of a sampled frame, from the decoder's position.
+
+    Phone footage is often variable frame rate, where the frame count drifts
+    seconds away from the real time; the decoder's position matches the
+    stream's own timestamps (fragmented MP4, MKV, WebM, TS and trimmed files
+    alike). A reading that jumps forward by more than about ten samples is
+    held back once: when the next one continues from it, the stream really
+    jumped (re-anchor there); otherwise it was a single corrupt value. `state`
+    carries that across calls ({} for a new pass).
+    """
+    window = max(1.0, 10 * stride / fps)
+    rejected = state.pop("rejected", None)
+    started = state.get("started", False)
+    state["started"] = True
+    if math.isfinite(position):
+        if not started and position >= 0:
+            return position
+        if started and position > last_t:
+            if position - last_t <= window:
+                return position
+            if rejected is not None and rejected < position <= rejected + window:
+                return position
+            state["rejected"] = position
+    if not started:
+        return index_time
+    return index_time if last_t < index_time <= last_t + window else last_t + 1 / fps
+
+
+def limitations(kit_warning, declared_seconds, analysed_seconds, requested_seconds):
+    """What a result does not measure, listed under every report."""
+    notes = ([kit_warning] if kit_warning else []) + [
+        "Ball confidence scores are not calibrated probabilities.",
+        "Faint ball candidates require temporal and neural support; "
+        "short gaps on the same track are camera-compensated and marked inferred.",
+        "Possession is estimated from observed ball control and the passes between; it is not official match possession.",
+        "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
+        "Track IDs change after occlusion and cuts; they are not player identities.",
+        "Positions are image coordinates until the pitch is set up; speed and xG are not measured; "
+        "running distance is a per-kit estimate scaled by a 1.8 m player, and goals count only when a person confirms them.",
+        "Green-surface filtering can include sideline players or miss players near boundaries.",
+    ]
+    if analysed_seconds < requested_seconds * 0.97:
+        notes.append(
+            f"The file declares {declared_seconds:.0f} s but decoding ended at "
+            f"{analysed_seconds:.0f} s; results cover the decodable part."
+        )
+    return notes
+
+
 def merge_candidates(detector, motion, limit=12):
     """Keep at most `limit` candidates per frame without letting motion blobs
     (which all saturate at the same low confidence) push out the faint detector
@@ -258,7 +341,11 @@ def run_video(
     profile="general",
     start_seconds=0,
     ball_search="exhaustive",
+    reference_colours=None,
+    reference_job=None,
 ):
+    """Analyse a video. reference_colours (two hex colours, Kit A first) keeps the
+    kit order of the earlier run reference_job of the same footage."""
     total_started = time.monotonic()
     timings = Counter()
     if ball_search not in ("exhaustive", "adaptive", "none"):
@@ -376,7 +463,7 @@ def run_video(
                 for (frame_index, frame), (boxes, scores, classes) in zip(
                     samples, detect_batch([frame for _, frame in samples])
                 ):
-                    calibration[frame_index] = (boxes, scores, classes)
+                    calibration[frame_index] = ((boxes, scores, classes), _fingerprint(frame))
                     mask = field_mask(frame)
                     pitch = pitch_colour(frame, mask)
                     for box, c in zip(boxes, classes):
@@ -395,8 +482,12 @@ def run_video(
     # Four clusters otherwise split one striped kit and discard part of that team.
     role_aware = "player" in [name.lower() for name in names.values()]
     kit_warning = None
+    aligned_to = None
     try:
         centres, colours = train_colours(features, n_clusters=2 if role_aware else 4)
+        if reference_colours:
+            centres, colours = align_to_reference(centres, colours, reference_colours)
+            aligned_to = reference_job
     except ValueError as exc:
         centres, colours = None, []
         kit_warning = str(exc) + " Team assignments and possession are unavailable."
@@ -415,6 +506,8 @@ def run_video(
     previous_ball = None
     last_sweep = -math.inf
     last_t = -1.0
+    clock = {}  # decoder-time state (_frame_time)
+    analysed_start = None
     started = time.monotonic()
     reported = started
     progress(
@@ -429,7 +522,13 @@ def run_video(
         nonlocal previous_gray, previous_frame, previous_boxes, previous_ball, last_sweep
         nonlocal scene, reported
         # Calibration already detected some of these frames; only run the rest.
-        detections = [calibration.pop(index, None) for _, _, index in batch]
+        # Those were read by seeking, which lands a frame late on trimmed
+        # variable-frame-rate video: reuse them only for the same picture.
+        detections = []
+        for _, frame, index in batch:
+            cached = calibration.pop(index, None)
+            same = cached is not None and float(np.mean(cv2.absdiff(cached[1], _fingerprint(frame)))) < 0.5
+            detections.append(cached[0] if same else None)
         missing = [i for i, d in enumerate(detections) if d is None]
         if missing:
             for i, d in zip(missing, detect_batch([batch[i][1] for i in missing])):
@@ -568,7 +667,7 @@ def run_video(
             if now - reported >= 3:
                 reported = now
                 elapsed = now - started
-                done = t - start_seconds
+                done = t - analysed_start
                 progress(
                     stage="Detecting players and tracking kits" if ball_detector is None else "Detecting players, tracking kits and following the ball",
                     progress=round(5 + done / duration * 88, 1),
@@ -580,6 +679,7 @@ def run_video(
                 )
 
     try:
+        # The frame count is only an upper guard: the window ends by decoder time (below).
         while frame_num / meta["fps"] < start_seconds + duration:
             if cancelled():
                 raise InterruptedError("Analysis cancelled")
@@ -603,22 +703,17 @@ def run_video(
                 if frames or pending:
                     break
                 raise ValueError("Video decoding stopped before the end.")
-            # Phone footage is often variable frame rate: prefer the decoder's
-            # presentation time so overlays line up with the video.
+            # Phone footage is often variable frame rate: use the decoder's
+            # presentation time so overlays, events and seeks line up with the
+            # video (the browser seeks by the same timestamps).
             position = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            index_time = frame_num / meta["fps"]
-            # Trust decoder timestamps only while they agree with the frame count:
-            # fragmented/streaming MP4s can report drifting or offset positions,
-            # which would misplace every overlay box.
-            t = (
-                position
-                if math.isfinite(position)
-                and position > last_t
-                and abs(position - index_time) <= 0.5
-                else index_time
-            )
-            if (frames or pending) and t <= last_t:
-                t = last_t + 1 / meta["fps"]
+            t = _frame_time(position, last_t, frame_num / meta["fps"], meta["fps"], stride, clock)
+            if analysed_start is None:
+                # Where the seek really landed (on variable-frame-rate video a
+                # frame-number seek is not at frame / average fps).
+                analysed_start = t
+            elif t >= analysed_start + duration:
+                break
             last_t = t
             pending.append((t, frame, frame_num))
             if len(pending) >= batch_size:
@@ -677,12 +772,16 @@ def run_video(
         for f in frames:
             f.pop("ballCandidates", None)
     progress(stage="Measuring temporal observations", progress=96)
-    analysed_duration = min(
-        duration, max((frame_num - first_frame) / meta["fps"], last_t - start_seconds)
-    )
+    if analysed_start is None:
+        analysed_start = start_seconds
+    # In decoder time, like every frame's t: the last sample covers one sampling interval.
+    analysed_duration = min(duration, max(0.0, last_t - analysed_start + stride / meta["fps"]))
     corrected_roles = stabilise_roles(frames)
     vote_teams(frames)
-    metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=start_seconds)
+    metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=analysed_start)
+    if ball_detector is None:
+        # The ball was never looked for: possession was not measured (not 0).
+        metrics.update(teamSeconds=None, possessionCoverage=None, possessionShare=[None, None], possessions=None)
     result = {
         "schemaVersion": 1,
         "pipelineVersion": "local-vision-2.7",
@@ -690,6 +789,9 @@ def run_video(
         "profile": profile,
         "performance": {
             **{k: round(v, 3) for k, v in timings.items()},
+            # Always present: null when the ball model was not run (not 0), and
+            # 0 for an adaptive job that never needed a ball batch.
+            "ballInferenceSeconds": None if ball_detector is None else round(timings["ballInferenceSeconds"], 3),
             "totalSeconds": round(time.monotonic() - total_started, 3),
             "device": device,
             "batchSize": batch_size,
@@ -713,30 +815,14 @@ def run_video(
         "auxiliaryBallDetector": bool(ball_classes),
         "video": meta,
         "analysedDuration": analysed_duration,
-        "analysedStart": start_seconds,
+        "analysedStart": analysed_start,
         "sampleFps": effective_fps,
         "teams": [{"id": i, "label": f"Kit {'AB'[i]}", "colour": c} for i, c in enumerate(colours)],
+        # The job whose Kit A / Kit B order these kits follow (the report reuses its team names).
+        **({"teamsAlignedTo": aligned_to} if aligned_to else {}),
         "metrics": metrics,
         "frames": frames,
-        "limitations": ([kit_warning] if kit_warning else [])
-        + [
-            "Ball confidence scores are not calibrated probabilities.",
-            "Faint ball candidates require temporal and neural support; "
-            "short gaps on the same track are camera-compensated and marked inferred.",
-            "Possession is estimated from observed ball control and the passes between; it is not official match possession.",
-            "Passes and turnovers are unreviewed temporal candidates, not verified match events.",
-            "Track IDs change after occlusion and cuts; they are not player identities.",
-            "Positions are image coordinates until the pitch is set up; speed, distance and xG are not measured, and goals count only when a person confirms them.",
-            "Green-surface filtering can include sideline players or miss players near boundaries.",
-        ]
-        + (
-            [
-                f"The file declares {meta['duration']:.0f} s but decoding ended at "
-                f"{analysed_duration:.0f} s; results cover the decodable part."
-            ]
-            if analysed_duration < duration * 0.97
-            else []
-        ),
+        "limitations": limitations(kit_warning, meta["duration"], analysed_duration, duration),
     }
     result["performance"]["totalSeconds"] = round(time.monotonic() - total_started, 3)
     output = Path(output)

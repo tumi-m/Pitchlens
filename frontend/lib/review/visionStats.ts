@@ -32,9 +32,10 @@ export function possessionOwner(frame: VisionFrame): number | null {
 export type TeamPair = [number, number];
 
 export type MatchStats = {
-  controlSeconds: TeamPair;
+  /** null on a player-load job: the ball was not looked for. */
+  controlSeconds: [number | null, number | null];
   controlShare: [number | null, number | null];
-  controlCoverage: number;
+  controlCoverage: number | null;
   passCandidates: TeamPair;
   turnoversWon: TeamPair;
   avgPlayers: TeamPair;
@@ -102,7 +103,7 @@ export function matchStats(result: VisionResult): MatchStats {
     result.ballSearch === "none"
       ? Math.round(playerCoverage) / 10
       : Math.round(
-          ((playerCoverage * 0.3 + ballCoverage * 0.4 + Math.min(100, m.possessionCoverage) * 0.3) /
+          ((playerCoverage * 0.3 + ballCoverage * 0.4 + Math.min(100, m.possessionCoverage ?? 0) * 0.3) /
             10) *
             10,
         ) / 10;
@@ -115,7 +116,9 @@ export function matchStats(result: VisionResult): MatchStats {
   // Possessions, not frames, are the independent units: consecutive frames of
   // one spell are not separate evidence (sample-size lesson from the library).
   const chainCount = pos?.chains.length ?? 0;
-  const aShare = m.teamSeconds[0] + m.teamSeconds[1] > 0 ? m.teamSeconds[0] / (m.teamSeconds[0] + m.teamSeconds[1]) : 0;
+  // Player-load jobs carry null possession figures (not measured, never 0).
+  const seconds = m.teamSeconds;
+  const aShare = seconds && seconds[0] + seconds[1] > 0 ? seconds[0] / (seconds[0] + seconds[1]) : 0;
   const shareRange =
     chainCount >= 2 ? wilson(Math.round(aShare * chainCount), chainCount) : null;
   const cumulative: [number, number, number][] = [[result.analysedStart ?? 0, 0, 0]];
@@ -131,9 +134,9 @@ export function matchStats(result: VisionResult): MatchStats {
     cumulative.push([(result.analysedStart ?? 0) + result.analysedDuration, a, b]);
   }
   return {
-    controlSeconds: [m.teamSeconds[0] ?? 0, m.teamSeconds[1] ?? 0],
-    controlShare: [m.possessionShare[0] ?? null, m.possessionShare[1] ?? null],
-    controlCoverage: m.possessionCoverage,
+    controlSeconds: seconds ? [seconds[0] ?? 0, seconds[1] ?? 0] : [null, null],
+    controlShare: [m.possessionShare?.[0] ?? null, m.possessionShare?.[1] ?? null],
+    controlCoverage: m.possessionCoverage ?? null,
     passCandidates: [count("pass-candidate", 0), count("pass-candidate", 1)],
     turnoversWon: [count("turnover-candidate", 0), count("turnover-candidate", 1)],
     avgPlayers: [Math.round((players[0] / n) * 10) / 10, Math.round((players[1] / n) * 10) / 10],
