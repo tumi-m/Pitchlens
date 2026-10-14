@@ -43,8 +43,8 @@ export default function DashboardIndexPage() {
                 Your Matches
               </h1>
               <p className="text-pitch-muted mt-1">
-                {matches.length} saved manual review
-                {matches.length !== 1 ? "s" : ""} · This device
+                {visionCount !== null && `${visionCount} ${visionCount === 1 ? "analysis" : "analyses"} · `}
+                {matches.length} manual review{matches.length !== 1 ? "s" : ""} · This device
               </p>
             </div>
             <div className="flex flex-wrap gap-3 items-start">

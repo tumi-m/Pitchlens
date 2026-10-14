@@ -241,7 +241,7 @@ export function ReviewRoom({ match }: { match: Match }) {
                   readOnly
                   value={exportText}
                   rows={8}
-                  className="pitch-input w-full font-mono text-xs mt-3"
+                  className="pitch-input w-full font-mono text-base sm:text-xs mt-3"
                 />
               </details>
             </section>

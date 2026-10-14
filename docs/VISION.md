@@ -219,6 +219,11 @@ switch team, set shot outcome, add missed moments, set attacking direction,
 enter the final score. Goals count only when confirmed. Every decision is
 kept; analysis is recomputed from the model output plus decisions.
 
+**Match details (`/jobs/{id}/details`).** Team names, a title and the match
+date the owner sets after the upload. Kept in `details.json` beside the job
+(never in `status.json`, which a running analysis rewrites) and returned with
+the job to its owner only; reruns start without them.
+
 **Tracking.** Default tracker since pipeline 2.2 is ByteTrack-style (Kalman,
 two-pass association, 3.5 s lost buffer, two-sighting confirmation);
 `VISION_TRACKER=legacy` restores the previous one. Track IDs remain short-term

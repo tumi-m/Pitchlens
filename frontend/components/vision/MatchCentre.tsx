@@ -5,6 +5,7 @@ import { ArrowLeftRight, Send, Info } from "lucide-react";
 import type { VisionResult } from "@/lib/review/vision";
 import { clockTime } from "@/lib/review/vision";
 import type { MatchStats } from "@/lib/review/visionStats";
+import { shares } from "@/lib/review/visionStats";
 
 type Props = {
   result: VisionResult;
@@ -186,8 +187,9 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
     coverage >= 20 &&
     stats.controlShare[0] !== null &&
     stats.controlShare[1] !== null;
+  // Whole percents that add up to 100 (59.5 / 40.5 reads 60 / 40, not 60 / 41).
   const shareValues: [number | null, number | null] = shareKnown
-    ? stats.controlShare
+    ? shares(stats.controlShare[0], stats.controlShare[1])
     : [null, null];
   const lowEvidence = coverage !== null && coverage < 50 && result.ballSearch !== "none";
   const events = result.metrics.events;
@@ -245,11 +247,11 @@ export function MatchCentre({ result, stats, names, colours, onSeek }: Props) {
               {shareKnown ? (
                 <>
                   <span style={{ color: colours[0] }}>
-                    <CountUp value={stats.controlShare[0] ?? 0} format={(v) => `${Math.round(v)}`} />
+                    <CountUp value={shareValues[0] ?? 0} format={(v) => `${Math.round(v)}`} />
                   </span>
                   <span className="text-pitch-muted text-3xl">–</span>
                   <span style={{ color: colours[1] }}>
-                    <CountUp value={stats.controlShare[1] ?? 0} format={(v) => `${Math.round(v)}`} />
+                    <CountUp value={shareValues[1] ?? 0} format={(v) => `${Math.round(v)}`} />
                   </span>
                 </>
               ) : (

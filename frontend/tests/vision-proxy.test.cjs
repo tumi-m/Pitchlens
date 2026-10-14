@@ -292,3 +292,18 @@ test('an open site tells the page up front that training is unavailable, in word
   const closed = setup();
   assert.equal((await (await closed.api.GET(closed.request({ owner: OWNER }), model)).json()).siteTraining, true);
 });
+
+test('team names, title and match date are saved through the details path, for the owner only', async () => {
+  const s = setup();
+  const saved = await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('details'));
+  assert.equal(saved.status, 200);
+  assert.equal(new URL(s.calls[0].url).pathname, `/jobs/${ID}/details`);
+  assert.equal(sentOwner(s.calls[0]), OWNER);
+  assert.equal(s.calls[0].init.method, 'POST');
+  // Another browser's key reaches the worker as that key, which answers 404.
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OTHER, access: 'fixture-access' }), s.route('details'))).status, 404);
+  // A look-alike path is never forwarded.
+  const before = s.calls.length;
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('detailsx'))).status, 404);
+  assert.equal(s.calls.length, before);
+});

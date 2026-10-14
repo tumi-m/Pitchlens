@@ -48,6 +48,7 @@ def private_job(tmp_path, monkeypatch):
         ("GET", "/review"),
         ("GET", "/calibration"),
         ("POST", "/review"),
+        ("POST", "/details"),
         ("POST", "/cancel"),
         ("POST", "/start"),
         ("POST", "/calibration"),

@@ -43,3 +43,14 @@ test('a ball result keeps its measured possession figures', () => {
   assert.equal(stats.controlCoverage, 80);
   assert.deepEqual(stats.controlShare, [75, 25]);
 });
+
+test('complementary shares add up to 100, so 59.5 / 40.5 reads 60 / 40', () => {
+  const shares = (a, b) => JSON.parse(JSON.stringify(lib.shares(a, b)));
+  assert.deepEqual(shares(59.5, 40.5), [60, 40]);
+  assert.deepEqual(shares(40.5, 59.5), [41, 59]);
+  assert.deepEqual(shares(50, 50), [50, 50]);
+  // One side missing, or shares that are not complementary: each on its own.
+  assert.deepEqual(shares(null, 40), [null, 40]);
+  assert.deepEqual(shares(33.3, 33.3), [33, 33]);
+  assert.deepEqual(shares(null, null), [null, null]);
+});

@@ -790,10 +790,12 @@ def test_upload_time_limit_applies_only_when_another_start_waits_and_says_so(hos
     assert client.get(f"/jobs/{job['id']}", headers=headers).json()["stage"] == "Upload took longer than the 1-minute limit."
 
 
-def test_idle_upload_is_still_released_by_any_poll_with_the_idle_message(hosted, monkeypatch):
+def test_abandoned_upload_is_still_released_by_any_poll_with_the_idle_message(hosted, monkeypatch):
     server, client, _ = hosted
     job = client.post("/jobs?size=8", headers={"Content-Type": "video/mp4"}).json()
-    monkeypatch.setattr(server, "UPLOAD_IDLE_SECONDS", 0)
+    # Past the abandon limit (2 h by default) a poll frees the worker; the 5-minute
+    # idle limit applies only when another owner's start wants it.
+    monkeypatch.setattr(server, "UPLOAD_ABANDON_SECONDS", 0)
     client.get("/jobs")
     assert server.active is None
     late = client.put(f"/jobs/{job['id']}/video?offset=0", content=b"0123")
@@ -852,7 +854,7 @@ def test_cancel_during_start_probe_never_queues_work(hosted, monkeypatch):
 def test_abandoned_upload_is_released_when_anyone_reads_status(hosted, monkeypatch):
     server, client, _ = hosted
     job = client.post("/jobs?size=10", headers={"Content-Type": "video/mp4"}).json()
-    monkeypatch.setattr(server, "UPLOAD_IDLE_SECONDS", 0)
+    monkeypatch.setattr(server, "UPLOAD_ABANDON_SECONDS", 0)
     assert client.get(f"/jobs/{job['id']}").json()["status"] == "failed"
     assert server.active is None
 
@@ -2516,11 +2518,17 @@ def test_a_large_upload_gets_longer_than_an_hour_but_not_forever(hosted, monkeyp
     clock['now'] = start + 60 * 60
     assert contend() and state(small) == 'failed'
 
-    idle = reserve(2 * 1024**3)  # stalled: the idle rule still frees the worker
+    idle = reserve(2 * 1024**3)  # stalled: after 5 minutes another start may have the worker
     clock['now'] += 299
-    assert state(idle) == 'uploading'
+    assert not contend() and state(idle) == 'uploading'
     clock['now'] += 2
-    assert state(idle) == 'failed' and server.active is None
+    assert state(idle) == 'uploading'  # polls alone keep a paused upload for its browser
+    assert contend() and state(idle) == 'failed' and server.active is None
+    abandoned = reserve(2 * 1024**3)  # nobody comes back: released once abandoned
+    clock['now'] += server.UPLOAD_ABANDON_SECONDS - 1
+    assert state(abandoned) == 'uploading'
+    clock['now'] += 2
+    assert state(abandoned) == 'failed' and server.active is None
 
 
 # ── Engine: player load, adaptive search, decoder time, calibration reuse ──
@@ -3139,8 +3147,165 @@ def test_the_newest_upload_survives_a_restart_and_resumes(hosted, monkeypatch):
     assert client.put(f'/jobs/{newer}/video?offset={8 * mib}', content=b'y' * 10, headers=owner).json() == {'received': 8 * mib + 10}
     assert json.loads((server.ROOT / older / 'status.json').read_text())['status'] == 'interrupted'
     assert not (server.ROOT / older / 'video').exists()
-    # Nobody came back: the usual idle release frees the worker.
-    monkeypatch.setattr(server, 'UPLOAD_IDLE_SECONDS', 0)
+    # Nobody came back: the abandon release frees the worker.
+    monkeypatch.setattr(server, 'UPLOAD_ABANDON_SECONDS', 0)
     server.sweep_stale()
     assert server.active is None
     assert client.get(f'/jobs/{newer}', headers=owner).json()['status'] == 'failed'
+
+
+# ── Paused phone uploads resume instead of starting again ─────────────────
+def _paused_upload(hosted, monkeypatch, data, sent):
+    """A resumable upload by owner 'c…', `sent` bytes in, then the phone locks for 6 minutes."""
+    server, client, _ = hosted
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(server.time, 'monotonic', lambda: clock['now'])
+    mine = 'c' * 32
+    url = f'/jobs?size={len(data)}&title=Match&owner={mine}&requestId={"1" * 32}'
+    job = client.post(url, headers={'Content-Type': 'video/mp4'}).json()
+    headers = {'x-pitchlens-owner': mine}
+    assert client.put(f"/jobs/{job['id']}/video?offset=0", content=data[:sent], headers=headers).status_code == 200
+    clock['now'] += 6 * 60
+    return job, url, headers, clock
+
+
+def test_a_paused_upload_survives_polls_and_resumes_where_it_stopped(hosted, monkeypatch):
+    server, client, submitted = hosted
+    data = FIXTURE.read_bytes()
+    half = len(data) // 2
+    job, url, headers, _ = _paused_upload(hosted, monkeypatch, data, half)
+    # Every poll sweeps stale uploads: none of them is contention.
+    client.get('/health')
+    client.get(f"/jobs?owner={'c' * 32}")
+    assert client.get(f"/jobs/{job['id']}", headers=headers).json()['status'] == 'uploading'
+    # Back on the upload page: the same file and options under the same request ID.
+    resumed = client.post(url, headers={'Content-Type': 'video/mp4'})
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()['id'] == job['id'] and resumed.json()['receivedBytes'] == half
+    assert client.put(f"/jobs/{job['id']}/video?offset={half}", content=data[half:], headers=headers).json() == {'received': len(data)}
+    started = client.post(f"/jobs/{job['id']}/start", headers=headers)
+    assert started.status_code == 200, started.text
+    assert started.json()['status'] == 'processing' and len(submitted) == 1
+
+
+def test_a_paused_upload_gives_way_to_another_owners_start(hosted, monkeypatch):
+    server, client, _ = hosted
+    job, _, headers, _ = _paused_upload(hosted, monkeypatch, b'01234567', 4)
+    other = client.post(f"/jobs?size=10&owner={'d' * 32}", headers={'Content-Type': 'video/mp4'})
+    assert other.status_code == 200, other.text
+    assert client.get(f"/jobs/{job['id']}", headers=headers).json()['stage'] == 'Upload stopped before the video was complete.'
+
+
+def test_the_same_owner_with_other_options_is_told_about_its_paused_upload(hosted, monkeypatch):
+    server, client, _ = hosted
+    job, _, headers, _ = _paused_upload(hosted, monkeypatch, b'01234567', 4)
+    again = client.post(f"/jobs?size=8&title=Other&owner={'c' * 32}&requestId={'2' * 32}", headers={'Content-Type': 'video/mp4'})
+    assert again.status_code == 409 and again.json()['code'] == 'own-upload' and again.json()['receivedBytes'] == 4
+    assert server.active == job['id']
+    assert client.get(f"/jobs/{job['id']}", headers=headers).json()['status'] == 'uploading'
+
+
+def test_an_upload_paused_past_the_abandon_limit_is_released_by_a_poll(hosted, monkeypatch):
+    server, client, _ = hosted
+    job, _, headers, clock = _paused_upload(hosted, monkeypatch, b'01234567', 4)
+    clock['now'] += server.UPLOAD_ABANDON_SECONDS
+    assert client.get(f"/jobs/{job['id']}", headers=headers).json()['stage'] == 'Upload stopped before the video was complete.'
+    assert server.active is None
+
+
+def test_a_retry_is_not_blocked_by_an_upload_paused_for_six_minutes(hosted, monkeypatch):
+    server, client, submitted = hosted
+    _paused_upload(hosted, monkeypatch, b'01234567', 4)
+    stopped = '6' * 32
+    _stopped_job(server, stopped, 1)
+    response = client.post(f'/jobs/{stopped}/retry')
+    assert response.status_code == 200, response.text
+    assert server.active == stopped and len(submitted) == 1
+
+
+def test_health_says_how_long_a_paused_upload_is_kept(service, monkeypatch):
+    server, client = service
+    monkeypatch.setattr(server, 'UPLOAD_ABANDON_SECONDS', 7200)
+    body = client.get('/health').json()
+    assert body['uploadIdleSeconds'] == server.UPLOAD_IDLE_SECONDS == 300
+    assert body['uploadAbandonSeconds'] == 7200
+
+
+# ── Team names, title and match date saved for the owner ──────────────────
+def _owned_match(server, job='7' * 32, owner='c' * 32):
+    directory = server.ROOT / job
+    directory.mkdir()
+    server.write_status(directory, {'id': job, 'owner': owner, 'status': 'completed', 'stage': 'done',
+                                    'progress': 100, 'createdAt': 100.0, 'title': 'IMG_4821'})
+    return job, directory, {'x-pitchlens-owner': owner}
+
+
+def test_team_names_title_and_date_are_saved_for_the_owner(hosted):
+    server, client, _ = hosted
+    job, directory, mine = _owned_match(server)
+    saved = client.post(f'/jobs/{job}/details', headers=mine,
+                        json={'names': ['Tekkerz FC', 'PUSHIT Legends'], 'title': 'Tekkerz v PUSHIT', 'matchDate': '2026-10-11'})
+    assert saved.status_code == 200, saved.text
+    assert saved.json() == {'teamNames': ['Tekkerz FC', 'PUSHIT Legends'], 'title': 'Tekkerz v PUSHIT', 'matchDate': '2026-10-11'}
+    one = client.get(f'/jobs/{job}', headers=mine).json()
+    assert one['teamNames'] == ['Tekkerz FC', 'PUSHIT Legends'] and one['title'] == 'Tekkerz v PUSHIT' and one['matchDate'] == '2026-10-11'
+    listed = client.get(f"/jobs?owner={'c' * 32}").json()
+    assert listed[0]['teamNames'] == ['Tekkerz FC', 'PUSHIT Legends'] and listed[0]['title'] == 'Tekkerz v PUSHIT'
+    # Keys left out keep their saved value; a date can be cleared.
+    client.post(f'/jobs/{job}/details', headers=mine, json={'matchDate': None})
+    one = client.get(f'/jobs/{job}', headers=mine).json()
+    assert one['matchDate'] is None and one['teamNames'] == ['Tekkerz FC', 'PUSHIT Legends'] and one['title'] == 'Tekkerz v PUSHIT'
+    assert 'owner' not in one
+
+
+def test_another_owner_can_neither_read_nor_change_the_details(hosted):
+    server, client, _ = hosted
+    job, directory, mine = _owned_match(server)
+    client.post(f'/jobs/{job}/details', headers=mine, json={'names': ['A', 'B']})
+    theirs = {'x-pitchlens-owner': 'd' * 32}
+    assert client.post(f'/jobs/{job}/details', headers=theirs, json={'names': ['X', 'Y']}).status_code == 404
+    assert client.get(f'/jobs/{job}', headers=theirs).status_code == 404
+    assert client.get(f"/jobs?owner={'d' * 32}").json() == []
+    assert client.get(f'/jobs/{job}', headers=mine).json()['teamNames'] == ['A', 'B']
+
+
+def test_invalid_details_are_refused_and_control_characters_stripped(hosted):
+    server, client, _ = hosted
+    job, directory, mine = _owned_match(server)
+
+    def post(body):
+        return client.post(f'/jobs/{job}/details', headers=mine, json=body)
+
+    for body in ({'names': ['A', 'B', 'C']}, {'names': ['x' * 81, 'B']}, {'names': ['A', '​ ']},
+                 {'matchDate': '2026-13-01'}, {'matchDate': '1999-12-31'}, {'matchDate': '2099-01-01'},
+                 {'matchDate': '20261011'}, {'title': ''}, {'venue': 'Hall 2'}, {'names': 'A v B'}):
+        assert post(body).status_code == 400, body
+    big = client.post(f'/jobs/{job}/details', headers={**mine, 'content-type': 'application/json'},
+                      content=('{"title": "' + 'x' * 5000 + '"}').encode())
+    assert big.status_code == 400
+    assert not (directory / 'details.json').exists()
+    ok = post({'names': ['Tekkerz\u0000 FC\n', '‮PUSHIT'], 'title': ' Final\t'})
+    assert ok.status_code == 200 and ok.json()['teamNames'] == ['Tekkerz FC', 'PUSHIT'] and ok.json()['title'] == 'Final'
+
+
+def test_a_status_rewrite_during_analysis_keeps_the_details(hosted):
+    import json
+
+    server, client, _ = hosted
+    job, directory, mine = _owned_match(server)
+    client.post(f'/jobs/{job}/details', headers=mine, json={'names': ['A', 'B'], 'title': 'Renamed'})
+    # work() keeps the status in memory and rewrites status.json on every update.
+    status = json.loads((directory / 'status.json').read_text())
+    server.write_status(directory, {**status, 'stage': 'Tracking players', 'progress': 50})
+    one = client.get(f'/jobs/{job}', headers=mine).json()
+    assert one['teamNames'] == ['A', 'B'] and one['title'] == 'Renamed' and one['stage'] == 'Tracking players'
+
+
+def test_deleting_a_match_deletes_its_details(hosted):
+    server, client, _ = hosted
+    job, directory, mine = _owned_match(server)
+    client.post(f'/jobs/{job}/details', headers=mine, json={'names': ['A', 'B']})
+    assert (directory / 'details.json').is_file()
+    assert client.delete(f'/jobs/{job}', headers=mine).status_code == 200
+    assert not directory.exists()
+    assert client.post(f'/jobs/{job}/details', headers=mine, json={'names': ['A', 'B']}).status_code == 404

@@ -14,9 +14,11 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -80,8 +82,12 @@ def max_size_text():
 
 # Chunked uploads keep every request small enough for serverless proxies (Vercel: 4.5 MB).
 MAX_CHUNK = 8 * 1024 * 1024
-# A chunked upload that stops sending data releases the worker after this long.
+# A chunked upload that stops sending data gives way after this long once another
+# owner's start wants the worker (contended).
 UPLOAD_IDLE_SECONDS = int(os.getenv("VISION_UPLOAD_IDLE_SECONDS", "300"))
+# Alone, a paused upload (a locked phone, another app) is kept this long for its
+# browser to resume it; only then is it treated as abandoned and released.
+UPLOAD_ABANDON_SECONDS = int(os.getenv("VISION_UPLOAD_ABANDON_SECONDS", "7200"))
 # Even a trickling upload cannot hold the single worker longer than this once
 # another start is waiting for it (a lone slow upload may finish). A large
 # declared upload gets longer, at a 2 Mbit/s floor (2 GB: about 2.4 h), up to
@@ -299,6 +305,30 @@ def public(data):
     )}
 
 
+# Team names, a title and the match date the owner set after the upload. Kept in
+# details.json, never status.json: work(), expire_footage and _interrupt rewrite
+# the status from memory, which would lose a rename made meanwhile.
+DETAILS = "details.json"
+DETAILS_KEYS = {"names", "title", "matchDate"}
+MAX_DETAILS_BODY = 4096
+details_lock = threading.Lock()
+
+
+def with_details(directory, data):
+    """The job as listed: the owner's team names, match date and title, when set."""
+    details = _read_json(directory / DETAILS, {})
+    if not isinstance(details, dict) or not details:
+        return data
+    data = dict(data)
+    if details.get("names"):
+        data["teamNames"] = details["names"]
+    if "matchDate" in details:
+        data["matchDate"] = details["matchDate"]
+    if details.get("title"):
+        data["title"] = details["title"]
+    return data
+
+
 def work(directory, status, event):
     global active
 
@@ -474,7 +504,10 @@ def release_stale_upload(contended=False):
     """A browser that closed mid-upload must not block the worker forever.
 
     The overall time limit (upload_deadline) only matters when another start
-    wants the worker (contended): a lone slow upload is allowed to finish.
+    wants the worker (contended): a lone slow upload is allowed to finish. A
+    paused upload gives way after UPLOAD_IDLE_SECONDS only to such a start;
+    otherwise (polls, its own owner) it is kept for UPLOAD_ABANDON_SECONDS so a
+    phone that locked or switched apps resumes instead of starting from 0%.
     """
     job_id = active
     if job_id is None or job_id in cancellations:
@@ -483,7 +516,7 @@ def release_stale_upload(contended=False):
     if last is None:
         return
     now = time.monotonic()
-    idle = now - last >= UPLOAD_IDLE_SECONDS
+    idle = now - last >= (UPLOAD_IDLE_SECONDS if contended else UPLOAD_ABANDON_SECONDS)
     overdue = contended and now - upload_started.get(job_id, now) >= upload_deadline(job_id)
     if not (idle or overdue):
         return
@@ -620,6 +653,10 @@ def health():
         "diagnostics": True,
         "maxBytes": MAX_BYTES,
         "maxChunk": MAX_CHUNK,
+        # A paused upload gives way to another start after uploadIdleSeconds; alone
+        # it is kept for uploadAbandonSeconds, so the browser can resume it.
+        "uploadIdleSeconds": UPLOAD_IDLE_SECONDS,
+        "uploadAbandonSeconds": UPLOAD_ABANDON_SECONDS,
         "retentionHours": RETENTION_HOURS or None,
         "gpu": gpu.modal_enabled() or os.getenv("VISION_DEVICE", "").startswith(("cuda", "mps")),
         # Pitch calibration, event detection and reviewer decisions.
@@ -649,7 +686,7 @@ def jobs(request: Request):
         # Ownerless legacy jobs are visible only to a local, unscoped listing.
         if owner is not None and data.get("owner") != owner:
             continue
-        entries.append(public(with_retryable(p.parent, data)))
+        entries.append(public(with_details(p.parent, with_retryable(p.parent, data))))
     return sorted(entries, key=lambda x: x["createdAt"], reverse=True)[:100]
 
 
@@ -735,7 +772,23 @@ async def create(request: Request):
     await asyncio.to_thread(delete_expired)
     job_id = uuid.uuid4().hex
     with lock:
-        release_stale_upload(contended=True)
+        # The browser resuming the upload it reserved (same owner, request ID and
+        # options) is never contention, however long it paused.
+        if request_id and active is not None and active in upload_activity:
+            current = _read_json(ROOT / active / "status.json", {})
+            if (
+                isinstance(current, dict)
+                and current.get("status") == "uploading"
+                and current.get("owner") == owner
+                and current.get("uploadRequestId") == request_id
+                and current.get("uploadRequestDigest") == digest
+            ):
+                upload_activity[active] = time.monotonic()
+                return public(current)
+        # This owner's own paused upload is not released by its own new request
+        # (a reload with other options gets the own-upload answer below instead);
+        # another owner's start still frees an upload idle for UPLOAD_IDLE_SECONDS.
+        release_stale_upload(contended=not (active is not None and own_upload(active, owner)))
         if request_id:
             # The first response may have been lost after reserving the worker.
             # Persisted IDs also prevent a restart from silently creating a second job.
@@ -1016,7 +1069,79 @@ async def start(job_id: str):
 def status(job_id: str):
     sweep_stale()
     directory = folder(job_id)
-    return public(with_retryable(directory, expire_if_due(directory, load_status(directory))))
+    return public(with_details(directory, with_retryable(directory, expire_if_due(directory, load_status(directory)))))
+
+
+def _clean_text(value, limit, what):
+    """Printable text only (control, format and private-use characters removed), trimmed."""
+    if not isinstance(value, str):
+        raise HTTPException(400, f"{what} must be text")
+    text = "".join(c for c in value if not unicodedata.category(c).startswith("C")).strip()
+    if not 1 <= len(text) <= limit:
+        raise HTTPException(400, f"{what} must be 1 to {limit} characters")
+    return text
+
+
+@app.post("/jobs/{job_id}/details")
+async def save_details(job_id: str, request: Request):
+    """Team names, title and match date for the owner (authorized like every job route).
+
+    Every key is optional; the ones sent replace the saved ones. Not copied to reruns.
+    """
+    directory = folder(job_id)
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_DETAILS_BODY:
+            raise HTTPException(400, "Details are too large")
+
+    def reject_constant(value):
+        raise ValueError(f"{value} is not allowed")
+
+    try:
+        patch = json.loads(body or b"{}", parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise HTTPException(400, "Invalid JSON") from exc
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    unknown = set(patch) - DETAILS_KEYS
+    if unknown:
+        raise HTTPException(400, f"Unknown detail: {sorted(unknown)[0][:40]}")
+    clean = {}
+    if "names" in patch:
+        names = patch["names"]
+        if not isinstance(names, list) or len(names) != 2:
+            raise HTTPException(400, "Send two team names")
+        clean["names"] = [_clean_text(n, 80, "A team name") for n in names]
+    if "title" in patch:
+        clean["title"] = _clean_text(patch["title"], 200, "The title")
+    if "matchDate" in patch:
+        value = patch["matchDate"]
+        if value is not None:
+            try:
+                if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    raise ValueError(value)
+                day = date.fromisoformat(value)
+            except ValueError as exc:
+                raise HTTPException(400, "The match date must be a date (YYYY-MM-DD)") from exc
+            if not date(2000, 1, 1) <= day <= date.today() + timedelta(days=1):
+                raise HTTPException(400, "The match date must be between 2000 and today")
+        clean["matchDate"] = value
+
+    def merge():
+        with details_lock:
+            if not (directory / "status.json").is_file():
+                raise HTTPException(404, "Job not found")  # deleted meanwhile
+            saved = _read_json(directory / DETAILS, {})
+            merged = {**(saved if isinstance(saved, dict) else {}), **clean}
+            try:
+                _write_json(directory / DETAILS, merged)
+            except FileNotFoundError as exc:
+                raise HTTPException(404, "Job not found") from exc
+            return merged
+
+    merged = await asyncio.to_thread(merge)
+    return {"teamNames": merged.get("names"), "title": merged.get("title"), "matchDate": merged.get("matchDate")}
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -1162,7 +1287,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 10  # rounds 1 and 2 each used 9 for different analytics; 10 is the merge
+ANALYTICS_VERSION = 11  # 10 merged rounds 1 and 2; 11 adds kit colours, span, ball search and player load
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
@@ -1242,12 +1367,19 @@ def compute_analysis(directory, include_positions=True):
 
 
 @app.get("/jobs/{job_id}/analysis")
-def analysis(job_id: str):
+def analysis(job_id: str, request: Request):
+    """The match analytics. ?positions=0 leaves out the per-frame pitch positions
+    (most of a calibrated analysis), so the report can draw before they arrive;
+    the cached analysis keeps them either way."""
     directory, _ = _finished_result(job_id)
     try:
-        return compute_analysis(directory)
+        data = compute_analysis(directory)
     except (KeyError, ValueError) as exc:
         raise HTTPException(422, f"Analytics could not be computed: {exc}") from exc
+    if request.query_params.get("positions") == "0":
+        data = {k: v for k, v in data.items() if k != "positions"}
+        data["positionsOmitted"] = True
+    return data
 
 
 @app.get("/jobs/{job_id}/calibration")
@@ -1922,6 +2054,8 @@ def retry_job(job_id: str):
             return public(status)
         if status["status"] not in ("failed", "interrupted", "cancelled"):
             raise HTTPException(409, "Only stopped analyses can be retried")
+        # A retry wants the worker like any start: a stale upload reservation gives way.
+        release_stale_upload(contended=True)
         if active is not None:
             raise HTTPException(409, "Another video is being analysed. Try again when it finishes.")
         if not (directory / "video").is_file() or expired(status) or not status.get("video"):

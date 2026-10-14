@@ -55,6 +55,7 @@ export function PitchCalibration({
   onStep,
   videoAvailable = true,
   onDeleted,
+  zoomed = false,
 }: {
   jobId: string;
   videoSize: [number, number];
@@ -73,6 +74,8 @@ export function PitchCalibration({
   videoAvailable?: boolean;
   /** The worker no longer has this match. */
   onDeleted?: () => void;
+  /** The video shows a magnified crop: the next tap places the point. */
+  zoomed?: boolean;
 }) {
   const saved = calibration?.request;
   const [presetKey, setPresetKey] = useState<string>("five-a-side");
@@ -417,21 +420,38 @@ export function PitchCalibration({
       </section>
     );
 
+  const lineLabel = LINES.find((l) => l.name === lineName)?.label ?? "the line";
+  const allPlaced = mode === "landmark" && marks.every((m) => points.some((p) => p.name === m.name));
+  const undo = () => {
+    setPreview(null);
+    if (mode === "line" && linePoints.length) setLinePoints((l) => l.slice(0, -1));
+    else setPoints((p) => p.slice(0, -1));
+  };
   return (
     <section className="glass-card p-5 space-y-4" aria-label="Pitch setup">
-      <div className="flex items-center justify-between">
-        <h2 className="font-semibold">Pitch setup</h2>
-        <button className="text-sm text-pitch-muted" onClick={() => onActive(false)}>
+      {/* First in the panel, and data-reveal: on a phone the page scrolls this strip to
+          just below the pinned video, so what the next tap places is always in view. */}
+      <div
+        className="flex items-center gap-2 rounded-xl border border-pitch-green/40 bg-pitch-green/10 p-2 pl-3 text-sm"
+        data-reveal
+        data-testid="calibration-next"
+      >
+        <p className="flex-1 min-w-0" aria-live="polite">
+          {allPlaced
+            ? "Every landmark is placed · check the fit below"
+            : zoomed
+              ? `Place ${mode === "landmark" ? selected?.label ?? "the landmark" : `a point on the ${lineLabel.toLowerCase()}`} · tap exactly on it`
+              : `Next: ${mode === "landmark" ? selected?.label ?? "a landmark" : `a point on the ${lineLabel.toLowerCase()}`} · tap it on the video`}
+        </p>
+        <button className="pitch-button-secondary min-h-11 px-3 shrink-0" disabled={!points.length && !linePoints.length} onClick={undo}>
+          <Undo2 size={15} /> Undo
+        </button>
+        <button className="pitch-button-secondary min-h-11 px-3 shrink-0" onClick={() => onActive(false)}>
           Close
         </button>
       </div>
-      <ol className="text-sm text-pitch-muted list-decimal pl-5 space-y-1">
-        <li>Pause on a frame where you can see several pitch lines.</li>
-        <li>Pick a landmark below, then click exactly on it in the video. Aim for 6 or more, spread out.</li>
-        <li>Low cameras rarely see the near corners: add points along any straight line you can see.</li>
-      </ol>
-      {/* data-reveal: on a phone the page scrolls this to just below the pinned video. */}
-      <div className="flex flex-wrap items-center gap-1 text-sm" role="group" aria-label="Choose the frame" data-reveal>
+      <h2 className="font-semibold">Pitch setup</h2>
+      <div className="flex flex-wrap items-center gap-1 text-sm" role="group" aria-label="Choose the frame">
         <span className="text-pitch-muted mr-1">Frame {clockTime(time)}</span>
         {(
           [
@@ -451,47 +471,6 @@ export function PitchCalibration({
             {label}
           </button>
         ))}
-      </div>
-      <div className="grid grid-cols-2 gap-2 text-sm">
-        <label className="col-span-2">
-          Pitch type
-          <select aria-label="Pitch type" className="pitch-input w-full mt-1" value={presetKey} onChange={(e) => choosePreset(e.target.value)}>
-            {Object.entries(PITCH_PRESETS).map(([key, p]) => (
-              <option key={key} value={key}>
-                {p.label}
-              </option>
-            ))}
-            <option value="custom">Custom size</option>
-          </select>
-        </label>
-        {(
-          [
-            ["length", "Length (m)"],
-            ["width", "Width (m)"],
-            ["goalWidth", "Goal width (m)"],
-            ["centreRadius", "Centre circle radius (m)"],
-          ] as const
-        ).map(([key, label]) => (
-          <label key={key}>
-            {label}
-            <input
-              aria-label={label}
-              type="number"
-              step="0.1"
-              min="0"
-              className="pitch-input w-full mt-1"
-              value={template[key] ?? ""}
-              onChange={(e) => setDim(key, e.target.value)}
-            />
-          </label>
-        ))}
-        <label className="col-span-2 flex gap-2 items-center">
-          <input type="checkbox" checked={walls} onChange={(e) => setWalls(e.target.checked)} />
-          Walled cage (the ball cannot go out of play)
-        </label>
-        <p className="col-span-2 text-xs text-pitch-muted">
-          Unsure of the size? Pick the closest preset: heatmaps and zones stay right, distances become approximate.
-        </p>
       </div>
       <div role="tablist" aria-label="Click type" className="flex gap-1 p-1 rounded-lg bg-white/5 text-sm">
         {(
@@ -563,32 +542,65 @@ export function PitchCalibration({
           {notice}
         </p>
       )}
-      <div className="flex gap-2">
-        <button
-          className="pitch-button-secondary flex-1"
-          disabled={!points.length && !linePoints.length}
-          onClick={() => {
-            setPreview(null);
-            if (mode === "line" && linePoints.length) setLinePoints((l) => l.slice(0, -1));
-            else setPoints((p) => p.slice(0, -1));
-          }}
-        >
-          <Undo2 size={15} /> Undo
-        </button>
-        <button
-          className="pitch-button-secondary flex-1"
-          onClick={() => {
-            setPoints([]);
-            setLinePoints([]);
-            setFrameTime(null);
-            setPreview(null);
-            setError("");
-            setNotice("");
-            setLandmarkName(marks[0].name);
-          }}
-        >
-          <RotateCcw size={15} /> Clear
-        </button>
+      <button
+        className="pitch-button-secondary w-full"
+        onClick={() => {
+          setPoints([]);
+          setLinePoints([]);
+          setFrameTime(null);
+          setPreview(null);
+          setError("");
+          setNotice("");
+          setLandmarkName(marks[0].name);
+        }}
+      >
+        <RotateCcw size={15} /> Clear
+      </button>
+      <ol className="text-sm text-pitch-muted list-decimal pl-5 space-y-1">
+        <li>Pause on a frame where you can see several pitch lines.</li>
+        <li>Pick a landmark above, then tap exactly on it in the video (on a phone the first tap zooms in). Aim for 6 or more, spread out.</li>
+        <li>Low cameras rarely see the near corners: add points along any straight line you can see.</li>
+      </ol>
+      <div className="grid grid-cols-2 gap-2 text-sm">
+        <label className="col-span-2">
+          Pitch type
+          <select aria-label="Pitch type" className="pitch-input w-full mt-1" value={presetKey} onChange={(e) => choosePreset(e.target.value)}>
+            {Object.entries(PITCH_PRESETS).map(([key, p]) => (
+              <option key={key} value={key}>
+                {p.label}
+              </option>
+            ))}
+            <option value="custom">Custom size</option>
+          </select>
+        </label>
+        {(
+          [
+            ["length", "Length (m)"],
+            ["width", "Width (m)"],
+            ["goalWidth", "Goal width (m)"],
+            ["centreRadius", "Centre circle radius (m)"],
+          ] as const
+        ).map(([key, label]) => (
+          <label key={key}>
+            {label}
+            <input
+              aria-label={label}
+              type="number"
+              step="0.1"
+              min="0"
+              className="pitch-input w-full mt-1"
+              value={template[key] ?? ""}
+              onChange={(e) => setDim(key, e.target.value)}
+            />
+          </label>
+        ))}
+        <label className="col-span-2 flex gap-2 items-center">
+          <input type="checkbox" checked={walls} onChange={(e) => setWalls(e.target.checked)} />
+          Walled cage (the ball cannot go out of play)
+        </label>
+        <p className="col-span-2 text-xs text-pitch-muted">
+          Unsure of the size? Pick the closest preset: heatmaps and zones stay right, distances become approximate.
+        </p>
       </div>
       <details className="text-sm">
         <summary className="cursor-pointer text-pitch-muted">Lens (advanced)</summary>

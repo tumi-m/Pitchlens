@@ -20,9 +20,34 @@ export type VisionJob = {
   ballSearch?: string;
   /** Bytes the worker holds of an upload in progress. */
   receivedBytes?: number;
+  /** Size of a chunked upload in progress (absent for a YouTube download). */
+  expectedBytes?: number;
+  /** The upload every re-analysis of the same video goes back to (absent on the original). */
+  rootJobId?: string | null;
   /** The worker can retry this stopped job from its saved upload (absent on older workers). */
   retryable?: boolean;
+  /** Team names the owner saved on the worker (Kit A first); absent until named. */
+  teamNames?: [string, string] | null;
+  /** The day the match was played, "YYYY-MM-DD", when the owner set it. */
+  matchDate?: string | null;
 };
+
+/** What the owner can name after the upload; every key is optional. */
+export type VisionDetails = { names?: [string, string]; title?: string; matchDate?: string | null };
+
+/** Saves team names, title or match date on the worker for this browser's match. */
+export const saveVisionDetails = (jobId: string, patch: VisionDetails) =>
+  visionJson<{ teamNames: [string, string] | null; title: string | null; matchDate: string | null }>(`jobs/${jobId}/details`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+
+/** "YYYY-MM-DD" as this browser writes dates, read as a local day (not UTC midnight). */
+export function matchDateLabel(iso: string | null | undefined): string | null {
+  const m = iso ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso) : null;
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).toLocaleDateString() : null;
+}
 export type VisionPlayer = {
   id: number;
   team: number;
@@ -141,6 +166,10 @@ export type VisionHealth = {
   retentionHours?: number | null;
   /** Largest upload the worker accepts, in bytes. */
   maxBytes?: number;
+  /** A paused upload gives way to another browser's analysis after this many seconds. */
+  uploadIdleSeconds?: number;
+  /** Alone, a paused upload is kept this long for its browser to continue it. */
+  uploadAbandonSeconds?: number;
   /** Analysis runs on a Modal GPU (minutes rather than an hour). */
   gpu?: boolean;
   /** false when this deployment has no VISION_SERVICE_URL/TOKEN at all. */
@@ -346,9 +375,21 @@ const sleep = (ms: number, signal?: AbortSignal) =>
     if (signal?.aborted) aborted();
   });
 
-/** Network drops shorter than this resume where they left off. It stays under
- *  the worker's 5-minute idle release (VISION_UPLOAD_IDLE_SECONDS). */
+/** Network drops shorter than this (while the page is visible) resume where they
+ *  left off. It stays under the worker's 5-minute idle release (VISION_UPLOAD_IDLE_SECONDS). */
 const RESUME_WINDOW_MS = 240_000;
+/** Smallest piece a stalled upload retries with (the worker accepts any piece up to its maximum). */
+const MIN_UPLOAD_CHUNK = 512 * 1024;
+/** A piece gets at least this long, or three times the slowest acknowledged piece. */
+const MIN_PIECE_TIMEOUT_MS = 120_000;
+
+/** "about 2 hours" for how long the worker keeps a paused upload. */
+function keptFor(seconds: number) {
+  const hours = Math.round(seconds / 3600);
+  if (hours >= 1) return `about ${hours} hour${hours === 1 ? "" : "s"}`;
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
 // Not 429: the worker's only 429 here is its 24-hour cap (code "daily-limit"),
 // which retrying cannot lift; it only delays the message.
 const transient = (e: unknown) =>
@@ -393,6 +434,57 @@ function pendingUpload(): PendingUpload | null {
   }
 }
 
+/** The reservation's own query (title, start, diagnostic...), as it was sent. */
+function storedQuery(entry: PendingUpload): [string, string][] {
+  try {
+    const parsed = JSON.parse(entry.optionsDigest);
+    return Array.isArray(parsed) ? parsed.filter((p) => Array.isArray(p) && p.length === 2).map(([k, v]) => [String(k), String(v)]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** This browser's unfinished upload, for the upload page to name after a reload. */
+export function pendingUploadInfo(): { name: string; size: number; query: [string, string][] } | null {
+  const entry = pendingUpload();
+  return entry ? { name: entry.name, size: entry.size, query: storedQuery(entry) } : null;
+}
+
+/** The unfinished upload this file can continue: same name and size. lastModified is
+ *  only a tie-breaker, since an iPhone Photos pick can give the same video a fresh one. */
+export function pendingUploadFor(file: { name: string; size: number }): { requestId: string; query: [string, string][] } | null {
+  const entry = pendingUpload();
+  if (!entry || entry.name !== file.name || entry.size !== file.size) return null;
+  const query = storedQuery(entry);
+  return query.length ? { requestId: entry.requestId, query } : null;
+}
+
+type UploadChoices = {
+  title: string;
+  profile?: string;
+  fps?: string;
+  diagnostic?: boolean;
+  start?: number;
+  search?: "exhaustive" | "adaptive" | "none";
+};
+
+/** The reservation query for a file and these choices (without the request ID). */
+export function uploadQuery(file: { size: number }, options: UploadChoices): URLSearchParams {
+  return new URLSearchParams({
+    title: options.title,
+    profile: options.profile || "general",
+    fps: options.fps || "3",
+    size: String(file.size),
+    diagnostic: String(options.diagnostic ?? false),
+    start: String(options.start ?? 0),
+    search: options.search ?? "exhaustive",
+  });
+}
+
+/** Whether these choices are the ones the stored reservation was made with. */
+export const sameUploadOptions = (query: URLSearchParams, stored: [string, string][]) =>
+  JSON.stringify([...query.entries()]) === JSON.stringify(stored);
+
 function savePendingUpload(entry: PendingUpload | null) {
   try {
     if (entry) localStorage.setItem(PENDING_KEY, JSON.stringify(entry));
@@ -409,27 +501,26 @@ export class UploadInterruptedError extends Error {}
  */
 export async function uploadToVision(
   file: Blob,
-  options: {
-    title: string;
-    profile?: string;
-    fps?: string;
-    diagnostic?: boolean;
-    start?: number;
-    search?: "exhaustive" | "adaptive" | "none";
+  options: UploadChoices & {
     signal?: AbortSignal;
-    onProgress?: (percent: number) => void;
+    /** Whole percent acknowledged, plus the bytes behind it. */
+    onProgress?: (percent: number, sentBytes: number, totalBytes: number) => void;
+    /** The request ID this upload uses (called again if it has to be renewed). */
+    onRequest?: (requestId: string) => void;
+    /** The worker reserved the job. */
+    onReserved?: (job: VisionJob) => void;
+    /** Continue this browser's earlier upload: exactly its stored query and request ID. */
+    resume?: { requestId: string; query: [string, string][] };
+    /** The worker's idle limit (health.uploadIdleSeconds): a stalled piece is given up before it. */
+    uploadIdleSeconds?: number;
+    /** How long the worker keeps a paused upload (health.uploadAbandonSeconds), for the give-up message. */
+    uploadAbandonSeconds?: number;
+    /** Per-piece stall timeout in ms instead of the adaptive one (tests). */
+    pieceTimeoutMs?: number;
   },
 ): Promise<VisionJob> {
-  const { signal, onProgress } = options;
-  const query = new URLSearchParams({
-    title: options.title,
-    profile: options.profile || "general",
-    fps: options.fps || "3",
-    size: String(file.size),
-    diagnostic: String(options.diagnostic ?? false),
-    start: String(options.start ?? 0),
-    search: options.search ?? "exhaustive",
-  });
+  const { signal, onProgress, resume } = options;
+  const query = resume ? new URLSearchParams(resume.query.filter(([k]) => k !== "requestId")) : uploadQuery(file, options);
   // The same file with the same options reuses the stored request ID: after a
   // reload or a long drop the worker answers with the upload it already holds.
   const optionsDigest = JSON.stringify([...query.entries()]);
@@ -448,8 +539,9 @@ export async function uploadToVision(
     previous.size === file.size &&
     previous.lastModified === (named.lastModified ?? 0) &&
     previous.optionsDigest === optionsDigest;
-  query.set("requestId", same ? previous.requestId : crypto.randomUUID());
+  query.set("requestId", resume ? resume.requestId : same ? previous.requestId : crypto.randomUUID());
   savePendingUpload(entry(query.get("requestId")!));
+  options.onRequest?.(query.get("requestId")!);
   signal?.throwIfAborted();
   // Never abort the reservation mid-flight: the worker would stay reserved
   // under an id this browser never learns. Cancellation is checked just after.
@@ -468,6 +560,7 @@ export async function uploadToVision(
         renewed = true;
         query.set("requestId", crypto.randomUUID());
         savePendingUpload(entry(query.get("requestId")!));
+        options.onRequest?.(query.get("requestId")!);
         continue;
       }
       // Another file holds the worker: keep the entry that can still resume it.
@@ -482,21 +575,82 @@ export async function uploadToVision(
       await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
     }
   }
+  options.onReserved?.(job);
   let starting = false;
   let offset = Math.min(file.size, Math.max(0, job.receivedBytes ?? 0));
   // Leaving the page does not cancel the upload: phones discard background tabs
   // (switching apps mid-upload), and a reload resumes from the last byte the
   // worker acknowledged. An abandoned upload frees the worker by itself after
   // VISION_UPLOAD_IDLE_SECONDS without data.
+  // Time only counts toward giving up while the page is visible: a locked phone or
+  // another app suspends the page, and the worker keeps the upload meanwhile.
+  const page = typeof document === "undefined" ? null : document;
+  let hiddenMs = 0;
+  let hiddenSince = page?.visibilityState === "hidden" ? Date.now() : null;
+  const visibleNow = () => Date.now() - hiddenMs - (hiddenSince === null ? 0 : Date.now() - hiddenSince);
+  // Back online, or back on the page: retry at once instead of finishing a backoff.
+  let wake: (() => void) | null = null;
+  const onVisibility = () => {
+    if (page?.visibilityState === "hidden") {
+      if (hiddenSince === null) hiddenSince = Date.now();
+      return;
+    }
+    if (hiddenSince !== null) hiddenMs += Date.now() - hiddenSince;
+    hiddenSince = null;
+    wake?.();
+  };
+  const onOnline = () => wake?.();
+  const backoff = (ms: number) =>
+    new Promise<void>((resolve, reject) => {
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", aborted);
+        wake = null;
+      };
+      const aborted = () => {
+        done();
+        reject(new DOMException("Upload cancelled.", "AbortError"));
+      };
+      const timer = setTimeout(() => {
+        done();
+        resolve();
+      }, ms);
+      wake = () => {
+        done();
+        resolve();
+      };
+      signal?.addEventListener("abort", aborted, { once: true });
+      if (signal?.aborted) aborted();
+    });
+  page?.addEventListener("visibilitychange", onVisibility);
+  if (typeof window !== "undefined") window.addEventListener("online", onOnline);
+  // A piece whose reply never comes (a silently dead connection, a Wi-Fi to mobile
+  // handover) is abandoned after this and resent smaller; never a fixed minute: a
+  // 4 MB piece takes about a minute at 0.5 Mbit/s.
+  const idleLimitMs = Math.max(MIN_PIECE_TIMEOUT_MS, ((options.uploadIdleSeconds ?? 300) - 30) * 1000);
+  let slowestPieceMs = 0;
+  let chunkSize = UPLOAD_CHUNK;
   try {
     signal?.throwIfAborted();
-    let lastAck = Date.now();
+    let lastAck = visibleNow();
     // Rounded down, as below: 100% means every byte arrived.
-    onProgress?.(Math.floor((offset / file.size) * 100));
+    onProgress?.(Math.floor((offset / file.size) * 100), offset, file.size);
     while (offset < file.size) {
-      const piece = file.slice(offset, Math.min(file.size, offset + UPLOAD_CHUNK));
       for (let attempt = 0; ; attempt++) {
         signal?.throwIfAborted();
+        // Re-sliced on every attempt: a stalled piece is resent smaller from the same offset.
+        const piece = file.slice(offset, Math.min(file.size, offset + chunkSize));
+        // Its own controller, chained by hand to the user's (AbortSignal.any needs Safari 17.4).
+        const controller = new AbortController();
+        const userAbort = () => controller.abort();
+        signal?.addEventListener("abort", userAbort, { once: true });
+        let stalled = false;
+        const limit = options.pieceTimeoutMs ?? Math.min(idleLimitMs, Math.max(MIN_PIECE_TIMEOUT_MS, 3 * slowestPieceMs));
+        const stall = setTimeout(() => {
+          stalled = true;
+          controller.abort();
+        }, limit);
+        const sentAt = Date.now();
         try {
           const { received } = await visionJson<{ received: number }>(
             `jobs/${job.id}/video?offset=${offset}`,
@@ -504,13 +658,17 @@ export async function uploadToVision(
               method: "PUT",
               headers: { "Content-Type": "application/octet-stream" },
               body: piece,
-              signal,
+              signal: controller.signal,
             },
           );
+          if (received > offset) slowestPieceMs = Math.max(slowestPieceMs, Date.now() - sentAt);
           offset = received;
-          lastAck = Date.now();
+          lastAck = visibleNow();
+          // Acknowledged again: grow back towards full-size pieces.
+          chunkSize = Math.min(UPLOAD_CHUNK, chunkSize * 2);
           break;
         } catch (e) {
+          // Only the user's cancel ends the upload; a stall is a dropped connection.
           if (signal?.aborted) throw e;
           const resync =
             e instanceof VisionError &&
@@ -520,18 +678,23 @@ export async function uploadToVision(
             offset = Number(resync[1]);
             break;
           }
+          if (stalled) chunkSize = Math.max(MIN_UPLOAD_CHUNK, Math.floor(chunkSize / 2));
           // Lost connection (phone switching networks, Wi-Fi blip) or a worker
           // redeploying (the site answers 502-504; the worker keeps the upload):
-          // keep trying until the worker would give up on us. Server errors: a few retries.
-          const giveUp = unreachable(e)
-            ? Date.now() - lastAck > RESUME_WINDOW_MS
+          // keep trying for a few visible minutes. Server errors: a few retries.
+          const giveUp = stalled || unreachable(e)
+            ? visibleNow() - lastAck > RESUME_WINDOW_MS
             : !transient(e) || attempt >= 4;
-          if (giveUp) throw e;
-          await sleep(Math.min(15_000, 1000 * 2 ** attempt), signal);
+          if (giveUp) throw stalled ? new TypeError("Upload stalled") : e;
+          // A stalled piece already waited its timeout: resend at once.
+          if (!stalled) await backoff(Math.min(15_000, 1000 * 2 ** attempt));
+        } finally {
+          clearTimeout(stall);
+          signal?.removeEventListener("abort", userAbort);
         }
       }
       // Rounded down: 100% means every byte arrived and the analysis is starting.
-      onProgress?.(Math.floor((offset / file.size) * 100));
+      onProgress?.(Math.floor((offset / file.size) * 100), offset, file.size);
     }
     // From here the server may already be analysing (paid GPU time): closing the
     // tab or leaving the page must not cancel it. An explicit cancel (the upload
@@ -560,12 +723,19 @@ export async function uploadToVision(
       // Analyse with the same file continues from what the worker received.
       if (unreachable(e))
         throw new UploadInterruptedError(
-          `Connection lost at ${Math.round((offset / file.size) * 100)}%. Press Analyse with the same file to resume.`,
+          `Connection lost at ${Math.floor((offset / file.size) * 100)}%. Press Analyse with the same file to continue.${
+            options.uploadAbandonSeconds
+              ? ` What was sent is kept for ${keptFor(options.uploadAbandonSeconds)} unless someone else starts an analysis.`
+              : ""
+          }`,
         );
       // Free the worker straight away instead of waiting for the idle timeout.
       requestCancel(job.id).then((stopped) => stopped && savePendingUpload(null));
     }
     throw e;
+  } finally {
+    page?.removeEventListener("visibilitychange", onVisibility);
+    if (typeof window !== "undefined") window.removeEventListener("online", onOnline);
   }
 }
 

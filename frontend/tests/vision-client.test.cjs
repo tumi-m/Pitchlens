@@ -14,7 +14,7 @@ const ACCESS_KEY = 'pitchlens-vision-access';
 const OLD = 'a'.repeat(32);
 const FRESH = 'e'.repeat(32);
 
-function setup({ stored = {}, respond } = {}) {
+function setup({ stored = {}, respond, context = {} } = {}) {
   const store = new Map(Object.entries(stored));
   const localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -30,9 +30,11 @@ function setup({ stored = {}, respond } = {}) {
     CustomEvent: class { constructor(type) { this.type = type; } },
     window: { dispatchEvent: (e) => events.push(e.type), addEventListener() {}, removeEventListener() {} },
     fetch: async (url, init) => {
-      calls.push({ url, headers: init.headers });
+      calls.push({ url, headers: init.headers, init });
       return respond ? respond(url, init) : Response.json({ ok: true });
     },
+    AbortController,
+    ...context,
   });
   return { lib: exports, store, events, calls };
 }
@@ -102,4 +104,100 @@ test('upload defaults: player load unless the ball model is asked for, football 
   assert.deepEqual(plain(options(null, { playerLoadOnly: false })), { profile: 'general', search: 'exhaustive' });
   assert.deepEqual(plain(options({ profiles: ['broadcast'] }, { playerLoadOnly: false, adaptive: true })), { profile: 'broadcast', search: 'adaptive' });
   assert.deepEqual(plain(options({ profiles: ['broadcast'] }, { playerLoadOnly: false, adaptive: true, profile: 'general' })), { profile: 'general', search: 'exhaustive' });
+});
+
+// ── Uploads that stall, pause or are cancelled ──────────────────────────
+const MiB = 1024 * 1024;
+const JOB = 'f'.repeat(32);
+
+/** A worker that reserves JOB and acknowledges each piece; `put` may answer a piece itself. */
+function uploadWorker(put) {
+  const puts = [];
+  const respond = (url, init) => {
+    if (/\/jobs\?/.test(url)) return Response.json({ id: JOB, status: 'uploading', receivedBytes: 0 });
+    if (url.endsWith('/start')) return Response.json({ id: JOB, status: 'processing' });
+    if (url.endsWith('/cancel')) return Response.json({ requested: true });
+    const offset = Number(new URL(url, 'https://site.example').searchParams.get('offset'));
+    puts.push({ offset, size: init.body.size });
+    return (put && put(offset, init, puts)) || Response.json({ received: offset + init.body.size });
+  };
+  return { puts, respond };
+}
+
+/** A reply that never comes; it only ends when its request is aborted. */
+const never = (init) =>
+  new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError'))));
+
+test('a piece whose reply never comes is resent smaller from the same offset, without cancelling', async () => {
+  let stalled = false;
+  const worker = uploadWorker((offset, init) => {
+    if (offset === 4 * MiB && !stalled) {
+      stalled = true;
+      return never(init);
+    }
+  });
+  const s = setup({ respond: worker.respond });
+  const job = await s.lib.uploadToVision(new Blob([new Uint8Array(7 * MiB)]), { title: 't', pieceTimeoutMs: 50 });
+  assert.equal(job.status, 'processing');
+  assert.deepEqual(worker.puts.map((p) => [p.offset / MiB, p.size / MiB]), [[0, 4], [4, 3], [4, 2], [6, 1]]);
+  assert.ok(!s.calls.some((c) => c.url.endsWith('/cancel')));
+});
+
+test('cancelling during a piece that hangs asks the worker to stop', async () => {
+  const worker = uploadWorker((offset, init) => never(init));
+  const s = setup({ respond: worker.respond });
+  const controller = new AbortController();
+  const upload = s.lib.uploadToVision(new Blob([new Uint8Array(MiB)]), { title: 't', signal: controller.signal, pieceTimeoutMs: 60_000 });
+  setTimeout(() => controller.abort(), 30);
+  await assert.rejects(upload, (e) => e.name === 'AbortError');
+  assert.equal(s.calls.filter((c) => c.url.endsWith(`/jobs/${JOB}/cancel`)).length, 1);
+});
+
+/** Pages and windows that record their listeners, and a clock the test moves. */
+function pageAt(visibility) {
+  const listeners = { document: {}, window: {} };
+  const on = (where) => ({
+    addEventListener: (type, fn) => (listeners[where][type] = fn),
+    removeEventListener: (type) => delete listeners[where][type],
+  });
+  const clock = { t: 1_000_000 };
+  const document = { visibilityState: visibility, ...on('document') };
+  const window = { dispatchEvent() {}, ...on('window') };
+  const fire = (where, type) => listeners[where][type] && listeners[where][type]();
+  return { document, window, fire, clock, Date: { now: () => clock.t } };
+}
+
+test('minutes spent hidden (a locked phone) do not count towards giving up', async () => {
+  const page = pageAt('hidden');
+  let failures = 0;
+  const worker = uploadWorker((offset) => {
+    if (failures === 3) return undefined;
+    failures++;
+    page.clock.t += 200_000; // 200 s pass while the phone is locked
+    if (failures < 3) setTimeout(() => page.fire('window', 'online'), 5); // back online: no backoff wait
+    else
+      setTimeout(() => {
+        page.document.visibilityState = 'visible';
+        page.fire('document', 'visibilitychange'); // unlocked: retry at once
+      }, 5);
+    throw new TypeError('Failed to fetch');
+  });
+  const s = setup({ respond: worker.respond, context: { document: page.document, window: page.window, Date: page.Date } });
+  const job = await s.lib.uploadToVision(new Blob([new Uint8Array(10)]), { title: 't', uploadAbandonSeconds: 7200 });
+  assert.equal(job.status, 'processing');
+  assert.equal(worker.puts.length, 4);
+  // The same 400 s of failures with the page on screen give up, and say how long the worker keeps it.
+  const shown = pageAt('visible');
+  const down = uploadWorker(() => {
+    shown.clock.t += 200_000;
+    setTimeout(() => shown.fire('window', 'online'), 5);
+    throw new TypeError('Failed to fetch');
+  });
+  const again = setup({ respond: down.respond, context: { document: shown.document, window: shown.window, Date: shown.Date } });
+  await assert.rejects(
+    again.lib.uploadToVision(new Blob([new Uint8Array(10)]), { title: 't', uploadAbandonSeconds: 7200 }),
+    /^Error: Connection lost at 0%\. Press Analyse with the same file to continue\. What was sent is kept for about 2 hours unless someone else starts an analysis\.$/,
+  );
+  assert.equal(down.puts.length, 2);
+  assert.ok(!again.calls.some((c) => c.url.endsWith('/cancel')));
 });

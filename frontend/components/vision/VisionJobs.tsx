@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { VisionJob, VisionError, visionJson, clockTime } from "@/lib/review/vision";
+import { VisionJob, VisionError, visionJson, clockTime, matchDateLabel } from "@/lib/review/vision";
 
 /** Which part of the file a job analysed: a test section, or the whole match. */
 function span(j: VisionJob) {
@@ -14,6 +14,11 @@ function span(j: VisionJob) {
   }
   return duration !== undefined ? `Full match · ${clockTime(duration)}` : "Full match";
 }
+
+/** Analyses of the same uploaded video: re-runs share (hard-link) its file, so it
+ *  stays on the server until every one of them is deleted. */
+const videoKey = (j: VisionJob) => j.rootJobId ?? j.sourceJobId ?? j.id;
+const busyStatus = (j: VisionJob) => ["uploading", "processing"].includes(j.status);
 
 /** Which saved venues deleting this match also deletes (the worker removes venues saved from it). */
 async function venuesFrom(jobId: string): Promise<string[] | null> {
@@ -42,26 +47,42 @@ export function VisionJobs({ onCount }: { onCount?: (count: number) => void }) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
+  /** Deleting one analysis of a video that others still use: asked inline, with the choice to delete them all. */
+  const [asking, setAsking] = useState<{ job: VisionJob; others: VisionJob[]; venues: string[] | null } | null>(null);
   useEffect(() => {
     if (loaded) onCount?.(jobs.length);
   }, [loaded, jobs.length, onCount]);
   async function remove(job: VisionJob) {
     setDeleting(job.id);
+    setAsking(null);
     const venues = await venuesFrom(job.id);
+    const others = jobs.filter((j) => j.id !== job.id && videoKey(j) === videoKey(job));
+    if (others.length) {
+      setAsking({ job, others, venues });
+      setDeleting(null);
+      return;
+    }
     if (!window.confirm(deleteMessage(job.title, venues))) {
       setDeleting(null);
       return;
     }
+    await deleteJobs([job]);
+  }
+  async function deleteJobs(list: VisionJob[]) {
+    setAsking(null);
     setError("");
-    try {
-      await visionJson(`jobs/${job.id}`, { method: "DELETE" });
-      setJobs((items) => items.filter((item) => item.id !== job.id));
-      try { localStorage.removeItem(`vision-names-${job.id}`); } catch {}
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Deletion failed. Try again.");
-    } finally {
-      setDeleting(null);
+    for (const job of list) {
+      setDeleting(job.id);
+      try {
+        await visionJson(`jobs/${job.id}`, { method: "DELETE" });
+        setJobs((items) => items.filter((item) => item.id !== job.id));
+        try { localStorage.removeItem(`vision-names-${job.id}`); } catch {}
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Deletion failed. Try again.");
+        break;
+      }
     }
+    setDeleting(null);
   }
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -130,20 +151,68 @@ export function VisionJobs({ onCount }: { onCount?: (count: number) => void }) {
               {j.status === "completed" ? "Vision report" : j.status}
               {j.sourceJobId ? " · Re-analysis" : ""}
             </p>
-            <h3 className="font-semibold break-words">{j.title}</h3>
+            {/* The owner's names for the teams and the day it was played, once set; the upload date until then. */}
+            <h3 className="font-semibold break-words">
+              {j.title}
+              {j.teamNames ? ` · ${j.teamNames[0]} v ${j.teamNames[1]}` : ""}
+            </h3>
             <p className="text-sm text-pitch-muted" data-testid="vision-job-span">
               {span(j)}
-              {j.createdAt ? ` · ${new Date(j.createdAt * 1000).toLocaleDateString()}` : ""}
+              {matchDateLabel(j.matchDate)
+                ? ` · ${matchDateLabel(j.matchDate)}`
+                : j.createdAt
+                  ? ` · ${new Date(j.createdAt * 1000).toLocaleDateString()}`
+                  : ""}
             </p>
             <p className="text-sm text-pitch-muted">
               {j.stage}
-              {j.status === "processing" ? ` · ${j.progress}%` : ""}
+              {j.status === "processing"
+                ? ` · ${j.progress}%`
+                : j.status === "uploading" && j.expectedBytes
+                  ? ` · ${Math.floor(((j.receivedBytes ?? 0) / j.expectedBytes) * 100)}%`
+                  : ""}
             </p>
+            {j.status === "uploading" && !!j.expectedBytes && (
+              <p className="text-xs text-pitch-muted">Sent from the page that started it</p>
+            )}
           </Link>
-          {!["uploading", "processing"].includes(j.status) && (
-            <button className="text-xs text-pitch-muted underline mt-2" disabled={deleting !== null} onClick={() => remove(j)}>
+          {!busyStatus(j) && (
+            <button className="pitch-button-secondary min-h-11 mt-3" disabled={deleting !== null} onClick={() => remove(j)}>
               {deleting === j.id ? "Deleting…" : "Delete analysis and footage"}
             </button>
+          )}
+          {asking?.job.id === j.id && (
+            <div role="alertdialog" aria-label="Delete analysis" className="glass-card border-red-400/40 p-4 mt-3 space-y-3 text-sm" data-testid="delete-shared-video">
+              {(() => {
+                const kept = asking.others.filter((o) => !busyStatus(o));
+                const running = asking.others.filter(busyStatus);
+                const quoted = (asking.venues ?? []).map((v) => `"${v}"`);
+                return (
+                  <>
+                    <p>
+                      Delete &quot;{j.title}&quot; with its report, reviews and pitch setup?
+                      {quoted.length ? ` This also deletes the saved venue${quoted.length === 1 ? "" : "s"} ${quoted.join(", ")}.` : ""}
+                    </p>
+                    <p className="text-pitch-muted">
+                      The video stays on the server while {asking.others.length} other analys{asking.others.length === 1 ? "is" : "es"} of
+                      it remain{asking.others.length === 1 ? "s" : ""} ({asking.others.map(span).join(", ")}).
+                      {running.length ? ` Still running, so not deletable yet: ${running.map(span).join(", ")}.` : ""}
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button className="pitch-button-secondary min-h-11" onClick={() => deleteJobs([j])}>
+                        Delete this analysis only
+                      </button>
+                      <button className="pitch-button-secondary min-h-11 border-red-400/50" onClick={() => deleteJobs([j, ...kept])}>
+                        Delete all analyses of this video
+                      </button>
+                      <button className="pitch-button-secondary min-h-11" onClick={() => setAsking(null)}>
+                        Keep
+                      </button>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
           )}
           </motion.div>
         ))}

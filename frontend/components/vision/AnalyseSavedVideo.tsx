@@ -76,6 +76,8 @@ export function AnalyseSavedVideo({
       const job = await uploadToVision(video, {
         title,
         ...defaultVisionOptions(status, { playerLoadOnly: !ballModel }),
+        uploadIdleSeconds: status.uploadIdleSeconds,
+        uploadAbandonSeconds: status.uploadAbandonSeconds,
         signal: controller.signal,
         onProgress: setPercent,
       });

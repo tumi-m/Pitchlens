@@ -1,8 +1,19 @@
 import { test, expect, Page } from "@playwright/test";
+import fs from "node:fs";
 import path from "node:path";
 
 const ID = "a".repeat(32);
 const FIXTURE = path.join(__dirname, "fixtures/review.mp4");
+const PIECE = 4 * 1024 * 1024;
+
+/** The fixture video (still decodable) grown to `total` bytes with a trailing MP4 "free" box. */
+function paddedVideo(name: string, total: number) {
+  const video = fs.readFileSync(FIXTURE);
+  const free = Buffer.alloc(Math.max(8, total - video.length));
+  free.writeUInt32BE(free.length, 0);
+  free.write("free", 4, "latin1");
+  return { name, mimeType: "video/mp4", buffer: Buffer.concat([video, free]) };
+}
 
 async function mockChunkedWorker(page: Page) {
   const calls = { created: 0, chunks: [] as number[], started: 0, owner: "", diagnostic: "", start: "" };
@@ -470,7 +481,7 @@ async function uploadAndWaitForStart(page: Page, order: string[]) {
   await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
   await expect.poll(() => order).toContain("start");
   // The upload card's button (the analysis page has its own "Cancel analysis").
-  return page.getByText("Keep this tab open until the upload finishes").locator("..").getByRole("button", { name: /^Cancel (upload|analysis)$/ });
+  return page.getByText(/Keep this page open/).locator("..").getByRole("button", { name: /^Cancel (upload|analysis)$/ });
 }
 
 test("cancelling while the video is checked opens the analysis if the worker had already started it", async ({ page }) => {
@@ -591,7 +602,7 @@ test("this browser's earlier upload is named and can be cancelled before trying 
 
 test("a connection that stays down says how far the upload got and how to resume", async ({ page }) => {
   await page.clock.install();
-  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false, uploadIdleSeconds: 300, uploadAbandonSeconds: 7200 } }));
   const calls = await mockChunkedWorker(page);
   await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), (r) => r.abort("failed"));
   const cancels: string[] = [];
@@ -602,7 +613,9 @@ test("a connection that stays down says how far the upload got and how to resume
   await page.goto("/upload");
   await page.getByLabel("Video for computer vision").setInputFiles(broken);
   await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
-  const lost = page.getByRole("alert").filter({ hasText: "Connection lost at 0%. Press Analyse with the same file to resume." });
+  const lost = page.getByRole("alert").filter({
+    hasText: "Connection lost at 0%. Press Analyse with the same file to continue. What was sent is kept for about 2 hours unless someone else starts an analysis.",
+  });
   await expect.poll(async () => {
     await page.clock.fastForward(60_000);
     return lost.count();
@@ -640,10 +653,16 @@ test("a file over the server's limit says how much fits and how to get under it"
   await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true, maxBytes: 1024 * 1024 } }));
   await page.goto("/upload");
   await expect(page.getByText("Up to 1 MB", { exact: false })).toBeVisible();
-  await page.getByLabel("Video for computer vision").setInputFiles({ name: "full-match.mp4", mimeType: "video/mp4", buffer: Buffer.alloc(2 * 1024 * 1024) });
+  // Decodable, so the readiness card is shown: without its 20-second test, which cannot be sent either.
+  await page.getByLabel("Video for computer vision").setInputFiles(paddedVideo("full-match.mp4", 2 * 1024 * 1024));
   const alert = page.getByTestId("too-large");
   await expect(alert).toContainText("This video is 2 MB; this server accepts up to 1 MB.");
-  await expect(alert).toContainText("Trim it into parts in Photos, or export at 720p");
+  // Advice an iPhone can follow: Photos trims and saves a new clip; it has no 720p export.
+  await expect(alert).toContainText("In Photos, tap Edit, trim, then Save Video as New Clip");
+  await expect(alert).not.toContainText("export at 720p, then");
+  await expect(page.getByRole("heading", { name: "Video checked on your device" })).toBeVisible();
+  await expect(page.getByLabel("Test start (seconds)")).toHaveCount(0);
+  await expect(page.getByLabel(/Only analyse a 20-second test/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Analyse video automatically", exact: true })).toBeDisabled();
 });
 
@@ -661,4 +680,304 @@ test("the daily limit is not retried and says when analysis resumes", async ({ p
   await expect(page.getByRole("alert").filter({ hasText: "Analysis is paused until" })).toBeVisible();
   await page.waitForTimeout(1500);
   expect(posts).toBe(1);
+});
+
+test("leaving for another page of the site keeps the upload going, and the upload page shows it again", async ({ page }) => {
+  // Navbar links navigate inside the app: the upload page unmounts, the upload must not.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  const file = paddedVideo("match.mp4", 4 * PIECE - 1000);
+  let posts = 0;
+  await page.route(/\/api\/vision\/jobs\?/, (r) => {
+    posts++;
+    return r.fulfill({ json: uploading });
+  });
+  const puts: number[] = [];
+  let received = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    const offset = Number(new URL(r.request().url()).searchParams.get("offset"));
+    puts.push(offset);
+    await new Promise((done) => setTimeout(done, 1500));
+    received = offset + (r.request().postDataBuffer()?.length ?? 0);
+    await r.fulfill({ json: { received } }).catch(() => {});
+  });
+  const cancels: string[] = [];
+  await page.route(/\/api\/vision\/jobs\/[a-f0-9]{32}\/cancel$/, (r) => {
+    cancels.push(r.request().url());
+    return r.fulfill({ json: { requested: true } });
+  });
+  let started = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/start$`), (r) => {
+    started++;
+    return r.fulfill({ json: processing });
+  });
+  await page.route("**/api/vision/jobs", (r) =>
+    r.fulfill({ json: [{ ...uploading, receivedBytes: received, expectedBytes: file.buffer.length }] }),
+  );
+  await page.route(new RegExp(`/api/vision/jobs/${ID}$`), (r) => r.fulfill({ json: processing }));
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(file);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect.poll(() => received, { timeout: 10_000 }).toBe(PIECE);
+  const left = Date.now();
+  await page.getByRole("button", { name: "Toggle mobile menu" }).click();
+  await page.getByRole("link", { name: "Dashboard", exact: true }).click();
+  await expect(page).toHaveURL(/\/dashboard$/);
+  await expect(page.getByTestId("nav-upload")).toContainText("Uploading");
+  // Back on the upload page: the same upload, not a new reservation.
+  await page.getByTestId("nav-upload").click();
+  await expect(page).toHaveURL(/\/upload$/);
+  await expect(page.getByRole("button", { name: "Cancel upload" })).toBeVisible();
+  await expect(page.getByTestId("upload-bytes")).toContainText("MB of");
+  await expect(page.getByText("match.mp4")).toBeVisible();
+  await expect.poll(() => puts, { timeout: 15_000 }).toContain(3 * PIECE);
+  await expect(page).toHaveURL(`/vision/${ID}`, { timeout: 15_000 });
+  await page.waitForTimeout(Math.max(0, 5000 - (Date.now() - left)));
+  expect(cancels).toEqual([]);
+  expect(posts).toBe(1);
+  expect(puts).toEqual([0, PIECE, 2 * PIECE, 3 * PIECE]);
+  expect(started).toBe(1);
+});
+
+test("an upload that finishes after the page was left links to its report from the navbar", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  const calls = await mockChunkedWorker(page);
+  let sending = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    sending = true;
+    await new Promise((done) => setTimeout(done, 1500));
+    await r.fallback();
+  });
+  await page.route("**/api/vision/jobs", (r) => r.fulfill({ json: [processing] }));
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(broken);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect.poll(() => sending).toBe(true);
+  await page.getByRole("button", { name: "Toggle mobile menu" }).click();
+  await page.getByRole("link", { name: "Dashboard", exact: true }).click();
+  const link = page.getByTestId("nav-upload");
+  await expect(link).toHaveText("Analysis started · open report", { timeout: 10_000 });
+  await expect(link).toHaveAttribute("href", `/vision/${ID}`);
+  expect(calls.started).toBe(1);
+  await link.click();
+  await expect(page).toHaveURL(`/vision/${ID}`);
+  await expect(page.getByTestId("nav-upload")).toHaveCount(0);
+});
+
+test("after a reload, the same video continues its upload with the title and test it was started with", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false, diagnostics: true } }));
+  const file = paddedVideo("match.mp4", 2 * PIECE + 1000);
+  const posts: URLSearchParams[] = [];
+  const puts: number[][] = [[], []];
+  await page.route(/\/api\/vision\/jobs\?/, (r) => {
+    posts.push(new URL(r.request().url()).searchParams);
+    // The worker still holds the first 4 MB piece.
+    return r.fulfill({ json: posts.length === 1 ? uploading : { ...uploading, receivedBytes: PIECE } });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    const offset = Number(new URL(r.request().url()).searchParams.get("offset"));
+    const session = posts.length - 1;
+    puts[session].push(offset);
+    if (session === 0 && offset > 0) {
+      // The page is reloaded while the second piece is on its way.
+      await new Promise((done) => setTimeout(done, 8000));
+      return r.fulfill({ json: { received: PIECE } }).catch(() => {});
+    }
+    return r.fulfill({ json: { received: offset + (r.request().postDataBuffer()?.length ?? 0) } });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/start$`), (r) => r.fulfill({ json: processing }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}$`), (r) => r.fulfill({ json: processing }));
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(file);
+  await expect(page.getByRole("heading", { name: "Video checked on your device" })).toBeVisible();
+  await page.getByLabel("Analysis title").fill("Tekkerz Tuesday vs Lions");
+  await page.getByLabel("Test start (seconds)").fill("2");
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect.poll(() => puts[0]).toEqual([0, PIECE]);
+  await page.reload();
+  // The page names the unfinished upload before a file is chosen.
+  await expect(page.getByTestId("unfinished-upload")).toContainText('Unfinished upload: "Tekkerz Tuesday vs Lions", test 0:02–0:22');
+  // Choosing the video again resets the title and test start; continuing keeps the originals.
+  await page.getByLabel("Video for computer vision").setInputFiles(file);
+  await expect(page.getByRole("button", { name: "Start again with these options" })).toBeVisible();
+  await page.getByRole("button", { name: "Continue this upload" }).click();
+  await expect(page.getByRole("heading", { name: "Detecting players", exact: true })).toBeVisible();
+  expect(posts).toHaveLength(2);
+  expect(posts[1].get("requestId")).toBe(posts[0].get("requestId"));
+  expect(posts[1].get("title")).toBe("Tekkerz Tuesday vs Lions");
+  expect(posts[1].get("start")).toBe("2");
+  expect(posts[1].get("diagnostic")).toBe("true");
+  expect(puts[1][0]).toBe(PIECE);
+});
+
+test("the short-test checkbox says it only analyses a test, and how the full match follows", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false, diagnostics: true } }));
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  const box = page.getByLabel(/Only analyse a 20-second test/);
+  await expect(box).toBeChecked();
+  await expect(page.getByText("After the test you can analyse the full match from its report, without uploading again.")).toBeVisible();
+  await expect(page.getByText(/before analysing the full match/)).toHaveCount(0);
+});
+
+test("the readiness card shows the file size and the upload card how much has been sent", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await mockChunkedWorker(page);
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let pieces = 0;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    // The first piece arrives; the second waits until the card has been read.
+    if (++pieces > 1) await released;
+    await r.fallback();
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(paddedVideo("match.mp4", 9 * 1024 * 1024));
+  await expect(page.getByLabel("Video readiness")).toContainText("9.0 MB to upload");
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect(page.getByTestId("upload-bytes")).toContainText("4.0 MB of 9.0 MB");
+  release();
+  await expect(page.getByRole("heading", { name: "Detecting players", exact: true })).toBeVisible();
+});
+
+test("the screen is kept awake while the upload runs, asked for again when the page shows, and released when it ends", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as unknown as { wake: { requests: string[]; releases: number } };
+    w.wake = { requests: [], releases: 0 };
+    Object.defineProperty(navigator, "wakeLock", {
+      configurable: true,
+      value: {
+        request: async (type: string) => {
+          w.wake.requests.push(type);
+          return { type, released: false, release: async () => void w.wake.releases++, addEventListener() {}, removeEventListener() {} };
+        },
+      },
+    });
+  });
+  const wake = () => page.evaluate(() => (window as unknown as { wake: { requests: string[]; releases: number } }).wake);
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await mockChunkedWorker(page);
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let sending = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    sending = true;
+    await released;
+    await r.fallback();
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(broken);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect.poll(() => sending).toBe(true);
+  await expect.poll(async () => (await wake()).requests).toEqual(["screen"]);
+  await expect(page.getByText(/we keep the screen awake while it uploads/)).toBeVisible();
+  // Back from another app: the browser dropped the lock, so it is asked for again.
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(async () => (await wake()).requests).toEqual(["screen", "screen"]);
+  const before = (await wake()).releases;
+  release();
+  await expect(page).toHaveURL(`/vision/${ID}`);
+  expect((await wake()).releases).toBeGreaterThan(before);
+});
+
+test("a cancelled upload releases the screen", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as unknown as { wake: { requests: number; releases: number } };
+    w.wake = { requests: 0, releases: 0 };
+    Object.defineProperty(navigator, "wakeLock", {
+      configurable: true,
+      value: { request: async () => (w.wake.requests++, { released: false, release: async () => void w.wake.releases++, addEventListener() {}, removeEventListener() {} }) },
+    });
+  });
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await mockChunkedWorker(page);
+  await page.route(/\/api\/vision\/jobs\/[a-f0-9]{32}\/cancel$/, (r) => r.fulfill({ json: { requested: true } }));
+  let sending = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    sending = true;
+    await new Promise((done) => setTimeout(done, 10_000));
+    await r.fallback().catch(() => {});
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(broken);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect.poll(() => sending).toBe(true);
+  await page.getByRole("button", { name: "Cancel upload" }).click();
+  await expect(page.getByText("Upload cancelled. Your file is still selected.")).toBeVisible();
+  const wake = await page.evaluate(() => (window as unknown as { wake: { requests: number; releases: number } }).wake);
+  expect(wake.requests).toBe(1);
+  expect(wake.releases).toBe(1);
+});
+
+test("without Screen Wake Lock the upload still works and asks to keep the screen on", async ({ page }) => {
+  await page.addInitScript(() => {
+    delete (Navigator.prototype as unknown as { wakeLock?: unknown }).wakeLock;
+  });
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  const calls = await mockChunkedWorker(page);
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/video\\?offset=`), async (r) => {
+    await released;
+    await r.fallback();
+  });
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(broken);
+  await page.getByRole("button", { name: "Analyse video automatically", exact: true }).click();
+  await expect(page.getByText("Keep this page open and the screen on until the upload finishes.", { exact: false })).toBeVisible();
+  await expect(page.getByText(/we keep the screen awake/)).toHaveCount(0);
+  release();
+  await expect(page.getByRole("heading", { name: "Detecting players", exact: true })).toBeVisible();
+  expect(calls.started).toBe(1);
+});
+
+test("a 360p video gets one note about the small ball, not two", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false, diagnostics: true } }));
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  await expect(page.getByRole("heading", { name: "Video checked on your device" })).toBeVisible();
+  await expect(page.getByText(/about the size of a boot/)).toHaveCount(1);
+  await expect(page.getByLabel(/Player load only/)).toHaveAccessibleName(/Player load only: running distance per team, quicker/);
+});
+
+test("on a phone the video picker is on the first screen; on a desktop the feature cards stay", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await page.setViewportSize({ width: 390, height: 664 });
+  await page.goto("/upload");
+  await expect(page.getByRole("heading", { name: "Let the footage do the talking." })).toBeVisible();
+  const picker = page.getByLabel("Video for computer vision");
+  expect((await picker.boundingBox())!.y).toBeLessThan(664);
+  await expect(page.getByText("Player + ball detection")).toBeHidden();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  for (const card of ["Player + ball detection", "Kit grouping + tracking", "Evidence-linked analytics"])
+    await expect(page.getByText(card)).toBeVisible();
+});
+
+test("a missing or refused access code brings its field into view with the cursor in it", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route("**/api/vision/health", (r) =>
+    r.fulfill({ json: { available: true, hosted: true, accessRequired: true, retentionHours: 168 } }),
+  );
+  await page.route(/\/api\/vision\/jobs\?/, (r) =>
+    r.fulfill({ status: 401, json: { detail: "Enter the access code to analyse videos.", code: "access" } }),
+  );
+  const field = page.getByLabel("Access code");
+  const inView = async () => {
+    const box = await field.boundingBox();
+    return !!box && box.y >= 0 && box.y + box.height <= 844;
+  };
+  await page.goto("/upload");
+  await page.getByLabel("Video for computer vision").setInputFiles(FIXTURE);
+  const analyse = page.getByRole("button", { name: "Analyse video automatically", exact: true });
+  await analyse.click();
+  await expect(page.getByText("Enter the access code first.")).toBeVisible();
+  await expect(field).toBeFocused();
+  await expect.poll(inView).toBe(true);
+  await field.fill("wrong");
+  await analyse.click();
+  await expect(page.getByText("Enter the access code to analyse videos.")).toBeVisible();
+  await expect(field).toHaveValue("");
+  await expect(field).toBeFocused();
+  await expect.poll(inView).toBe(true);
 });

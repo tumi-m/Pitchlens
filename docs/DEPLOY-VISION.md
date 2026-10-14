@@ -139,9 +139,14 @@ reserves itself for it again. The browser keeps retrying through the outage
 (a 502/503/504 from the site counts as a dropped connection, for up to four
 minutes) and continues from the server's offset. A page reloaded meanwhile
 resumes too when the same file is chosen again. Any older unfinished upload is
-marked interrupted and its partial file deleted. Uploads that stop half-way
-free the worker after five minutes (`VISION_UPLOAD_IDLE_SECONDS`), including
-one kept across a restart whose browser never comes back.
+marked interrupted and its partial file deleted. An upload that stops half-way
+(a phone that locked or switched apps) keeps what it received, so pressing
+Analyse with the same file continues from there. After five minutes without data
+(`VISION_UPLOAD_IDLE_SECONDS`) it gives way to another browser's analysis, which
+deletes the partial file; with nobody else waiting it is kept for two hours
+(`VISION_UPLOAD_ABANDON_SECONDS`), including one kept across a restart, and only
+then released as abandoned. The same browser starting a different upload is told
+about its paused one instead of losing it.
 Check the Railway **Deploy logs** for model or decoding errors.
 
 ## Run the same container anywhere
@@ -223,7 +228,8 @@ Pitch calibration, event detection and reviewer decisions run on the Railway
 worker itself (CPU, a few seconds per match; applying a pitch setup to a
 moving camera re-reads the video once, about a minute). They are stored next
 to each job on the `/data` volume: `calibration.json`, `review.json`
-(append-only), `analysis.json` (a cache). Saved venues live in
+(append-only), `details.json` (team names, title, match date), `analysis.json`
+(a cache). Saved venues live in
 `/data/venues/`. The website needs no new variables; redeploy both the worker
 and the site so the new `/analysis`, `/calibration`, `/review` and `/venues`
 routes exist on both sides.

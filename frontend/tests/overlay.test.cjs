@@ -7,7 +7,7 @@ const ts = require('typescript');
 const source = fs.readFileSync(path.join(__dirname, '../lib/review/overlay.ts'), 'utf8');
 const mod = { exports: {} };
 new Function('module', 'exports', ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText)(mod, mod.exports);
-const { overlayAt, playerMaps } = mod.exports;
+const { overlayAt, playerMaps, zoomCrop, zoomToSource } = mod.exports;
 
 const player = (id, x, y = 100) => ({ id, team: 0, box: [x, y, x + 20, y + 40], confidence: 0.9 });
 const frame = (t, players, { scene = 0, ball = { x: 10 * t, y: 50, box: null, confidence: 0.8 } } = {}) => ({ t, scene, players, ball });
@@ -51,4 +51,30 @@ test('the ball is never interpolated', () => {
 
 test('an index with no frame draws nothing', () => {
   assert.deepEqual(at([], 0, 0), { players: [], ball: null });
+});
+
+test('a tap at the centre of the zoomed view is the tap that opened it', () => {
+  const crop = zoomCrop(320, 180, 640, 360, 5);
+  assert.deepEqual(crop, { x0: 256, y0: 144, w: 128, h: 72 });
+  assert.deepEqual(zoomToSource(crop, 0.5, 0.5), { x: 320, y: 180 });
+});
+
+test('the corners of the zoomed view map to the corners of the crop', () => {
+  // 4x: a 160 x 90 crop around (300, 200).
+  const crop = zoomCrop(300, 200, 640, 360, 4);
+  assert.deepEqual(zoomToSource(crop, 0, 0), { x: 220, y: 155 });
+  assert.deepEqual(zoomToSource(crop, 1, 1), { x: 380, y: 245 });
+  assert.deepEqual(zoomToSource(crop, 1, 0), { x: 380, y: 155 });
+  // A tap just outside the drawn crop stays on its edge.
+  assert.deepEqual(zoomToSource(crop, 1.2, -0.1), { x: 380, y: 155 });
+});
+
+test('a crop opened at the frame edge is moved inside the frame, and taps still land right', () => {
+  const corner = zoomCrop(5, 350, 640, 360, 5);
+  assert.deepEqual(corner, { x0: 0, y0: 288, w: 128, h: 72 });
+  // The far-left corner itself, at the left edge of the crop.
+  assert.deepEqual(zoomToSource(corner, 5 / 128, (350 - 288) / 72), { x: 5, y: 350 });
+  const right = zoomCrop(639, 1, 640, 360, 5);
+  assert.deepEqual(right, { x0: 512, y0: 0, w: 128, h: 72 });
+  assert.deepEqual(zoomToSource(right, 1, 0), { x: 640, y: 0 });
 });

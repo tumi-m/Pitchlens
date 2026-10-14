@@ -1,4 +1,4 @@
-import { test, expect, Page, Route } from "@playwright/test";
+import { test, expect, Page, Route, Locator } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -87,6 +87,11 @@ function analysis(calibrated: boolean, shotStatus: "proposed" | "confirmed" = "p
   };
 }
 
+/** The saved-footage controls and processing times sit below the report, in a closed "Analyse again". */
+async function openAnalyseAgain(page: Page) {
+  await page.getByTestId("analyse-again").locator("summary").click();
+}
+
 async function mockReport(page: Page, opts: { calibrated: boolean }) {
   const state = { calibrated: opts.calibrated, shot: "proposed" as "proposed" | "confirmed", reviews: [] as unknown[], previews: 0, saves: [] as unknown[] };
   await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false, analytics: true } }));
@@ -97,7 +102,7 @@ async function mockReport(page: Page, opts: { calibrated: boolean }) {
   await page.route(new RegExp(`/api/vision/jobs/${ID}/video`), (r) =>
     r.fulfill({ status: 200, body: VIDEO, headers: { "content-type": "video/mp4", "accept-ranges": "bytes" } }),
   );
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: analysis(state.calibrated, state.shot) }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: analysis(state.calibrated, state.shot) }));
   await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration(\\?.*)?$`), async (r: Route) => {
     if (r.request().method() === "POST") {
       state.saves.push(r.request().postDataJSON());
@@ -150,7 +155,8 @@ test("an uncalibrated match shows possession and passes, and withholds shots ins
   await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible();
   await expect(page.getByText("Unlock shots, heatmaps and positions")).toBeVisible();
   await expect(page.locator('[data-stat="Shots"]')).toContainText("—");
-  await expect(page.locator('[data-stat="Passes"]')).toContainText("4");
+  // Passes are shown with where their review stands (none confirmed yet), not withheld.
+  await expect(page.locator('[data-stat="Passes"]')).toContainText("0 confirmed so far · check them all");
   await expect(page.getByText("75%").first()).toBeVisible();
 });
 
@@ -161,7 +167,7 @@ test("high ball coverage without control is not presented as verified ball accur
   data.stats.coverage.ballStatePercent = 90;
   data.stats.coverage.possessionPercent = 0;
   data.stats.coverage.possessionShown = false;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), r => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), r => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await expect(page.getByText("Ball detections did not establish possession")).toBeVisible();
   await expect(page.getByText("Ball position coverage 90%")).toBeVisible();
@@ -181,6 +187,7 @@ test("saved footage can start a new section without uploading the file again", a
   });
   await page.route(new RegExp(`/api/vision/jobs/${next}$`), r => r.fulfill({ json: { id: next, status: "processing", progress: 5, stage: "Detecting players", title: "Friday 5s" } }));
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   await page.getByLabel("Saved video test start").fill("2");
   await page.getByRole("button", { name: "Test 20 seconds" }).click();
   await expect(page).toHaveURL(`/vision/${next}`);
@@ -203,7 +210,10 @@ test("full-match reruns start at zero and retry with the same reservation ID", a
   });
   await page.route(new RegExp(`/api/vision/jobs/${next}$`), r => r.fulfill({ json: { id: next, status: "processing", progress: 5, stage: "Detecting players", title: "Friday 5s" } }));
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   await page.getByLabel("Saved video test start").fill("2");
+  // A full run asks first (Playwright dismisses dialogs unless told otherwise).
+  page.once("dialog", (d) => d.accept());
   await page.getByRole("button", { name: "Analyse full match" }).click();
   await expect(page).toHaveURL(`/vision/${next}`);
   expect(requests).toHaveLength(2);
@@ -331,7 +341,7 @@ test("unreviewed events are excluded from headline counts and uncertainty is not
   await page.goto(`/vision/${ID}`);
   await expect(page.getByText("Assisted review", { exact: true })).toBeVisible();
   const shots = page.locator('[data-stat="Shots"]');
-  await expect(shots).toContainText("0 confirmed · 1 to review");
+  await expect(shots).toContainText("0 confirmed so far · 1 to review");
   await expect(shots).toContainText("—");
   await expect(page.getByText(/^95%:/)).toHaveCount(0);
   await page.getByRole("button", { name: "Start reviewing" }).click();
@@ -425,7 +435,7 @@ test("checked passes turn unchecked detections into an estimate with a range", a
   data.stats.teams[0].passes = { value: 48, confirmed: 8, pending: 40, checked: 20, checkedCorrect: 15, estimate: 38, estimateRange: [29, 44] } as never;
   data.stats.teams[1].passes = { value: 30, confirmed: 2, pending: 28, checked: 20 } as never;
   data.review = { ...data.review, pending: 70, pendingKey: 2, pendingByType: { pass: 68, shot: 2 } } as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const passes = page.locator('[data-stat="Passes"]');
   await expect(passes).toContainText("≈38");
@@ -564,7 +574,7 @@ test("passes checked in the random-sample view are marked as sampled", async ({ 
   const state = await mockReport(page, { calibrated: false });
   const data = analysis(false);
   data.events = Array.from({ length: 12 }, (_, i) => ({ id: `ev-${i}`, type: "pass", t: i, team: i % 2, confidence: 0.6, status: "proposed", outcome: "complete" })) as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: /Enter the score and review|Review/ }).first().click();
   await page.getByRole("tab", { name: "Check a sample" }).click();
@@ -583,7 +593,7 @@ test("a won ball is checked as an interception or recovery, not as an intercepti
     { id: "i1", type: "interception", t: 1, team: 0, confidence: 0.6, status: "proposed" },
     { id: "i2", type: "interception", t: 2, team: 1, confidence: 0.6, status: "proposed" },
   ] as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: /Enter the score and review|Review/ }).first().click();
   await page.getByRole("tab", { name: "Check a sample" }).click();
@@ -676,7 +686,7 @@ test("a player-load job leads with the distance it measured, not dashes, unmeasu
     frames: base.frames.map((f) => ({ ...f, ball: null })),
   };
   await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: playerLoadAnalysis() }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: playerLoadAnalysis() }));
   await page.goto(`/vision/${ID}`);
   const hero = page.getByTestId("report-hero");
   await expect(hero).toContainText("4321.9");
@@ -691,6 +701,7 @@ test("a player-load job leads with the distance it measured, not dashes, unmeasu
   await expect(page.getByText(/could only be followed for 0%/)).toHaveCount(0);
   for (const stat of ["Observed control share", "Passes", "Shots", "Interceptions & recoveries", "Tackles", "Field tilt"])
     await expect(page.locator(`[data-stat="${stat}"]`)).toHaveCount(0);
+  await openAnalyseAgain(page);
   await expect(page.getByText(/ball model not run/)).toBeVisible();
   // Score entry and manual goals still work, and the pitch setup is still offered.
   await expect(page.getByRole("button", { name: /Enter the score and review/ })).toBeVisible();
@@ -704,7 +715,7 @@ test("a ball job shows the distance too, keeps its coverage chips, and an unmeas
   const data = analysis(false);
   data.stats.coverage.deadBallSeconds = 42;
   await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: withLoad }));
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const distance = page.locator('[data-stat="Distance"]');
   await expect(distance).toContainText("1234.5 m");
@@ -731,7 +742,7 @@ test("the score says which possible goals are still to check instead of a hard 0
     data.stats.teams[1].goals = { value: 0, candidates: reviewed ? 0 : 2 };
     return data;
   };
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: scored() }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: scored() }));
   await page.goto(`/vision/${ID}`);
   await expect(page.getByTestId("report-hero")).toHaveText(/1\s*–\s*0/);
   await expect(page.getByText("1 confirmed · 2 possible goals still to check")).toBeVisible();
@@ -751,7 +762,7 @@ test("a highlight is named by its most important moment: a confirmed possible go
     { id: "s1", type: "shot", t: 2, team: 0, confidence: 0.6, status: "proposed", outcome: "goal-candidate", x: 39, y: 10 },
     { id: "g1", type: "goal-candidate", t: 2, team: 0, confidence: 0.45, status: "confirmed" },
   ] as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const bar = page.getByTestId("highlights");
   await bar.getByRole("button", { name: "Play highlights (1)" }).click();
@@ -767,7 +778,7 @@ test("a reviewer's goal after an automatic shot is one highlight, labelled and t
     { id: "s1", type: "shot", t: 1, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 35, y: 10 },
     { id: "added-1", type: "goal", t: 3, team: 0, confidence: 1, status: "confirmed", source: "manual" },
   ] as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const bar = page.getByTestId("highlights");
   await bar.getByRole("button", { name: "Play highlights (1)" }).click();
@@ -781,7 +792,7 @@ test("a run of close shots is one highlight that plays through every shot", asyn
   await mockReport(page, { calibrated: true });
   const data = analysis(true);
   data.events = [0.5, 3, 5.5, 8].map((t, i) => ({ id: `s${i}`, type: "shot", t, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 35, y: 10 })) as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const bar = page.getByTestId("highlights");
   await bar.getByRole("button", { name: "Play highlights (1)" }).click();
@@ -798,7 +809,7 @@ test("a review clip ending never hands the video back to the highlight reel", as
     { id: "ev-1", type: "shot", t: 3.9, team: 1, confidence: 0.6, status: "proposed", outcome: "off-target", x: 30, y: 10 },
   ] as never;
   data.review.pending = 2;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const bar = page.getByTestId("highlights");
   await expect(bar).toBeVisible();
@@ -984,7 +995,7 @@ test("dragging the video's own scrubber stops the highlight reel", async ({ page
     { id: "ev-0", type: "shot", t: 0.6, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 30, y: 10 },
     { id: "ev-1", type: "shot", t: 3.9, team: 1, confidence: 0.6, status: "proposed", outcome: "off-target", x: 30, y: 10 },
   ] as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   const bar = page.getByTestId("highlights");
   await expect(bar).toBeVisible();
@@ -1022,9 +1033,10 @@ for (const [name, timings] of [
       frames: base.frames.map((f) => ({ ...f, ball: null })),
     };
     await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
-    await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: playerLoadAnalysis() }));
+    await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: playerLoadAnalysis() }));
     await page.goto(`/vision/${ID}`);
     await expect(page.getByTestId("report-hero")).toContainText("98.2");
+    await openAnalyseAgain(page);
     const times = page.getByTestId("processing-times");
     await expect(times).toHaveText("Processing took 58.9s on cpu · players 41.2s · ball model not run.");
     await expect(page.getByText("Application error")).toHaveCount(0);
@@ -1039,7 +1051,7 @@ test("a shot read as a possible goal says confirming it is not a goal, and Goal 
     { id: "s1", type: "shot", t: 2, team: 0, confidence: 0.6, status: "proposed", outcome: "goal-candidate", onTarget: true, x: 35, y: 10 },
     { id: "g1", type: "goal-candidate", t: 2, team: 0, confidence: 0.45, status: "proposed", x: 35, y: 10 },
   ] as never;
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: "Start reviewing" }).click();
   await expect(page.getByRole("heading", { name: "Review moments" })).toBeVisible();
@@ -1090,7 +1102,7 @@ test("the classic report shows a measured kit's distance and — for an unmeasur
   page.on("pageerror", (e) => errors.push(e));
   await mockReport(page, { calibrated: false });
   // Analytics unavailable (an older worker): the classic match centre is shown.
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ status: 404, json: { detail: "Not found" } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ status: 404, json: { detail: "Not found" } }));
   const base = result();
   const loadOnly = {
     ...base,
@@ -1125,7 +1137,7 @@ test("a set-up pitch on a player-load job says shots were not looked for, not 'n
     stats: { ...pl.stats, shotMap: [], heatmaps: calibrated.stats.heatmaps, coverage: { ...pl.stats.coverage, calibratedPercent: 100, shotsBasis: "no-ball" } },
   };
   await page.route(new RegExp(`/api/vision/jobs/${ID}/result$`), (r) => r.fulfill({ json: loadOnly }));
-  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis$`), (r) => r.fulfill({ json: data }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`), (r) => r.fulfill({ json: data }));
   await page.goto(`/vision/${ID}`);
   await expect(page.getByRole("heading", { name: /Shot map/ })).toBeVisible();
   await expect(page.getByTestId("shot-map-empty")).toHaveText("Shots are not looked for in a player-load job; add any you saw in the review.");
@@ -1135,7 +1147,7 @@ test("a set-up pitch on a player-load job says shots were not looked for, not 'n
 const JOB = { id: ID, title: "Friday 5s", status: "completed", stage: "Analysis complete", progress: 100, createdAt: 0 };
 const jobRoute = new RegExp(`/api/vision/jobs/${ID}$`);
 const resultRoute = new RegExp(`/api/vision/jobs/${ID}/result$`);
-const analysisRoute = new RegExp(`/api/vision/jobs/${ID}/analysis$`);
+const analysisRoute = new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`);
 
 /** A player-load job: the ball model was not run, so the engine wrote no ball timing. */
 export function playerLoadResult() {
@@ -1163,7 +1175,9 @@ test("a player-load result (ball model not run) renders the report", async ({ pa
   await mockReport(page, { calibrated: false });
   await page.route(resultRoute, (r) => r.fulfill({ json: playerLoadResult() }));
   await page.goto(`/vision/${ID}`);
-  await expect(page.getByRole("heading", { name: "Player load" })).toBeVisible();
+  // The banner (h2); the report's own "Player load" group (h3) now draws at the same time.
+  await expect(page.getByRole("heading", { name: "Player load", level: 2 })).toBeVisible();
+  await openAnalyseAgain(page);
   await expect(page.getByText("Processing took 137.3s on cpu · players 126.4s · ball model not run.")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible();
   expect(await page.locator("main").innerText()).not.toMatch(/undefined|NaN/);
@@ -1399,6 +1413,7 @@ test("the saved-footage test starts after the analysed section by default", asyn
     r.fulfill({ json: { ...data, video: { ...data.video, duration: 180.18 }, analysedStart: 90, analysedDuration: 20, frames: data.frames.map((f) => ({ ...f, t: 90 + f.t })) } }),
   );
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   await expect(page.getByLabel("Saved video test start")).toHaveValue("110");
 });
 
@@ -1424,12 +1439,17 @@ test("review guidance asks for every check when too few moments exist to sample"
   await expect(advice).toContainText("2 won balls found: check all 2");
   await expect(page.getByText("about ten", { exact: false })).toHaveCount(0);
   await expect(page.getByText("more checks", { exact: false })).toHaveCount(0);
-  // The per-team notes no longer repeat the sampling need.
-  for (const stat of ["Passes", "Interceptions & recoveries"]) await expect(page.locator(`[data-stat="${stat}"]`)).toContainText("0 confirmed · 1 to review");
-  // Three different counts, each labelled for what it counts.
+  // Sampled types never say "to review": too few to sample means check them all.
+  for (const stat of ["Passes", "Interceptions & recoveries"]) {
+    await expect(page.locator(`[data-stat="${stat}"]`)).toContainText("0 confirmed so far · check them all for the exact count");
+    await expect(page.locator(`[data-stat="${stat}"]`)).not.toContainText("to review");
+  }
+  // Three different counts, each labelled for what it counts: unreviewed won balls
+  // stay off the timeline until asked for, and the review card asks for the sample.
   await expect(page.getByText("0 shots and goals to check", { exact: false })).toBeVisible();
-  await expect(page.getByText("2 moments on the timeline", { exact: false })).toBeVisible();
-  await expect(page.getByText("4 automatic moments to check", { exact: false })).toBeVisible();
+  await expect(page.getByText("0 moments on the timeline", { exact: false })).toBeVisible();
+  await expect(page.getByTestId("review-summary")).toHaveText("0 shots or goals to check · check all 2 passes and all 2 won balls to estimate the rest. Confirmed goals set the score.");
+  await expect(page.getByText("4 automatic moments to check", { exact: false })).toHaveCount(0);
 });
 
 test("footage that disappears is reported as deleted, not as a codec problem", async ({ page }) => {
@@ -1463,6 +1483,7 @@ test("an action on a match deleted in another tab shows the deleted-match messag
   await mockReport(page, { calibrated: false });
   await page.route(new RegExp(`/api/vision/jobs/${ID}/rerun\\?`), (r) => r.fulfill({ status: 404, json: { detail: "Job not found" } }));
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   await page.getByRole("button", { name: "Test 20 seconds" }).click();
   await expect(page.getByRole("alert").filter({ hasText: "This match was deleted" })).toBeVisible();
   await expect(page.getByText("Job not found")).toHaveCount(0);
@@ -1502,6 +1523,7 @@ for (const run of [
       }),
     );
     await page.goto(`/vision/${ID}`);
+    await openAnalyseAgain(page);
     await expect(page.getByText("Processing took 60.0s on cpu · players 40.0s · ball 10.0s.")).toBeVisible();
     if (run.expect) await expect(page.getByText(run.expect, { exact: false })).toBeVisible();
     await expect(page.getByText(run.absent, { exact: false })).toHaveCount(0);
@@ -1688,6 +1710,7 @@ test("a player-load report can test 20 seconds with the ball model", async ({ pa
   await page.route(resultRoute, (r) => r.fulfill({ json: playerLoadResult() }));
   const { next, requests } = await mockRerun(page);
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   await expect(page.getByLabel("Run the ball model (possession, passes, shots)")).not.toBeChecked();
   await page.getByRole("button", { name: "Test 20 seconds with the ball model" }).click();
   await expect(page).toHaveURL(`/vision/${next}`);
@@ -1700,6 +1723,7 @@ test("unticking the ball model reruns a section without it", async ({ page }) =>
   await mockReport(page, { calibrated: false });
   const { next, requests } = await mockRerun(page);
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   const ball = page.getByLabel("Run the ball model (possession, passes, shots)");
   await expect(ball).toBeChecked();
   await ball.uncheck();
@@ -1717,6 +1741,7 @@ test("the daily limit on a rerun says when analysis resumes", async ({ page }) =
     return r.fulfill({ status: 429, json: { detail: "This server has reached its limit of 30 analyses in 24 hours.", code: "daily-limit", resetsAt } });
   });
   await page.goto(`/vision/${ID}`);
+  await openAnalyseAgain(page);
   await page.getByRole("button", { name: "Test 20 seconds", exact: true }).click();
   await expect(page.getByRole("alert").filter({ hasText: "Analysis is paused until" })).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: "daily limit" })).toBeVisible();
@@ -1747,3 +1772,786 @@ for (const aligned of [true, false]) {
     await expect(page.getByLabel("Name for kit B")).toHaveValue(aligned ? "Tigers" : "Kit B");
   });
 }
+
+/** A full match whose passes are still being sampled: 12 unchecked, no shots or goals left. */
+function sampling() {
+  const data = analysis(false);
+  data.events = Array.from({ length: 12 }, (_, i) => ({ id: `p${i}`, type: "pass", t: i * 0.3, team: i % 2, confidence: 0.6, status: "proposed", outcome: "complete" })) as never;
+  data.review = { ...data.review, pending: 12, pendingKey: 0, pendingByType: { pass: 12 } } as never;
+  return data;
+}
+const fontSize = (l: Locator) => l.evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
+const box = async (l: Locator) => (await l.boundingBox())!;
+
+test("a count still being reviewed reads N+, with no comparison bar or leader next to an estimate", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.stats.teams[0].passes = { value: 105, confirmed: 8, pending: 97, checked: 10, checkedCorrect: 8, estimate: 105, estimateRange: [66, 123] } as never;
+  data.stats.teams[1].passes = { value: 83, confirmed: 5, pending: 78, checked: 10, checkedCorrect: 8, estimate: 83, estimateRange: [51, 98] } as never;
+  data.stats.teams[0].passesComplete = { value: 73, confirmed: 3, pending: 70, checked: 5 } as never;
+  data.stats.teams[1].passesComplete = { value: 42, confirmed: 1, pending: 41, checked: 5 } as never;
+  data.review = { ...data.review, pending: 175, pendingKey: 0, pendingByType: { pass: 175 } } as never;
+  await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const accurate = page.locator('[data-stat="Accurate passes"]');
+  await expect(accurate).toContainText("3+");
+  await expect(accurate).toContainText("1+");
+  await expect(accurate).toContainText("3 confirmed so far");
+  await expect(accurate.getByTestId("stat-bar")).toHaveCount(0);
+  await expect(accurate.locator('span[style*="background"]')).toHaveCount(0);
+  // Two estimates stay comparable.
+  const passes = page.locator('[data-stat="Passes"]');
+  await expect(passes).toContainText("≈105");
+  await expect(passes.getByTestId("stat-bar")).toHaveCount(1);
+  // Ten passes checked is not ten checked passes the detector called complete.
+  const advice = page.getByTestId("sample-advice");
+  await expect(advice).toContainText("accurate passes 5/10");
+  await expect(advice).toContainText("Accurate passes need 10 checked passes the detector called complete (5 so far)");
+  await expect(advice).not.toContainText("enough checked");
+  await expect(page.locator('[data-stat="Shots"]')).toContainText("—");
+});
+
+test("possession that splits 59.5 / 40.5 reads 60% and 40%, adding up to 100", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = analysis(false);
+  data.stats.teams[0].possession = 59.5;
+  data.stats.teams[1].possession = 40.5;
+  await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const row = page.locator('[data-stat="Observed control share"]');
+  await expect(row).toContainText("60%");
+  await expect(row).toContainText("40%");
+  await expect(row).not.toContainText("41%");
+});
+
+test("the review card and the sampled notes ask for a random sample, not every automatic moment", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const data = analysis(true);
+  data.review = { ...data.review, pending: 354, pendingKey: 0, pendingByType: { pass: 235, interception: 119 } } as never;
+  await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+  await page.goto(`/vision/${ID}`);
+  const card = page.getByTestId("review-summary");
+  await expect(card).toContainText("0 shots or goals to check · check 10 random passes and 10 random won balls to estimate the rest");
+  await expect(card).toContainText("Confirmed goals set the score.");
+  await expect(card).not.toContainText("354");
+  const passes = page.locator('[data-stat="Passes"]');
+  await expect(passes).toContainText("check 10 at random");
+  await expect(passes).not.toContainText("to review");
+  // Shots are checked one by one.
+  await expect(page.locator('[data-stat="Shots"]')).toContainText("1 to review");
+});
+
+test("a finished 20-second test leads with analysing the full match, no new upload needed", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const data = result();
+  await page.route(jobRoute, (r) => r.fulfill({ json: { ...JOB, maxSeconds: 20, startSeconds: 90 } }));
+  await page.route(resultRoute, (r) =>
+    r.fulfill({ json: { ...data, video: { ...data.video, duration: 180.2 }, analysedStart: 90, analysedDuration: 20, frames: data.frames.map((f) => ({ ...f, t: 90 + f.t })) } }),
+  );
+  const { requests } = await mockRerun(page);
+  await page.goto(`/vision/${ID}`);
+  const note = page.getByTestId("span-note");
+  await expect(note).toContainText("This was a 20-second test (1:30–1:50). Analyse the full match now, no new upload needed.");
+  await expect(note).toContainText("Diagnostic section: 1:30–1:50");
+  expect((await box(note)).y).toBeLessThan((await box(page.getByTestId("score-card"))).y);
+  const full = note.getByRole("button", { name: "Analyse full match" });
+  await expect(full).toBeVisible();
+  // A test section has no next-steps card, and the disclosure does not offer the full match twice.
+  await expect(page.getByTestId("next-steps")).toHaveCount(0);
+  await openAnalyseAgain(page);
+  await expect(page.getByRole("button", { name: "Analyse full match" })).toHaveCount(1);
+  page.once("dialog", (d) => d.accept());
+  await full.click();
+  await expect.poll(() => requests.length).toBe(1);
+  expect(requests[0].searchParams.get("mode")).toBe("full");
+});
+
+test.describe("the report on a phone", () => {
+  test.use({ viewport: { width: 390, height: 664 }, hasTouch: true, isMobile: true });
+
+  test("opens on the score; re-runs, processing times and model names sit below the report, and a full re-run asks first", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.route(resultRoute, (r) => r.fulfill({ json: { ...result(), ballModel: "ball.pt", performance: { totalSeconds: 60, device: "cpu", playerInferenceSeconds: 40, ballInferenceSeconds: 10 } } }));
+    const { requests } = await mockRerun(page);
+    await page.goto(`/vision/${ID}`);
+    const card = page.getByTestId("score-card");
+    await expect(card).toBeVisible();
+    expect((await box(card)).y).toBeLessThan(664);
+    await expect(page.locator("main header")).not.toContainText("players.pt");
+    await expect(page.getByTestId("models")).toContainText("Player model: players.pt");
+    await expect(page.getByTestId("models")).toContainText("Ball model: ball.pt");
+    await expect(page.getByTestId("processing-times")).toBeHidden();
+    const full = page.getByRole("button", { name: "Analyse full match" });
+    await expect(full).toBeHidden();
+    await openAnalyseAgain(page);
+    await expect(full).toBeVisible();
+    await expect(page.getByTestId("processing-times")).toBeVisible();
+    page.once("dialog", (d) => d.dismiss());
+    await full.tap();
+    await page.waitForTimeout(500);
+    expect(requests).toHaveLength(0);
+    page.once("dialog", (d) => d.accept());
+    await full.tap();
+    await expect.poll(() => requests.length).toBe(1);
+    expect(requests[0].searchParams.get("mode")).toBe("full");
+  });
+
+  test("a test section keeps its notice above the score", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    const data = result();
+    await page.route(jobRoute, (r) => r.fulfill({ json: { ...JOB, maxSeconds: 20, startSeconds: 90 } }));
+    await page.route(resultRoute, (r) =>
+      r.fulfill({ json: { ...data, video: { ...data.video, duration: 180.2 }, analysedStart: 90, analysedDuration: 20, frames: data.frames.map((f) => ({ ...f, t: 90 + f.t })) } }),
+    );
+    await page.goto(`/vision/${ID}`);
+    const note = page.getByTestId("span-note");
+    await expect(note).toContainText("These results do not describe the full match.");
+    expect((await box(note)).y).toBeLessThan((await box(page.getByTestId("score-card"))).y);
+  });
+
+  test("a next-steps card under the score lists what to do and each step does it", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.route(analysisRoute, (r) => r.fulfill({ json: sampling() }));
+    await page.goto(`/vision/${ID}`);
+    const steps = page.getByTestId("next-steps");
+    await expect(steps).toBeVisible();
+    const card = await box(page.getByTestId("score-card"));
+    const gap = (await box(steps)).y - (card.y + card.height);
+    expect(gap).toBeGreaterThanOrEqual(0);
+    expect(gap).toBeLessThanOrEqual(32);
+    await expect(steps).toContainText("Next steps · 0 of 4 done");
+    await steps.getByRole("button", { name: /^Next steps/ }).tap();
+    for (const label of ["Name the teams", "Enter the final score", "Check a sample", "Set up the pitch"]) await expect(steps).toContainText(label);
+    await expect(steps).toContainText("passes 0/10");
+    await expect(steps).toContainText("Unlocks shots, tackles, heatmaps");
+    await steps.getByRole("button", { name: "Enter the final score" }).tap();
+    await expect(page.getByLabel("Goals for Kit A")).toBeFocused();
+    await steps.getByRole("button", { name: "Check a sample" }).dispatchEvent("click");
+    await expect(page.getByRole("tab", { name: "Check a sample" })).toHaveAttribute("aria-selected", "true");
+    await steps.getByRole("button", { name: "Set up the pitch" }).dispatchEvent("click");
+    await expect(page.getByTestId("calibration-next")).toBeVisible();
+  });
+
+  test("finished steps say Done, and a player-load job has no sample step", async ({ page }) => {
+    await page.addInitScript((id) => localStorage.setItem(`vision-names-${id}`, JSON.stringify(["Lions", "Tigers"])), ID);
+    await mockReport(page, { calibrated: false });
+    await page.route(analysisRoute, (r) => r.fulfill({ json: { ...sampling(), enteredScore: [2, 1] } }));
+    await page.goto(`/vision/${ID}`);
+    const steps = page.getByTestId("next-steps");
+    await expect(steps).toContainText("2 of 4 done");
+    await steps.getByRole("button", { name: /^Next steps/ }).tap();
+    await expect(steps.locator('[data-step="names"]')).toContainText("Done");
+    await expect(steps.locator('[data-step="score"]')).toContainText("Done");
+    await expect(steps.locator('[data-step="sample"]')).not.toContainText("Done");
+    await page.route(resultRoute, (r) => r.fulfill({ json: playerLoadResult() }));
+    await page.route(analysisRoute, (r) => r.fulfill({ json: playerLoadAnalysis() }));
+    await page.reload();
+    await expect(steps).toContainText("of 3 done");
+    await expect(steps.locator('[data-step="sample"]')).toHaveCount(0);
+  });
+
+  test("pitch setup names the next landmark under the video, and a first tap zooms in for the second to place", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.goto(`/vision/${ID}`);
+    await page.getByRole("button", { name: "Set up the pitch" }).first().tap();
+    const strip = page.getByTestId("calibration-next");
+    await expect(strip).toContainText("Next: Far-left corner · tap it on the video");
+    await expect.poll(async () => {
+      const s = await strip.boundingBox();
+      const v = await page.locator("video").boundingBox();
+      return !!s && !!v && s.y >= v.y + v.height - 1 && s.y + s.height <= 664;
+    }).toBe(true);
+    const close = await box(strip.getByRole("button", { name: "Close" }));
+    const hit = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest("button")?.textContent?.trim(), [close.x + close.width / 2, close.y + close.height / 2]);
+    expect(hit).toBe("Close");
+    const overlay = page.getByTestId("calibration-overlay");
+    const o = await box(overlay);
+    await overlay.tap({ position: { x: o.width * 0.1, y: o.height * 0.1 } });
+    const zoom = page.getByTestId("calibration-zoom");
+    await expect(zoom).toBeVisible();
+    await expect(strip).toContainText("tap exactly on it");
+    await expect(page.getByText("0 landmarks ·")).toBeAttached();
+    const z = await box(zoom.locator("canvas"));
+    await zoom.locator("canvas").tap({ position: { x: z.width / 2, y: z.height / 2 } });
+    await expect(page.getByText("1 landmark ·")).toBeAttached();
+    await expect(zoom).toHaveCount(0);
+    await expect(strip).toContainText("Next: Far-right corner");
+  });
+});
+
+test("on a desktop a click on the video places the landmark directly", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Set up the pitch" }).first().click();
+  const overlay = page.getByTestId("calibration-overlay");
+  const o = await box(overlay);
+  await overlay.click({ position: { x: o.width * 0.1, y: o.height * 0.1 } });
+  await expect(page.getByText("1 landmark ·")).toBeVisible();
+  await expect(page.getByTestId("calibration-zoom")).toHaveCount(0);
+});
+
+test.describe("entering the score on a phone", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript((id) => localStorage.setItem(`vision-names-${id}`, JSON.stringify(["Tekkerz United Reserves", "PUSHIT Legends FC"])), ID);
+  });
+
+  test("'Enter the score and review' shows the score box below the video, with the cursor in it, and the row fits the screen", async ({ page }) => {
+    await mockReport(page, { calibrated: true });
+    await page.goto(`/vision/${ID}`);
+    await page.getByRole("button", { name: /Enter the score and review/ }).tap();
+    const goals = page.getByLabel("Goals for Tekkerz United Reserves");
+    await expect(goals).toBeFocused();
+    await expect.poll(async () => {
+      const g = await goals.boundingBox();
+      const v = await page.locator("video").boundingBox();
+      if (!g || !v) return "no boxes";
+      const hit = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.getAttribute("aria-label") ?? document.elementFromPoint(x, y)?.tagName, [g.x + g.width / 2, g.y + g.height / 2]);
+      return g.y >= v.y + v.height - 1 && g.y + g.height <= 844 ? hit : `top ${g.y} under the video (${v.y + v.height})`;
+    }).toBe("Goals for Tekkerz United Reserves");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    const save = await box(page.getByRole("button", { name: "Save score" }));
+    const scoreBox = await box(page.getByTestId("final-score"));
+    expect(save.x + save.width).toBeLessThanOrEqual(390);
+    expect(save.x).toBeGreaterThanOrEqual(scoreBox.x);
+    expect(save.x + save.width).toBeLessThanOrEqual(scoreBox.x + scoreBox.width);
+  });
+
+  test("with no shots or goals left, Start reviewing opens on the random sample", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.route(analysisRoute, (r) => r.fulfill({ json: sampling() }));
+    await page.goto(`/vision/${ID}`);
+    await page.getByRole("button", { name: "Start reviewing" }).tap();
+    await expect(page.getByRole("tab", { name: "Check a sample" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  test("with shots to check, Start reviewing opens on them", async ({ page }) => {
+    await mockReport(page, { calibrated: true });
+    const data = analysis(true);
+    data.review = { ...data.review, pending: 13, pendingKey: 1, pendingByType: { shot: 1, pass: 12 } } as never;
+    await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+    await page.goto(`/vision/${ID}`);
+    await page.getByRole("button", { name: "Start reviewing" }).tap();
+    await expect(page.getByRole("tab", { name: "Shots & key moments" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  test("hero team names get room: two lines at most for a long name", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.goto(`/vision/${ID}`);
+    const names = page.getByTestId("hero-name");
+    for (const i of [0, 1])
+      expect(await names.nth(i).evaluate((el) => Math.round(el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight)))).toBeLessThanOrEqual(2);
+  });
+});
+
+test.describe("the score card on a phone", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("short team names stay on one line, the card stays compact and the score action is a real button", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.goto(`/vision/${ID}`);
+    const names = page.getByTestId("hero-name");
+    for (const i of [0, 1])
+      expect(await names.nth(i).evaluate((el) => el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight))).toBeLessThanOrEqual(1.5);
+    expect((await box(page.getByTestId("score-card"))).height).toBeLessThanOrEqual(400);
+    expect((await box(page.getByRole("button", { name: /Enter the score and review/ }))).height).toBeGreaterThanOrEqual(44);
+  });
+
+  test("text fields are at least 16 px, so iOS Safari does not zoom in", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.goto(`/vision/${ID}`);
+    await openAnalyseAgain(page);
+    expect(await fontSize(page.getByLabel("Saved video test start"))).toBeGreaterThanOrEqual(16);
+    await page.getByRole("button", { name: /Enter the score and review/ }).tap();
+    expect(await fontSize(page.getByLabel("Goals for Kit A"))).toBeGreaterThanOrEqual(16);
+    await page.getByRole("button", { name: "Set up the pitch" }).first().dispatchEvent("click");
+    await expect(page.getByTestId("calibration-next")).toBeVisible();
+    for (const label of ["Pitch type", "Length (m)", "Landmark to place", "Lens distortion"])
+      expect(await fontSize(page.getByLabel(label))).toBeGreaterThanOrEqual(16);
+  });
+
+  test("Why buttons, review arrows and heatmap toggles are big enough to tap, and caveats are readable", async ({ page }) => {
+    await mockReport(page, { calibrated: true });
+    const data = analysis(true);
+    data.stats.coverage = { ...data.stats.coverage, possessionMissingBounds: [45, 69] } as never;
+    data.stats.teams[0].passes = { value: 48, confirmed: 8, pending: 40, checked: 20, checkedCorrect: 15, estimate: 38, estimateRange: [29, 44] } as never;
+    await page.route(analysisRoute, (r) => r.fulfill({ json: data }));
+    await page.goto(`/vision/${ID}`);
+    const whys = page.getByRole("button", { name: /^Why:/ });
+    await expect(whys.first()).toBeVisible();
+    expect(await whys.count()).toBeGreaterThan(3);
+    for (const why of await whys.all()) {
+      const b = await box(why);
+      expect(Math.min(b.width, b.height)).toBeGreaterThanOrEqual(44);
+    }
+    for (const tab of await page.getByRole("tablist", { name: "Heatmap team" }).getByRole("tab").all())
+      expect((await box(tab)).height).toBeGreaterThanOrEqual(40);
+    expect(await fontSize(page.getByText("unseen-play bounds: 45–69%"))).toBeGreaterThanOrEqual(12);
+    expect(await fontSize(page.getByText("29–44 · 8 confirmed"))).toBeGreaterThanOrEqual(12);
+    await page.getByRole("button", { name: "Start reviewing" }).tap();
+    for (const name of ["Previous moment", "Next moment"]) {
+      const b = await box(page.getByRole("button", { name }));
+      expect(Math.min(b.width, b.height)).toBeGreaterThanOrEqual(44);
+    }
+  });
+
+  test("the pitch set-up link in the score card is a 44 px button", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.goto(`/vision/${ID}`);
+    expect((await box(page.getByRole("button", { name: "Pitch not set up · set it up" }))).height).toBeGreaterThanOrEqual(44);
+  });
+
+  test("Check a sample keeps Confirm in the same place from one moment to the next", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    const kinds = ["pass", "interception", "intercepted"];
+    let events = Array.from({ length: 9 }, (_, i) => {
+      const kind = kinds[i % 3];
+      return { id: `e${i}`, type: kind === "interception" ? "interception" : "pass", ...(kind === "interception" ? {} : { outcome: kind === "pass" ? "complete" : "intercepted" }), t: i * 0.4, team: i % 2, confidence: 0.6, status: "proposed" };
+    });
+    const data = () => ({ ...analysis(false), events, review: { decisions: 0, confirmed: 0, rejected: 0, pending: events.filter((e) => e.status === "proposed").length, pendingKey: 0, pendingByType: { pass: 6, interception: 3 } } });
+    let decisions = 0;
+    await page.route(analysisRoute, (r) => r.fulfill({ json: data() }));
+    await page.route(new RegExp(`/api/vision/jobs/${ID}/review$`), (r) => {
+      const id = r.request().postDataJSON().decisions[0].eventId;
+      events = events.map((e) => (e.id === id ? { ...e, status: "confirmed" } : e));
+      decisions++;
+      return r.fulfill({ json: { decisions, analysis: data() } });
+    });
+    await page.goto(`/vision/${ID}`);
+    await page.getByRole("button", { name: "Start reviewing" }).tap();
+    await expect(page.getByRole("tab", { name: "Check a sample" })).toHaveAttribute("aria-selected", "true");
+    const review = page.getByRole("region", { name: "Review moments" });
+    const confirm = page.getByRole("button", { name: /^Confirm/ });
+    const tops: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      // The decided moment leaves the sample: one fewer to go each time.
+      await expect(review.getByText(new RegExp(`^\\d+ / ${9 - i} ·`))).toBeVisible();
+      await expect(confirm).toBeEnabled();
+      // Both rectangles in one go: the page may still be scrolling.
+      tops.push(await confirm.evaluate((el) => el.getBoundingClientRect().top - el.closest("section")!.getBoundingClientRect().top));
+      await confirm.tap();
+      await expect.poll(() => decisions).toBe(i + 1);
+    }
+    expect(Math.max(...tops) - Math.min(...tops)).toBeLessThanOrEqual(1);
+  });
+
+  test("the match timeline lists key moments only, with every moment on request", async ({ page }) => {
+    await mockReport(page, { calibrated: true });
+    await page.route(analysisRoute, (r) => r.fulfill({ json: wonBalls() }));
+    await page.goto(`/vision/${ID}`);
+    const list = page.getByTestId("timeline-list");
+    await expect(list.getByRole("button")).toHaveCount(2);
+    await expect(page.getByTestId("timeline-strip")).toBeHidden();
+    for (const row of await list.getByRole("button").all()) expect((await box(row)).height).toBeGreaterThanOrEqual(44);
+    await page.getByRole("button", { name: /Show all moments/ }).tap();
+    await expect(list.getByRole("button")).toHaveCount(121);
+  });
+});
+
+/** 119 unreviewed won balls and 2 shots. */
+function wonBalls() {
+  const data = analysis(true);
+  data.events = [
+    ...Array.from({ length: 119 }, (_, i) => ({ id: `w${i}`, type: "interception", t: (i % 40) * 0.1, team: i % 2, confidence: 0.6, status: "proposed" })),
+    { id: "s1", type: "shot", t: 1, team: 0, confidence: 0.6, status: "proposed", outcome: "on-target", x: 30, y: 10 },
+    { id: "s2", type: "shot", t: 3, team: 1, confidence: 0.6, status: "proposed", outcome: "off-target", x: 30, y: 10 },
+  ] as never;
+  return data;
+}
+
+test("from md up the timeline strip shows the key moments only", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  await page.route(analysisRoute, (r) => r.fulfill({ json: wonBalls() }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByTestId("timeline-strip").getByRole("button")).toHaveCount(2);
+  await expect(page.getByTestId("timeline-list")).toBeHidden();
+});
+
+test("Share summary hands the share sheet a plain-text summary", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as unknown as { shared: { title?: string; text?: string }[] };
+    w.shared = [];
+    Object.defineProperty(navigator, "share", { configurable: true, value: async (data: { title?: string; text?: string }) => void w.shared.push(data) });
+  });
+  await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Share summary" }).click();
+  const shared = () => page.evaluate(() => (window as unknown as { shared: { title?: string; text?: string }[] }).shared);
+  await expect.poll(async () => (await shared()).length).toBe(1);
+  const [{ title, text }] = await shared();
+  expect(title).toBe("Friday 5s");
+  expect(text).toContain("Friday 5s");
+  expect(text).toContain("Kit A v Kit B");
+  expect(text).toContain("Score not entered");
+  expect(text).toMatch(/Shots: — – —/);
+  expect(text).not.toMatch(/http|b{32}/);
+});
+
+test("without a share sheet the summary is copied", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as unknown as { copied: string[] };
+    w.copied = [];
+    delete (Navigator.prototype as unknown as { share?: unknown }).share;
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => void w.copied.push(text) } });
+  });
+  await mockReport(page, { calibrated: false });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Share summary" }).click();
+  await expect(page.getByText("Summary copied")).toBeVisible();
+  const copied = await page.evaluate(() => (window as unknown as { copied: string[] }).copied);
+  expect(copied).toHaveLength(1);
+  expect(copied[0]).toContain("Friday 5s");
+});
+
+for (const [name, status, body] of [
+  ["404", 404, { detail: "Job not found" }],
+  ["refused ownership", 401, { detail: "Open this match in the browser that uploaded it.", code: "ownership" }],
+] as const) {
+  test(`a match this browser cannot open says why, offers a way forward and stops asking (${name})`, async ({ page }) => {
+    let reads = 0;
+    await page.route(jobRoute, (r) => {
+      reads++;
+      return r.fulfill({ status, json: body });
+    });
+    await page.goto(`/vision/${ID}`);
+    await expect(page.getByRole("heading", { name: "Match not available" })).toBeVisible();
+    const card = page.getByTestId("match-not-available");
+    await expect(card).toContainText("private to the browser that uploaded it");
+    await expect(card).toContainText("ask them to share a summary from their report");
+    await expect(card.getByRole("link", { name: "Analyse your own match" })).toHaveAttribute("href", "/upload");
+    await expect(card.getByRole("link", { name: "Your matches", exact: true })).toHaveAttribute("href", "/dashboard");
+    await expect(page.getByText("Opening analysis…")).toHaveCount(0);
+    await expect(page.getByText("Video analysis runs on the vision worker", { exact: false })).toHaveCount(0);
+    await page.waitForTimeout(5000);
+    expect(reads).toBe(1);
+  });
+}
+
+test("a job still receiving its upload says to keep the sending page open, then that the upload paused", async ({ page }) => {
+  await page.clock.install();
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await page.route(jobRoute, (r) =>
+    r.fulfill({ json: { ...JOB, status: "uploading", stage: "Receiving video", progress: 37.2, receivedBytes: 800e6, expectedBytes: 2.1e9 } }),
+  );
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Receiving video from the page that started it: 37%", { exact: false })).toContainText("Keep that page open.");
+  await expect(page.getByText("Waiting for the video upload.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cancel upload" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cancel analysis" })).toHaveCount(0);
+  await expect(page.getByText("You can close this tab", { exact: false })).toHaveCount(0);
+  await page.clock.runFor(21_000);
+  await expect(page.getByText("Upload paused at 37%", { exact: false })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Open Upload" })).toHaveAttribute("href", "/upload");
+  await expect(page.getByText("You can close this tab", { exact: false })).toHaveCount(0);
+});
+
+test("a YouTube download still shows the analysis wait", async ({ page }) => {
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await page.route(jobRoute, (r) => r.fulfill({ json: { ...JOB, status: "uploading", stage: "Downloading from YouTube", progress: 40 } }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Analysing your match")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cancel analysis" })).toBeVisible();
+});
+
+test("an uploading card on the dashboard shows how much has arrived and where it comes from", async ({ page }) => {
+  await page.route("**/api/vision/jobs", (r) =>
+    r.fulfill({ json: [{ ...JOB, status: "uploading", stage: "Receiving video", progress: 37.2, receivedBytes: 781_200_000, expectedBytes: 2.1e9 }] }),
+  );
+  await page.goto("/dashboard");
+  await expect(page.getByText("Receiving video · 37%")).toBeVisible();
+  await expect(page.getByText("Sent from the page that started it")).toBeVisible();
+});
+
+test("a hidden tab stops asking for the analysis, asks again on return, and the tab title says when the report is ready", async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(() => {
+    const w = window as unknown as { hidden: boolean };
+    w.hidden = true;
+    Object.defineProperty(Document.prototype, "visibilityState", { configurable: true, get: () => (w.hidden ? "hidden" : "visible") });
+  });
+  await mockReport(page, { calibrated: false });
+  let reads = 0;
+  let status = "processing";
+  await page.route(jobRoute, (r) => {
+    reads++;
+    return r.fulfill({ json: { ...JOB, status, stage: status === "completed" ? "Analysis complete" : "Detecting players", progress: status === "completed" ? 100 : 40 } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect.poll(() => reads).toBe(1);
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await page.clock.runFor(10_000);
+  await page.waitForTimeout(300);
+  expect(reads).toBeLessThanOrEqual(1);
+  status = "completed";
+  await page.evaluate(() => {
+    (window as unknown as { hidden: boolean }).hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect.poll(() => reads, { timeout: 1000 }).toBe(2);
+  await expect.poll(() => page.title()).toMatch(/^Report ready · Friday 5s/);
+});
+
+test("deleting one analysis of a video that others still use offers to delete them all", async ({ page }) => {
+  const other = "c".repeat(32);
+  let listed = [
+    { ...JOB, id: other, video: { duration: 180 }, startSeconds: 10, maxSeconds: 20, sourceJobId: ID, rootJobId: ID },
+    { ...JOB, id: ID, video: { duration: 180 }, startSeconds: 0, maxSeconds: null, sourceJobId: null },
+  ];
+  const deletes: string[] = [];
+  await page.route("**/api/vision/jobs", (r) => r.fulfill({ json: listed }));
+  await page.route("**/api/vision/venues", (r) => r.fulfill({ json: [] }));
+  await page.route(/\/api\/vision\/jobs\/[a-f0-9]{32}$/, (r) => {
+    expect(r.request().method()).toBe("DELETE");
+    const id = r.request().url().split("/").pop()!;
+    deletes.push(id);
+    listed = listed.filter((j) => j.id !== id);
+    return r.fulfill({ json: { deleted: true } });
+  });
+  let dialogs = 0;
+  page.on("dialog", (d) => {
+    dialogs++;
+    d.dismiss();
+  });
+  await page.goto("/dashboard");
+  // The full match is listed second.
+  await page.getByRole("button", { name: "Delete analysis and footage" }).nth(1).click();
+  const panel = page.getByTestId("delete-shared-video");
+  await expect(panel).toContainText("The video stays on the server while 1 other analysis of it remains (Test 0:10–0:30).");
+  await expect(panel.getByRole("button", { name: "Delete this analysis only" })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Keep" })).toBeVisible();
+  await panel.getByRole("button", { name: "Delete all analyses of this video" }).click();
+  await expect.poll(() => [...deletes].sort()).toEqual([ID, other].sort());
+  await expect(page.getByTestId("vision-job-span")).toHaveCount(0);
+  expect(dialogs).toBe(0);
+});
+
+test("your matches counts the analyses, and delete is its own 44 px button clear of the card", async ({ page }) => {
+  const jobs = Array.from({ length: 7 }, (_, i) => ({ ...JOB, id: String(i).repeat(32), title: `Match ${i}` }));
+  await page.route("**/api/vision/jobs", (r) => r.fulfill({ json: jobs }));
+  await page.goto("/dashboard");
+  await expect(page.getByText("7 analyses · 0 manual reviews · This device")).toBeVisible();
+  const buttons = page.getByRole("button", { name: "Delete analysis and footage" });
+  await expect(buttons).toHaveCount(7);
+  for (let i = 0; i < 7; i++) {
+    const b = await box(buttons.nth(i));
+    const link = await box(page.locator(`a[href="/vision/${jobs[i].id}"]`));
+    expect(b.height).toBeGreaterThanOrEqual(44);
+    expect(b.y - (link.y + link.height)).toBeGreaterThanOrEqual(12);
+  }
+});
+
+// ── The report draws from the analysis, before the result (detections) arrives ──
+/** The analysis as a current worker sends it: kit colours, span, ball search and load included. */
+function withReportFields<T extends object>(data: T) {
+  return { ...data, teams: [{ colour: "#dc2626" }, { colour: "#22c55e" }], analysedStart: 0, analysedDuration: 4, ballSearch: "exhaustive", ballFrames: 20, playerLoad: null };
+}
+/** Flags any moment the classic report (MatchCentre) is on the page, however briefly. */
+async function watchClassic(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as unknown as { classicSeen: boolean };
+    w.classicSeen = false;
+    new MutationObserver(() => {
+      if (/Pass candidates|Passes per possession/.test(document.body?.textContent ?? "")) w.classicSeen = true;
+    }).observe(document, { childList: true, subtree: true, characterData: true });
+  });
+  return () => page.evaluate(() => (window as unknown as { classicSeen: boolean }).classicSeen);
+}
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("the score card shows before the result arrives, never the classic report, and an early tap waits for the video", async ({ page }) => {
+  const classicSeen = await watchClassic(page);
+  await mockReport(page, { calibrated: false });
+  const asked: string[] = [];
+  await page.route(analysisRoute, (r) => {
+    asked.push(r.request().url());
+    return r.fulfill({ json: withReportFields(analysis(false)) });
+  });
+  let served = false;
+  await page.route(resultRoute, async (r) => {
+    await pause(3000);
+    served = true;
+    return r.fulfill({ json: result() });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByTestId("score-card")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible();
+  expect(served).toBe(false);
+  expect(asked[0]).toContain("positions=0");
+  await expect(page.getByText("Loading the report…")).toBeVisible();
+  await expect(page.getByText("Video analysis runs on the vision worker", { exact: false })).toHaveCount(0);
+  await expect(page.getByTestId("result-loading")).toHaveText("Loading the video and detections…");
+  // Tapped before the video exists: the review opens once it does.
+  await page.getByRole("button", { name: "Enter the score and review" }).click();
+  await expect(page.getByLabel("Goals for Kit A")).toBeVisible({ timeout: 10_000 });
+  expect(served).toBe(true);
+  await expect(page.getByTestId("result-loading")).toHaveCount(0);
+  expect(await classicSeen()).toBe(false);
+});
+
+test("while the stats load the page says so, and never shows the classic report", async ({ page }) => {
+  const classicSeen = await watchClassic(page);
+  await mockReport(page, { calibrated: false });
+  await page.route(analysisRoute, async (r) => {
+    await pause(3000);
+    return r.fulfill({ json: withReportFields(analysis(false)) });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByTestId("report-loading")).toHaveText("Loading match stats…");
+  await expect(page.getByTestId("report-loading")).toHaveAttribute("role", "status");
+  await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByTestId("report-loading")).toHaveCount(0);
+  expect(await classicSeen()).toBe(false);
+});
+
+test("a worker without analytics (404) shows the classic report once the result arrives", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  await page.route(analysisRoute, (r) => r.fulfill({ status: 404, json: { detail: "Not Found" } }));
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Pass candidates")).toBeVisible();
+  await expect(page.getByTestId("report-loading")).toHaveCount(0);
+  await expect(page.getByTestId("score-card")).toHaveCount(0);
+});
+
+test("stats that fail to load offer a retry, never the classic report, and the retry shows the report", async ({ page }) => {
+  const classicSeen = await watchClassic(page);
+  await mockReport(page, { calibrated: false });
+  let fail = true;
+  await page.route(analysisRoute, (r) =>
+    fail ? r.fulfill({ status: 500, json: { detail: "Analytics could not be computed" } }) : r.fulfill({ json: withReportFields(analysis(false)) }),
+  );
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Match analytics could not be loaded (Analytics could not be computed).")).toBeVisible();
+  await expect(page.getByText("The classic report is shown", { exact: false })).toHaveCount(0);
+  // The video and its detections still load underneath.
+  await expect(page.getByText("Ball visibility across the video")).toBeVisible();
+  expect(await classicSeen()).toBe(false);
+  fail = false;
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible();
+  await expect(page.getByText("Match analytics could not be loaded", { exact: false })).toHaveCount(0);
+  expect(await classicSeen()).toBe(false);
+});
+
+test("a slow pitch setup file never holds the report back, and the positions follow in the background", async ({ page }) => {
+  await mockReport(page, { calibrated: true });
+  const asked: string[] = [];
+  await page.route(analysisRoute, (r) => {
+    asked.push(r.request().url());
+    const full = withReportFields(analysis(true));
+    return r.fulfill({ json: r.request().url().includes("positions=0") ? { ...full, positions: undefined, positionsOmitted: true } : full });
+  });
+  let calibrationServed = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration$`), async (r) => {
+    await pause(5000);
+    calibrationServed = true;
+    return r.fallback();
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible({ timeout: 4000 });
+  expect(calibrationServed).toBe(false);
+  // Without positions first, then the full analysis for the mini pitch.
+  await expect.poll(() => asked.length).toBe(2);
+  expect(asked[0]).toContain("positions=0");
+  expect(asked[1]).not.toContain("positions=0");
+  // The mini pitch draws from the positions that came with the full analysis.
+  await expect(page.getByRole("img", { name: "Live pitch view" })).toBeVisible();
+});
+
+test("an analysis from an older worker (without kit colours or span) is drawn once the result arrives", async ({ page }) => {
+  const classicSeen = await watchClassic(page);
+  await mockReport(page, { calibrated: false });
+  let served = false;
+  await page.route(resultRoute, async (r) => {
+    await pause(2000);
+    served = true;
+    return r.fulfill({ json: result() });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByTestId("report-loading")).toBeVisible();
+  expect(served).toBe(false);
+  await expect(page.getByRole("heading", { name: "Match stats" })).toBeVisible({ timeout: 10_000 });
+  expect(served).toBe(true);
+  expect(await classicSeen()).toBe(false);
+});
+
+// ── Team names, title and date are kept on the worker ──
+test("team names typed in the report are saved on the worker and come back without this browser's storage", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const saved: { names?: string[]; title?: string; matchDate?: string | null }[] = [];
+  const details: { teamNames?: string[]; title?: string; matchDate?: string | null } = {};
+  await page.route(jobRoute, (r) => r.fulfill({ json: { ...JOB, ...details } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/details$`), (r) => {
+    const body = r.request().postDataJSON();
+    saved.push(body);
+    if (body.names) details.teamNames = body.names;
+    if (body.title) details.title = body.title;
+    if ("matchDate" in body) details.matchDate = body.matchDate;
+    return r.fulfill({ json: { teamNames: details.teamNames ?? null, title: details.title ?? null, matchDate: details.matchDate ?? null } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByLabel("Name for kit A").fill("Tekkerz FC");
+  await page.getByLabel("Name for kit B").fill("PUSHIT");
+  await expect.poll(() => saved.at(-1)?.names).toEqual(["Tekkerz FC", "PUSHIT"]);
+  // Safari wipes script storage after a week; the worker's copy remains.
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  await expect(page.getByTestId("hero-name").first()).toHaveText("Tekkerz FC");
+  await expect(page.getByTestId("hero-name").last()).toHaveText("PUSHIT");
+  await page.getByRole("button", { name: "Enter the score and review" }).click();
+  await expect(page.getByLabel("Goals for Tekkerz FC")).toBeVisible();
+  await expect(page.getByLabel("Goals for PUSHIT")).toBeVisible();
+  await expect(page.getByTestId("names-local-only")).toHaveCount(0);
+});
+
+test("names saved only on this browser are copied to the worker once, and a failed save says so", async ({ page }) => {
+  await page.addInitScript((id) => {
+    if (!sessionStorage.getItem("seeded")) {
+      sessionStorage.setItem("seeded", "1");
+      localStorage.setItem(`vision-names-${id}`, JSON.stringify(["Lions", "Tigers"]));
+    }
+  }, ID);
+  await mockReport(page, { calibrated: false });
+  const saved: unknown[] = [];
+  let fail = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/details$`), (r) => {
+    saved.push(r.request().postDataJSON());
+    return fail ? r.fulfill({ status: 503, json: { detail: "Cannot reach the vision server." } }) : r.fulfill({ json: { teamNames: ["Lions", "Tigers"], title: null, matchDate: null } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect.poll(() => saved).toEqual([{ names: ["Lions", "Tigers"] }]);
+  fail = true;
+  await page.getByLabel("Name for kit A").fill("Lions Reserves");
+  await page.getByLabel("Name for kit A").blur();
+  await expect(page.getByTestId("names-local-only")).toHaveText("Saved on this device only");
+  expect(await page.evaluate((id) => localStorage.getItem(`vision-names-${id}`), ID)).toBe(JSON.stringify(["Lions Reserves", "Tigers"]));
+});
+
+test("the match title and date are edited in the header and shown in Your matches", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const details: { teamNames?: string[]; title?: string; matchDate?: string | null } = { teamNames: ["Tekkerz FC", "PUSHIT"] };
+  const posts: unknown[] = [];
+  await page.route(jobRoute, (r) => r.fulfill({ json: { ...JOB, ...details } }));
+  await page.route("**/api/vision/jobs", (r) => r.fulfill({ json: [{ ...JOB, ...details, video: { duration: 4 } }] }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/details$`), (r) => {
+    const body = r.request().postDataJSON();
+    posts.push(body);
+    Object.assign(details, body);
+    return r.fulfill({ json: { teamNames: details.teamNames ?? null, title: details.title ?? null, matchDate: details.matchDate ?? null } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Friday 5s");
+  await page.getByRole("button", { name: "Edit match title and date" }).click();
+  await expect(page.getByLabel("Match title")).toHaveValue("Friday 5s");
+  expect(await fontSize(page.getByLabel("Match title"))).toBeGreaterThanOrEqual(16);
+  expect(await fontSize(page.getByLabel("Match date"))).toBeGreaterThanOrEqual(16);
+  await page.getByLabel("Match title").fill("Tekkerz v PUSHIT, league week 3");
+  await page.getByLabel("Match date").fill("2026-10-11");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => posts).toEqual([{ title: "Tekkerz v PUSHIT, league week 3", matchDate: "2026-10-11" }]);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Tekkerz v PUSHIT, league week 3");
+  const day = await page.evaluate(() => new Date(2026, 9, 11).toLocaleDateString());
+  await expect(page.getByTestId("match-date")).toHaveText(`Played ${day}`);
+  await page.goto("/dashboard");
+  await expect(page.getByRole("heading", { name: "Tekkerz v PUSHIT, league week 3 · Tekkerz FC v PUSHIT" })).toBeVisible();
+  await expect(page.getByTestId("vision-job-span")).toContainText(day);
+});

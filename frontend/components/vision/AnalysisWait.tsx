@@ -5,6 +5,10 @@ import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { AlertTriangle, Check, Cpu, Film, Palette, ScanLine, BarChart3 } from "lucide-react";
 import type { VisionJob } from "@/lib/review/vision";
 import { clockTime } from "@/lib/review/vision";
+import { formatBytes } from "@/lib/review/uploadProgress";
+
+/** No new bytes for this long: nothing is being sent, the upload is paused. */
+const UPLOAD_STALL_SECONDS = 20;
 
 const STEPS = [
   { key: "upload", label: "Video received", icon: Film },
@@ -125,18 +129,25 @@ export function PitchAnimation({ progress }: { progress: number }) {
 export function AnalysisWait({
   job,
   onCancel,
+  stalledSeconds = 0,
 }: {
   job: VisionJob;
   onCancel: () => void;
+  /** Seconds since the worker last received upload bytes (while the job is uploading). */
+  stalledSeconds?: number;
 }) {
   const [tip, setTip] = useState(0);
   const running = ["processing", "uploading"].includes(job.status);
   const failed = ["failed", "interrupted", "cancelled"].includes(job.status);
+  // A chunked upload still arriving: only the page holding the file sends it, so
+  // this page must not say the owner can leave (a YouTube download has no expectedBytes).
+  const receiving = job.status === "uploading" && !!job.expectedBytes;
+  const paused = receiving && stalledSeconds >= UPLOAD_STALL_SECONDS;
   useEffect(() => {
-    if (!running) return;
+    if (!running || receiving) return;
     const timer = setInterval(() => setTip((t) => (t + 1) % TIPS.length), 7000);
     return () => clearInterval(timer);
-  }, [running]);
+  }, [running, receiving]);
   const current = stepIndex(job);
   const gpu = job.stage.startsWith("GPU");
   const stage = job.stage.replace(/^GPU · /, "");
@@ -175,7 +186,7 @@ export function AnalysisWait({
                 <Cpu size={12} /> GPU
               </span>
             )}
-            Analysing your match
+            {receiving ? (paused ? "Upload paused" : "Receiving your video") : "Analysing your match"}
           </div>
           <h2 className="text-xl font-semibold leading-snug">{stage}</h2>
           <div>
@@ -188,10 +199,12 @@ export function AnalysisWait({
               {Math.floor(job.progress)}
               <span className="text-2xl text-pitch-muted">%</span>
             </motion.p>
-            <p className="text-sm text-pitch-muted mt-1">
-              {job.processedSeconds !== undefined && `${clockTime(job.processedSeconds)} of footage processed`}
-              {job.etaSeconds ? ` · about ${clockTime(job.etaSeconds)} left` : ""}
-            </p>
+            {!receiving && (
+              <p className="text-sm text-pitch-muted mt-1">
+                {job.processedSeconds !== undefined && `${clockTime(job.processedSeconds)} of footage processed`}
+                {job.etaSeconds ? ` · about ${clockTime(job.etaSeconds)} left` : ""}
+              </p>
+            )}
           </div>
           <ol className="space-y-2.5">
             {STEPS.map(({ key, label, icon: Icon }, i) => {
@@ -218,7 +231,7 @@ export function AnalysisWait({
                     )}
                   </span>
                   <span className={active ? "text-pitch-white font-medium" : done ? "text-pitch-muted line-through decoration-white/20" : "text-pitch-muted"}>
-                    {label}
+                    {receiving && i === 0 ? "Receiving video" : label}
                   </span>
                 </li>
               );
@@ -228,6 +241,29 @@ export function AnalysisWait({
       </div>
       <div className="flex flex-col sm:flex-row sm:items-center gap-4 justify-between border-t border-white/10 pt-5">
         <div className="min-h-[3rem] flex-1">
+          {receiving ? (
+            <div className="text-sm space-y-3" data-testid="upload-wait">
+              {(() => {
+                const pct = Math.floor(job.progress);
+                const sizes = `${formatBytes(job.receivedBytes ?? 0)} of ${formatBytes(job.expectedBytes ?? 0)}`;
+                return paused ? (
+                  <p className="text-amber-200">
+                    Upload paused at {pct}% ({sizes}). Open Upload on the device that started it, choose the same video
+                    and press Analyse to continue.
+                  </p>
+                ) : (
+                  <p className="text-pitch-muted">
+                    Receiving video from the page that started it: {pct}% ({sizes}). Keep that page open.
+                  </p>
+                );
+              })()}
+              {paused && (
+                <Link href="/upload" className="pitch-button-primary inline-flex">
+                  Open Upload
+                </Link>
+              )}
+            </div>
+          ) : (
           <AnimatePresence mode="wait">
             <motion.p
               key={tip}
@@ -241,10 +277,11 @@ export function AnalysisWait({
               {TIPS[tip]}
             </motion.p>
           </AnimatePresence>
+          )}
         </div>
         {running && (
           <button className="pitch-button-secondary shrink-0" onClick={onCancel}>
-            Cancel analysis
+            {receiving ? "Cancel upload" : "Cancel analysis"}
           </button>
         )}
       </div>

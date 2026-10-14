@@ -24,6 +24,11 @@ const SAMPLED = ["pass", "interception", "tackle"];
 
 const PRIORITY: Record<string, number> = { "goal-candidate": 0, shot: 1, interception: 2, tackle: 3, pass: 4, out: 5 };
 
+export type ReviewFilter = "key" | "sample" | "pending" | "all";
+
+/** Where the review was opened for: n changes on every request, so asking again re-applies it. */
+export type ReviewFocus = { target: "score" | "sample" | "key" | null; filter: ReviewFilter; n: number };
+
 export function ReviewQueue({
   jobId,
   analysis,
@@ -33,6 +38,7 @@ export function ReviewQueue({
   onWatch,
   onAnalysis,
   onDeleted,
+  focus = { target: null, filter: "key", n: 0 },
 }: {
   jobId: string;
   analysis: Analysis;
@@ -44,8 +50,25 @@ export function ReviewQueue({
   onAnalysis: (analysis: Analysis) => void;
   /** The worker no longer has this match. */
   onDeleted?: () => void;
+  /** What the review was opened for, and the list to open on. */
+  focus?: ReviewFocus;
 }) {
-  const [filter, setFilter] = useState<"key" | "sample" | "pending" | "all">("key");
+  const [filter, setFilter] = useState<ReviewFilter>(focus.filter);
+  const goalsInput = useRef<HTMLInputElement>(null);
+  // Opened (again) for the score or for a list: show that. The page scrolls the
+  // score box (or the list) to just below the pinned video first, so the cursor
+  // goes into the score once that scroll has settled.
+  useEffect(() => {
+    if (focus.target === "sample" || focus.target === "key") {
+      setFilter(focus.target);
+      setSelectedId(null);
+    }
+    if (focus.target !== "score") return;
+    const timer = setTimeout(() => goalsInput.current?.focus({ preventScroll: true }), 350);
+    return () => clearTimeout(timer);
+    // Only when the review is asked for again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus.n]);
   // The selection follows the event, not a position: decisions change the list.
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [team, setTeam] = useState<0 | 1>(0);
@@ -169,6 +192,9 @@ export function ReviewQueue({
   const scoreValid = score.every((v) => /^\d{1,2}$/.test(v));
   // The worker's count: it merges a confirmed shot-with-goal and a goal moment.
   const confirmedGoals = [0, 1].map((team) => analysis.stats.teams[team]?.goals?.value ?? 0);
+  // One place to scroll to on a phone: the score box when it is asked for or still
+  // empty, the list of moments otherwise.
+  const revealScore = focus.target === "score" || !analysis.enteredScore;
   return (
     <section className="glass-card p-5 space-y-4" aria-label="Review moments">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -181,23 +207,26 @@ export function ReviewQueue({
         Confirm what the camera saw, reject mistakes, and add anything it missed. Confirmed goals set the score; every
         decision is kept, so you can undo it later.
       </p>
-      <div className="rounded-xl border border-white/10 p-4 space-y-2">
+      <div className="rounded-xl border border-white/10 p-4 space-y-2" data-reveal={revealScore ? "" : undefined} data-testid="final-score">
         <p className="text-sm font-semibold">Final score</p>
-        <p className="text-xs text-pitch-muted">
+        {/* Hidden on a phone: the score box and the moment below it share one screen under the video. */}
+        <p className="text-xs text-pitch-muted max-sm:hidden">
           Type the score you know. It sets the scoreline; possible goals are listed first so you can find each one.
         </p>
-        <div className="flex items-center gap-2">
-          <label className="flex items-center gap-2 text-sm">
-            <span style={{ color: colours[0] }}>{names[0]}</span>
-            <input aria-label={`Goals for ${names[0]}`} inputMode="numeric" className="pitch-input w-14 text-center" value={score[0]} onChange={(e) => setScore([e.target.value.trim(), score[1]])} />
+        {/* Wraps on a phone: long team names are cut short (full name on hover) and
+            Save score takes its own line, so the row never widens the page. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-2 text-sm min-w-0">
+            <span className="min-w-0 max-w-[8rem] truncate" style={{ color: colours[0] }} title={names[0]}>{names[0]}</span>
+            <input ref={goalsInput} aria-label={`Goals for ${names[0]}`} inputMode="numeric" className="pitch-input w-14 py-2 text-center shrink-0" value={score[0]} onChange={(e) => setScore([e.target.value.trim(), score[1]])} />
           </label>
           <span className="text-pitch-muted">–</span>
-          <label className="flex items-center gap-2 text-sm">
-            <input aria-label={`Goals for ${names[1]}`} inputMode="numeric" className="pitch-input w-14 text-center" value={score[1]} onChange={(e) => setScore([score[0], e.target.value.trim()])} />
-            <span style={{ color: colours[1] }}>{names[1]}</span>
+          <label className="flex items-center gap-2 text-sm min-w-0">
+            <input aria-label={`Goals for ${names[1]}`} inputMode="numeric" className="pitch-input w-14 py-2 text-center shrink-0" value={score[1]} onChange={(e) => setScore([score[0], e.target.value.trim()])} />
+            <span className="min-w-0 max-w-[8rem] truncate" style={{ color: colours[1] }} title={names[1]}>{names[1]}</span>
           </label>
           <button
-            className="pitch-button-secondary ml-auto"
+            className="pitch-button-secondary w-full sm:w-auto sm:ml-auto"
             disabled={!scoreValid || saving}
             onClick={() => decide([{ action: "score", value: [Number(score[0]), Number(score[1])] }], false)}
           >
@@ -233,7 +262,7 @@ export function ReviewQueue({
         </div>
       )}
       {/* data-reveal: on a phone the page scrolls this to just below the pinned video. */}
-      <div className="flex gap-1 p-1 rounded-lg bg-white/5 text-sm" role="tablist" aria-label="Which moments" data-reveal>
+      <div className="flex gap-1 p-1 rounded-lg bg-white/5 text-sm" role="tablist" aria-label="Which moments" data-reveal={revealScore ? undefined : ""}>
         {(
           [
             ["key", "Shots & key moments"],
@@ -242,7 +271,7 @@ export function ReviewQueue({
             ["all", "Everything"],
           ] as const
         ).map(([key, label]) => (
-          <button key={key} role="tab" aria-selected={filter === key} onClick={() => { setFilter(key); setSelectedId(null); }} className={`flex-1 py-1.5 rounded-md ${filter === key ? "bg-pitch-indigo-soft/50" : "text-pitch-muted"}`}>
+          <button key={key} role="tab" aria-selected={filter === key} onClick={() => { setFilter(key); setSelectedId(null); }} className={`flex-1 py-1.5 rounded-md max-sm:text-xs ${filter === key ? "bg-pitch-indigo-soft/50" : "text-pitch-muted"}`}>
             {label}
           </button>
         ))}
@@ -255,7 +284,13 @@ export function ReviewQueue({
               const checked = analysis.events.filter((e) => (e.original?.type ?? e.type) === type && e.status !== "proposed" && e.source !== "reviewer" && e.sampled).length;
               // With fewer than ten found, checking them all is the whole sample.
               const target = Math.min(found, analysis.params?.minCheckedForEstimate ?? 10);
-              return found ? `${type === "pass" ? "passes" : type === "interception" ? "won balls" : "tackles"} ${Math.min(checked, target)}/${target}` : "";
+              const part = found ? `${type === "pass" ? "passes" : type === "interception" ? "won balls" : "tackles"} ${Math.min(checked, target)}/${target}` : "";
+              // Accurate passes are estimated from checked passes the detector called complete.
+              const accurate = analysis.stats.teams[0]?.passesComplete;
+              const min = analysis.params?.minCheckedForEstimate ?? 10;
+              if (type === "pass" && found > min && accurate)
+                return `${part} · accurate passes ${Math.min(accurate.checked ?? 0, min)}/${min}`;
+              return part;
             }).filter(Boolean);
             return `Random passes, won balls and tackles in turn. Check about ten of each (all of them when there are fewer) and the report estimates their totals: ${parts.join(" · ") || "nothing to check"}.`;
           })()}
@@ -264,24 +299,35 @@ export function ReviewQueue({
       {current ? (
         <div className="rounded-xl border border-white/10 p-4 space-y-3">
           <div className="flex items-center justify-between gap-3">
-            <button aria-label="Previous moment" className="p-2 rounded-lg hover:bg-white/10" onClick={() => move(-1)}>
+            <button aria-label="Previous moment" className="inline-flex items-center justify-center min-h-11 min-w-11 shrink-0 rounded-lg hover:bg-white/10" onClick={() => move(-1)}>
               <ChevronLeft size={18} />
             </button>
-            <button className="flex-1 text-left" onClick={() => watch(current)}>
-              <span className="font-mono text-pitch-green mr-2">{clockTime(current.t)}</span>
-              <span className="font-semibold">{describeEvent(current)}</span>
-              {current.team !== null && (
-                <span className="ml-2 text-sm" style={{ color: colours[current.team] }}>
-                  {names[current.team]}
-                </span>
-              )}
-              <span className="block text-xs text-pitch-muted">
+            {/* A fixed height on a phone: a one-line "Pass" and a two-line won ball must
+                not move Confirm and Reject between one moment and the next. */}
+            <button className="flex-1 min-w-0 text-left max-sm:h-20 max-sm:overflow-hidden" onClick={() => watch(current)}>
+              <span className="block max-sm:line-clamp-2">
+                <span className="font-mono text-pitch-green mr-2">{clockTime(current.t)}</span>
+                {current.type === "interception" ? (
+                  <>
+                    <span className="font-semibold sm:hidden">Ball won</span>
+                    <span className="font-semibold max-sm:hidden">{describeEvent(current)}</span>
+                  </>
+                ) : (
+                  <span className="font-semibold">{describeEvent(current)}</span>
+                )}
+                {current.team !== null && (
+                  <span className="ml-2 text-sm" style={{ color: colours[current.team] }}>
+                    {names[current.team]}
+                  </span>
+                )}
+              </span>
+              <span className="block text-xs text-pitch-muted max-sm:line-clamp-2">
                 {current.status === "confirmed" ? "Confirmed" : current.status === "rejected" ? "Rejected" : `Automatic · confidence ${Math.round(current.confidence * 100)}%`}
                 {current.ballSeen !== undefined ? ` · ball seen ${Math.round(current.ballSeen * 100)}% of the transfer` : ""}
                 {current.source === "reviewer" ? " · added by you" : ""}
               </span>
             </button>
-            <button aria-label="Next moment" className="p-2 rounded-lg hover:bg-white/10" onClick={() => move(1)}>
+            <button aria-label="Next moment" className="inline-flex items-center justify-center min-h-11 min-w-11 shrink-0 rounded-lg hover:bg-white/10" onClick={() => move(1)}>
               <ChevronRight size={18} />
             </button>
           </div>

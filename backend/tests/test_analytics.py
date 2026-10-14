@@ -731,6 +731,45 @@ def test_review_keypresses_do_not_recompute_the_whole_analysis(tmp_path, monkeyp
     assert len(calls) == 2
 
 
+def test_the_analysis_carries_what_the_report_needs_and_can_leave_out_positions(tmp_path, monkeypatch):
+    import json
+
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, directory = make_job(server, build_match())
+    result = json.loads((directory / "result.json").read_text())
+    load = {"metres": [812.4, None], "steps": 40, "method": "test", "playerHeightM": 1.8, "footNoisePx": 2}
+    result.update(teams=[{"id": 0, "label": "Kit A", "colour": "#ff0000"}, {"id": 1, "label": "Kit B", "colour": "#0000ff"}],
+                  ballSearch="exhaustive", analysedStart=12.0, metrics={"ballFrames": 31, "playerLoad": load})
+    (directory / "result.json").write_text(json.dumps(result))
+    assert client.post(f"/jobs/{job_id}/calibration", json={"template": "futsal", "points": clicks(), "t": 0.0}).status_code == 200
+    full = client.get(f"/jobs/{job_id}/analysis").json()
+    assert full["teams"] == [{"colour": "#ff0000"}, {"colour": "#0000ff"}]
+    assert full["analysedStart"] == 12.0 and full["analysedDuration"] == result["analysedDuration"]
+    assert full["ballSearch"] == "exhaustive" and full["ballFrames"] == 31 and full["playerLoad"] == load
+    assert full["positions"] and "positionsOmitted" not in full
+    light = client.get(f"/jobs/{job_id}/analysis?positions=0").json()
+    assert "positions" not in light and light["positionsOmitted"] is True
+    assert light["teams"] == full["teams"] and light["stats"] == full["stats"]
+    # The cached computation keeps the positions: a plain read still returns them.
+    assert json.loads((directory / "analysis.json").read_text())["positions"]
+    assert client.get(f"/jobs/{job_id}/analysis").json()["positions"] == full["positions"]
+
+
+def test_an_analysis_cached_by_the_previous_version_is_recomputed(tmp_path, monkeypatch):
+    import json
+
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, directory = make_job(server, build_match())
+    first = client.get(f"/jobs/{job_id}/analysis").json()
+    assert first["inputs"][0] == server.ANALYTICS_VERSION == 11 and "teams" in first
+    # A file written by version 10 for the same inputs, without the new fields.
+    old = {k: v for k, v in first.items() if k not in ("teams", "analysedStart", "analysedDuration", "ballSearch", "ballFrames", "playerLoad")}
+    old["inputs"] = [10] + first["inputs"][1:]
+    (directory / "analysis.json").write_text(json.dumps(old))
+    again = client.get(f"/jobs/{job_id}/analysis").json()
+    assert again["inputs"][0] == 11 and again["analysedDuration"] == first["analysedDuration"]
+
+
 def test_calibration_can_be_polled_without_its_frames(tmp_path, monkeypatch):
     server, client = _client(tmp_path, monkeypatch)
     job_id, _ = make_job(server, build_match())

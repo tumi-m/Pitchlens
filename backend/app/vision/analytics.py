@@ -1721,6 +1721,8 @@ def prepare(result, calibration=None, direction=None):
     live = stoppages(projected, sample_fps)
     owner, sequences, possession_seconds, in_play_seconds = possession_sequences(projected, spells, in_play, sample_fps, live)
     events, kickoffs = detect_events(projected, states, spells, template, directions, sample_fps, in_play, dead_intervals)
+    teams = result.get("teams") if isinstance(result.get("teams"), list) else []
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
     return {
         "projected": projected,
         "template": template,
@@ -1739,6 +1741,11 @@ def prepare(result, calibration=None, direction=None):
         "duration": duration,
         "start": start,
         "positions": compact_positions(projected, player_of) if template else None,
+        # What the report page needs from result.json to draw before that (large) file arrives.
+        "teams": [{"colour": teams[i].get("colour") if i < len(teams) and isinstance(teams[i], dict) else None} for i in range(2)],
+        "ball_search": result.get("ballSearch"),
+        "ball_frames": metrics.get("ballFrames"),
+        "player_load": metrics.get("playerLoad"),
     }
 
 
@@ -1783,6 +1790,15 @@ def finish(base, review=None, include_positions=True):
             "pendingByType": dict(Counter(e["type"] for e in events if e["status"] == "proposed" and e.get("needsReview", True))),
         },
         "positions": base["positions"] if include_positions else None,
+        # Copied from the result so the report renders from the analysis alone:
+        # kit colours (Kit A first), the analysed span, the ball search ("none" is
+        # a player-load job), retained ball frames and per-kit running distance.
+        "teams": base.get("teams"),
+        "analysedStart": base["start"],
+        "analysedDuration": base["duration"],
+        "ballSearch": base.get("ball_search"),
+        "ballFrames": base.get("ball_frames"),
+        "playerLoad": base.get("player_load"),
     }
 
 

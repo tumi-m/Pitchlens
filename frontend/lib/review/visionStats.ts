@@ -31,6 +31,20 @@ export function possessionOwner(frame: VisionFrame): number | null {
 
 export type TeamPair = [number, number];
 
+/**
+ * Two complementary shares as whole percents that add up to 100. The worker
+ * rounds each to one decimal, so 59.5 / 40.5 rounded on their own read 60% and
+ * 41%; here they read 60% and 40%. Shares that do not sum to about 100 (one side
+ * missing, or not complementary) are rounded on their own; null stays null.
+ */
+export function shares(a: number | null, b: number | null): [number | null, number | null] {
+  if (a !== null && b !== null && Math.abs(a + b - 100) <= 0.6) {
+    const ra = Math.round(a);
+    return [ra, 100 - ra];
+  }
+  return [a === null ? null : Math.round(a), b === null ? null : Math.round(b)];
+}
+
 export type MatchStats = {
   /** null on a player-load job: the ball was not looked for. */
   controlSeconds: [number | null, number | null];

@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
 import { inspectVideo, PreflightRejected, VideoPreflight } from "@/lib/review/preflight";
@@ -10,9 +10,7 @@ import { gradeFootage } from "@/lib/review/footageCheck";
 import {
   VisionHealth,
   VisionError,
-  VisionStartedError,
   DEFAULT_MAX_BYTES,
-  uploadToVision,
   analyseYouTube,
   cancelEarlierUpload,
   visionAccessCode,
@@ -24,7 +22,24 @@ import {
   CONNECTION_LOST,
   connectionLost,
   defaultVisionOptions,
+  pendingUploadFor,
+  pendingUploadInfo,
+  sameUploadOptions,
+  uploadQuery,
 } from "@/lib/review/vision";
+import {
+  UploadEntry,
+  currentUpload,
+  dismissUpload,
+  findUpload,
+  inFlight,
+  markLeft,
+  startUpload,
+  subscribeUploads,
+  uploadsVersion,
+  wakeLockSupported,
+} from "@/lib/review/uploadStore";
+import { etaSeconds, formatBytes, minutesAt10Mbit, percentLabel } from "@/lib/review/uploadProgress";
 
 /** Bytes as the size people see in Photos or Files ("1.5 MB", "820 MB", "2 GB"). */
 function megabytes(bytes: number) {
@@ -49,9 +64,31 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [checkingServer, setCheckingServer] = useState(false);
   const defaultsApplied = useRef(false);
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [percent, setPercent] = useState(0);
-  const [phase, setPhase] = useState("");
+  /** A YouTube link being sent, or an earlier upload being cancelled (uploads live in the store). */
+  const [localBusy, setLocalBusy] = useState(false);
+  const [localPhase, setLocalPhase] = useState("");
+  // Re-render whenever the upload moves on; it lives outside this page, so leaving
+  // for another page of the site (navbar links) neither stops nor cancels it.
+  const uploadVersion = useSyncExternalStore(subscribeUploads, uploadsVersion, () => 0);
+  const [active, setActive] = useState<UploadEntry | null>(null);
+  const activeRef = useRef<UploadEntry | null>(null);
+  activeRef.current = active;
+  const running = inFlight(active);
+  // A started upload keeps the page busy until the report opens.
+  const busy = localBusy || (!!active && active.state !== "failed");
+  const phase = active
+    ? active.state === "started"
+      ? "Opening the analysis"
+      : active.state === "starting"
+        ? "Checking the video"
+        : active.jobId
+          ? "Uploading"
+          : "Reserving the analysis server"
+    : localPhase;
+  const sent = active?.sentBytes ?? 0;
+  const total = active?.totalBytes ?? 0;
+  const percentText = total > 0 ? percentLabel(sent, total) : "0%";
+  const eta = active && phase === "Uploading" ? etaSeconds(active.acks, total) : null;
   const [profile, setProfile] = useState("general");
   const [fps, setFps] = useState("3");
   const [playerLoadOnly, setPlayerLoadOnly] = useState(true);
@@ -64,7 +101,9 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
   const [diagnostic, setDiagnostic] = useState(false);
   const [start, setStart] = useState(0);
   /** This browser's earlier upload still holds the worker (409 "own-upload"). */
-  const [earlier, setEarlier] = useState<string | null>(null);
+  const [earlier, setEarlier] = useState<{ jobId: string; expectedBytes: number } | null>(null);
+  /** An upload this browser started before a reload, not finished yet (named until a file is chosen). */
+  const [unfinished, setUnfinished] = useState<ReturnType<typeof pendingUploadInfo>>(null);
   useEffect(() => {
     setPreflight(null);
     setPreviewFailed(false);
@@ -99,21 +138,52 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     source === "file" ? !!file && !checking && !rejected && !tooLarge : linkOk && rights;
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
-  const upload = useRef<AbortController | null>(null);
-  const left = useRef(false);
-  /** The upload is complete and /start was sent: the analysis may be running. */
-  const starting = useRef(false);
+  const codeField = useRef<HTMLInputElement>(null);
+  /** Bumped when the code is missing or refused: the field is brought into view and focused. */
+  const [focusCode, setFocusCode] = useState(0);
   const [codeProblem, setCodeProblem] = useState("");
   useEffect(() => {
-    left.current = false;
     setCode(visionAccessCode());
+    // Back on this page while an upload of this tab runs: show it, not the empty form.
+    const entry = currentUpload();
+    if (inFlight(entry)) {
+      markLeft(entry!, false);
+      setActive(entry);
+    } else if (entry?.state === "failed") {
+      showFailure(entry.error);
+      dismissUpload(entry);
+    } else setUnfinished(pendingUploadInfo());
     return () => {
-      left.current = true;
-      // Stops an unfinished upload; an analysis already started is never cancelled
-      // by leaving (only the "Cancel analysis" button asks the worker to stop it).
-      if (!starting.current) upload.current?.abort();
+      // Leaving never stops the upload: only Cancel does. The navbar follows it meanwhile.
+      const current = activeRef.current;
+      if (inFlight(current)) markLeft(current!, true);
     };
+    // Once, on arrival.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // The upload finished, failed or was cancelled (handled once: dismissing it moves the store on).
+  const finished = useRef<UploadEntry | null>(null);
+  useEffect(() => {
+    const entry = activeRef.current;
+    if (!entry || inFlight(entry) || finished.current === entry) return;
+    finished.current = entry;
+    dismissUpload(entry);
+    if (entry.state === "started" && entry.jobId) {
+      router.push(`/vision/${entry.jobId}`);
+      return;
+    }
+    setActive(null);
+    showFailure(entry.error);
+    // Only when the upload moves on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uploadVersion]);
+  useEffect(() => {
+    // Only where the site asks for a code (an open site has no field).
+    const field = codeField.current;
+    if (!focusCode || !field) return;
+    field.scrollIntoView({ block: "center" });
+    field.focus({ preventScroll: true });
+  }, [focusCode]);
   useEffect(() => {
     const controller = new AbortController();
     let stopped = false;
@@ -161,32 +231,65 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
       : `${Math.round(health.retentionHours)} hours`
     : "";
   const profiles = health?.profiles ?? ["general"];
-  async function submit() {
+  // The short test needs the decoded preview: without one (a file this browser
+  // cannot decode) its checkbox is not even shown, so it can never apply.
+  const shortTest = diagnostic && !!preflight;
+  const choices = {
+    title: title.trim() || file?.name || "",
+    profile,
+    fps,
+    diagnostic: shortTest,
+    start: shortTest ? start : 0,
+    search: defaultVisionOptions(health, { playerLoadOnly, adaptive, profile }).search,
+  };
+  // How long the worker waits for a paused upload: the stall timeout and the give-up message use them.
+  const limits = { uploadIdleSeconds: health?.uploadIdleSeconds, uploadAbandonSeconds: health?.uploadAbandonSeconds };
+  // The chosen file is this browser's unfinished upload, picked again after a reload.
+  const saved = source === "file" && file && ready && !busy ? pendingUploadFor(file) : null;
+  const optionsChanged = !!saved && !!file && !sameUploadOptions(uploadQuery(file, choices), saved.query);
+  // The worker still holds this browser's earlier upload of this very file.
+  const earlierIsThisFile = !!earlier && !!file && earlier.expectedBytes === file.size && !!saved;
+  /** What a failed or stopped upload means, in words; a refused code puts the cursor in its field. */
+  function showFailure(e: unknown) {
+    if (e instanceof VisionError && e.code === "access") {
+      setVisionAccessCode("");
+      setCode("");
+      setNeedsCode(true);
+      setFocusCode((n) => n + 1);
+    }
+    if (e instanceof VisionError && e.code === "own-upload" && typeof e.data?.jobId === "string")
+      setEarlier({ jobId: e.data.jobId, expectedBytes: Number(e.data.expectedBytes) });
+    setError(
+      e instanceof DOMException && e.name === "AbortError"
+        ? file
+          ? "Upload cancelled. Your file is still selected."
+          : "Upload cancelled."
+        : connectionLost(e)
+          ? CONNECTION_LOST
+          : visionErrorMessage(e, "Unable to start analysis"),
+    );
+  }
+  async function submit(resume?: { requestId: string; query: [string, string][] }) {
     if (!ready) return;
     if (health?.accessRequired) {
       if (!cleanAccessCode(code)) {
         setNeedsCode(true);
         setError("Enter the access code first.");
+        setFocusCode((n) => n + 1);
         return;
       }
       if (!setVisionAccessCode(code)) {
         setError(ACCESS_CODE_CHARACTERS);
+        setFocusCode((n) => n + 1);
         return;
       }
     }
-    // The short test needs the decoded preview: without one (a file this browser
-    // cannot decode) its checkbox is not even shown, so it can never apply.
-    const shortTest = diagnostic && !!preflight;
-    const controller = new AbortController();
-    upload.current = controller;
     setError("");
     setEarlier(null);
-    setBusy(true);
-    setPercent(0);
-    setPhase("Reserving the analysis server");
-    try {
-      if (source === "youtube") {
-        setPhase("Sending the link to the analysis server");
+    if (source === "youtube") {
+      setLocalBusy(true);
+      setLocalPhase("Sending the link to the analysis server");
+      try {
         const job = await analyseYouTube(link.trim(), {
           title: title.trim(),
           profile,
@@ -194,63 +297,58 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           search: playerLoadOnly ? "none" : "exhaustive",
         });
         router.push(`/vision/${job.id}`);
-        return;
+      } catch (e) {
+        showFailure(e);
+        setLocalBusy(false);
       }
-      if (!file) return;
-      const job = await uploadToVision(file, {
-        title: title.trim() || file.name,
-        profile,
-        fps,
-        diagnostic: shortTest,
-        start: shortTest ? start : 0,
-        search: defaultVisionOptions(health, { playerLoadOnly, adaptive, profile }).search,
-        signal: controller.signal,
-        onProgress: (p) => {
-          setPercent(p);
-          // From 100% the analysis is being started on the server: leaving the page
-          // no longer cancels it, and the button asks the worker to stop it.
-          starting.current = p >= 100;
-          setPhase(p < 100 ? "Uploading" : "Checking the video");
-        },
-      });
-      // Left the page meanwhile: the analysis runs on and is listed on the dashboard.
-      if (!left.current) router.push(`/vision/${job.id}`);
-    } catch (e) {
-      if (e instanceof VisionStartedError) {
-        // Too late to stop: show the running analysis instead of saying it was cancelled.
-        if (!left.current) router.push(`/vision/${e.jobId}`);
-        return;
-      }
-      if (e instanceof VisionError && e.code === "access") {
-        setVisionAccessCode("");
-        setCode("");
-        setNeedsCode(true);
-      }
-      if (e instanceof VisionError && e.code === "own-upload" && typeof e.data?.jobId === "string")
-        setEarlier(e.data.jobId);
-      setError(
-        e instanceof DOMException && e.name === "AbortError"
-          ? "Upload cancelled. Your file is still selected."
-          : connectionLost(e)
-            ? CONNECTION_LOST
-            : visionErrorMessage(e, "Unable to start analysis"),
-      );
-      setBusy(false);
-    } finally {
-      upload.current = null;
-      starting.current = false;
+      return;
     }
+    if (!file) return;
+    // This tab is already sending this file (the page was left and opened again):
+    // show that upload instead of a second one on the same job.
+    const already = findUpload(file);
+    if (already) {
+      setActive(already);
+      return;
+    }
+    setUnfinished(null);
+    setActive(
+      startUpload(
+        file,
+        resume ? { title: new URLSearchParams(resume.query).get("title") || file.name, resume, ...limits } : { ...choices, ...limits },
+      ),
+    );
   }
   /** Free the worker from this browser's stopped upload, then try once more. */
   async function replaceEarlier() {
     if (!earlier) return;
-    setBusy(true);
-    setPhase("Cancelling the earlier upload");
-    await cancelEarlierUpload(earlier);
+    setLocalBusy(true);
+    setLocalPhase("Cancelling the earlier upload");
+    await cancelEarlierUpload(earlier.jobId);
     setEarlier(null);
-    setBusy(false);
+    setLocalBusy(false);
     await submit();
   }
+  /** Continue the unfinished upload of this file with the choices it was started with. */
+  function continueUpload() {
+    if (!file) return;
+    const resume = pendingUploadFor(file);
+    if (!resume) return;
+    const query = new URLSearchParams(resume.query);
+    setTitle(query.get("title") ?? title);
+    setDiagnostic(query.get("diagnostic") === "true");
+    setStart(Math.max(0, Number(query.get("start")) || 0));
+    if (query.get("profile")) setProfile(query.get("profile")!);
+    if (query.get("fps")) setFps(query.get("fps")!);
+    const search = query.get("search");
+    if (search) {
+      setPlayerLoadOnly(search === "none");
+      setAdaptive(search === "adaptive");
+    }
+    submit(resume);
+  }
+  const unfinishedQuery = unfinished ? new URLSearchParams(unfinished.query) : null;
+  const unfinishedStart = Number(unfinishedQuery?.get("start")) || 0;
   return (
     <>
       <Navbar />
@@ -263,13 +361,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             <h1 className="text-4xl font-bold mb-4">
               Let the footage do the talking.
             </h1>
-            <p className="text-pitch-muted">
+            {/* On a phone the video picker belongs on the first screen: one line here. */}
+            <p className="text-pitch-muted sm:hidden">Upload a match and get its stats.</p>
+            <p className="text-pitch-muted hidden sm:block">
               Detect players and the ball across the video, follow track IDs,
               separate kit colours and find possible passes and changes of
               possession automatically.
             </p>
           </div>
-          <div className="grid sm:grid-cols-3 gap-3">
+          <div className="hidden sm:grid sm:grid-cols-3 gap-3">
             {[
               "Player + ball detection",
               "Kit grouping + tracking",
@@ -338,6 +438,15 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </button>
             </div>
           )}
+          {unfinished && unfinishedQuery && !file && !busy && source === "file" && (
+            <p role="status" className="border border-sky-400/40 bg-sky-400/10 rounded-xl p-4 text-sm" data-testid="unfinished-upload">
+              Unfinished upload: &quot;{unfinishedQuery.get("title") || unfinished.name}&quot;
+              {unfinishedQuery.get("diagnostic") === "true"
+                ? `, test ${clockTime(unfinishedStart)}–${clockTime(unfinishedStart + 20)}`
+                : ""}
+              . Choose the same video to continue.
+            </p>
+          )}
           <div
             role="tablist"
             aria-label="Video source"
@@ -375,7 +484,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               <Upload className="mx-auto text-pitch-green mb-4" />
             </motion.span>
             <span className="block font-semibold break-all">
-              {file ? file.name : "Choose your match video"}
+              {file ? file.name : running && active ? active.fileName : "Choose your match video"}
             </span>
             <span className="text-sm text-pitch-muted block mt-2">
               MP4 or MOV (H.264/HEVC) · Up to {megabytes(maxBytes)} · upload the camera&apos;s original file ·{" "}
@@ -402,6 +511,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 setTitle(f.name.replace(/\.(mp4|mov)$/i, ""));
                 setError("");
                 setEarlier(null);
+                setUnfinished(null);
               }}
             />
           </label>
@@ -459,7 +569,10 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   })()}
                 </p>
               )}
-              <p>Trim it into parts in Photos, or export at 720p, then analyse each part.</p>
+              <p>
+                In Photos, tap Edit, trim, then Save Video as New Clip; repeat for each part. iMovie can
+                also export at 720p.
+              </p>
             </div>
           )}
           {source === "file" && checking && (
@@ -493,8 +606,14 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                     <h2 className="font-semibold">Video checked on your device</h2>
                     <p className="text-sm text-pitch-muted">
                       {preflight.width} × {preflight.height} · {clockTime(preflight.duration)} · ball ≈{" "}
-                      {check.ballPixels}px wide · No video uploaded yet.
+                      {check.ballPixels}px wide · {file ? `${formatBytes(file.size)} to upload` : "No video uploaded yet."}
                     </p>
+                    {file && file.size > 300 * 1024 * 1024 && (
+                      <p className="text-sm text-amber-200 mt-1">
+                        About {minutesAt10Mbit(file.size)} minutes on a 10 Mbit/s connection. Use Wi-Fi if you
+                        can; mobile data charges may apply.
+                      </p>
+                    )}
                   </div>
                   <span
                     className="px-3 py-1 rounded-full text-sm font-bold shrink-0"
@@ -525,7 +644,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   {check.notes.map((n) => (
                     <li key={n}>· {n}</li>
                   ))}
-                  {Math.min(check.width, check.height) <= 480 && (
+                  {Math.min(check.width, check.height) <= 480 && !check.notes.some((n) => n.includes("size of a boot")) && (
                     <li className="text-amber-200">
                       · This looks like a reduced copy (shortest side {Math.min(preflight.width, preflight.height)}px): the ball is only about{" "}
                       {check.ballPixels}px across, about the size of a boot, and is easily missed or
@@ -538,6 +657,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                     <li>· One fixed, high camera showing the whole pitch gives the best results.</li>
                   )}
                 </ul>
+                {!tooLarge && (
+                <>
                 <div className="grid grid-cols-3 gap-2">
                   {preflight.samples.map((sample) => (
                     <button
@@ -568,7 +689,12 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                     disabled={busy || !health?.diagnostics}
                     onChange={(e) => setDiagnostic(e.target.checked)}
                   />
-                  Test 20 seconds before analysing the full match
+                  <span>
+                    Only analyse a 20-second test
+                    <span className="block text-xs text-pitch-muted">
+                      After the test you can analyse the full match from its report, without uploading again.
+                    </span>
+                  </span>
                 </label>
                 {!health?.diagnostics && (
                   <p className="text-sm text-amber-200">
@@ -611,6 +737,8 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                   server; only the selected section is analysed. Detection coverage is not an
                   accuracy score.
                 </p>
+                </>
+                )}
               </motion.section>
             )}
           </AnimatePresence>
@@ -631,6 +759,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 <KeyRound size={15} className="text-pitch-green" /> Access code
               </span>
               <input
+                ref={codeField}
                 aria-label="Access code"
                 data-access-field
                 type="password"
@@ -688,7 +817,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
           {source === "file" || source === "youtube" ? (
             <label className="flex gap-2 text-sm">
               <input type="checkbox" checked={playerLoadOnly} disabled={busy} onChange={(e) => setPlayerLoadOnly(e.target.checked)} />
-              Player load only. Skips the ball model, the motion search and gap filling. That is the cheaper job. Running distance does not use the ball.
+              Player load only: running distance per team, quicker. Possession, passes and shots need the ball model.
             </label>
           ) : null}
           {source === "file" && profile !== "general" && !playerLoadOnly && <label className="flex gap-2 text-sm"><input type="checkbox" checked={adaptive} disabled={busy} onChange={(e) => setAdaptive(e.target.checked)} />Experimental faster ball search; compare a short test first.</label>}
@@ -702,19 +831,38 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </p>
           )}
           {earlier && !busy && (
-            <button type="button" className="pitch-button-secondary" onClick={replaceEarlier}>
-              Cancel the earlier upload
-            </button>
+            <div className="flex flex-wrap gap-3">
+              {earlierIsThisFile && (
+                <button type="button" className="pitch-button-primary" onClick={continueUpload}>
+                  Continue this upload
+                </button>
+              )}
+              <button type="button" className="pitch-button-secondary" onClick={replaceEarlier}>
+                Cancel the earlier upload
+              </button>
+            </div>
           )}
+          {optionsChanged && !earlier ? (
+            // The same video as the unfinished upload, with other choices: continuing
+            // keeps what was sent; the new choices would start from the first byte.
+            <div className="grid sm:grid-cols-2 gap-3">
+              <button disabled={!available} onClick={continueUpload} className="pitch-button-primary w-full py-4">
+                Continue this upload
+              </button>
+              <button disabled={!available} onClick={() => submit()} className="pitch-button-secondary w-full py-4">
+                Start again with these options
+              </button>
+            </div>
+          ) : (
           <button
             disabled={!ready || !available || busy}
-            onClick={submit}
+            onClick={() => submit()}
             className="pitch-button-primary w-full py-4"
           >
             {busy ? (
               <>
                 <Loader2 size={18} className="animate-spin" />
-                {phase === "Uploading" ? `Uploading · ${percent}%` : `${phase}…`}
+                {phase === "Uploading" ? `Uploading · ${percentText}` : `${phase}…`}
               </>
             ) : (
               <>
@@ -722,6 +870,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
               </>
             )}
           </button>
+          )}
           <AnimatePresence>
             {busy && (
               <motion.div
@@ -737,12 +886,12 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                       ? "Sending your video in secure 4 MB pieces"
                       : `${phase}…`}
                   </span>
-                  <span className="text-2xl font-black tabular-nums">{percent}%</span>
+                  <span className="text-2xl font-black tabular-nums">{percentText}</span>
                 </div>
                 <div className="relative h-2.5 rounded-full bg-white/10 overflow-hidden">
                   <motion.div
                     className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-emerald-400 to-sky-400"
-                    animate={{ width: `${Math.max(3, percent)}%` }}
+                    animate={{ width: `${Math.max(3, total > 0 ? (sent / total) * 100 : 0)}%` }}
                     transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
                   />
                   <motion.div
@@ -751,18 +900,28 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                     transition={{ duration: 1.6, repeat: Infinity, ease: "linear" }}
                   />
                 </div>
+                {phase === "Uploading" && total > 0 && (
+                  <p className="text-sm tabular-nums" data-testid="upload-bytes">
+                    {formatBytes(sent)} of {formatBytes(total)}
+                    {eta !== null ? ` · about ${Math.max(1, Math.round(eta / 60))} min left` : ""}
+                  </p>
+                )}
                 <p className="text-xs text-pitch-muted">
-                  Keep this tab open until the upload finishes. After that the analysis
-                  runs on the server and you can leave.
+                  {wakeLockSupported()
+                    ? "Keep this page open until the upload finishes; we keep the screen awake while it uploads."
+                    : "Keep this page open and the screen on until the upload finishes."}{" "}
+                  After that the analysis runs on the server and you can leave.
                 </p>
                 {/* Once the video is being checked the analysis may already be running:
                     the worker is asked to stop it, and a run it could not stop opens. */}
-                <button
-                  onClick={() => upload.current?.abort()}
-                  className="pitch-button-secondary"
-                >
-                  {phase === "Checking the video" ? "Cancel analysis" : "Cancel upload"}
-                </button>
+                {running && (
+                  <button
+                    onClick={() => active?.controller.abort()}
+                    className="pitch-button-secondary"
+                  >
+                    {phase === "Checking the video" ? "Cancel analysis" : "Cancel upload"}
+                  </button>
+                )}
               </motion.div>
             )}
           </AnimatePresence>

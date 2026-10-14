@@ -45,3 +45,24 @@ export function overlayAt(
   });
   return { players, ball: held.ball };
 }
+
+/** A magnified crop of the frame, in source pixels. */
+export type ZoomCrop = { x0: number; y0: number; w: number; h: number };
+
+/**
+ * The crop a first tap opens for precise placement: 1/zoom of the frame in each
+ * direction, centred on the tap and moved back inside the frame at its edges.
+ */
+export function zoomCrop(x: number, y: number, width: number, height: number, zoom: number): ZoomCrop {
+  const w = width / zoom;
+  const h = height / zoom;
+  const x0 = Math.min(Math.max(0, x - w / 2), width - w);
+  const y0 = Math.min(Math.max(0, y - h / 2), height - h);
+  return { x0, y0, w, h };
+}
+
+/** A tap inside the zoomed view, as fractions (0-1) of its box, back to source pixels. */
+export function zoomToSource(crop: ZoomCrop, fx: number, fy: number): { x: number; y: number } {
+  const clamp = (v: number) => Math.min(1, Math.max(0, v));
+  return { x: crop.x0 + clamp(fx) * crop.w, y: crop.y0 + clamp(fy) * crop.h };
+}

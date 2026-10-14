@@ -3,18 +3,17 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import { Info, Target, Crosshair } from "lucide-react";
 import type { Analysis, AnalysisEvent, CountStat, TeamStats } from "@/lib/review/analysis";
-import { describeEvent, isConfirmedGoal } from "@/lib/review/analysis";
+import { describeEvent, isConfirmedGoal, sampleNeeds, MIN_CHECKED } from "@/lib/review/analysis";
 import { clockTime } from "@/lib/review/vision";
 import type { VisionResult } from "@/lib/review/vision";
 import { AveragePositions, Heatmap, ShotMap } from "@/components/vision/PitchGraphics";
 import { DISTANCE_HINT } from "@/components/vision/MatchCentre";
+import { shares } from "@/lib/review/visionStats";
 
 const card = "rounded-2xl border border-white/10 bg-[#11162a]/80 backdrop-blur p-5";
 
-type Value = { value: number | null; note?: string; approx?: boolean };
-
-/** Minimum checked detections of a type before the rest are estimated (the worker's default). */
-const MIN_CHECKED = 10;
+/** partial: still being reviewed with no estimate, so the value is a lower bound ("3+"). */
+type Value = { value: number | null; note?: string; approx?: boolean; partial?: boolean };
 /** Share of in-play time the ball must be followed before possession is shown (the worker's default). */
 const POSSESSION_MIN_COVERAGE = 0.6;
 /** Observed control in a minute before its momentum bar is drawn (the worker's default). */
@@ -27,23 +26,26 @@ function metres(load: PlayerLoad | undefined, team: 0 | 1): Value {
 
 type PlayerLoad = NonNullable<VisionResult["metrics"]["playerLoad"]>;
 
-/** Types estimated from a random sample (checks are pooled across both teams). */
-const SAMPLED: { type: string; key: "passes" | "interceptions" | "tackles"; one: string; many: string }[] = [
-  { type: "pass", key: "passes", one: "pass", many: "passes" },
-  // "interception" is every ball won that is not a tackle, loose-ball recoveries included.
-  { type: "interception", key: "interceptions", one: "won ball", many: "won balls" },
-  { type: "tackle", key: "tackles", one: "tackle", many: "tackles" },
-];
-
-function count(c: CountStat | null | undefined): Value {
+/**
+ * A counted stat. `sampled` marks the types estimated from a random sample (passes,
+ * accurate passes, won balls, tackles): their unchecked moments are never gone
+ * through one by one, so the note asks for a sample, not for "N to review".
+ */
+function count(c: CountStat | null | undefined, sampled?: { pooled: number; min: number }): Value {
   if (!c) return { value: null };
   if (!c.pending) return { value: c.confirmed > 0 ? c.confirmed : null, note: c.confirmed ? "confirmed in reviewed clips" : "none confirmed" };
   if (c.estimate !== undefined && c.estimateRange) {
     // Unchecked detections counted at the rate the reviewer found them right.
     return { value: c.estimate, approx: true, note: `${c.estimateRange[0]}–${c.estimateRange[1]} · ${c.confirmed} confirmed` };
   }
-  // How many more checks an estimate needs is a per-type figure (shown once, in the score panel).
-  return { value: c.confirmed > 0 ? c.confirmed : null, note: `${c.confirmed} confirmed · ${c.pending} to review` };
+  // Moments still unchecked and no estimate yet: what is confirmed is a lower bound
+  // ("3+"), not a total to set against the other team or an estimate.
+  const next = sampled
+    ? sampled.pooled <= sampled.min
+      ? "check them all for the exact count"
+      : `check ${sampled.min} at random to estimate`
+    : `${c.pending} to review`;
+  return { value: c.confirmed > 0 ? c.confirmed : null, partial: true, note: `${c.confirmed} confirmed so far · ${next}` };
 }
 
 /** Possible goals still to check; null when they were not looked for (no pitch setup). */
@@ -71,7 +73,9 @@ function Row({
   note?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const known = a.value !== null && b.value !== null;
+  // A partial count is a lower bound: no leader and no bar against the other side
+  // (an exact count next to an estimate stays comparable).
+  const known = a.value !== null && b.value !== null && !a.partial && !b.partial;
   const total = known ? (a.value as number) + (b.value as number) : 0;
   const share = (v: number | null) => (known && total > 0 ? (v as number) / total : 0);
   const leader = known && a.value !== b.value ? ((a.value as number) > (b.value as number) ? 0 : 1) : null;
@@ -81,9 +85,9 @@ function Row({
         className="px-2.5 py-0.5 rounded-full text-sm font-bold tabular-nums"
         style={leader === side ? { background: colours[side], color: "#0b0f1a" } : undefined}
       >
-        {v.value === null ? "—" : `${v.approx ? "≈" : ""}${format(v.value)}`}
+        {v.value === null ? "—" : `${v.approx ? "≈" : ""}${format(v.value)}${v.partial ? "+" : ""}`}
       </span>
-      {v.note && <span className="text-[10px] text-pitch-muted mt-0.5">{v.note}</span>}
+      {v.note && <span className="text-xs text-pitch-muted mt-0.5 text-center">{v.note}</span>}
     </span>
   );
   return (
@@ -100,7 +104,8 @@ function Row({
               aria-label={`Why: ${label}`}
               aria-expanded={open}
               onClick={() => setOpen((v) => !v)}
-              className="p-2 -m-2 rounded-full opacity-70 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pitch-green"
+              // 44 px to tap; the negative margin keeps the row as compact as the 13 px icon.
+              className="inline-flex items-center justify-center min-h-11 min-w-11 -my-3 -mr-3 -ml-2 rounded-full opacity-70 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pitch-green"
             >
               <Info size={13} />
             </button>
@@ -108,10 +113,10 @@ function Row({
         </span>
         {pill(b, 1)}
       </div>
-      {note && <p className="text-[11px] text-amber-200/90 text-center mt-1">{note}</p>}
-      {open && hint && <p className="text-[11px] text-pitch-muted text-center mt-1.5">{hint}</p>}
+      {note && <p className="text-xs text-amber-200/90 text-center mt-1">{note}</p>}
+      {open && hint && <p className="text-xs text-pitch-muted text-center mt-1.5">{hint}</p>}
       {known && total > 0 && (
-        <div className="flex gap-1.5 mt-1.5 h-1.5">
+        <div className="flex gap-1.5 mt-1.5 h-1.5" data-testid="stat-bar">
           <div className="flex-1 flex justify-end rounded-full bg-white/5 overflow-hidden">
             <motion.div className="h-full rounded-full" style={{ background: colours[0] }} initial={{ width: 0 }} whileInView={{ width: `${share(a.value) * 100}%` }} viewport={{ once: true }} transition={{ duration: 0.8 }} />
           </div>
@@ -171,6 +176,7 @@ export function MatchReport({
   videoAvailable = true,
   playerLoad,
   ballTracked = true,
+  afterHero,
 }: {
   analysis: Analysis;
   names: string[];
@@ -179,15 +185,20 @@ export function MatchReport({
   start: number;
   onSeek: (t: number) => void;
   onCalibrate: () => void;
-  onReview: () => void;
+  /** Open the review: at the score box, on the random sample, or on the key moments. */
+  onReview: (target?: "score" | "sample" | "key") => void;
   /** False once the footage is deleted: pitch setup is clicked on the video. */
   videoAvailable?: boolean;
   /** Per-kit running distance, measured for every job with or without the ball model (absent on results before 2.6). */
   playerLoad?: PlayerLoad;
   /** False for a player-load job: the ball model was not run, so nothing about the ball was measured. */
   ballTracked?: boolean;
+  /** Shown directly under the score card (the next steps). */
+  afterHero?: React.ReactNode;
 }) {
   const [heatTeam, setHeatTeam] = useState<0 | 1>(0);
+  // The timeline shows key moments; unreviewed won balls (often over a hundred) on request.
+  const [allMoments, setAllMoments] = useState(false);
   const [A, B] = analysis.stats.teams as [TeamStats, TeamStats];
   const cov = analysis.stats.coverage;
   const minChecked = analysis.params?.minCheckedForEstimate ?? MIN_CHECKED;
@@ -208,8 +219,21 @@ export function MatchReport({
   const possessionShown = cov.possessionShown;
   const range = cov.possessionMissingBounds;
   const pct = (v: number) => `${Math.round(v)}%`;
+  // Two-sided shares as whole percents that add up to 100.
+  const [possA, possB] = shares(possessionShown ? A.possession : null, possessionShown ? B.possession : null);
+  const [passShareA, passShareB] = shares(A.passShare ?? null, B.passShare ?? null);
+  const [tiltA, tiltB] = shares(A.fieldTilt, B.fieldTilt);
+  const needs = sampleNeeds(analysis);
+  // Unchecked moments of a type over both teams (older workers do not send pendingByType).
+  const pooled = (type: string, key: "passes" | "interceptions" | "tackles") => ({
+    pooled: analysis.review.pendingByType?.[type] ?? (A[key]?.pending ?? 0) + (B[key]?.pending ?? 0),
+    min: minChecked,
+  });
   const events = analysis.events.filter((e) => e.status !== "rejected" && ["shot", "goal", "goal-candidate", "interception", "tackle", "pass"].includes(e.type));
-  const keyEvents = events.filter((e) => e.type !== "pass");
+  const wonBall = (e: AnalysisEvent) => e.type === "interception" || e.type === "tackle";
+  // Goals, possible goals, shots and confirmed won balls; unreviewed won balls only on request.
+  const keyEvents = events.filter((e) => e.type !== "pass" && (allMoments || !wonBall(e) || e.status === "confirmed"));
+  const hiddenWon = events.filter((e) => wonBall(e) && e.status !== "confirmed").length;
   const scoreShown = !!analysis.enteredScore || (goalsKnown && reviewedGoals > 0);
   // Older analyses have no shotsBasis: unmeasured shots there meant no direction.
   const shotsNote =
@@ -220,29 +244,47 @@ export function MatchReport({
         : null;
   // Player-load job without a score: what was measured (distance) leads instead of "– : –".
   const distanceHero = !ballTracked && !scoreShown && kitMetres.some((v) => v !== null);
+  // Accurate passes are estimated from checked passes the detector called complete:
+  // enough checked passes do not yet mean enough of those.
+  const accurateOpen = [A, B].some((t) => t.passesComplete && t.passesComplete.pending > 0 && t.passesComplete.estimate === undefined);
+  const accurateChecked = A.passesComplete?.checked ?? 0;
+  const advice = needs
+    .map((t) => {
+      const n = t.pending;
+      if (!n) return "";
+      const found = `${n} ${n === 1 ? t.one : t.many} found`;
+      // Too few to sample: checking them all gives the exact count.
+      if (t.few) return `${found}: check ${n === 1 ? "it" : `all ${n}`} for the exact count`;
+      const accurate = t.type === "pass" && accurateOpen ? `accurate passes ${Math.min(accurateChecked, t.min)}/${t.min}` : "";
+      if (t.checked >= t.min)
+        return accurate
+          ? `${found}: ${accurate}. Accurate passes need ${t.min} checked passes the detector called complete (${accurateChecked} so far): check a few more random passes`
+          : `${found}: enough checked to estimate the rest`;
+      return `${found}: check ${t.checked ? `${t.min - t.checked} more` : t.min} at random to estimate the total, no need to go through them all${accurate ? ` (${accurate})` : ""}`;
+    })
+    .filter(Boolean);
   return (
     <div className="space-y-6">
-      {ballTracked && (
-        <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
-          <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check a random sample of
-          passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
-          detections you checked were right. Moments the system never found are not included; add them in the review.
-        </section>
-      )}
       <motion.section
         initial={{ opacity: 0, y: 14 }}
         animate={{ opacity: 1, y: 0 }}
         className="relative overflow-hidden rounded-3xl border border-white/10"
         style={{ background: `linear-gradient(115deg, ${colours[0]}33 0%, #0e1326 38%, #0e1326 62%, ${colours[1]}33 100%)` }}
+        data-testid="score-card"
       >
-        <div className="relative grid grid-cols-[1fr_auto_1fr] items-center gap-4 px-5 py-8 sm:px-10">
-          <div className="flex flex-col items-center gap-2">
-            <span className="w-12 h-12 rounded-full border-4 border-white/20" style={{ background: colours[0] }} />
-            <span className="font-bold text-lg text-center break-words">{names[0]}</span>
+        {/* On a phone the centre holds only the score, so team names get room; the
+            score note, the review action and the sample advice take a row of their own. */}
+        <div className="relative grid grid-cols-[minmax(0,1fr)_minmax(0,6rem)_minmax(0,1fr)] sm:grid-cols-[1fr_auto_1fr] items-center gap-x-1 gap-y-4 px-2 py-6 sm:gap-x-4 sm:px-10 sm:py-8">
+          <div className="flex flex-col items-center gap-2 min-w-0">
+            <span className="w-10 h-10 sm:w-12 sm:h-12 rounded-full border-4 border-white/20" style={{ background: colours[0] }} />
+            <span className="font-bold text-sm sm:text-lg leading-snug text-center break-words max-w-full" data-testid="hero-name">{names[0]}</span>
           </div>
-          <div className="flex flex-col items-center gap-2 text-center">
+          <div className="flex flex-col items-center gap-2 text-center min-w-0">
             <span className="text-[11px] uppercase tracking-[0.2em] text-pitch-muted">{distanceHero ? "Distance" : "Score"}</span>
-            <div className={`${distanceHero ? "text-4xl sm:text-5xl" : "text-5xl"} font-black tabular-nums`} data-testid="report-hero">
+            <div
+              className={`${distanceHero ? "text-3xl sm:text-5xl flex flex-wrap justify-center items-baseline" : "text-4xl sm:text-5xl whitespace-nowrap"} font-black tabular-nums`}
+              data-testid="report-hero"
+            >
               {analysis.enteredScore ? (
                 <>
                   <span style={{ color: colours[0] }}>{analysis.enteredScore[0]}</span>
@@ -265,7 +307,13 @@ export function MatchReport({
                 <span className="text-pitch-muted text-3xl">– : –</span>
               )}
             </div>
-            <span className="text-xs text-pitch-muted max-w-[16rem]">
+          </div>
+          <div className="flex flex-col items-center gap-2 min-w-0">
+            <span className="w-10 h-10 sm:w-12 sm:h-12 rounded-full border-4 border-white/20" style={{ background: colours[1] }} />
+            <span className="font-bold text-sm sm:text-lg leading-snug text-center break-words max-w-full" data-testid="hero-name">{names[1]}</span>
+          </div>
+          <div className="col-span-3 flex flex-col items-center gap-2 text-center">
+            <span className="text-xs text-pitch-muted max-w-md">
               {analysis.enteredScore
                 ? `Score entered by you · ${reviewedGoals} of ${analysis.enteredScore[0] + analysis.enteredScore[1]} goals located in the video`
                 : reviewedGoals > 0
@@ -282,38 +330,22 @@ export function MatchReport({
                         ? `${pendingTotal} possible goal${pendingTotal === 1 ? "" : "s"} to confirm`
                         : "No goal confirmed yet. Add goals you saw in the review."}
             </span>
-            <button className="text-xs underline text-pitch-green" onClick={onReview}>
+            <button className="pitch-button-primary min-h-11" onClick={() => onReview("score")}>
               {analysis.enteredScore ? "Review" : "Enter the score and review"}
-              {analysis.review.pendingKey !== undefined
-                ? ` · ${analysis.review.pendingKey} ${analysis.review.pendingKey === 1 ? "shot or goal" : "shots and goals"} to check`
-                : ` · ${analysis.review.pending} waiting`}
             </button>
-            {(() => {
-              // What each sampled type still needs, once per type (checks are pooled across teams).
-              const by = analysis.review.pendingByType ?? {};
-              const advice = SAMPLED.map(({ type, key, one, many }) => {
-                const n = by[type] ?? 0;
-                if (!n) return "";
-                const checked = A[key]?.checked ?? 0;
-                const found = `${n} ${n === 1 ? one : many} found`;
-                // Too few to sample: checking them all gives the exact count.
-                if (n <= minChecked) return `${found}: check ${n === 1 ? "it" : `all ${n}`} for the exact count`;
-                if (checked >= minChecked) return `${found}: enough checked to estimate the rest`;
-                return `${found}: check ${checked ? `${minChecked - checked} more` : minChecked} at random to estimate the total, no need to go through them all`;
-              }).filter(Boolean);
-              return advice.length ? (
-                <span className="text-[11px] text-pitch-muted max-w-[18rem]" data-testid="sample-advice">
-                  {advice.join(". ")}.
-                </span>
-              ) : null;
-            })()}
-          </div>
-          <div className="flex flex-col items-center gap-2">
-            <span className="w-12 h-12 rounded-full border-4 border-white/20" style={{ background: colours[1] }} />
-            <span className="font-bold text-lg text-center break-words">{names[1]}</span>
+            <span className="text-xs text-pitch-muted">
+              {analysis.review.pendingKey !== undefined
+                ? `${analysis.review.pendingKey} ${analysis.review.pendingKey === 1 ? "shot or goal" : "shots and goals"} to check`
+                : `${analysis.review.pending} waiting`}
+            </span>
+            {advice.length > 0 && (
+              <span className="text-xs text-pitch-muted max-w-md" data-testid="sample-advice">
+                {advice.join(". ")}.
+              </span>
+            )}
           </div>
         </div>
-        <p className="relative border-t border-white/10 px-5 py-2.5 text-xs text-pitch-muted flex flex-wrap gap-x-4 gap-y-1 justify-center">
+        <p className="relative border-t border-white/10 px-5 py-2.5 text-xs text-pitch-muted flex flex-wrap items-center gap-x-4 gap-y-1 justify-center">
           {/* Stoppage time is not shown: against labelled matches the detector found
               only a few percent of real stoppages, and most of what it flagged was live play. */}
           {ballTracked ? (
@@ -329,7 +361,7 @@ export function MatchReport({
           {cov.calibratedPercent > 0 ? (
             <span>Pitch mapped {cov.calibratedPercent}%</span>
           ) : videoAvailable ? (
-            <button className="underline text-pitch-green" onClick={onCalibrate}>
+            <button className="underline text-pitch-green min-h-11 py-3 px-1" onClick={onCalibrate}>
               Pitch not set up · set it up
             </button>
           ) : (
@@ -338,6 +370,16 @@ export function MatchReport({
           <span title="Pieces of player tracks after joining; one player usually appears as several.">{analysis.stats.tracks.players} track segments</span>
         </p>
       </motion.section>
+
+      {afterHero}
+
+      {ballTracked && (
+        <section className="rounded-2xl border border-amber-300/20 bg-amber-300/5 p-4 text-sm" role="status">
+          <strong>Assisted review</strong> · Automatic moments are candidates until checked. Check a random sample of
+          passes (and each shot) and the counts become estimates marked ≈, with a range, scaled by how often the
+          detections you checked were right. Moments the system never found are not included; add them in the review.
+        </section>
+      )}
 
       {!analysis.calibrated && (
         <section className="rounded-2xl border border-pitch-green/40 bg-pitch-green/5 p-5 flex flex-wrap gap-4 items-center justify-between">
@@ -389,8 +431,8 @@ export function MatchReport({
           <Group title="Possession">
             <Row
               label="Observed control share"
-              a={{ value: possessionShown ? A.possession : null, note: possessionShown && range ? `unseen-play bounds: ${Math.round(range[0])}–${Math.round(range[1])}%` : undefined }}
-              b={{ value: possessionShown ? B.possession : null }}
+              a={{ value: possA, note: possessionShown && range ? `unseen-play bounds: ${Math.round(range[0])}–${Math.round(range[1])}%` : undefined }}
+              b={{ value: possB }}
               colours={colours}
               format={pct}
               hint={
@@ -409,8 +451,8 @@ export function MatchReport({
             />
             <Row
               label="Candidate pass share"
-              a={{ value: A.passShare ?? null }}
-              b={{ value: B.passShare ?? null }}
+              a={{ value: passShareA }}
+              b={{ value: passShareB }}
               colours={colours}
               format={pct}
               hint="Each team's share of all detected passes. Many stats sites define possession this way; it can differ from the time-based figure above."
@@ -426,16 +468,16 @@ export function MatchReport({
             <Row label="Average possession" a={{ value: possessionShown ? A.averagePossession : null }} b={{ value: possessionShown ? B.averagePossession : null }} colours={colours} format={(v) => `${v.toFixed(1)}s`} />
             <Row
               label="Field tilt"
-              a={{ value: A.fieldTilt }}
-              b={{ value: B.fieldTilt }}
+              a={{ value: tiltA }}
+              b={{ value: tiltB }}
               colours={colours}
               format={pct}
               hint="Share of all ball control in an attacking third that was this team's: who pinned whom back."
             />
           </Group>
           <Group title="Passing">
-            <Row label="Passes" a={count(A.passes)} b={count(B.passes)} colours={colours} hint="Ball moved from one player to another (to a teammate or intercepted). Unseen transfers get lower confidence." />
-            <Row label="Accurate passes" a={count(A.passesComplete)} b={count(B.passesComplete)} colours={colours} />
+            <Row label="Passes" a={count(A.passes, pooled("pass", "passes"))} b={count(B.passes, pooled("pass", "passes"))} colours={colours} hint="Ball moved from one player to another (to a teammate or intercepted). Unseen transfers get lower confidence." />
+            <Row label="Accurate passes" a={count(A.passesComplete, pooled("pass", "passes"))} b={count(B.passesComplete, pooled("pass", "passes"))} colours={colours} />
             <Row
               label="Reviewed pass accuracy"
               a={{ value: A.passAccuracy, note: A.passAccuracy === null && A.passes?.value ? "needs 20+ reviewed passes" : undefined }}
@@ -446,13 +488,13 @@ export function MatchReport({
           </Group>
           <Group title="Attacking">
             {analysis.calibrated && cov.calibratedPercent < 60 && (
-              <p className="text-[11px] text-amber-200/90 pt-1">
+              <p className="text-xs text-amber-200/90 pt-1">
                 The pitch is mapped for {cov.calibratedPercent}% of the match, so shots cover that part only.
               </p>
             )}
             <Row label="Shots" a={count(A.shots)} b={count(B.shots)} colours={colours} hint="Fast ball released towards the goal the team attacks. Needs the pitch set up, or add the shots you saw in review." />
             {shotsNote && (
-              <p className="text-[11px] text-pitch-muted pb-1" data-testid="shots-note">
+              <p className="text-xs text-pitch-muted pb-1" data-testid="shots-note">
                 {shotsNote}
               </p>
             )}
@@ -474,15 +516,15 @@ export function MatchReport({
           <Group title="Defending">
             <Row
               label="Interceptions & recoveries"
-              a={count(A.interceptions)}
-              b={count(B.interceptions)}
+              a={count(A.interceptions, pooled("interception", "interceptions"))}
+              b={count(B.interceptions, pooled("interception", "interceptions"))}
               colours={colours}
               hint="Ball taken from the other team: an intercepted pass or a loose ball; without the pitch set up this includes tackles."
             />
             <Row
               label="Tackles"
-              a={count(A.tackles)}
-              b={count(B.tackles)}
+              a={count(A.tackles, pooled("tackle", "tackles"))}
+              b={count(B.tackles, pooled("tackle", "tackles"))}
               colours={colours}
               hint="Ball won within 2 m and 0.8 s of the opponent losing it; needs the pitch set up."
               // Unmeasured, not zero: without metres a tackle cannot be told from another won ball.
@@ -571,7 +613,7 @@ export function MatchReport({
                 <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Heatmap</h2>
                 <div className="flex gap-1 text-xs" role="tablist" aria-label="Heatmap team">
                   {([0, 1] as const).map((t) => (
-                    <button key={t} role="tab" aria-selected={heatTeam === t} onClick={() => setHeatTeam(t)} className={`px-2.5 py-1 rounded-full ${heatTeam === t ? "text-[#0b0f1a] font-bold" : "text-pitch-muted"}`} style={heatTeam === t ? { background: colours[t] } : undefined}>
+                    <button key={t} role="tab" aria-selected={heatTeam === t} onClick={() => setHeatTeam(t)} className={`px-2.5 py-2.5 min-h-10 rounded-full ${heatTeam === t ? "text-[#0b0f1a] font-bold" : "text-pitch-muted"}`} style={heatTeam === t ? { background: colours[t] } : undefined}>
                       {names[t]}
                     </button>
                   ))}
@@ -595,33 +637,59 @@ export function MatchReport({
       ) : null}
 
       <section className={card}>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
           <h2 className="text-xs uppercase tracking-widest text-pitch-muted">Match timeline</h2>
-          <span className="text-xs text-pitch-muted">{keyEvents.length} moment{keyEvents.length === 1 ? "" : "s"} on the timeline · click to watch</span>
+          <span className="text-xs text-pitch-muted">{keyEvents.length} moment{keyEvents.length === 1 ? "" : "s"} on the timeline · tap to watch</span>
         </div>
-        <div className="relative h-14">
-          <div className="absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-white/10" />
-          {keyEvents.map((e) => (
-            <button
-              key={e.id}
-              onClick={() => onSeek(Math.max(0, e.t - 2))}
-              title={`${clockTime(e.t)} · ${e.team !== null ? names[e.team] : ""} · ${describeEvent(e)}${e.status === "confirmed" ? " · confirmed" : " · to review"}`}
-              className="absolute -translate-x-1/2 w-5 h-5 rounded-full ring-2 ring-[#11162a]"
-              style={{
-                left: `${Math.min(100, Math.max(0, ((e.t - start) / Math.max(1, duration)) * 100))}%`,
-                top: e.team === 0 ? 0 : "auto",
-                bottom: e.team === 0 ? "auto" : 0,
-                background: e.team !== null ? colours[e.team] : "#94a3b8",
-                opacity: e.status === "confirmed" ? 1 : 0.55,
-                outline: e.type === "goal" || e.type === "goal-candidate" ? "2px solid #facc15" : undefined,
-              }}
-            />
-          ))}
+        {/* On a phone a list with rows big enough to tap; from md up the strip. */}
+        {keyEvents.length > 0 && (
+          <ul className="md:hidden divide-y divide-white/5 max-h-[26rem] overflow-auto" data-testid="timeline-list">
+            {keyEvents.map((e) => (
+              <li key={e.id}>
+                <button className="flex w-full items-center gap-3 min-h-11 py-2 text-left text-sm" onClick={() => onSeek(Math.max(0, e.t - 2))}>
+                  <span className="font-mono text-pitch-green tabular-nums">{clockTime(e.t)}</span>
+                  <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: e.team !== null ? colours[e.team] : "#94a3b8" }} />
+                  <span className="flex-1 min-w-0 truncate">
+                    {describeEvent(e)}
+                    {e.team !== null ? ` · ${names[e.team]}` : ""}
+                  </span>
+                  <span className="text-xs text-pitch-muted shrink-0">{e.status === "confirmed" ? "confirmed" : "to review"}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="hidden md:block" data-testid="timeline-strip">
+          <div className="relative h-14">
+            <div className="absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-white/10" />
+            {keyEvents.map((e) => (
+              <button
+                key={e.id}
+                onClick={() => onSeek(Math.max(0, e.t - 2))}
+                title={`${clockTime(e.t)} · ${e.team !== null ? names[e.team] : ""} · ${describeEvent(e)}${e.status === "confirmed" ? " · confirmed" : " · to review"}`}
+                aria-label={`${clockTime(e.t)} · ${describeEvent(e)}${e.status === "confirmed" ? " · confirmed" : " · to review"}`}
+                className="absolute -translate-x-1/2 w-5 h-5 rounded-full ring-2 ring-[#11162a]"
+                style={{
+                  left: `${Math.min(100, Math.max(0, ((e.t - start) / Math.max(1, duration)) * 100))}%`,
+                  top: e.team === 0 ? 0 : "auto",
+                  bottom: e.team === 0 ? "auto" : 0,
+                  background: e.team !== null ? colours[e.team] : "#94a3b8",
+                  opacity: e.status === "confirmed" ? 1 : 0.55,
+                  outline: e.type === "goal" || e.type === "goal-candidate" ? "2px solid #facc15" : undefined,
+                }}
+              />
+            ))}
+          </div>
+          <div className="flex justify-between text-[11px] text-pitch-muted mt-2">
+            <span>{clockTime(start)}</span>
+            <span>{clockTime(start + duration)}</span>
+          </div>
         </div>
-        <div className="flex justify-between text-[11px] text-pitch-muted mt-2">
-          <span>{clockTime(start)}</span>
-          <span>{clockTime(start + duration)}</span>
-        </div>
+        {hiddenWon > 0 && (
+          <button className="pitch-button-secondary min-h-11 mt-3 text-xs" aria-pressed={allMoments} onClick={() => setAllMoments((v) => !v)}>
+            {allMoments ? "Key moments only" : `Show all moments (+${hiddenWon} won ball${hiddenWon === 1 ? "" : "s"} to review)`}
+          </button>
+        )}
       </section>
     </div>
   );

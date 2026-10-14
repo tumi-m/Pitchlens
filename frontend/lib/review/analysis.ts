@@ -1,4 +1,5 @@
 import { VisionError, visionJson } from "./vision";
+import type { VisionResult } from "./vision";
 
 /** Pitch presets; mirrors backend/app/vision/pitch.py PRESETS (the worker validates). */
 export type PitchTemplate = {
@@ -287,6 +288,16 @@ export type Analysis = {
   };
   /** [t, [[player, team, x, y]...] | null, [bx, by, inferred] | null] per sampled frame. */
   positions: [number, [number, number, number, number][] | null, [number, number, number] | null][] | null;
+  /** Asked for without positions (?positions=0): they come with the full analysis. */
+  positionsOmitted?: boolean;
+  /** Copied from the result so the report draws before it arrives (absent on older workers). */
+  teams?: { colour: string | null }[] | null;
+  analysedStart?: number;
+  analysedDuration?: number;
+  /** "none" is a player-load job (null on results that predate the choice). */
+  ballSearch?: string | null;
+  ballFrames?: number | null;
+  playerLoad?: VisionResult["metrics"]["playerLoad"] | null;
 };
 
 export type CalibrationFit = {
@@ -348,8 +359,9 @@ export type ReviewDecision =
   | { action: "direction"; value: "left" | "right" }
   | { action: "score"; value: [number, number] };
 
-export const fetchAnalysis = (jobId: string, signal?: AbortSignal) =>
-  visionJson<Analysis>(`jobs/${jobId}/analysis`, { signal });
+/** positions: false leaves out the per-frame pitch positions (most of a calibrated analysis). */
+export const fetchAnalysis = (jobId: string, options: { positions?: boolean; signal?: AbortSignal } = {}) =>
+  visionJson<Analysis>(`jobs/${jobId}/analysis${options.positions === false ? "?positions=0" : ""}`, { signal: options.signal });
 
 export const fetchCalibration = (jobId: string, signal?: AbortSignal, frames = true) =>
   visionJson<Calibration>(`jobs/${jobId}/calibration${frames ? "" : "?frames=0"}`, { signal });
@@ -402,6 +414,52 @@ export function isConfirmedGoal(e: AnalysisEvent): boolean {
   if (e.status !== "confirmed") return false;
   if (e.type === "goal" || e.type === "goal-candidate") return true;
   return e.type === "shot" && (e.outcome === "goal" || e.outcome === "goal-candidate") && e.outcomeBy === "reviewer";
+}
+
+/** Types estimated from a random sample (mirrors SAMPLED_TYPES in the worker's analytics);
+ *  "interception" is every ball won that is not a tackle, loose-ball recoveries included. */
+export const SAMPLED_TYPES = [
+  { type: "pass", key: "passes", one: "pass", many: "passes" },
+  { type: "interception", key: "interceptions", one: "won ball", many: "won balls" },
+  { type: "tackle", key: "tackles", one: "tackle", many: "tackles" },
+] as const;
+
+/** Checked detections of a type before the unchecked ones are estimated (the worker's default). */
+export const MIN_CHECKED = 10;
+
+export type SampleNeed = (typeof SAMPLED_TYPES)[number] & {
+  /** Unchecked detections of this type (both teams). */
+  pending: number;
+  /** Detections of this type the reviewer has checked (pooled across teams). */
+  checked: number;
+  min: number;
+  /** Too few to sample: checking every one gives the exact count. */
+  few: boolean;
+  /** Nothing left to check, or enough checked to estimate the rest. */
+  done: boolean;
+  /** "passes 4/10": checks so far against what the estimate (or the exact count) needs. */
+  progress: string;
+};
+
+/** What each sampled type still needs, once per type (checks are pooled across teams). */
+export function sampleNeeds(analysis: Analysis): SampleNeed[] {
+  const min = analysis.params?.minCheckedForEstimate ?? MIN_CHECKED;
+  const by = analysis.review.pendingByType ?? {};
+  return SAMPLED_TYPES.map((t) => {
+    const pending = by[t.type] ?? 0;
+    const checked = analysis.stats.teams[0]?.[t.key]?.checked ?? 0;
+    const few = pending <= min;
+    const target = few ? checked + pending : min;
+    return {
+      ...t,
+      pending,
+      checked,
+      min,
+      few,
+      done: pending === 0 || (!few && checked >= min),
+      progress: `${t.many} ${Math.min(checked, target)}/${target}`,
+    };
+  });
 }
 
 export function describeEvent(e: AnalysisEvent): string {

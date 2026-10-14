@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
@@ -10,6 +10,43 @@ import { AuthModal } from '@/components/auth/AuthModal';
 import { logout } from '@/lib/firebase/auth';
 import { cn } from '@/lib/utils/cn';
 import toast from 'react-hot-toast';
+import { currentUpload, dismissUpload, inFlight, subscribeUploads, uploadsVersion } from '@/lib/review/uploadStore';
+import { percentLabel } from '@/lib/review/uploadProgress';
+
+/** An upload of this tab, followed while the upload page is left for another page. */
+function UploadStatus({ pathname }: { pathname: string }) {
+  useSyncExternalStore(subscribeUploads, uploadsVersion, () => 0);
+  const upload = currentUpload();
+  const report = upload?.state === 'started' && upload.left && upload.jobId ? `/vision/${upload.jobId}` : null;
+  // Opening the report (from here or elsewhere) is what this link was for.
+  useEffect(() => {
+    if (upload && report && pathname === report) dismissUpload(upload);
+  }, [upload, report, pathname]);
+  if (!upload) return null;
+  const chip = 'text-xs font-medium px-2.5 py-1.5 rounded-lg border whitespace-nowrap';
+  if (inFlight(upload)) {
+    // The upload page shows the upload itself.
+    if (pathname === '/upload') return null;
+    return (
+      <Link href="/upload" className={cn(chip, 'border-pitch-green/40 text-pitch-green')} data-testid="nav-upload">
+        Uploading {upload.totalBytes > 0 ? percentLabel(upload.sentBytes, upload.totalBytes) : '0%'}
+      </Link>
+    );
+  }
+  if (report)
+    return (
+      <Link href={report} onClick={() => dismissUpload(upload)} className={cn(chip, 'border-pitch-green/40 text-pitch-green')} data-testid="nav-upload">
+        Analysis started · open report
+      </Link>
+    );
+  if (upload.state === 'failed' && upload.left && pathname !== '/upload')
+    return (
+      <Link href="/upload" className={cn(chip, 'border-amber-400/40 text-amber-200')} data-testid="nav-upload">
+        Upload stopped
+      </Link>
+    );
+  return null;
+}
 
 const navLinks = [
   { href: '/upload', label: 'Upload', icon: Upload },
@@ -62,8 +99,7 @@ export function Navbar() {
           </nav>
 
           <div className="flex items-center gap-2">
-
-
+            <UploadStatus pathname={pathname} />
             {!process.env.NEXT_PUBLIC_FIREBASE_API_KEY ? <span className="text-xs text-pitch-muted hidden md:block">No sign-in needed</span> : user ? (
               <div className="hidden md:flex items-center gap-2">
                 <div className="w-8 h-8 rounded-full bg-pitch-indigo-soft flex items-center justify-center text-xs font-bold text-pitch-white overflow-hidden">
