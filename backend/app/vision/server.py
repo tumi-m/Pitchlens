@@ -20,6 +20,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.vision import billing, gpu
-from app.vision.access import valid_video_grant
+from app.vision.access import model_grant_job, valid_video_grant
 from app.vision.engine import probe, run_video
 from app.vision.profiles import available_profiles, player_load_profiles
 
@@ -44,10 +45,11 @@ ops_log.propagate = False
 
 
 class RedactOwnerKeys(logging.Filter):
-    """uvicorn's access log prints each path with its query string, and owner keys
-    are capabilities for a browser's matches: never write one to the log."""
+    """uvicorn's access log prints each path with its query string. Owner keys are
+    capabilities for a browser's matches, and match titles (pre-filled from file
+    names) and video links can name people: never write any of them to the log."""
 
-    pattern = re.compile(r"(?i)(owner=)[^&\s]*")
+    pattern = re.compile(r"(?i)((?:^|[?&])(?:owner|title|url)=)[^&\s]*")
 
     def filter(self, record):
         # uvicorn's args: (client_addr, method, full_path, http_version, status_code).
@@ -124,8 +126,32 @@ UPLOAD_ABANDON_SECONDS = int(os.getenv("VISION_UPLOAD_ABANDON_SECONDS", "7200"))
 UPLOAD_MAX_SECONDS = int(os.getenv("VISION_UPLOAD_MAX_SECONDS", "3600"))
 UPLOAD_FLOOR_BYTES_PER_SECOND = 250_000
 UPLOAD_SIZED_MAX_SECONDS = 4 * 3600
-# Hosted deployments delete uploaded footage after this many hours (unset = keep forever).
-RETENTION_HOURS = float(os.getenv("VISION_RETENTION_HOURS", "0") or 0)
+
+
+def _retention_hours():
+    """Hours after which uploaded footage is deleted; 0 keeps it until the owner deletes it.
+
+    Unset keeps it (local runs); vision.Dockerfile sets 168 for hosted workers.
+    A value that is set but empty (a blank hosting variable overrides the image's
+    168), not a number, negative or not finite was meant to set retention:
+    deleting after 168 hours is the safer reading, with a warning, and a typo
+    cannot stop the worker from starting.
+    """
+    raw = os.getenv("VISION_RETENTION_HOURS")
+    if raw is None:
+        return 0.0
+    try:
+        hours = float(raw.strip())
+    except ValueError:
+        hours = math.nan
+    if not math.isfinite(hours) or hours < 0:
+        logging.warning("VISION_RETENTION_HOURS=%r is not a number of hours; deleting footage after 168 hours", raw)
+        return 168.0
+    return hours
+
+
+# Hosted deployments delete uploaded footage after this many hours (0 = keep until deleted).
+RETENTION_HOURS = _retention_hours()
 # Open-ended playback ranges are capped so one response never streams a whole match.
 RANGE_CAP = 16 * 1024 * 1024
 OWNER = re.compile(r"[a-f0-9]{32}")
@@ -280,9 +306,30 @@ pitch_slot = threading.BoundedSemaphore(1)
 MAX_JSON_BODY = 256 * 1024
 
 
+def gpu_grant(request):
+    """Whether this request is a GPU run's own read, authorised by its scoped grant.
+
+    Only GET /jobs/{id}/video (that job's grant) and GET /models/{name} (a grant
+    for that file), and only while that job runs on the GPU: a grant reaches no
+    other route, no other job, and nothing once the run has ended or expired.
+    """
+    if request.method != "GET" or not TOKEN:
+        return False
+    job_id, name = request.path_params.get("job_id"), request.path_params.get("name")
+    if job_id and request.url.path == f"/jobs/{job_id}/video":
+        granted = job_id if valid_video_grant(TOKEN, job_id, request.headers.get("x-pitchlens-video-grant")) else None
+    elif name and request.url.path == f"/models/{name}":
+        granted = model_grant_job(TOKEN, name, request.headers.get("x-pitchlens-model-grant"))
+    else:
+        return False
+    return bool(granted) and engines.get(granted) == "gpu"
+
+
 def auth(request: Request):
     # Platform health checks (Railway, Docker) carry no credentials and learn nothing.
     if request.url.path == "/healthz":
+        return
+    if gpu_grant(request):
         return
     if not TOKEN or not hmac.compare_digest(
         request.headers.get("authorization", "").encode(), f"Bearer {TOKEN}".encode()
@@ -290,13 +337,7 @@ def auth(request: Request):
         raise HTTPException(401, "Vision service authentication required")
     job_id = request.path_params.get("job_id")
     if job_id:
-        worker_read = (
-            request.method == "GET"
-            and request.url.path == f"/jobs/{job_id}/video"
-            and valid_video_grant(TOKEN, job_id, request.headers.get("x-pitchlens-video-grant"))
-        )
-        if not worker_read:
-            authorize_job(job_id, request)
+        authorize_job(job_id, request)
 
 
 def require_owner(request):
@@ -327,7 +368,7 @@ def allowed_hosts():
 
 
 app = FastAPI(
-    title="Pitchlens vision worker", docs_url=None, redoc_url=None, dependencies=[Depends(auth)]
+    title="Pitchlens vision worker", docs_url=None, redoc_url=None, openapi_url=None, dependencies=[Depends(auth)]
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 app.include_router(billing.router(lambda: ROOT))
@@ -711,11 +752,9 @@ def recover_after_restart():
 
 
 def _interrupt(path, data, interrupted_by=None):
-    if data["status"] == "uploading":
-        (path.parent / "video").unlink(missing_ok=True)
-    # A YouTube download stopped by the restart (yt-dlp's download.*.part, up to 2 GB).
-    for leftover in path.parent.glob("download.*"):
-        leftover.unlink(missing_ok=True)
+    # A YouTube download or remux stopped by the restart (yt-dlp's download.*.part,
+    # up to 2 GB); a partial upload too, but never a complete video a retry can use.
+    remove_footage(path.parent, keep=() if data["status"] == "uploading" else ("video", "labelframes"))
     data.update(status="interrupted", stage=RESTARTED)
     if interrupted_by:
         data["interruptedBy"] = interrupted_by
@@ -809,19 +848,38 @@ def expired(data):
     )
 
 
+# Every copy of the footage a match folder can hold: the video, a YouTube
+# download (yt-dlp's download.*) and its remux, and the label stills
+# (balllabels.frame_cache).
+FOOTAGE_LEFTOVERS = ("video", "download.*", "remuxed.mp4", "labelframes")
+
+
+def footage_left(directory):
+    return any(any(directory.glob(pattern)) for pattern in FOOTAGE_LEFTOVERS)
+
+
+def remove_footage(directory, keep=()):
+    """Delete the copies of the footage in a job folder, except the names in `keep`."""
+    for pattern in FOOTAGE_LEFTOVERS:
+        if pattern in keep:
+            continue
+        if pattern == "labelframes":
+            _remove_label_frames(directory)
+            continue
+        for leftover in directory.glob(pattern):
+            leftover.unlink(missing_ok=True)
+
+
 def expire_footage(directory, data):
-    """Delete every copy of the footage (video, label frames, a stopped download); keep the measured result."""
-    (directory / "video").unlink(missing_ok=True)
-    for leftover in directory.glob("download.*"):
-        leftover.unlink(missing_ok=True)
-    _remove_label_frames(directory)  # balllabels.frame_cache
+    """Delete every copy of the footage (video, label frames, a stopped download or remux); keep the measured result."""
+    remove_footage(directory)
     data["videoDeleted"] = True
     write_status(directory, data)
 
 
 def expire_if_due(directory, data):
     """Apply retention when a job is read, not only at the hourly sweep."""
-    if expired(data) and ((directory / "video").exists() or (directory / "labelframes").exists()):
+    if expired(data) and footage_left(directory):
         expire_footage(directory, data)
     elif data.get("videoDeleted") and (directory / "labelframes").exists():
         # Label stills are full-resolution pictures of the footage: they go with
@@ -1284,10 +1342,9 @@ def fetch_and_work(directory, status, event, url):
         logging.exception("YouTube fetch failed")
         update(status="failed", stage="Could not fetch this YouTube video.")
     finally:
+        # A stopped download or remux never stays; the video stays once the analysis has it.
+        remove_footage(directory, keep=("video", "labelframes") if handed_over else ())
         if not handed_over:
-            for leftover in directory.glob("download.*"):
-                leftover.unlink(missing_ok=True)
-            (directory / "video").unlink(missing_ok=True)
             with lock:
                 if active == status["id"]:
                     active = None
@@ -1447,6 +1504,26 @@ def _clean_text(value, limit, what):
     return text
 
 
+async def _small_json(request, too_large):
+    """A JSON object of at most MAX_DETAILS_BODY bytes (owner settings: details, training consent)."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_DETAILS_BODY:
+            raise HTTPException(400, too_large)
+
+    def reject_constant(value):
+        raise ValueError(f"{value} is not allowed")
+
+    try:
+        data = json.loads(body or b"{}", parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise HTTPException(400, "Invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    return data
+
+
 @app.post("/jobs/{job_id}/details")
 async def save_details(job_id: str, request: Request):
     """Team names, title and match date for the owner (authorized like every job route).
@@ -1454,21 +1531,7 @@ async def save_details(job_id: str, request: Request):
     Every key is optional; the ones sent replace the saved ones. Not copied to reruns.
     """
     directory = folder(job_id)
-    body = b""
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_DETAILS_BODY:
-            raise HTTPException(400, "Details are too large")
-
-    def reject_constant(value):
-        raise ValueError(f"{value} is not allowed")
-
-    try:
-        patch = json.loads(body or b"{}", parse_constant=reject_constant)
-    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-        raise HTTPException(400, "Invalid JSON") from exc
-    if not isinstance(patch, dict):
-        raise HTTPException(400, "Expected a JSON object")
+    patch = await _small_json(request, "Details are too large")
     unknown = set(patch) - DETAILS_KEYS
     if unknown:
         raise HTTPException(400, f"Unknown detail: {sorted(unknown)[0][:40]}")
@@ -1666,6 +1729,12 @@ def _stamp(path):
 # result version: video, sampling and each frame's time, number and ball.
 _slim = OrderedDict()  # (job, result stamp) -> slim result
 _slim_lock = threading.Lock()
+# One full parse of a result at a time (about 280 MB live for a 90-minute match):
+# concurrent cache misses wait here and then find the view cached, so a burst of
+# requests can never hold one copy per request (24 at once reached 6.2 GB). Taken
+# alone or around _slim_lock / _crops_lock, never while holding lock, label_lock
+# or post_lock.
+result_parse_lock = threading.Lock()
 SLIM_CACHE = 3
 SLIM_KEYS = ("video", "sampleFps", "ballSearch", "ballInference")
 
@@ -1679,15 +1748,20 @@ def _slim_result(directory):
         if cached is not None:
             _slim.move_to_end(key)
             return cached
-    full = json.loads(path.read_text())
-    view = {k: full[k] for k in SLIM_KEYS if k in full}
-    view["frames"] = [{k: f[k] for k in ("t", "frame", "ball") if k in f} for f in full.get("frames") or []]
-    del full
-    with _slim_lock:
-        _slim[key] = view
-        _slim.move_to_end(key)
-        while len(_slim) > SLIM_CACHE:
-            _slim.popitem(last=False)
+    with result_parse_lock:
+        with _slim_lock:
+            cached = _slim.get(key)
+        if cached is not None:
+            return cached
+        full = json.loads(path.read_text())
+        view = {k: full[k] for k in SLIM_KEYS if k in full}
+        view["frames"] = [{k: f[k] for k in ("t", "frame", "ball") if k in f} for f in full.get("frames") or []]
+        del full
+        with _slim_lock:
+            _slim[key] = view
+            _slim.move_to_end(key)
+            while len(_slim) > SLIM_CACHE:
+                _slim.popitem(last=False)
     return view
 
 
@@ -2114,6 +2188,24 @@ label_lock = threading.Lock()  # balllabels.json writes; never held during analy
 preparing_frames = set()  # job ids whose label frames are being extracted
 
 
+@contextmanager
+def _frame_write_guard(directory):
+    """Held around each still written from a match's footage (labelling, training).
+
+    The decoder keeps reading a deleted video through its open file: a still is
+    written only while the match exists and keeps its footage, and DELETE and
+    the retention sweep (which hold label_lock) wait for the write in progress.
+    One write is tens of milliseconds.
+    """
+    from app.vision import balllabels
+
+    with label_lock:
+        status = _read_json(directory / "status.json")
+        if not isinstance(status, dict) or status.get("videoDeleted") or expired(status):
+            raise balllabels.FramesWithdrawn(directory.name)
+        yield
+
+
 def _prepare_label_frames(job_id, directory, result, picks):
     """Extract the label frames in one background pass (exact engine numbering)."""
     from app.vision import balllabels
@@ -2131,19 +2223,25 @@ def _prepare_label_frames(job_id, directory, result, picks):
 
     def run():
         try:
-            balllabels.prepare_frames(directory, result, picks, video_path)
+            balllabels.prepare_frames(directory, result, picks, video_path, guard=lambda: _frame_write_guard(directory))
+        except balllabels.FramesWithdrawn:
+            pass  # deleted or expired meanwhile: nothing more is written
         except Exception:  # the next listing retries; frames already written stay
             pass
         finally:
             with label_lock:
                 preparing_frames.discard(job_id)
+                # A folder that lost its status.json (deleted while a still was
+                # being written) is listed and swept by nothing: remove it here.
+                if not (directory / "status.json").exists():
+                    shutil.rmtree(directory, ignore_errors=True)
 
     threading.Thread(target=run, daemon=True).start()
     return False
 
 
 def _ball_labels_response(job_id, directory, result, prepare=True):
-    from app.vision import balllabels
+    from app.vision import balllabels, balltrain
 
     store = balllabels.load(directory / "balllabels.json")
     picks = balllabels.sample_frames(result, seed=_label_seed(job_id))
@@ -2156,6 +2254,7 @@ def _ball_labels_response(job_id, directory, result, prepare=True):
         "metrics": balllabels.metrics(result, store),
         "videoAvailable": _video_path(directory) is not None,
         "size": [(result.get("video") or {}).get("width"), (result.get("video") or {}).get("height")],
+        "trainingConsent": balltrain.consented(directory),
     }
 
 
@@ -2194,6 +2293,37 @@ async def add_ball_label(job_id: str, request: Request):
 
     await asyncio.to_thread(save)
     return await asyncio.to_thread(_ball_labels_response, job_id, directory, result, False)
+
+
+@app.post("/jobs/{job_id}/training-consent")
+async def training_consent(job_id: str, request: Request):
+    """The owner's opt-in to train the ball finder used for every analysis on this match's
+    labelled frames: {"agreed": true} or {"agreed": false} (authorized like every job route).
+
+    Stored in status.json as trainingConsent (absent = not agreed), never copied to
+    reruns. Written under label_lock, which training holds for its final check and
+    the switch: a withdrawal during a run discards that run (balltrain.run_training).
+    """
+    directory = folder(job_id)
+    body = await _small_json(request, "Request is too large")
+    if set(body) != {"agreed"} or not isinstance(body["agreed"], bool):
+        raise HTTPException(400, 'Send {"agreed": true} or {"agreed": false}')
+    agreed = body["agreed"]
+
+    def save():
+        # Same order as delete_job: label_lock, then the lock status writes use.
+        with label_lock, lock:
+            data = _read_json(directory / "status.json")
+            if not isinstance(data, dict):
+                raise HTTPException(404, "Job not found")  # deleted meanwhile
+            if job_id == active:
+                # A running analysis rewrites its status from memory.
+                raise HTTPException(409, "Wait for this analysis to finish")
+            data["trainingConsent"] = {"agreed": agreed, "at": round(time.time(), 3)}
+            write_status(directory, data)
+
+    await asyncio.to_thread(save)
+    return {"trainingConsent": agreed}
 
 
 @app.get("/jobs/{job_id}/frames/{index}")
@@ -2317,19 +2447,24 @@ def team_groups(job_id: str):
     with _crops_lock:
         view = _crops.get(key)
     if view is None:
-        result = json.loads(path.read_text())
-        video = result.get("video") or {}
-        view = {
-            "colours": _team_colours(result.get("teams")),
-            "teamsSetBy": result.get("teamsSetBy"),
-            "size": [video.get("width"), video.get("height")],
-            "groups": _team_groups(job_id, result),
-        }
-        del result
-        with _crops_lock:
-            _crops[key] = view
-            while len(_crops) > SLIM_CACHE:
-                _crops.popitem(last=False)
+        with result_parse_lock:
+            with _crops_lock:
+                view = _crops.get(key)
+            if view is None:
+                result = json.loads(path.read_text())
+                video = result.get("video") or {}
+                view = {
+                    "colours": _team_colours(result.get("teams")),
+                    "teamsSetBy": result.get("teamsSetBy"),
+                    "size": [video.get("width"), video.get("height")],
+                    "groups": _team_groups(job_id, result),
+                }
+                del result
+                with _crops_lock:
+                    _crops[key] = view
+                    while len(_crops) > SLIM_CACHE:
+                        _crops.popitem(last=False)
+    # After result_parse_lock is released: _slim_result takes it itself.
     slim = _slim_result(directory)
     picks = balllabels.sample_frames(slim, seed=_label_seed(job_id))
     return {**view, "framesReady": _prepare_label_frames(job_id, directory, slim, picks)}
@@ -2613,6 +2748,10 @@ async def train_ball_model(request: Request):
                 progress=lambda message: _set_training(stage=message),
                 on_start=started,
                 usable=lambda d: balltrain._usable(d) and _video_path(d) is not None,
+                # Stills are written only for matches that still exist, and the
+                # final check and the switch happen under the lock DELETE holds.
+                frame_guard=lambda d: (lambda: _frame_write_guard(d)),
+                commit_guard=lambda: label_lock,
             )
             # A run refused for too few held-out balls says why (nothing was trained).
             _set_training(state="done", stage=outcome.get("message") or "Finished", run=outcome)
@@ -2709,6 +2848,12 @@ def delete_job(job_id: str):
                 raise HTTPException(409, "Cancel processing and wait for it to stop before deleting")
             # A concurrent delete may have removed it during the wait.
             shutil.rmtree(directory, ignore_errors=True)
+            # Its tiles and test frames in a training run in progress (named by
+            # job id): that run then records nothing and switches nothing.
+            for parent, _, names in os.walk(ROOT / "training" / "dataset"):
+                for name in names:
+                    if name.startswith(f"{job_id}-"):
+                        (Path(parent) / name).unlink(missing_ok=True)
             _forget_result(job_id, directory)
             # Saved venues derived from this match are personal derived data too.
             for path in _venue_dir().glob("*.json"):
@@ -2790,8 +2935,10 @@ def rerun_job(job_id: str, request: Request):
     search = request.query_params.get("search")
     if search is not None and search not in ("exhaustive", "adaptive", "none"):
         raise HTTPException(400, "Invalid ball search mode")
-    # Read before taking the lock: a full match's result is large.
-    reference = kit_colours(folder(job_id) / "result.json")
+    # Read before taking the lock: a full match's result is large. One parse at a
+    # time, like every other full read of a result (result_parse_lock).
+    with result_parse_lock:
+        reference = kit_colours(folder(job_id) / "result.json")
     with lock:
         source = folder(job_id)
         previous = load_status(source)

@@ -13,6 +13,7 @@ exported as a training set for fine-tuning the ball detector (balltrain.py;
 started with the curl command in docs/BALL-TRAINING.md).
 """
 
+import contextlib
 import json
 import math
 import random
@@ -124,8 +125,17 @@ def frame_cache(directory):
     return directory / "labelframes"
 
 
-def prepare_frames(directory, result, indices, video_path):
-    """Write the label frames as JPEGs in one pass (skips those already written)."""
+class FramesWithdrawn(Exception):
+    """The match was deleted, or its footage expired, while its frames were being written."""
+
+
+def prepare_frames(directory, result, indices, video_path, guard=None):
+    """Write the label frames as JPEGs in one pass (skips those already written).
+
+    guard: a zero-argument context-manager factory entered around each frame
+    write; it raises FramesWithdrawn when the match may no longer hold stills
+    (the decoder keeps reading a deleted video through its open file).
+    """
     cache = frame_cache(directory)
     cache.mkdir(exist_ok=True)
     wanted = {}
@@ -134,9 +144,10 @@ def prepare_frames(directory, result, indices, video_path):
             wanted.setdefault(source_frame(result, i), i)
 
     def write(i, image):
-        temporary = cache / f"{i}.tmp.jpg"
-        cv2.imwrite(str(temporary), image, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        temporary.replace(cache / f"{i}.jpg")
+        with guard() if guard else contextlib.nullcontext():
+            temporary = cache / f"{i}.tmp.jpg"
+            cv2.imwrite(str(temporary), image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            temporary.replace(cache / f"{i}.jpg")
 
     extract_frames(video_path, wanted, start=analysis_start(result), write=write)
     return cache

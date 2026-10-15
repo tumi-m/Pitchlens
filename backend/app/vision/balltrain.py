@@ -17,6 +17,7 @@
    find more balls without more false ones, by more than chance (see `better`).
 """
 
+import contextlib
 import json
 import math
 import os
@@ -35,6 +36,7 @@ MIN_TEST_VISIBLE = 30
 MIN_TRAIN_VISIBLE = 20
 MIN_MATCH_LABELS = 10
 NOT_ENOUGH_HELD_OUT = "not enough held-out balls"
+MATCH_WITHDRAWN = "match-withdrawn"
 
 
 def _usable(directory):
@@ -46,13 +48,27 @@ def _usable(directory):
     return (directory / "video").is_file() and not status.get("videoDeleted")
 
 
+def consented(directory):
+    """The match's owner ticked the training opt-in (status.json trainingConsent; absent = no)."""
+    try:
+        status = json.loads((directory / "status.json").read_text())
+    except (OSError, ValueError):
+        return False
+    consent = status.get("trainingConsent") if isinstance(status, dict) else None
+    return isinstance(consent, dict) and consent.get("agreed") is True
+
+
 def labelled_jobs(root, usable=_usable):
-    """Match folders with ball labels, a finished result and the footage."""
+    """Match folders with ball labels, a finished result, the footage and the owner's consent.
+
+    A match without consent is neither trained nor tested on: its test frames
+    would be in the dataset sent to the GPU too.
+    """
     out = []
     for directory in sorted(Path(root).iterdir()):
         if not directory.is_dir() or not (directory / "balllabels.json").is_file() or not (directory / "result.json").is_file():
             continue
-        if not usable(directory):
+        if not consented(directory) or not usable(directory):
             continue
         if balllabels.load(directory / "balllabels.json").get("labels"):
             out.append(directory)
@@ -226,13 +242,17 @@ def _box(label, scale, x0, y0, diameter, tile_w, tile_h):
     return (cx / tile_w, cy / tile_h, min(1.0, d / tile_w), min(1.0, d / tile_h))
 
 
-def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.15, seed=0):
+def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.15, seed=0, frame_guard=None):
     """Write a YOLO dataset to `out`; returns counts. Test frames are only kept whole, for scoring.
 
     Frames are read one at a time from the label cache (shared with the
     labelling screen, numbered exactly as the engine numbered them) and dropped
     after use: decoded 1080p frames are 6 MB each, and this runs inside the
     worker. Empty tiles wait on disk until the negatives are sampled.
+
+    Every file is named after the full job id, so deleting a match can find its
+    copies here. frame_guard(directory) gives the guard for that match's label
+    frames (balllabels.prepare_frames).
     """
     out = Path(out)
     if out.exists():
@@ -256,7 +276,8 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
         items = [(i, l) for i, l in items if indices is None or i in indices]
         cut = int(len(items) * (1 - val_fraction))  # the latest frames choose the epoch
         height = float((result.get("video") or {}).get("height") or 360)
-        cache = balllabels.prepare_frames(directory, result, [i for i, _ in items], directory / "video")
+        guard = frame_guard(directory) if frame_guard else None
+        cache = balllabels.prepare_frames(directory, result, [i for i, _ in items], directory / "video", guard=guard)
         for k, (i, label) in enumerate(items):
             frame = cv2.imread(str(cache / f"{i}.jpg"))
             if frame is None:
@@ -266,7 +287,7 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
             for t, (x0, y0, scale, crop) in enumerate(tile_frame(frame)):
                 th, tw = crop.shape[:2]
                 box = _box(label, scale, x0, y0, diameter, tw, th) if label.get("visible") else None
-                name = f"{directory.name[:8]}-{i}-{t}"
+                name = f"{directory.name}-{i}-{t}"
                 if box is None:
                     cv2.imwrite(str(staging / f"{name}.jpg"), crop)
                     empties[part].append(name)
@@ -288,12 +309,13 @@ def build_dataset(train, test, out, negatives_per_positive=1.0, val_fraction=0.1
         result, items = _frames_of(directory)
         items = [(i, l) for i, l in items if indices is None or i in indices]
         video = result.get("video") or {}
-        cache = balllabels.prepare_frames(directory, result, [i for i, _ in items], directory / "video")
+        guard = frame_guard(directory) if frame_guard else None
+        cache = balllabels.prepare_frames(directory, result, [i for i, _ in items], directory / "video", guard=guard)
         for i, label in items:
             source = cache / f"{i}.jpg"
             if not source.is_file():
                 continue
-            name = f"{directory.name[:8]}-{i}.jpg"
+            name = f"{directory.name}-{i}.jpg"
             shutil.copyfile(source, out / "test_frames" / name)  # already a JPEG: no re-encode
             whole.append({"image": name, "label": label, "width": video.get("width"), "height": video.get("height")})
     (out / "test_frames.json").write_text(json.dumps(whole))
@@ -486,13 +508,21 @@ def _public_score(score):
     return {k: v for k, v in (score or {}).items() if k not in ("hits", "falsePositives")}
 
 
-def run_training(root, models, base_weights, epochs=60, owner=None, remote=None, device="cpu", now=0.0, progress=None, usable=_usable, on_start=None):
-    """Build the dataset from every labelled match, fine-tune, validate, keep if better.
+def run_training(
+    root, models, base_weights, epochs=60, owner=None, remote=None, device="cpu", now=0.0, progress=None,
+    usable=_usable, on_start=None, frame_guard=None, commit_guard=None,
+):
+    """Build the dataset from every labelled match whose owner agreed, fine-tune, validate, keep if better.
 
     `remote(dataset_zip, base_bytes, epochs)` runs training on a GPU (Modal) and
     returns the same dict as modal_app.train_ball; without it, training runs here.
     `on_start()` is called once the labels passed every check, right before the
     GPU (or this machine) starts training: the moment a run costs compute.
+    `frame_guard` is passed to build_dataset. `commit_guard()` is held while the
+    matches are checked again and the result is recorded: the worker passes the
+    lock its DELETE holds, so a match cannot be deleted between the check and
+    the switch (the worker's consent endpoint holds it too). Weights are
+    written only when they are kept.
     """
     import hashlib
 
@@ -508,7 +538,7 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
     planned = plan(jobs, trained=trained_on(models, base_name))
     train_set, val_set, how = planned["train"], planned["test"], planned["how"]
     if not train_set:
-        raise ValueError("Label the ball in at least one match first (about 150 frames).")
+        raise ValueError("Label the ball in at least one match and allow training on it first (about 150 frames).")
     record = {
         "at": now,
         "base": base_name,
@@ -536,24 +566,40 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
 
     if not val_set:
         return refuse(0)
+
+    def withdrawn():
+        # Matches deleted, whose footage expired, or whose owner withdrew consent since the split was made.
+        return [d for d, _ in train_set + val_set if not ((d / "status.json").is_file() and usable(d) and consented(d))]
+
     work = Path(root) / "training"
     work.mkdir(exist_ok=True)
     dataset = work / "dataset"
     try:
         say("Building the training set from your labels")
-        counts = build_dataset(train_set, val_set, dataset)
+        counts = build_dataset(train_set, val_set, dataset, frame_guard=frame_guard)
         if counts["train"]["positive"] < 20 or counts["testFrames"] < 10:
             raise ValueError(
                 f"Too few labels to train ({counts['train']['positive']} balls to learn from, "
                 f"{counts['testFrames']} frames to check against). Label more frames."
             )
+        if withdrawn():
+            # Withdrawn while its frames were copied: they are never sent to the GPU.
+            raise ValueError(
+                "A match was deleted or withdrawn from training while the training set was being built; "
+                "nothing was trained. Start training again."
+            )
         test_visible = sum(1 for f in json.loads((dataset / "test_frames.json").read_text()) if f["label"].get("visible"))
         if test_visible < MIN_TEST_VISIBLE:
             shutil.rmtree(dataset, ignore_errors=True)
             return refuse(test_visible, counts)
-    except BaseException:
+    except BaseException as exc:
         # Frame copies of customers' footage never outlive a failed build (a full volume, a bad frame).
         shutil.rmtree(dataset, ignore_errors=True)
+        # A deleted match's copies vanish under the build (DELETE removes them).
+        if isinstance(exc, balllabels.FramesWithdrawn) or (isinstance(exc, OSError) and withdrawn()):
+            raise ValueError(
+                "A match was deleted while the training set was being built; nothing was trained. Start training again."
+            ) from exc
         raise
     try:
         if on_start:
@@ -572,28 +618,51 @@ def run_training(root, models, base_weights, epochs=60, owner=None, remote=None,
         # Frame copies of customers' footage do not outlive the run.
         shutil.rmtree(dataset, ignore_errors=True)
         shutil.rmtree(work / "runs", ignore_errors=True)
-    name = f"ball-{hashlib.sha256(weights_bytes).hexdigest()[:16]}.pt"
     Path(models).mkdir(parents=True, exist_ok=True)
-    (Path(models) / name).write_bytes(weights_bytes)
-    kept = better(candidate, baseline)
-    if kept:
-        records = lineage(models)
-        records[name] = {"base": base_name, "groups": planned["trainedGroups"]}
-        _write(Path(models) / LINEAGE, records)
-    reg = registry(models)
-    reg["runs"].append(
-        {
-            **record,
-            "weights": name,
-            "counts": counts,
-            "testVisible": test_visible,
-            "baseline": _public_score(baseline),
-            "candidate": _public_score(candidate),
-            "pairedTest": paired_test(candidate, baseline),
-            "kept": kept,
-        }
-    )
-    if kept:
-        reg["active"] = name
-    _write(_registry_path(models), reg, indent=1)
+    with (commit_guard or contextlib.nullcontext)():
+        reg = registry(models)
+        if withdrawn():
+            # A match was deleted or withdrawn from training during the run: a
+            # model trained on it is never written, recorded as trained on it, or
+            # switched on.
+            reg["runs"].append(
+                {
+                    **record,
+                    "counts": counts,
+                    "testVisible": test_visible,
+                    "baseline": _public_score(baseline),
+                    "candidate": _public_score(candidate),
+                    "kept": False,
+                    "reason": MATCH_WITHDRAWN,
+                    "message": (
+                        "A match used for training was deleted or withdrawn from training during the run; "
+                        "nothing was switched. Start training again."
+                    ),
+                }
+            )
+            _write(_registry_path(models), reg, indent=1)
+            return reg["runs"][-1]
+        name = f"ball-{hashlib.sha256(weights_bytes).hexdigest()[:16]}.pt"
+        kept = better(candidate, baseline)
+        if kept:
+            # Rejected weights (derived from customers' frames, never loaded) are not kept.
+            (Path(models) / name).write_bytes(weights_bytes)
+            records = lineage(models)
+            records[name] = {"base": base_name, "groups": planned["trainedGroups"]}
+            _write(Path(models) / LINEAGE, records)
+        reg["runs"].append(
+            {
+                **record,
+                "weights": name,
+                "counts": counts,
+                "testVisible": test_visible,
+                "baseline": _public_score(baseline),
+                "candidate": _public_score(candidate),
+                "pairedTest": paired_test(candidate, baseline),
+                "kept": kept,
+            }
+        )
+        if kept:
+            reg["active"] = name
+        _write(_registry_path(models), reg, indent=1)
     return reg["runs"][-1]

@@ -66,7 +66,7 @@ from app.vision import modal_app
 
 url = f"http://127.0.0.1:{httpd.server_port}/jobs/{'a' * 32}/video"
 stages = []
-for item in modal_app.analyse.local(url, "test-token", "general", 3, max_seconds=2, ball_search="none"):
+for item in modal_app.analyse.local(url, {}, "general", 3, max_seconds=2, ball_search="none"):
     stages.append(item.get("stage"))
     if "result_gz" in item:
         result = json.loads(gzip.decompress(item["result_gz"]))

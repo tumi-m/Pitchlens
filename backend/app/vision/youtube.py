@@ -58,12 +58,17 @@ def remux(path):
     except Exception:
         return path
     target = path.with_name("remuxed.mp4")
-    done = subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
-         "-map", "0:v:0", "-c", "copy", "-movflags", "+faststart", str(target)],
-        capture_output=True,
-        timeout=600,
-    )
+    try:
+        done = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+             "-map", "0:v:0", "-c", "copy", "-movflags", "+faststart", str(target)],
+            capture_output=True,
+            timeout=600,
+        )
+    except BaseException:
+        # Timed out (ffmpeg is killed) or stopped by a shutdown: no partial copy stays.
+        target.unlink(missing_ok=True)
+        raise
     if done.returncode != 0 or not target.exists() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         return path

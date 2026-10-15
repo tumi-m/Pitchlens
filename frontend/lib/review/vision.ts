@@ -43,6 +43,14 @@ export const saveVisionDetails = (jobId: string, patch: VisionDetails) =>
     body: JSON.stringify(patch),
   });
 
+/** The owner's opt-in (or withdrawal) for training the site's ball finder on this match's labels. */
+export const setTrainingConsent = (jobId: string, agreed: boolean) =>
+  visionJson<{ trainingConsent: boolean }>(`jobs/${jobId}/training-consent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agreed }),
+  });
+
 /** One player in one of the ball-label frames (GET /frames/{index}), in video pixels. */
 export type TeamCrop = { index: number; id: number; box: [number, number, number, number] };
 export type TeamPick = Pick<TeamCrop, "index" | "id">;
@@ -207,6 +215,13 @@ export type VisionHealth = {
   siteTraining?: boolean;
   detail?: string;
 };
+
+/** How long footage is kept, from /health retentionHours ("7 days", "24 hours");
+ *  "" when the worker keeps it until it is deleted (null) or did not say. */
+export function retentionLabel(hours: number | null | undefined): string {
+  if (!hours) return "";
+  return hours >= 48 ? `${Math.round(hours / 24)} days` : `${Math.round(hours)} hours`;
+}
 
 /** The worker's default upload limit, used when /health does not say. */
 export const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;

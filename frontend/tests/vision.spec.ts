@@ -1049,3 +1049,67 @@ test("a missing or refused access code brings its field into view with the curso
   await expect(field).toBeFocused();
   await expect.poll(inView).toBe(true);
 });
+
+test("the hosted upload notice says how long footage is kept, links the privacy page and asks for permission", async ({ page }) => {
+  let retentionHours: number | null = null;
+  await page.route("**/api/vision/health", (r) =>
+    r.fulfill({ json: { available: true, hosted: true, accessRequired: false, retentionHours } }),
+  );
+  await page.goto("/upload");
+  // Retention off on a current worker: say so rather than nothing.
+  await expect(page.getByText("Uploaded to the Pitchlens analysis server; footage kept until you delete it")).toBeVisible();
+  const privacy = page.getByRole("link", { name: "Privacy", exact: true });
+  await expect(privacy).toHaveAttribute("href", "/privacy");
+  const permission = page.getByTestId("upload-permission");
+  await expect(permission).toHaveText("Stored on Railway and analysed on Modal GPUs. Only upload footage you filmed or have permission to use.");
+  await expect(page.locator("main")).toContainText("Modal");
+  await expect(page.locator("main")).toContainText("permission");
+  retentionHours = 168;
+  await page.reload();
+  await expect(page.getByText("Uploaded to the Pitchlens analysis server; footage deleted after 7 days")).toBeVisible();
+  await expect(page.getByText("kept until you delete it")).toHaveCount(0);
+  // An older worker that does not report retention: nothing is claimed.
+  await page.unroute("**/api/vision/health");
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true } }));
+  await page.reload();
+  await expect(page.getByTestId("upload-permission")).toBeVisible();
+  await expect(page.getByText("kept until you delete it")).toHaveCount(0);
+  await expect(page.getByText("footage deleted after")).toHaveCount(0);
+  // This computer's own worker: no hosted notice, no processors named.
+  await page.unroute("**/api/vision/health");
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: false } }));
+  await page.reload();
+  await expect(page.getByText("Video stays on this computer")).toBeVisible();
+  await expect(page.getByTestId("upload-permission")).toHaveCount(0);
+});
+
+test("the privacy page names the processors and shows the server's retention", async ({ page }) => {
+  let health: Record<string, unknown> = { available: true, hosted: true, retentionHours: 168 };
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: health }));
+  await page.goto("/privacy");
+  await expect(page.getByRole("heading", { name: "Privacy", exact: true })).toBeVisible();
+  await expect(page.getByTestId("privacy-retention")).toHaveText("Uploaded footage is deleted after 7 days.");
+  const main = page.locator("main");
+  for (const name of ["Vercel", "Railway", "Modal", "YouTube", "Roboflow", "Paystack", "Firebase", "Google Fonts"])
+    await expect(main).toContainText(name);
+  await expect(main).toContainText("six sample frames");
+  await expect(main).toContainText("Delete analysis and footage");
+  health = { available: true, hosted: true, retentionHours: null };
+  await page.reload();
+  await expect(page.getByTestId("privacy-retention")).toHaveText("Uploaded footage is kept until you delete it.");
+  // The worker cannot be reached: no number is claimed.
+  health = { detail: "Cannot reach the vision server.", available: false };
+  await page.route("**/api/vision/health", (r) => r.fulfill({ status: 503, json: health }));
+  await page.reload();
+  await expect(page.getByTestId("privacy-retention")).toContainText("could not be checked just now");
+  await expect(page.getByTestId("privacy-retention")).not.toContainText(/\d/);
+});
+
+test("the home page footer links the privacy page", async ({ page }) => {
+  await page.goto("/");
+  const link = page.locator("footer").getByRole("link", { name: "Privacy" });
+  await expect(link).toHaveAttribute("href", "/privacy");
+  await link.click();
+  await expect(page).toHaveURL(/\/privacy$/);
+  await expect(page.getByRole("heading", { name: "Privacy", exact: true })).toBeVisible();
+});

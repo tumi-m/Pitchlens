@@ -139,7 +139,8 @@ def test_worker_serves_frames_and_records_labels(tmp_path, monkeypatch):
     assert client.get(f"/jobs/{job_id}/frames/99").status_code == 404
 
 
-def _labelled_job(root, name, n=40, size=(640, 360)):
+def _labelled_job(root, name, n=40, size=(640, 360), consent=True):
+    """A labelled match; with consent, its owner ticked the training opt-in."""
     directory = root / name
     directory.mkdir()
     writer = cv2.VideoWriter(str(directory / "v.avi"), cv2.VideoWriter_fourcc(*"MJPG"), 10, size)
@@ -155,7 +156,10 @@ def _labelled_job(root, name, n=40, size=(640, 360)):
     (directory / "v.avi").rename(directory / "video")
     (directory / "result.json").write_text(json.dumps({"frames": frames, "video": {"width": size[0], "height": size[1], "fps": 10}}))
     (directory / "balllabels.json").write_text(json.dumps({"labels": labels}))
-    (directory / "status.json").write_text(json.dumps({"id": name, "status": "completed", "owner": "f" * 32 if name.startswith("a") else "e" * 32}))
+    status = {"id": name, "status": "completed", "owner": "f" * 32 if name.startswith("a") else "e" * 32}
+    if consent:
+        status["trainingConsent"] = {"agreed": True, "at": 0}
+    (directory / "status.json").write_text(json.dumps(status))
     return directory
 
 
@@ -498,7 +502,8 @@ def test_labelling_reuses_one_parse_of_the_result_until_it_changes(tmp_path, mon
     assert not any(key[0] == job for key in server._slim)
 
 
-def _cached_job(root, name, n=20, size=(1280, 720), visible=lambda i: i % 4, source=None, sha=None, frame_step=10, offset=0):
+def _cached_job(root, name, n=20, size=(1280, 720), visible=lambda i: i % 4, source=None, sha=None, frame_step=10, offset=0,
+                consent=True):
     """A labelled job whose label frames are already in the cache (no decoding)."""
     directory = root / name
     (directory / "labelframes").mkdir(parents=True)
@@ -520,6 +525,8 @@ def _cached_job(root, name, n=20, size=(1280, 720), visible=lambda i: i % 4, sou
     status = {"id": name, "status": "completed"}
     if source:
         status["sourceJobId"] = source
+    if consent:
+        status["trainingConsent"] = {"agreed": True, "at": 0}
     (directory / "status.json").write_text(json.dumps(status))
     return directory
 
@@ -543,7 +550,8 @@ def test_training_set_is_unchanged_when_frames_are_streamed_from_the_cache(tmp_p
     ds = tmp_path / "ds"
 
     def short(path):
-        return path.stem.replace("a" * 8, "a").replace("b" * 8, "b")
+        # Files are named after the full job id, so DELETE can find a run's copies.
+        return path.stem.replace("a" * 32, "a").replace("b" * 32, "b")
 
     for (part, kind), names in expected.items():
         found = sorted(
@@ -555,7 +563,7 @@ def test_training_set_is_unchanged_when_frames_are_streamed_from_the_cache(tmp_p
     assert sorted(p.name for p in ds.iterdir()) == ["data.yaml", "images", "labels", "test_frames", "test_frames.json"]
     assert sum(1 for p in ds.rglob("*") if p.is_file()) == 176
     # Test frames are the cached JPEGs themselves.
-    assert (ds / "test_frames" / f"{'b' * 8}-14.jpg").read_bytes() == (b / "labelframes" / "14.jpg").read_bytes()
+    assert (ds / "test_frames" / f"{'b' * 32}-14.jpg").read_bytes() == (b / "labelframes" / "14.jpg").read_bytes()
 
 
 def test_building_the_training_set_never_holds_a_match_of_frames_in_memory(tmp_path):
@@ -841,3 +849,431 @@ def test_a_failed_training_set_build_leaves_no_frame_copies(tmp_path, monkeypatc
         balltrain.run_training(tmp_path, tmp_path / "models", base, remote=lambda *a: None, on_start=lambda: None)
     assert written["labels"] > 25
     assert not (tmp_path / "training" / "dataset").exists()
+
+
+def test_stills_written_while_a_match_is_deleted_never_outlive_it(tmp_path, monkeypatch):
+    """A still landing between rmtree's listing of labelframes/ and its rmdir kept the
+    folder (ignore_errors hid it); the decoder, reading the unlinked video through its
+    open file, then filled it: frames of a deleted match that nothing lists or sweeps."""
+    import os
+    import threading
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "TOKEN", "t")
+    monkeypatch.setattr(server, "active", None)
+    monkeypatch.setattr(server, "calibrating", set())
+    monkeypatch.setattr(server, "RETENTION_HOURS", 0)
+    job, owner = "a" * 32, "b" * 32
+    d = tmp_path / job
+    d.mkdir()
+    server.write_status(d, {"id": job, "owner": owner, "status": "completed", "createdAt": time.time()})
+    frames = [{"t": i / 10, "frame": i, "scene": 0, "players": [], "ball": None} for i in range(300)]
+    (d / "result.json").write_text(json.dumps({"frames": frames, "video": {"width": 64, "height": 48, "fps": 10}}))
+    (d / "video").write_bytes(b"not decoded: extract_frames is replaced below")
+
+    go = threading.Event()
+    wrote = threading.Event()
+
+    def fake_extract(video_path, wanted, start=None, write=None):
+        # Decoding a real match: one wanted frame every so often.
+        for k, (number, key) in enumerate(sorted(wanted.items())):
+            if k == 1:
+                go.wait(5)  # the next frame arrives while DELETE is running
+            write(key, np.zeros((48, 64, 3), np.uint8))
+            if k == 1:
+                wrote.set()
+        return {}
+
+    monkeypatch.setattr(balllabels, "extract_frames", fake_extract)
+    real_rmdir = os.rmdir
+
+    def rmdir(path, *args, **kwargs):
+        if os.fspath(path) == "labelframes" or os.fspath(path).endswith("/labelframes"):
+            go.set()
+            wrote.wait(0.5)  # a decoder frame landing between rmtree's listing and its rmdir
+        return real_rmdir(path, *args, **kwargs)
+
+    client = TestClient(server.app, raise_server_exceptions=False)
+    client.headers.update({"Authorization": "Bearer t", "x-pitchlens-owner": owner})
+    assert client.get(f"/jobs/{job}/ball-labels").status_code == 200
+    for _ in range(100):
+        if (d / "labelframes").exists() and any((d / "labelframes").glob("*.jpg")):
+            break
+        time.sleep(0.01)
+    monkeypatch.setattr(os, "rmdir", rmdir)
+    assert client.delete(f"/jobs/{job}").status_code == 200
+    monkeypatch.setattr(os, "rmdir", real_rmdir)
+    for _ in range(500):
+        if job not in server.preparing_frames:
+            break
+        time.sleep(0.01)
+    assert job not in server.preparing_frames
+    assert not d.exists()
+    assert not list(tmp_path.rglob("*.jpg"))
+    assert client.get("/jobs").json() == []
+
+
+def test_a_withdrawn_match_gets_no_more_stills(tmp_path):
+    from contextlib import contextmanager
+
+    directory = tmp_path / "m"
+    directory.mkdir()
+    counter_video(directory / "video.avi")
+    (directory / "video.avi").rename(directory / "video")
+    data = result(30)
+    entered = []
+
+    @contextmanager
+    def allowed():
+        entered.append(1)
+        yield
+
+    balllabels.prepare_frames(directory, data, [1, 2], directory / "video", guard=allowed)
+    assert len(entered) == 2  # entered around each write
+    assert sorted(p.name for p in (directory / "labelframes").iterdir()) == ["1.jpg", "2.jpg"]
+
+    @contextmanager
+    def withdrawn():
+        raise balllabels.FramesWithdrawn("m")
+        yield  # pragma: no cover
+
+    with pytest.raises(balllabels.FramesWithdrawn):
+        balllabels.prepare_frames(directory, data, [3, 4, 5], directory / "video", guard=withdrawn)
+    assert sorted(p.name for p in (directory / "labelframes").iterdir()) == ["1.jpg", "2.jpg"]
+
+
+def test_rejected_weights_trained_on_customer_frames_are_not_kept(tmp_path):
+    import hashlib
+
+    from app.vision import balltrain
+
+    for name in ("a" * 32, "b" * 32):
+        _labelled_job(tmp_path, name)
+    base = tmp_path / "base.pt"
+    base.write_bytes(b"base weights")
+
+    def worse(dataset_zip, base_bytes, epochs):
+        return {"weights": b"rejected weights", **_scores(dataset_zip, 0.5, 0.4)}
+
+    run = balltrain.run_training(tmp_path, tmp_path / "models", base, remote=worse, now=1.0)
+    assert run["kept"] is False
+    # A model nobody loads, derived from customers' frames, is never written.
+    assert sorted(p.name for p in (tmp_path / "models").glob("ball-*.pt")) == []
+    last = balltrain.registry(tmp_path / "models")["runs"][-1]
+    assert last["weights"] == f"ball-{hashlib.sha256(b'rejected weights').hexdigest()[:16]}.pt"
+    assert last["baseline"]["recall"] == 0.5 and last["candidate"]["recall"] < 0.5
+    assert balltrain.registry(tmp_path / "models")["active"] is None
+
+
+def test_a_deleted_match_stays_named_in_ball_lineage(tmp_path, monkeypatch):
+    """Deliberate: footage a kept model trained on never becomes a later test set,
+    even when it is deleted and uploaded again."""
+    from app.vision import balltrain
+
+    server, client = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "calibrating", set())
+    monkeypatch.setattr(server, "RETENTION_HOURS", 0)
+    for name, sha in (("a" * 32, "1" * 64), ("b" * 32, "2" * 64), ("c" * 32, "3" * 64)):
+        _labelled_job(tmp_path, name)
+        r = json.loads((tmp_path / name / "result.json").read_text())
+        r["videoSha256"] = sha
+        (tmp_path / name / "result.json").write_text(json.dumps(r))
+    base = tmp_path / "base.pt"
+    base.write_bytes(b"base")
+    models = tmp_path / "models"
+    run = balltrain.run_training(
+        tmp_path, models, base, now=1.0, remote=lambda z, b, e: {"weights": b"new", **_scores(z, 0.5, 0.9)},
+    )
+    assert run["kept"]
+    victim = next(n for n in ("a" * 32, "b" * 32, "c" * 32) if n in (models / balltrain.LINEAGE).read_text())
+    owner = json.loads((tmp_path / victim / "status.json").read_text())["owner"]
+    assert client.delete(f"/jobs/{victim}", headers={"x-pitchlens-owner": owner}).status_code == 200
+    assert not (tmp_path / victim).exists()
+    after = json.loads((models / balltrain.LINEAGE).read_text())
+    assert victim in json.dumps(after)
+    assert any(k.startswith("sha:") for rec in after.values() for g in rec["groups"] for k in g["keys"])
+
+
+def _site_training(tmp_path, monkeypatch, remote):
+    """The worker's own training wiring (guards included), with Modal's GPU stubbed by `remote`."""
+    import sys
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    server, client = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "training", {"state": "idle"})
+    monkeypatch.setattr(server, "calibrating", set())
+    monkeypatch.setattr(server, "RETENTION_HOURS", 0)
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-test")
+    monkeypatch.delenv("VISION_USE_MODAL", raising=False)
+    (tmp_path / "ball.pt").write_bytes(b"tiled ball model")
+    monkeypatch.setattr("app.vision.profiles.model_paths", lambda profile="general": (tmp_path / "p.pt", tmp_path / "ball.pt"))
+    monkeypatch.setitem(sys.modules, "app.vision.modal_train",
+                        SimpleNamespace(app=SimpleNamespace(run=nullcontext), train_ball=SimpleNamespace(remote=remote)))
+    return server, client
+
+
+def _finished_training(server):
+    import time
+
+    for _ in range(3000):
+        if server.training.get("state") != "running":
+            return server.training
+        time.sleep(0.01)
+    raise AssertionError("training never finished")
+
+
+def test_a_match_deleted_during_training_is_never_trained_on_or_switched_on(tmp_path, monkeypatch):
+    from app.vision import balltrain
+
+    victim = "a" * 32
+    _labelled_job(tmp_path, victim, n=80)  # the largest match: always in the training part
+    for name in ("b" * 32, "c" * 32):
+        _labelled_job(tmp_path, name)
+    models = tmp_path / "models"
+    models.mkdir()
+    before = {"active": "ball-0123456789abcdef.pt", "runs": []}
+    (models / "ball-model.json").write_text(json.dumps(before))
+    seen = {}
+
+    def remote(dataset_zip, base_bytes, epochs):
+        # The owner of match a deletes it while the GPU trains (runs can take 2 h).
+        training = tmp_path / "training"
+        # (Matched on the short prefix that tiles were once named with, too.)
+        seen["copies"] = sum(1 for p in training.rglob("*") if p.name.startswith(victim[:8]))
+        owner = json.loads((tmp_path / victim / "status.json").read_text())["owner"]
+        seen["status"] = client.delete(f"/jobs/{victim}", headers={"x-pitchlens-owner": owner}).status_code
+        seen["left"] = sorted(p.name for p in training.rglob("*") if p.name.startswith(victim[:8]))
+        return {"weights": b"trained with a", **_scores(dataset_zip, 0.5, 0.9)}
+
+    server, client = _site_training(tmp_path, monkeypatch, remote)
+    assert client.post("/ball-model/train", json={}).status_code == 200
+    state = _finished_training(server)
+    assert seen["status"] == 200 and not (tmp_path / victim).exists()
+    assert seen["copies"] > 0 and seen["left"] == []  # its tiles went with the DELETE
+    run = state["run"]
+    assert state["state"] == "done" and run["kept"] is False and run["reason"] == "match-withdrawn"
+    assert state["stage"] == (
+        "A match used for training was deleted or withdrawn from training during the run; nothing was switched. "
+        "Start training again."
+    )
+    assert "weights" not in run and list(models.glob("ball-*.pt")) == []
+    lineage = models / balltrain.LINEAGE
+    assert not lineage.exists() or victim not in lineage.read_text()
+    registry = balltrain.registry(models)
+    assert registry["active"] == before["active"] and registry["runs"][-1]["reason"] == "match-withdrawn"
+
+
+def test_the_model_is_switched_under_the_lock_delete_holds(tmp_path, monkeypatch):
+    from app.vision import balltrain
+
+    for name in ("a" * 32, "b" * 32, "c" * 32):
+        _labelled_job(tmp_path, name)
+    server, client = _site_training(tmp_path, monkeypatch, lambda z, b, e: {"weights": b"better", **_scores(z, 0.5, 0.9)})
+    real, held = balltrain.better, []
+
+    def better(candidate, baseline, **kwargs):
+        held.append(server.label_lock.locked())
+        return real(candidate, baseline, **kwargs)
+
+    monkeypatch.setattr(balltrain, "better", better)
+    assert client.post("/ball-model/train", json={}).status_code == 200
+    state = _finished_training(server)
+    assert state["state"] == "done" and state["run"]["kept"], state
+    assert held == [True]
+    assert balltrain.registry(tmp_path / "models")["active"] == state["run"]["weights"]
+
+
+def test_a_match_deleted_while_the_training_set_is_built_stops_the_run(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from app.vision import balltrain
+
+    for name in ("a" * 32, "b" * 32):
+        _labelled_job(tmp_path, name)
+    base = tmp_path / "base.pt"
+    base.write_bytes(b"w")
+    trained = []
+
+    @contextmanager
+    def gone():
+        raise balllabels.FramesWithdrawn("a" * 32)
+        yield  # pragma: no cover
+
+    withdrawn = "A match was deleted while the training set was being built; nothing was trained. Start training again."
+    with pytest.raises(ValueError) as refused:
+        balltrain.run_training(tmp_path, tmp_path / "models", base, remote=lambda *a: trained.append(1), frame_guard=lambda d: gone)
+    assert str(refused.value) == withdrawn
+    assert not trained and not (tmp_path / "training" / "dataset").exists()
+    assert not list((tmp_path / ("a" * 32) / "labelframes").glob("*.jpg"))
+
+    # DELETE removed a staged tile the build was about to move: the match is gone, so say so.
+    def build(train, test, out, **kwargs):
+        (tmp_path / ("a" * 32) / "status.json").unlink()
+        raise FileNotFoundError(2, "No such file or directory", str(out / "staging" / f"{'a' * 32}-3-1.jpg"))
+
+    monkeypatch.setattr(balltrain, "build_dataset", build)
+    with pytest.raises(ValueError) as refused:
+        balltrain.run_training(tmp_path, tmp_path / "models", base, remote=lambda *a: trained.append(1))
+    assert str(refused.value) == withdrawn and not trained
+
+
+def test_gpu_training_receives_bytes_never_credentials(tmp_path, monkeypatch):
+    """train_ball gets the dataset and the base weights as bytes: no service token,
+    no owner key, no worker address, so nothing it holds reaches the worker."""
+    import io
+    import sys
+    import zipfile
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    server, client = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "training", {"state": "idle"})
+    monkeypatch.setenv("VISION_DEVICE", "cpu")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-test")
+    monkeypatch.setenv("VISION_PUBLIC_URL", "https://worker.example")
+    monkeypatch.setenv("VISION_SITE_TRAINING", "1")
+    (tmp_path / "ball.pt").write_bytes(b"tiled ball model")
+    monkeypatch.setattr("app.vision.profiles.model_paths", lambda profile="general": (tmp_path / "p.pt", tmp_path / "ball.pt"))
+    owner = "f" * 32
+    for name in ("a" * 32, "a" * 31 + "b"):
+        _labelled_job(tmp_path, name)
+    calls = []
+
+    def remote(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"weights": b"new", **_scores(args[0], 0.5, 0.4)}
+
+    monkeypatch.setitem(sys.modules, "app.vision.modal_train",
+                        SimpleNamespace(app=SimpleNamespace(run=nullcontext), train_ball=SimpleNamespace(remote=remote)))
+    site = {"x-pitchlens-require-owner": "1", "x-pitchlens-owner": owner}
+    assert client.post("/ball-model/train", json={"epochs": 5}, headers=site).status_code == 200
+    _wait_for_training(server)
+    (dataset, base, epochs), kwargs = calls[0]
+    assert isinstance(dataset, bytes) and base == b"tiled ball model" and epochs == 5 and kwargs == {}
+    archive = zipfile.ZipFile(io.BytesIO(dataset))
+    blob = b"".join(archive.read(n) for n in archive.namelist()) + "\n".join(archive.namelist()).encode()
+    for secret in (b"test-token", owner.encode(), b"worker.example", b"as-test"):
+        assert secret not in blob
+
+
+def _zipped_jobs(seen):
+    """A GPU stub that records which jobs' tiles and test frames were in the dataset zip."""
+    import io
+    import zipfile
+    from pathlib import Path
+
+    def remote(dataset_zip, base_bytes, epochs):
+        for name in zipfile.ZipFile(io.BytesIO(dataset_zip)).namelist():
+            if name.endswith(".jpg"):
+                seen.add(Path(name).name.split("-")[0])  # files are named after the full job id
+        return {"weights": b"new weights", **_scores(dataset_zip, 0.5, 0.9)}
+
+    return remote
+
+
+def test_training_uses_only_matches_whose_owner_agreed(tmp_path):
+    from app.vision import balltrain
+
+    # Owner f...f labelled match a and never agreed; owner e...e agreed for b and c.
+    _labelled_job(tmp_path, "a" * 32, n=80, consent=False)
+    for name in ("b" * 32, "c" * 32):
+        _labelled_job(tmp_path, name)
+    base = tmp_path / "base.pt"
+    base.write_bytes(b"base weights")
+    assert [d.name for d in balltrain.labelled_jobs(tmp_path)] == ["b" * 32, "c" * 32]
+    for owner in (None, "e" * 32):  # an operator run, and the agreeing owner's own run
+        seen = set()
+        run = balltrain.run_training(tmp_path, tmp_path / f"models-{owner}", base, owner=owner, remote=_zipped_jobs(seen), now=1.0)
+        # Neither a training tile nor a test frame of match a went to the GPU.
+        assert seen == {"b" * 32, "c" * 32} and run["matches"] == 2 and run["kept"], owner
+    with pytest.raises(ValueError, match="allow training"):
+        balltrain.run_training(tmp_path, tmp_path / "models-f", base, owner="f" * 32, remote=_zipped_jobs(set()))
+
+
+def test_a_withdrawn_match_leaves_the_training_set(tmp_path, monkeypatch):
+    from app.vision import balltrain
+
+    server, client = _client(tmp_path, monkeypatch)
+    for name in ("a" * 32, "b" * 32, "c" * 32):
+        _labelled_job(tmp_path, name)
+    assert len(balltrain.labelled_jobs(tmp_path)) == 3
+    owner = {"x-pitchlens-owner": "f" * 32}
+    response = client.post(f"/jobs/{'a' * 32}/training-consent", json={"agreed": False}, headers=owner)
+    assert response.status_code == 200 and response.json() == {"trainingConsent": False}
+    status = json.loads((tmp_path / ("a" * 32) / "status.json").read_text())
+    assert status["trainingConsent"]["agreed"] is False and status["trainingConsent"]["at"] > 0
+    jobs = balltrain.labelled_jobs(tmp_path)
+    assert [d.name for d in jobs] == ["b" * 32, "c" * 32]
+    planned = balltrain.plan(jobs)
+    assert {d.name for d, _ in planned["train"] + planned["test"]} == {"b" * 32, "c" * 32}
+    # Its labels stay: they still measure the ball finder on that match.
+    assert balllabels.load(tmp_path / ("a" * 32) / "balllabels.json")["labels"]
+
+
+def test_a_withdrawal_during_training_discards_the_run(tmp_path, monkeypatch):
+    from app.vision import balltrain
+
+    victim = "a" * 32
+    _labelled_job(tmp_path, victim, n=80)  # the largest match: always in the training part
+    for name in ("b" * 32, "c" * 32):
+        _labelled_job(tmp_path, name)
+    models = tmp_path / "models"
+    models.mkdir()
+    before = {"active": "ball-0123456789abcdef.pt", "runs": []}
+    (models / "ball-model.json").write_text(json.dumps(before))
+    seen = {}
+
+    def remote(dataset_zip, base_bytes, epochs):
+        # The owner of match a withdraws consent while the GPU trains.
+        seen["status"] = client.post(f"/jobs/{victim}/training-consent", json={"agreed": False},
+                                     headers={"x-pitchlens-owner": "f" * 32}).status_code
+        return {"weights": b"trained with a", **_scores(dataset_zip, 0.5, 0.9)}
+
+    server, client = _site_training(tmp_path, monkeypatch, remote)
+    assert client.post("/ball-model/train", json={}).status_code == 200
+    state = _finished_training(server)
+    assert seen["status"] == 200 and (tmp_path / victim / "status.json").is_file()
+    run = state["run"]
+    assert state["state"] == "done" and run["kept"] is False and run["reason"] == "match-withdrawn"
+    assert "weights" not in run and list(models.glob("ball-*.pt")) == []
+    lineage = models / balltrain.LINEAGE
+    assert not lineage.exists() or victim not in lineage.read_text()
+    registry = balltrain.registry(models)
+    assert registry["active"] == before["active"] and registry["runs"][-1]["reason"] == "match-withdrawn"
+
+
+def test_only_the_owner_sets_training_consent_with_a_boolean(tmp_path, monkeypatch):
+    import time
+
+    server, client = _client(tmp_path, monkeypatch)
+    # The listing starts extracting label stills in the background: not needed here.
+    monkeypatch.setattr(balllabels, "extract_frames", lambda *args, **kwargs: {})
+    job = "a" * 32
+    _labelled_job(tmp_path, job, consent=False)
+    owner, stranger = {"x-pitchlens-owner": "f" * 32}, {"x-pitchlens-owner": "e" * 32}
+    url = f"/jobs/{job}/training-consent"
+    assert client.post(url, json={"agreed": True}, headers=stranger).status_code == 404
+    assert client.post(url, json={"agreed": True}).status_code == 404  # no owner key
+    for bad in ({}, {"agreed": 1}, {"agreed": "true"}, {"agreed": None}, {"agreed": True, "x": 1}, [True]):
+        assert client.post(url, json=bad, headers=owner).status_code == 400, bad
+    for raw in (b'{"agreed": NaN}', b"not json", b'{"agreed": true, "pad": "' + b"x" * 5000 + b'"}'):
+        assert client.post(url, content=raw, headers={**owner, "content-type": "application/json"}).status_code == 400
+    assert "trainingConsent" not in json.loads((tmp_path / job / "status.json").read_text())
+    assert client.get(f"/jobs/{job}/ball-labels", headers=owner).json()["trainingConsent"] is False
+    assert client.post(url, json={"agreed": True}, headers=owner).json() == {"trainingConsent": True}
+    assert client.get(f"/jobs/{job}/ball-labels", headers=owner).json()["trainingConsent"] is True
+    assert client.post(url, json={"agreed": False}, headers=owner).json() == {"trainingConsent": False}
+    assert client.get(f"/jobs/{job}/ball-labels", headers=owner).json()["trainingConsent"] is False
+    assert client.post(f"/jobs/{'d' * 32}/training-consent", json={"agreed": True}, headers=owner).status_code == 404
+    for _ in range(500):
+        if job not in server.preparing_frames:
+            break
+        time.sleep(0.01)

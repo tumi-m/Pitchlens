@@ -570,6 +570,30 @@ test("training on the labels reports old and new ball recall and whether it was 
   await expect(result).toContainText("Switched on");
 });
 
+test("a training run refused before scoring shows its reason instead of breaking the labeller", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  await page.route("**/api/vision/health", (r) => r.fulfill({ json: { available: true, hosted: true, analytics: true, accessRequired: true, siteTraining: true } }));
+  const empty = { value: null, n: 0, interval95: null };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) => {
+    const frames = Array.from({ length: 150 }, (_, i) => ({ index: i, t: i, guess: null }));
+    const labels = Object.fromEntries(frames.map((f) => [String(f.index), { visible: false }]));
+    return r.fulfill({ json: { frames, labels, metrics: { labelled: 150, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: true, size: [640, 360] } });
+  });
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
+  // What the worker stores when too few held-out balls were labelled: no scores.
+  const refused = { at: 1, weights: "", matches: 1, split: "by-time", counts: { train: { positive: 0, negative: 120 }, testFrames: 30 }, kept: false,
+    message: "Not enough held-out balls to judge a new model (0 visible in frames no model has trained on, 30 needed). Label the ball in a new match." };
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: { active: null, runs: [], training: { state: "done", stage: "Finished", run: refused }, siteTraining: true } }));
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  const result = page.getByTestId("ball-training-result");
+  await expect(result).toContainText("Not enough held-out balls");
+  await expect(result).toContainText("The current finder stays.");
+  expect(errors).toEqual([]);
+});
+
 test("passes checked in the random-sample view are marked as sampled", async ({ page }) => {
   const state = await mockReport(page, { calibrated: false });
   const data = analysis(false);
@@ -1091,7 +1115,7 @@ test("the labeller shows no ball accuracy for a job that never ran the ball mode
   const labeller = page.getByTestId("ball-labeller");
   await expect(page.getByTestId("ball-recall")).toHaveText("—");
   await expect(page.getByTestId("ball-precision")).toHaveText("—");
-  await expect(page.getByTestId("ball-not-run")).toHaveText("The ball model was not run on this job; your labels still train the ball finder.");
+  await expect(page.getByTestId("ball-not-run")).toHaveText("The ball model was not run on this job; your labels can still train the ball finder if you allow it below.");
   await expect(labeller).toContainText("ball not searched in this job");
   await expect(labeller).not.toContainText("0%");
   await expect(labeller).not.toContainText("Pitchlens found no ball");
@@ -1673,7 +1697,7 @@ test("labelling a player-load job keeps the labels but measures no ball accuracy
   await expect(page.getByText("Frame 1 of 1")).toBeVisible();
   // Not measured reads "—" (both rounds' player-load labeller fixes share one rendering).
   await expect(page.getByTestId("ball-recall")).toHaveText("—");
-  await expect(page.getByTestId("ball-not-run")).toHaveText("The ball model was not run on this job; your labels still train the ball finder.");
+  await expect(page.getByTestId("ball-not-run")).toHaveText("The ball model was not run on this job; your labels can still train the ball finder if you allow it below.");
   await expect(page.getByTestId("ball-labeller")).not.toContainText("0%");
 });
 
@@ -1689,9 +1713,51 @@ test("a site that cannot train hides the button and says the labels are kept", a
   await page.goto(`/vision/${ID}`);
   await page.getByRole("button", { name: "Label the ball" }).click();
   const training = page.getByTestId("ball-training");
-  await expect(training).toContainText("Your labels are saved and will be used in the next ball-model update.");
+  await expect(training).toContainText("Labels from matches you allow for training are used in the next ball-model update.");
   await expect(page.getByRole("button", { name: "Train on my labels" })).toHaveCount(0);
   await expect(training).not.toContainText("VISION_");
+});
+
+test("training on a match's labels is an unticked opt-in that the owner can give and withdraw", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const empty = { value: null, n: 0, interval95: null };
+  const frames = [{ index: 3, t: 0.6, guess: null }];
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/ball-labels$`), (r) =>
+    r.fulfill({ json: { frames, labels: {}, metrics: { labelled: 0, visible: 0, tolerancePixels: 3, recall: empty, precision: empty, falseDetections: empty, inferredAccuracy: empty, medianHitErrorPixels: null }, videoAvailable: true, framesReady: true, size: [640, 360], trainingConsent: false } }),
+  );
+  await page.route(/\/api\/vision\/ball-model$/, (r) => r.fulfill({ json: { active: null, runs: [], training: { state: "idle" }, siteTraining: false } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 404 }));
+  const sent: unknown[] = [];
+  let fail = false;
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/training-consent$`), async (r) => {
+    sent.push(r.request().postDataJSON());
+    if (fail) await r.fulfill({ status: 503, json: { detail: "The vision server is restarting." } });
+    else await r.fulfill({ json: { trainingConsent: (r.request().postDataJSON() as { agreed: boolean }).agreed } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Label the ball" }).click();
+  const labeller = page.getByTestId("ball-labeller");
+  await expect(labeller).toContainText("Your answers measure ball accuracy for this match.");
+  await expect(labeller).not.toContainText("becomes training data");
+  const box = page.getByTestId("training-consent");
+  const label = page.getByLabel(/Let Pitchlens use these labelled frames to train the ball finder used for every analysis on this site/);
+  await expect(label).toBeVisible();
+  await expect(labeller).toContainText("Frames are sent to our GPU provider, Modal, for training.");
+  await expect(box).not.toBeChecked();
+  await box.check();
+  await expect.poll(() => sent).toEqual([{ agreed: true }]);
+  await expect(box).toBeChecked();
+  // A failed withdrawal shows why and leaves the box as the worker has it.
+  fail = true;
+  await box.click();
+  await expect(labeller).toContainText("The vision server is restarting.");
+  await expect(box).toBeChecked();
+  expect(sent).toEqual([{ agreed: true }, { agreed: false }]);
+  fail = false;
+  await box.uncheck();
+  await expect.poll(() => sent.length).toBe(3);
+  expect(sent[2]).toEqual({ agreed: false });
+  await expect(box).not.toBeChecked();
 });
 
 async function mockRerun(page: Page) {

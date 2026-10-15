@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, EyeOff, SkipForward, ChevronLeft, ZoomIn } from "lucide-react";
 import type { BallLabelState, BallModelState, Rate } from "@/lib/review/analysis";
 import { fetchBallLabels, fetchBallModel, frameImageUrl, sendBallLabel, trainBallModel } from "@/lib/review/analysis";
-import { clockTime, isMatchDeleted, VisionError, visionJson } from "@/lib/review/vision";
+import { clockTime, isMatchDeleted, setTrainingConsent, VisionError, visionJson } from "@/lib/review/vision";
 import type { VisionHealth } from "@/lib/review/vision";
 
 const ZOOM = 5; // magnification of the precise-click view
@@ -20,8 +20,9 @@ function range(rate: Rate) {
  * Ground truth for the ball, from the person who knows the match. Frames are
  * spread over the whole match; for each, confirm Pitchlens' guess, click the
  * ball (a first click zooms in, a second places it exactly), or mark it not
- * visible. The answers measure the ball finder on this match and become
- * training data for a better one.
+ * visible. The answers measure the ball finder on this match; they train a
+ * better one only if the owner ticks the training opt-in (off by default,
+ * withdrawable: POST /jobs/{id}/training-consent).
  */
 export function BallLabeller({
   jobId,
@@ -41,6 +42,9 @@ export function BallLabeller({
   // Loading the labels failed for a reason that passes (worker restarting): asking again.
   const [retrying, setRetrying] = useState(false);
   const [saving, setSaving] = useState(false);
+  // The training opt-in while its change is being saved (null: as the worker said).
+  const [consent, setConsent] = useState<boolean | null>(null);
+  const [consentError, setConsentError] = useState("");
   // Which frame image has finished loading (the zoom draws only from that one).
   const [loadedSrc, setLoadedSrc] = useState("");
   const image = useRef<HTMLImageElement>(null);
@@ -152,6 +156,21 @@ export function BallLabeller({
     [jobId, saving, state],
   );
 
+  async function changeConsent(agreed: boolean) {
+    setConsent(agreed);
+    setConsentError("");
+    try {
+      const saved = await setTrainingConsent(jobId, agreed);
+      setState((prev) => (prev ? { ...prev, trainingConsent: saved.trainingConsent } : prev));
+    } catch (e) {
+      if (isMatchDeleted(e) && gone.current) gone.current();
+      else setConsentError(e instanceof Error ? e.message : "Your choice could not be saved");
+    } finally {
+      // Back to the worker's value: the new one once saved, the old one after a failure.
+      setConsent(null);
+    }
+  }
+
   const accept = useCallback(() => {
     if (frame?.guess) save({ index: frame.index, x: frame.guess.x, y: frame.guess.y });
   }, [frame, save]);
@@ -236,7 +255,7 @@ export function BallLabeller({
     );
   const m = state.metrics;
   // A player-load job never ran the ball model (the job says so, or the worker's
-  // metrics do): nothing to score, so "—" rather than 0%; labels still train.
+  // metrics do): nothing to score, so "—" rather than 0%; labels can still train.
   const unmeasured = !ballModel || m.measured === false;
   const circle = (x: number, y: number, colour: string) => (
     <span
@@ -265,12 +284,12 @@ export function BallLabeller({
           <p className="text-xl font-bold">
             {done} / {state.frames.length}
           </p>
-          <p className="text-[11px] text-pitch-muted">every answer also becomes training data</p>
+          <p className="text-[11px] text-pitch-muted">Your answers measure ball accuracy for this match.</p>
         </div>
       </div>
       {unmeasured && (
         <p className="text-sm text-pitch-muted" data-testid="ball-not-run">
-          The ball model was not run on this job; your labels still train the ball finder.
+          The ball model was not run on this job; your labels can still train the ball finder if you allow it below.
         </p>
       )}
 
@@ -333,6 +352,24 @@ export function BallLabeller({
           {error && <p className="text-sm text-red-300">{error}</p>}
         </div>
       )}
+      <div className="space-y-1">
+        <label className="flex items-start gap-2 text-xs text-pitch-muted max-w-2xl cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            data-testid="training-consent"
+            checked={consent ?? state.trainingConsent === true}
+            disabled={consent !== null}
+            onChange={(e) => changeConsent(e.target.checked)}
+          />
+          <span>
+            Let Pitchlens use these labelled frames to train the ball finder used for every analysis on this site.
+            Frames are sent to our GPU provider, Modal, for training. You can withdraw at any time: this match is then
+            left out of future training runs, but a model already trained keeps what it learned.
+          </span>
+        </label>
+        {consentError && <p className="text-xs text-red-300">{consentError}</p>}
+      </div>
       <BallTraining labelled={done} />
     </div>
   );
@@ -344,7 +381,7 @@ const pctOf = (v: number | null | undefined) => (v === null || v === undefined ?
  *  wants 30 visible balls there (MIN_TEST_VISIBLE in balltrain.py). */
 const MIN_TRAINING_LABELS = 150;
 
-/** Fine-tune the ball finder on every match labelled from this browser (GPU, about $1). */
+/** Fine-tune the ball finder on every match labelled from this browser and allowed for training (GPU, about $1). */
 export function BallTraining({ labelled }: { labelled: number }) {
   const [model, setModel] = useState<BallModelState | null>(null);
   const [error, setError] = useState("");
@@ -396,12 +433,13 @@ export function BallTraining({ labelled }: { labelled: number }) {
           <p className="font-semibold">Train a better ball finder</p>
           {allowed ? (
             <p className="text-pitch-muted text-xs max-w-xl">
-              Uses the frames you labelled in every match from this browser. Part of them is held back to check the
-              result; the new finder is switched on only if it finds more balls there without more false ones.
+              Uses the frames you labelled in every match from this browser that you allowed for training. Part of
+              them is held back to check the result; the new finder is switched on only if it finds more balls there
+              without more false ones.
               {` One match is enough (about ${MIN_TRAINING_LABELS} labelled frames); more matches give a fairer check (${labelled} labelled here).`}
             </p>
           ) : refused ? (
-            <p className="text-pitch-muted text-xs max-w-xl">Your labels are saved and will be used in the next ball-model update.</p>
+            <p className="text-pitch-muted text-xs max-w-xl">Labels from matches you allow for training are used in the next ball-model update.</p>
           ) : null}
         </div>
         {allowed ? (
@@ -416,13 +454,17 @@ export function BallTraining({ labelled }: { labelled: number }) {
       </div>
       {running && <p className="text-pitch-muted">{model?.training.stage}</p>}
       {model?.training.state === "failed" && <p className="text-amber-200">{model.training.stage}</p>}
-      {last && (
+      {last && last.baseline && last.candidate ? (
         <p className="text-pitch-muted" data-testid="ball-training-result">
           Last run: ball found {pctOf(last.baseline.recall)} → {pctOf(last.candidate.recall)} of visible balls on{" "}
           {last.candidate.frames} held-back frames ({last.split === "by-match" ? "other matches" : "later in the same match"}).{" "}
           {last.kept ? "Switched on for new analyses." : "Not better, so the current finder stays."}
         </p>
-      )}
+      ) : last ? (
+        <p className="text-pitch-muted" data-testid="ball-training-result">
+          Last run: {last.message ?? "stopped before both models were scored."} The current finder stays.
+        </p>
+      ) : null}
       {error && <p className="text-red-300">{error}</p>}
     </div>
   );

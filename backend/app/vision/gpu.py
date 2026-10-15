@@ -10,7 +10,7 @@ import time
 import zlib
 from pathlib import Path
 
-from app.vision.access import video_grant
+from app.vision.access import MAX_GRANT_SECONDS, model_grant, video_grant
 
 
 class GPUUnavailable(Exception):
@@ -93,6 +93,24 @@ def active_ball_name():
     return path.name if path and CUSTOM_BALL.fullmatch(path.name) else ""
 
 
+def run_model_names(profile, ball_search, ball_name=""):
+    """Weight files a GPU run may copy from the worker (GET /models/{name})."""
+    from app.vision.profiles import model_paths
+
+    player, ball = model_paths(profile)
+    if ball_search == "none":
+        return [player.name]
+    return sorted({player.name, ball.name} | ({ball_name} if ball_name else set()))
+
+
+def encrypted(base):
+    """Whether the GPU reaches this worker address over TLS (or on this machine, for tests)."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base)
+    return parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1"))
+
+
 def public_base():
     explicit = os.getenv("VISION_PUBLIC_URL", "").rstrip("/")
     if explicit:
@@ -133,26 +151,36 @@ def run_on_modal(
     base = public_base()
     if not base:
         raise GPUUnavailable("No public URL for the GPU to fetch the video from.")
+    if not encrypted(base):
+        # The grants (and the match video) would cross the internet in clear text.
+        raise GPUUnavailable("VISION_PUBLIC_URL must be an https:// address for GPU runs.")
     try:
         from app.vision.modal_app import analyse, app
     except Exception as exc:
         raise GPUUnavailable(f"Modal client unavailable: {exc}") from exc
-    args = (
-        f"{base}/jobs/{job_id}/video",
-        token,
-        profile,
-        int(sample_fps),
-        max_seconds,
-        start_seconds,
-        ball_search,
-        video_grant(token, job_id),
-        active_ball_name(),
-        reference_colours,
-        reference_job,
-    )
+    ball_name = active_ball_name()
+    names = run_model_names(profile, ball_search, ball_name)
     inner = None
     try:
         with app.run():
+            # Grants last up to four hours, so that Modal re-running a preempted
+            # generator input can fetch again; the worker revokes them as soon as
+            # this run is no longer on the GPU (engines[job] == "gpu", server.gpu_grant).
+            # `token` signs the grants and never leaves this worker.
+            expires = time.time() + MAX_GRANT_SECONDS - 60
+            args = (
+                f"{base}/jobs/{job_id}/video",
+                {name: model_grant(token, job_id, name, expires) for name in names},
+                profile,
+                int(sample_fps),
+                max_seconds,
+                start_seconds,
+                ball_search,
+                video_grant(token, job_id, expires),
+                ball_name,
+                reference_colours,
+                reference_job,
+            )
             # A Modal refusal here is GPUUnavailable, like entering the app.
             fn = analyse
             if timeout_seconds and timeout_seconds > MODAL_TIMEOUT:

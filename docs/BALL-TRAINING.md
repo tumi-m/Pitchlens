@@ -33,7 +33,8 @@ They count toward the release gate "visible-ball recall ≥ 90%"
 
 A player-load job (the upload default) never ran the ball model, so it has no
 ball accuracy: the labeller shows — instead of a rate, and those matches do not
-count toward the gate. Their labels still train the ball finder.
+count toward the gate. Their labels can still train the ball finder (when the
+owner allows it, below).
 
 One fully labelled match (about 150 frames) is enough to train: its last 30%
 is held out for checking. More matches (ideally different days and lighting)
@@ -42,8 +43,19 @@ give a fairer check, because a whole match can then be held out.
 ## 2. Train (about $1 of GPU, 15-30 minutes)
 
 Switching the ball model changes every later analysis on the worker and a
-run costs GPU time, so training is an operator action. Run it from a terminal
-(it uses every labelled match on the worker):
+run costs GPU time, so training is an operator action.
+
+Training uses only the matches whose owner ticked the opt-in under the
+labeller ("Let Pitchlens use these labelled frames to train the ball finder
+used for every analysis on this site…"). It starts unticked, and the owner can
+untick it at any time. A match without it is neither trained nor tested on, and
+none of its frames go to Modal; its labels still measure the ball finder on
+that match. If an owner withdraws or deletes a match while a run is in
+progress, that run is discarded: no weights are written, nothing is recorded as
+trained on that match, and nothing is switched (`"reason": "match-withdrawn"`
+in `GET /ball-model`). A model already trained keeps what it learned.
+
+Run it from a terminal:
 
 ```bash
 curl -X POST "$VISION_SERVICE_URL/ball-model/train" \
@@ -53,17 +65,24 @@ curl -X POST "$VISION_SERVICE_URL/ball-model/train" \
 curl "$VISION_SERVICE_URL/ball-model" -H "Authorization: Bearer $VISION_SERVICE_TOKEN"
 ```
 
+To check consent, each match's `status.json` on the worker volume records the
+owner's choice as `trainingConsent` (`{"agreed": true, "at": <unix time>}`;
+absent means not agreed). From a shell on the worker (for example
+`railway ssh`), `grep -l '"trainingConsent": {"agreed": true' /data/jobs/*/status.json`
+lists the matches a run may use. Each run's `matches` in `GET /ball-model` is
+how many it used.
+
 On a deployment with a single owner, set `VISION_SITE_TRAINING=1` on the
 worker to enable **Label the ball → Train on my labels** in the app (needs
 about 150 labelled frames in the match being labelled; uses only the matches
-uploaded from that browser). The site refuses it while `VISION_ACCESS_CODE` is
-unset, so an open test site can never retrain the model everyone uses. Leave it
-off when other people use the site. The worker reports `siteTraining` in
-`/health` and in `GET /ball-model` (the site forces it to false while no access
-code is set). When it is false the app shows no training button, only that
-training is run by the site operator and the labels are saved for the next
-ball-model update; a training request from the site is refused with the same
-explanation.
+uploaded from that browser whose training opt-in is ticked). The site refuses
+it while `VISION_ACCESS_CODE` is unset, so an open test site can never retrain
+the model everyone uses. Leave it off when other people use the site. The
+worker reports `siteTraining` in `/health` and in `GET /ball-model` (the site
+forces it to false while no access code is set). When it is false the app
+shows no training button, only that training is run by the site operator and
+the labels are saved for the next ball-model update; a training request from
+the site is refused with the same explanation.
 
 `VISION_MAX_TRAINING_PER_DAY` limits the runs started from the site (default
 `2` per 24 hours, `0` = no limit; each can hold a GPU for up to two hours).
@@ -93,8 +112,11 @@ What happens:
    losing more than 2 points of precision. Every run, kept or not, is recorded
    in `.vision/models/ball-model.json` with both scores.
 
-The new weights are named by their hash (`ball-<hash>.pt`), stored on the
-worker volume, and copied to the Modal GPU (hash-checked) for later analyses.
+A kept model's weights are named by their hash (`ball-<hash>.pt`), stored on
+the worker volume, and copied to the Modal GPU (hash-checked) for later
+analyses. Weights that were not kept are deleted, and a run during which one of
+its matches is deleted or withdrawn from training records nothing and switches
+nothing.
 Re-run an analysis from the saved footage to apply it to an older match.
 
 To go back to the stock model, set `"active": null` in

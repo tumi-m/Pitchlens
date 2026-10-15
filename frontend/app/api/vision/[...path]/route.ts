@@ -26,7 +26,7 @@ async function proxy(
   const { path } = await context.params;
   const route = path.join("/");
   if (
-    !/^(health|jobs|venues|ball-model|ball-model\/train|billing\/(summary|checkout|verify)|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start|retry|rerun|analysis|calibration|calibration\/preview|review|details|ball-labels|teams|frames\/\d{1,6}))?)$/.test(
+    !/^(health|jobs|venues|ball-model|ball-model\/train|billing\/(summary|checkout|verify)|jobs\/from-url|jobs\/[a-f0-9]{32}(\/(result|video|cancel|start|retry|rerun|analysis|calibration|calibration\/preview|review|details|ball-labels|training-consent|teams|frames\/\d{1,6}))?)$/.test(
       route,
     )
   )
@@ -72,12 +72,25 @@ async function proxy(
         { status: 403 },
       );
   }
+  // The HttpOnly cookie outlives script storage (Safari's 7-day cap, "clear
+  // website data"), so a valid cookie wins: a freshly minted browser key must
+  // never hide this browser's matches or replace the only surviving copy.
+  const cookie = request.cookies.get(OWNER_COOKIE)?.value || "";
+  const header = request.headers.get("x-pitchlens-owner") || "";
+  const cookieOwner = OWNER.test(cookie) ? cookie : "";
+  const owner = cookieOwner || (OWNER.test(header) ? header : "");
   // Optional shared code. With VISION_ACCESS_CODE unset, anyone who has the
   // site's link can start analyses on the paid worker (fine for a small test
   // group); set it again to require the code. Each browser still only sees its
   // own matches.
   const accessCode = (process.env.VISION_ACCESS_CODE || "").trim();
   const writes = !["GET", "HEAD"].includes(request.method);
+  // Deleting costs no compute, and an owner must always be able to erase their
+  // footage, even after the code changes: the owner key and the origin checks
+  // below still guard it. The same holds for the training opt-in: withdrawing
+  // must never need the current code, and granting it costs no compute.
+  const erasure = request.method === "DELETE" && /^jobs\/[a-f0-9]{32}$/.test(route) && !!owner;
+  const consent = request.method === "POST" && /^jobs\/[a-f0-9]{32}\/training-consent$/.test(route) && !!owner;
   if (writes) {
     const origin = request.headers.get("origin");
     // Browsers send Origin on same-origin POST/PUT/DELETE. Locally a same-origin
@@ -101,7 +114,7 @@ async function proxy(
       );
     // Analysis uses paid compute: the optional shared code keeps strangers out.
     const sent = request.headers.get("x-pitchlens-access");
-    if (accessCode && !sameSecret(sent, accessCode))
+    if (accessCode && !erasure && !consent && !sameSecret(sent, accessCode))
       return Response.json(
         {
           detail: sent
@@ -124,13 +137,6 @@ async function proxy(
   // worker's access log prints every path with its query.
   const search = new URLSearchParams(request.nextUrl.search);
   search.delete("owner");
-  // The HttpOnly cookie outlives script storage (Safari's 7-day cap, "clear
-  // website data"), so a valid cookie wins: a freshly minted browser key must
-  // never hide this browser's matches or replace the only surviving copy.
-  const cookie = request.cookies.get(OWNER_COOKIE)?.value || "";
-  const header = request.headers.get("x-pitchlens-owner") || "";
-  const cookieOwner = OWNER.test(cookie) ? cookie : "";
-  const owner = cookieOwner || (OWNER.test(header) ? header : "");
   // Listings and new analyses are always scoped to a browser, locally too: an
   // ownerless listing would show every match on the worker.
   if ((route === "jobs" || route === "jobs/from-url" || route === "venues") && !owner) {

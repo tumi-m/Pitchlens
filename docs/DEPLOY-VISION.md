@@ -43,7 +43,11 @@ Browser ──4 MB chunks──▶ Vercel /api/vision/* ──Bearer token──
    | `RAILWAY_DOCKERFILE_PATH` | `vision.Dockerfile` (a safeguard that selects the right image even if the config-file step was missed) |
    | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | Required for full matches on a hosted worker (modal.com → Settings → API Tokens; see GPU analysis with Modal). The CPU-only alternative is `VISION_ALLOW_CPU_FALLBACK=1` (about an hour per 40-minute match on 4 vCPUs). With neither, the worker runs only 20-second tests: `/health` shows `"fullMatch": false`, the upload page says so, and a full match is refused before its upload (503, code `full-match-unavailable`). |
 
-   Optional: `VISION_RETENTION_HOURS` (default `168`), `VISION_ALLOWED_HOSTS`
+   Optional: `VISION_RETENTION_HOURS` (hours until uploaded footage is
+   deleted; vision.Dockerfile sets `168`, 7 days; `0` keeps footage until the
+   owner deletes it; an empty or invalid value falls back to `168` with a
+   warning in the log; `/health` shows the value in effect as
+   `retentionHours`, `null` when footage is kept), `VISION_ALLOWED_HOSTS`
    (default `*`; set to your Railway domain plus `healthcheck.railway.app` to
    lock it down), `VISION_MAX_BYTES` (see below), `VISION_SITE_TRAINING=1`
    (lets the site start ball-model training; see docs/BALL-TRAINING.md) with
@@ -250,16 +254,17 @@ Add `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` (modal.com → Settings → API
 Tokens) to the Railway service variables. Each job's inference then runs on a
 Modal GPU (`VISION_MODAL_GPU`, default `L4`); Railway keeps uploads, storage,
 status and playback. The GPU fetches the video from the worker's public
-address (`RAILWAY_PUBLIC_DOMAIN`, or `VISION_PUBLIC_URL`) with the service
-token. The first job builds the GPU image on Modal (a few minutes, then
-cached). On a hosted worker, a full match whose GPU fails (bad token, no
-credit, no GPU within `VISION_GPU_START_SECONDS`) ends with "GPU is
-unavailable. Your upload is saved; retry when GPU service returns." unless
-`VISION_ALLOW_CPU_FALLBACK=1` is set; when no GPU ran, neither the daily start
-nor the attempt is charged. 20-second tests and section re-runs fall back to
-the CPU and say so. An engine crash on the GPU is not re-run on the CPU.
-`VISION_USE_MODAL=0` switches the GPU off. Set a spend limit in Modal →
-Settings → Usage & billing.
+address (`RAILWAY_PUBLIC_DOMAIN`, or `VISION_PUBLIC_URL`, which must be
+`https://`: a GPU run refuses a plain-http internet address) with a scoped
+grant, never the service token (see GPU grants below). The first job builds
+the GPU image on Modal (a few minutes, then cached). On a hosted worker, a
+full match whose GPU fails (bad token, no credit, no GPU within
+`VISION_GPU_START_SECONDS`) ends with "GPU is unavailable. Your upload is
+saved; retry when GPU service returns." unless `VISION_ALLOW_CPU_FALLBACK=1`
+is set; when no GPU ran, neither the daily start nor the attempt is charged.
+20-second tests and section re-runs fall back to the CPU and say so. An engine
+crash on the GPU is not re-run on the CPU. `VISION_USE_MODAL=0` switches the
+GPU off. Set a spend limit in Modal → Settings → Usage & billing.
 
 ### Faster or cheaper GPU runs
 
@@ -324,8 +329,29 @@ account migration exists. Ownerless legacy hosted jobs are intentionally withhel
 do not auto-assign them to the first caller. Local unscoped access remains available
 for an operator-led migration after ownership verification.
 
-Modal receives a four-hour, per-video signed read grant in addition to the service
-token. The proxy never forwards browser-supplied GPU grants. Keep service keys secret.
+### GPU grants (the GPU never holds the service token)
+
+Each Modal run receives only short-lived grants, never `VISION_SERVICE_TOKEN`:
+one to read that job's video (`GET /jobs/{id}/video`, header
+`x-pitchlens-video-grant`) and one per weight file the run may copy
+(`GET /models/{name}`, header `x-pitchlens-model-grant`). Each is an HMAC-SHA256
+over the job id, an expiry and (for weights) the file name, keyed with a key
+derived from the service token and the grant's purpose, and checked in constant
+time. The worker accepts a grant on those two routes only, only for its own job
+and file, and only before its expiry (four hours, and only while that run is on
+the GPU); every other route still needs the service token. So anyone who reads
+a run's arguments or logs at Modal, or code inside the GPU image, can fetch
+that one video and those weights until the run ends, and nothing else.
+Ball-model training sends the GPU only the dataset and base weights as bytes.
+The proxy never forwards grant headers and never reaches `/models`. Rotating
+`VISION_SERVICE_TOKEN` invalidates every grant.
+
+`VISION_PUBLIC_URL` must be an `https://` address for GPU runs (the address
+made from `RAILWAY_PUBLIC_DOMAIN` always is). With a plain `http://` internet
+address a run fails before any Modal call ("VISION_PUBLIC_URL must be an
+https:// address for GPU runs."), so the grants and the video never cross the
+internet in clear text; `http://` to `127.0.0.1`, `localhost` or `::1` is
+allowed for local tests.
 
 Hosted full matches fail visibly when GPU execution is unavailable, preserving the
 complete upload for retry. CPU diagnostics remain possible; setting

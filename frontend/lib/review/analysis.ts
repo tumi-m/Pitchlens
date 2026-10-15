@@ -491,6 +491,8 @@ export type BallLabelState = {
   /** False while the worker is still extracting the label frames from the video. */
   framesReady: boolean;
   size: [number, number];
+  /** The owner allowed training the site's ball finder on this match (absent on older workers: not agreed). */
+  trainingConsent?: boolean;
 };
 
 export const fetchBallLabels = (jobId: string) => visionJson<BallLabelState>(`jobs/${jobId}/ball-labels`);
@@ -506,9 +508,12 @@ export type BallModelRun = {
   matches: number;
   split: string;
   counts: { train: { positive: number; negative: number }; testFrames: number };
-  baseline: { recall: number | null; precision: number | null; frames: number };
-  candidate: { recall: number | null; precision: number | null; frames: number };
+  /** Absent when the run was refused or stopped before both models were scored. */
+  baseline?: { recall: number | null; precision: number | null; frames: number };
+  candidate?: { recall: number | null; precision: number | null; frames: number };
   kept: boolean;
+  /** Why nothing was trained or switched (for example too few held-out balls). */
+  message?: string;
 };
 
 export type BallModelState = {

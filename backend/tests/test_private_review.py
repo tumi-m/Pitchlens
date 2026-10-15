@@ -6,7 +6,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from app.vision.access import video_grant
+from app.vision.access import model_grant, video_grant
 
 
 @pytest.fixture
@@ -73,20 +73,22 @@ def test_private_playback_requires_owner_and_preserves_ranges(private_job):
     assert client.get(f"/jobs/{job}").status_code == 404
 
 
-def test_worker_grant_only_reads_its_video_until_expiry(private_job):
-    _, client, job, _ = private_job
+def test_worker_grant_only_reads_its_video_until_expiry(private_job, monkeypatch):
+    server, client, job, _ = private_job
+    monkeypatch.setattr(server, "engines", {job: "gpu"})
     del client.headers["x-pitchlens-owner"]
+    del client.headers["Authorization"]  # a GPU run holds no service token
     grant = video_grant("test-token", job)
     headers = {"x-pitchlens-video-grant": grant}
     assert client.get(f"/jobs/{job}/video", headers=headers).status_code == 200
-    assert client.get(f"/jobs/{job}/result", headers=headers).status_code == 404
+    assert client.get(f"/jobs/{job}/result", headers=headers).status_code == 401
     for wrong in (
         video_grant("test-token", "d" * 32),
         video_grant("test-token", job, time.time() - 1),
     ):
         assert (
             client.get(f"/jobs/{job}/video", headers={"x-pitchlens-video-grant": wrong}).status_code
-            == 404
+            == 401
         )
 
 
@@ -218,3 +220,48 @@ def test_hosted_full_match_does_not_silently_fall_back_to_cpu(private_job, monke
     status = server.load_status(directory)
     assert status["status"] == "failed" and "upload is saved" in status["stage"]
     assert (directory / "video").is_file()
+
+
+def test_gpu_grants_open_only_their_own_job_video_and_weights_while_it_runs(private_job, monkeypatch, tmp_path):
+    """What a Modal run holds (its grants) reads that job's video and the weights it was
+    granted, nothing else: no other route, job or file, no Bearer use, not after expiry,
+    not once the run stops using the GPU."""
+    server, client, job, directory = private_job
+    other = "d" * 32
+    (tmp_path / other).mkdir()
+    server.write_status(tmp_path / other, {"id": other, "owner": "e" * 32, "status": "processing", "createdAt": time.time()})
+    (tmp_path / other / "video").write_bytes(b"someone else")
+    weights = tmp_path / "football-ball.onnx"
+    weights.write_bytes(b"weights")
+    monkeypatch.setenv("VISION_BALL_MODEL_PATH", str(weights))
+    monkeypatch.setenv("VISION_PUBLIC_URL", "https://worker.example")  # hosted: owners required
+    engines = {job: "gpu", other: "gpu"}
+    monkeypatch.setattr(server, "engines", engines)
+    client.headers.clear()
+    video = {"x-pitchlens-video-grant": video_grant("test-token", job)}
+    model = {"x-pitchlens-model-grant": model_grant("test-token", job, "football-ball.onnx")}
+
+    assert client.get(f"/jobs/{job}/video", headers=video).content == b"0123456789"
+    assert client.get("/models/football-ball.onnx", headers=model).content == b"weights"
+    # Every other route, and other jobs, still need the service token (and an owner).
+    for method, path in (("GET", f"/jobs/{job}"), ("GET", f"/jobs/{job}/result"), ("GET", f"/jobs/{job}/analysis"),
+                         ("GET", "/ops"), ("GET", "/jobs"), ("POST", "/jobs?size=10"), ("DELETE", f"/jobs/{job}"),
+                         ("POST", f"/jobs/{job}/cancel"), ("GET", "/ball-model"),
+                         ("GET", f"/jobs/{other}/video"), ("GET", "/models/yolo11s.pt")):
+        for headers in (video, model, {"Authorization": f"Bearer {video['x-pitchlens-video-grant']}"}):
+            assert client.request(method, path, headers=headers).status_code == 401, (method, path, headers)
+    # A grant for one purpose never passes as the other; nor a forged or stale one.
+    assert client.get(f"/jobs/{job}/video", headers={"x-pitchlens-video-grant": model["x-pitchlens-model-grant"]}).status_code == 401
+    assert client.get("/models/football-ball.onnx", headers={"x-pitchlens-model-grant": video["x-pitchlens-video-grant"]}).status_code == 401
+    for bad in (video_grant("wrong-token", job), video_grant("test-token", job, time.time() - 1),
+                video_grant("test-token", job, time.time() + 5 * 3600), video["x-pitchlens-video-grant"].upper(), ""):
+        assert client.get(f"/jobs/{job}/video", headers={"x-pitchlens-video-grant": bad}).status_code == 401
+    for bad in (model_grant("test-token", other, "football-ball.onnx").replace(other, job),
+                model_grant("test-token", job, "football-ball.onnx", time.time() - 1),
+                model_grant("wrong-token", job, "football-ball.onnx")):
+        assert client.get("/models/football-ball.onnx", headers={"x-pitchlens-model-grant": bad}).status_code == 401
+    # Once the run left the GPU (finished, cancelled, CPU fallback) its grants are dead.
+    engines[job] = "cpu"
+    assert client.get(f"/jobs/{job}/video", headers=video).status_code == 401
+    del engines[job]
+    assert client.get("/models/football-ball.onnx", headers=model).status_code == 401

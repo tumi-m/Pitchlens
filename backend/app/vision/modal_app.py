@@ -2,8 +2,10 @@
 
 The Railway worker stays in charge of uploads, storage, status and playback.
 For each job it starts this app (image builds are cached by Modal), and the GPU
-function fetches the video straight from the worker with the service token,
-streams progress back, and returns the gzip-compressed result JSON.
+function fetches the video straight from the worker, streams progress back,
+and returns the gzip-compressed result JSON. It never receives the service
+token: only grants scoped to this job's video and the weight files this run
+may copy, which expire (app.vision.access).
 
 Enabled when MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are set on the worker
 (VISION_USE_MODAL=0 turns it off). GPU type: VISION_MODAL_GPU (default L4).
@@ -72,7 +74,7 @@ models_volume = modal.Volume.from_name("pitchlens-models", create_if_missing=Tru
 @app.function(gpu=GPU, timeout=3 * 3600, max_containers=2, volumes={"/cache": models_volume})
 def analyse(
     video_url: str,
-    token: str,
+    model_grants: dict,
     profile: str,
     sample_fps: int,
     max_seconds=None,
@@ -109,7 +111,7 @@ def analyse(
         try:
             for path in missing:
                 yield {"stage": "GPU: preparing football models", "progress": 1}
-                ensure_model(path, base, token)
+                ensure_model(path, base, (model_grants or {}).get(path.name, ""))
         except Exception as exc:
             yield {"error": f"Model unavailable on GPU: {exc}", "user": False}
             return
@@ -120,7 +122,7 @@ def analyse(
     video = workdir / "video"
     yield {"stage": "GPU: fetching the video", "progress": 1}
     with requests.get(
-        video_url, headers={"Authorization": f"Bearer {token}", "x-pitchlens-video-grant": video_grant}, stream=True, timeout=120
+        video_url, headers={"x-pitchlens-video-grant": video_grant}, stream=True, timeout=120
     ) as response:
         response.raise_for_status()
         received, said = 0, None
@@ -167,7 +169,7 @@ def analyse(
     yield {"result_gz": gzip.compress((workdir / "result.json").read_bytes())}
 
 
-def ensure_model(path, base, token):
+def ensure_model(path, base, grant):
     """Copy a weight file from the volume cache, or from the worker, verifying its hash."""
     import hashlib
     import shutil
@@ -190,7 +192,7 @@ def ensure_model(path, base, token):
         temporary = cached.with_suffix(".download")
         with requests.get(
             f"{base}/models/{path.name}",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"x-pitchlens-model-grant": grant},
             stream=True,
             timeout=300,
         ) as response:

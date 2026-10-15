@@ -81,7 +81,10 @@ export default function HomePage() {
             ))}
           </section>
           <footer className="mt-20 text-sm text-pitch-muted border-t border-pitch-indigo-soft/30 pt-6">
-            Pitchlens · Football review grounded in footage.
+            Pitchlens · Football review grounded in footage ·{" "}
+            <Link href="/privacy" className="underline hover:text-pitch-white">
+              Privacy
+            </Link>
           </footer>
         </div>
       </main>

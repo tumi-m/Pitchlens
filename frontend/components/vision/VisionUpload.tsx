@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { Upload, ScanLine, Loader2, KeyRound } from "lucide-react";
 import { inspectVideo, PreflightRejected, VideoPreflight } from "@/lib/review/preflight";
 import { clockTime } from "@/lib/review/vision";
@@ -18,6 +19,7 @@ import {
   setVisionAccessCode,
   sizeLabel,
   cleanAccessCode,
+  retentionLabel,
   ACCESS_CODE_CHARACTERS,
   CONNECTION_LOST,
   connectionLost,
@@ -233,11 +235,7 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
     health?.hosted === false ||
     (typeof window !== "undefined" &&
       ["localhost", "127.0.0.1"].includes(window.location.hostname));
-  const retention = health?.retentionHours
-    ? health.retentionHours >= 48
-      ? `${Math.round(health.retentionHours / 24)} days`
-      : `${Math.round(health.retentionHours)} hours`
-    : "";
+  const retention = retentionLabel(health?.retentionHours);
   const profiles = health?.profiles ?? ["general"];
   // The short test needs the decoded preview: without one (a file this browser
   // cannot decode) its checkbox is not even shown, so it can never apply.
@@ -501,9 +499,24 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
             </span>
             <span className="text-sm text-pitch-muted block mt-2">
               MP4 or MOV (H.264/HEVC) · Up to {megabytes(maxBytes)} · upload the camera&apos;s original file ·{" "}
-              {hosted
-                ? `Uploaded to the Pitchlens analysis server${retention ? `; footage deleted after ${retention}` : ""}`
-                : "Video stays on this computer"}
+              {hosted ? (
+                <>
+                  {/* null: a current worker with retention off; undefined (an older worker) says nothing. */}
+                  {`Uploaded to the Pitchlens analysis server${
+                    retention
+                      ? `; footage deleted after ${retention}`
+                      : health?.retentionHours === null
+                        ? "; footage kept until you delete it"
+                        : ""
+                  }`}
+                  {" · "}
+                  <Link href="/privacy" className="underline hover:text-pitch-white">
+                    Privacy
+                  </Link>
+                </>
+              ) : (
+                "Video stays on this computer"
+              )}
             </span>
             <input
               aria-label="Video for computer vision"
@@ -527,6 +540,11 @@ export function VisionUpload({ onManual }: { onManual: () => void }) {
                 setUnfinished(null);
               }}
             />
+            {hosted && (
+              <span className="text-xs text-pitch-muted block mt-3" data-testid="upload-permission">
+                Stored on Railway and analysed on Modal GPUs. Only upload footage you filmed or have permission to use.
+              </span>
+            )}
           </label>
           ) : (
             <div className="glass-card p-6 space-y-4">

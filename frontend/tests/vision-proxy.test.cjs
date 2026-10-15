@@ -77,17 +77,62 @@ test('owner query cannot override the caller capability and GPU grants are not f
   assert.equal(response.headers.get('set-cookie'), null);
 });
 
-test('delete, retry and saved-video reruns require same-origin access authorization', async () => {
+test('delete needs only the owner and same origin; retry and reruns also need the access code', async () => {
   const s = setup();
-  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER }), s.route())).status, 401);
+  // Deleting costs no compute: an owner without the current code can still erase.
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER }), s.route())).status, 200);
+  assert.equal(s.calls.length, 1);
+  assert.equal(s.calls[0].init.method, 'DELETE');
+  assert.equal(sentOwner(s.calls[0]), OWNER);
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, access: 'wrong-code' }), s.route())).status, 200);
+  assert.equal(s.calls.length, 2);
+  // Cross-site and ownerless deletes never reach the worker, with or without the code.
   assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, access: 'fixture-access', origin: 'https://attacker.example' }), s.route())).status, 403);
-  assert.equal(s.calls.length, 0);
-  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, access: 'fixture-access' }), s.route())).status, 200);
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER, origin: null }), s.route())).status, 403);
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE' }), s.route())).status, 401);
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', access: 'fixture-access' }), s.route())).status, 401);
+  assert.equal(s.calls.length, 2);
+  // Only the match itself: a DELETE on any other route still needs the code.
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER }), s.route('ball-labels'))).status, 401);
+  assert.equal(s.calls.length, 2);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('retry'))).status, 401);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('retry'))).status, 200);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('rerun'))).status, 401);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'wrong-code' }), s.route('rerun'))).status, 401);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access', origin: 'https://attacker.example' }), s.route('rerun'))).status, 403);
+  assert.equal(s.calls.length, 3);
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access', query: '?mode=full&start=0&requestId=abc' }), s.route('rerun'))).status, 200);
+  assert.equal(s.calls.length, 4);
   assert.equal(new URL(s.calls.at(-1).url).searchParams.get('mode'), 'full');
+});
+
+test('the training opt-in needs only the owner and same origin, so anyone can withdraw without the code', async () => {
+  const s = setup();
+  // Granting costs no compute and withdrawing must always work: no access code needed.
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('training-consent'))).status, 200);
+  assert.equal(s.calls.length, 1);
+  assert.equal(new URL(s.calls[0].url).pathname, `/jobs/${ID}/training-consent`);
+  assert.equal(s.calls[0].init.method, 'POST');
+  assert.equal(sentOwner(s.calls[0]), OWNER);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'wrong-code' }), s.route('training-consent'))).status, 200);
+  assert.equal(s.calls.length, 2);
+  // Cross-site, origin-less and ownerless requests never reach the worker.
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, origin: 'https://attacker.example' }), s.route('training-consent'))).status, 403);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, origin: null }), s.route('training-consent'))).status, 403);
+  assert.equal((await s.api.POST(s.request({ method: 'POST' }), s.route('training-consent'))).status, 401);
+  assert.equal(s.calls.length, 2);
+  // An open site (no code): an owner still reaches the worker, nobody else does.
+  const open = setup({ VISION_ACCESS_CODE: '' });
+  assert.equal((await open.api.POST(open.request({ method: 'POST' }), open.route('training-consent'))).status, 401);
+  assert.equal((await open.api.POST(open.request({ method: 'POST', owner: OWNER }), open.route('training-consent'))).status, 200);
+  assert.equal(open.calls.length, 1);
+  // Only that route: its siblings are unknown, and other job writes still need the code.
+  for (const sibling of ['training-consents', 'training-consent/x', 'training']) {
+    assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route(sibling))).status, 404, sibling);
+  }
+  assert.equal((await s.api.DELETE(s.request({ method: 'DELETE', owner: OWNER }), s.route('training-consent'))).status, 401);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('details'))).status, 401);
+  assert.equal(s.calls.length, 2);
 });
 
 test('billing requires owner and write authorization; browser proxy never accepts webhooks', async () => {

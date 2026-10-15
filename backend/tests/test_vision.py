@@ -1817,13 +1817,66 @@ def test_gpu_receives_bounded_diagnostic_options(tmp_path, monkeypatch):
         ball_search="adaptive",
     )
     assert calls[0][2:7] == ("small-ball", 6, 20, 300, "adaptive")
-    from app.vision.access import valid_video_grant
+    from app.vision.access import model_grant_job, valid_video_grant
     assert valid_video_grant("fixture-token", "a" * 32, calls[0][7])
+    assert not valid_video_grant("fixture-token", "b" * 32, calls[0][7])
+    # Grants scoped to this job and to the weights this run may copy; never the token.
+    names = gpu.run_model_names("small-ball", "adaptive")
+    assert sorted(calls[0][1]) == names
+    assert all(model_grant_job("fixture-token", n, g) == "a" * 32 for n, g in calls[0][1].items())
+    assert all(model_grant_job("fixture-token", "other.pt", g) is None for g in calls[0][1].values())
+    assert "fixture-token" not in repr(calls[0])
     assert (tmp_path / "result.json").read_text() == '{"frames":[]}'
     # A rerun's kit order reaches the GPU engine too.
     gpu.run_on_modal("a" * 32, tmp_path / "result.json", "fixture-token", lambda **kw: None, lambda: False, "general", 6,
                      reference_colours=["#dc2626", "#22c55e"], reference_job="e" * 32)
     assert calls[1][9:] == (["#dc2626", "#22c55e"], "e" * 32)
+
+
+def test_gpu_grants_last_four_hours_so_a_preempted_input_can_fetch_again(tmp_path, monkeypatch):
+    """Modal re-runs a preempted generator input from the start: its grants must still
+    open the video then. The worker revokes them once the run leaves the GPU."""
+    import gzip
+    import sys
+    import time
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from app.vision import gpu
+    from app.vision.access import MAX_GRANT_SECONDS
+
+    calls = []
+    monkeypatch.setattr(gpu, "public_base", lambda: "https://worker.example")
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", SimpleNamespace(
+        app=SimpleNamespace(run=nullcontext),
+        analyse=SimpleNamespace(remote_gen=lambda *a: calls.append(a) or iter([{"result_gz": gzip.compress(b"{}")}]))))
+    gpu.run_on_modal("a" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+    video_expiry = int(calls[0][7].split(".")[0])
+    model_expiries = [int(g.split(".")[1]) for g in calls[0][1].values()]
+    assert model_expiries
+    for expiry in [video_expiry, *model_expiries]:
+        assert time.time() + 4 * 3600 - 120 < expiry <= time.time() + MAX_GRANT_SECONDS
+
+
+@pytest.mark.parametrize("base, expected", [
+    ("https://w.example", True),
+    ("HTTPS://w.example", True),
+    ("http://127.0.0.1:8000", True),
+    ("http://localhost", True),
+    ("http://LOCALHOST", True),
+    ("http://[::1]:8000", True),
+    ("http://w.example", False),
+    ("http://10.0.0.5", False),
+    ("ftp://w.example", False),
+    ("w.example", False),
+    ("http://127.0.0.1.evil.com", False),
+    ("http://localhost@evil.com", False),
+    ("http://evil.com#@localhost", False),
+])
+def test_gpu_runs_reach_the_worker_only_over_tls_or_on_this_machine(base, expected):
+    from app.vision import gpu
+
+    assert gpu.encrypted(base) is expected
 
 
 def test_gap_does_not_join_nearby_balls_with_different_identities():
@@ -3949,6 +4002,70 @@ def test_progress_errors_and_leaving_the_app_keep_their_own_meaning(tmp_path, mo
     stuck.gate.set()
 
 
+def test_a_gpu_run_never_fetches_over_plain_http_from_the_internet(tmp_path, monkeypatch):
+    import gzip
+    import sys
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from app.vision import gpu
+
+    calls = []
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", SimpleNamespace(
+        app=SimpleNamespace(run=nullcontext),
+        analyse=SimpleNamespace(remote_gen=lambda *a: calls.append(a) or iter([{"result_gz": gzip.compress(b"{}")}]))))
+    monkeypatch.setenv("VISION_PUBLIC_URL", "http://worker.example")
+    with pytest.raises(gpu.GPUUnavailable, match="https"):
+        gpu.run_on_modal("a" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+    assert calls == []
+    monkeypatch.setenv("VISION_PUBLIC_URL", "http://127.0.0.1:8100")  # a local GPU test
+    gpu.run_on_modal("a" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 3)
+    assert calls[0][0] == f"http://127.0.0.1:8100/jobs/{'a' * 32}/video"
+
+
+def test_the_gpu_fetches_weights_and_video_with_its_grants_and_no_bearer_token(tmp_path, monkeypatch):
+    import http.server
+    from types import SimpleNamespace
+
+    pytest.importorskip("modal")
+    from app.vision import modal_app
+
+    seen = []
+
+    class Serve(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, dict(self.headers)))
+            body = b"weights" if self.path.startswith("/models/") else b"\0" * 64
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Serve)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    player = tmp_path / "models" / "player.pt"  # missing: copied from the worker
+    monkeypatch.setenv("VISION_MODEL_PATH", str(player))
+    monkeypatch.setenv("VISION_GPU_WORKDIR", str(tmp_path / "job"))
+    monkeypatch.setattr(modal_app, "models_volume", SimpleNamespace(commit=lambda: None))
+    monkeypatch.setattr(modal_app, "Path", lambda p: tmp_path / "cache" if p == "/cache" else Path(p))
+    (tmp_path / "cache").mkdir()
+    monkeypatch.setattr("app.vision.engine.run_video", lambda video, output, **kw: Path(output).write_text('{"frames": []}'))
+    try:
+        items = list(modal_app.analyse.local(f"http://127.0.0.1:{httpd.server_port}/jobs/{'a' * 32}/video",
+                                             {"player.pt": "model-grant"}, "general", 3, ball_search="none",
+                                             video_grant="video-grant"))
+    finally:
+        httpd.shutdown()
+    assert "result_gz" in items[-1], items
+    assert [p for p, _ in seen] == ["/models/player.pt", f"/jobs/{'a' * 32}/video"]
+    assert seen[0][1].get("x-pitchlens-model-grant") == "model-grant"
+    assert seen[1][1].get("x-pitchlens-video-grant") == "video-grant"
+    assert all("Authorization" not in headers for _, headers in seen)
+
+
 def test_the_gpu_reports_progress_while_it_fetches_a_large_video(tmp_path, monkeypatch):
     import http.server
 
@@ -3984,7 +4101,7 @@ def test_the_gpu_reports_progress_while_it_fetches_a_large_video(tmp_path, monke
     monkeypatch.setattr("app.vision.engine.run_video", run_video)
     try:
         items = []
-        for item in modal_app.analyse.local(f"http://127.0.0.1:{httpd.server_port}/jobs/x/video", "tok", "general", 3,
+        for item in modal_app.analyse.local(f"http://127.0.0.1:{httpd.server_port}/jobs/x/video", {}, "general", 3,
                                             ball_search="none"):
             items.append(item)
             if "result_gz" in item:
@@ -4316,3 +4433,119 @@ def test_owner_keys_never_reach_the_access_log():
     assert "owner=[redacted]&x=1" in record.getMessage() and key not in record.getMessage()
     odd = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s", (f"owner={key}",), None)
     assert redact.filter(odd) and odd.args == (f"owner={key}",)
+    # Titles (pre-filled from file names) and video links can name people too.
+    upload = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("127.0.0.1:1", "POST", f"/jobs?title=Sipho+Ndlovu+U11&profile=general&owner={key}", "1.1", 200), None)
+    assert redact.filter(upload)
+    message = upload.getMessage()
+    assert "title=[redacted]" in message and "profile=general" in message and "owner=[redacted]" in message
+    assert "Sipho" not in message and key not in message
+    link = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                             ("127.0.0.1:1", "POST", "/jobs/from-url?url=https%3A%2F%2Fyoutu.be%2Fx&title=Thandi", "1.1", 200), None)
+    assert redact.filter(link)
+    message = link.getMessage()
+    assert "url=[redacted]" in message and "title=[redacted]" in message
+    assert "youtu" not in message and "Thandi" not in message
+
+
+def _slow_ffmpeg(monkeypatch):
+    """ffmpeg had copied most of the stream when its 600 s timeout (or a SIGTERM) hit."""
+    import subprocess
+
+    def run(cmd, **kw):
+        with open(cmd[-1], "wb") as f:
+            f.write(b"\x00" * 4096)
+        raise subprocess.TimeoutExpired(cmd, 600)
+
+    # The Poetry environment has no imageio-ffmpeg; the worker image does.
+    monkeypatch.setitem(sys.modules, "imageio_ffmpeg", SimpleNamespace(get_ffmpeg_exe=lambda: "ffmpeg"))
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_a_remux_that_stops_part_way_leaves_no_copy(tmp_path, monkeypatch):
+    import subprocess
+
+    from app.vision import youtube
+
+    _slow_ffmpeg(monkeypatch)
+    (tmp_path / "download.mp4").write_bytes(b"\x00" * 8192)
+    with pytest.raises(subprocess.TimeoutExpired):
+        youtube.remux(tmp_path / "download.mp4")
+    assert not (tmp_path / "remuxed.mp4").exists()
+
+
+def test_no_remux_outlives_a_failed_fetch_a_restart_or_retention(tmp_path, monkeypatch):
+    from app.vision import server, youtube
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "active", None)
+    job = "a" * 32
+    directory = tmp_path / job
+    directory.mkdir()
+    status = {"id": job, "status": "uploading", "createdAt": time.time() - 30 * 86400, "owner": "b" * 32, "title": "YouTube match"}
+    server.write_status(directory, status)
+
+    def fake_download(url, d, budget, progress=None, cancelled=None):
+        (d / "download.mp4").write_bytes(b"\x00" * 8192)
+        return youtube.remux(d / "download.mp4"), {"title": "x"}
+
+    _slow_ffmpeg(monkeypatch)
+    monkeypatch.setattr(youtube, "download", fake_download)
+    server.active = job
+    server.fetch_and_work(directory, status, threading.Event(), "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert sorted(p.name for p in directory.iterdir()) == ["status.json"]
+    assert server.load_status(directory)["status"] == "failed" and server.active is None
+    # A copy left behind earlier (a remux a redeploy stopped) in a 30-day-old match,
+    # and a fetch the restart itself stopped.
+    old = tmp_path / ("c" * 32)
+    old.mkdir()
+    server.write_status(old, {"id": "c" * 32, "owner": "b" * 32, "title": "Match", "status": "completed", "createdAt": time.time() - 30 * 86400})
+    (old / "remuxed.mp4").write_bytes(b"\x00" * 4096)
+    stopped = tmp_path / ("d" * 32)
+    stopped.mkdir()
+    server.write_status(stopped, {"id": "d" * 32, "owner": "b" * 32, "title": "YouTube match", "status": "uploading", "createdAt": time.time()})
+    (stopped / "download.mp4.part").write_bytes(b"\x00" * 4096)
+    (stopped / "remuxed.mp4").write_bytes(b"\x00" * 4096)
+    server.recover_after_restart()
+    assert sorted(p.name for p in stopped.iterdir()) == ["status.json"]
+    assert server.load_status(stopped)["status"] == "interrupted"
+    monkeypatch.setattr(server, "RETENTION_HOURS", 168)
+    server.delete_expired()
+    assert sorted(p.name for p in old.iterdir()) == ["status.json"]
+    assert json.loads((old / "status.json").read_text())["videoDeleted"] is True
+
+
+def test_retention_hours_fall_back_to_a_week_when_set_but_unreadable(monkeypatch, caplog):
+    from app.vision import server
+
+    monkeypatch.delenv("VISION_RETENTION_HOURS", raising=False)
+    assert server._retention_hours() == 0.0  # unset: local runs keep footage (docs/VISION.md)
+    for value, hours in (("0", 0.0), ("24", 24.0), (" 72 ", 72.0)):
+        monkeypatch.setenv("VISION_RETENTION_HOURS", value)
+        assert server._retention_hours() == hours, value
+    # A blank hosting variable overrides the image's 168: someone meant to set it.
+    for value in ("", "   ", "-5", "7d", "nan", "inf"):
+        monkeypatch.setenv("VISION_RETENTION_HOURS", value)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert server._retention_hours() == 168.0, value  # "7d" once crashed the import
+        assert "deleting footage after 168 hours" in caplog.text and repr(value) in caplog.text, value
+
+
+def test_footage_older_than_the_fallback_retention_is_deleted(tmp_path, monkeypatch):
+    from app.vision import server
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "active", None)
+    monkeypatch.setenv("VISION_RETENTION_HOURS", "")
+    monkeypatch.setattr(server, "RETENTION_HOURS", server._retention_hours())
+    job = "a" * 32
+    directory = tmp_path / job
+    directory.mkdir()
+    server.write_status(directory, {"id": job, "owner": "b" * 32, "title": "Match", "status": "completed",
+                                    "createdAt": time.time() - 200 * 3600})
+    (directory / "video").write_bytes(b"\x00" * 64)
+    (directory / "result.json").write_text('{"frames": []}')
+    server.delete_expired()
+    assert not (directory / "video").exists() and (directory / "result.json").is_file()
+    assert json.loads((directory / "status.json").read_text())["videoDeleted"] is True
