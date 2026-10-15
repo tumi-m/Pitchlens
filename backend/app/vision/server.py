@@ -1652,7 +1652,7 @@ def _calibration_ready(directory):
 
 
 # Bump when analytics logic changes so cached analyses are recomputed on deploy.
-ANALYTICS_VERSION = 12  # 10 merged rounds 1 and 2; 11 adds kit colours, span, ball search and player load; 12 counts control in sightings (E20)
+ANALYTICS_VERSION = 13  # 10 merged rounds 1 and 2; 11 adds kit colours, span, ball search and player load; 12 counts control in sightings (E20); 13 treats a kit-less player at the ball as unknown control (E23)
 _prepared = OrderedDict()  # (job, result stamp, calibration stamp, direction) -> prepared analysis
 PREPARED_CACHE = 3
 
@@ -2217,6 +2217,265 @@ def frame_image(job_id: str, index: int):
     raise HTTPException(409, "This frame is still being prepared")
 
 
+# ------------------------------------------------------------------ team fix
+# When kit clustering picked the wrong colour group (spectators as Kit B, say),
+# the owner taps one clear player per kit and the worker relabels the stored
+# kit colours with the engine's own rules: no GPU rerun (E24). Crops are cut by
+# the browser from the ball-label frames (GET /frames/{index}).
+
+PLAYER_ROLES = (None, "person", "player")
+TEAM_FIX_KEYS = {"kitA", "kitB", "reset"}
+MAX_TEAMS_BODY = 1024
+TEAM_CROPS = 4
+CROP_MIN_HEIGHT = 0.09  # of the frame height: a smaller player cannot be judged by eye
+NO_KIT_COLOURS = "This analysis has no kit colours to fix teams from. Analyse it again to fix teams here."
+_crops = OrderedDict()  # (job, result stamp) -> team groups without framesReady
+_crops_lock = threading.Lock()
+
+
+def _track_colours(frames):
+    """Median kit colour (LAB) per track, over its player detections; at least 3."""
+    import numpy as np
+
+    seen = {}
+    for f in frames:
+        for p in f.get("players") or []:
+            if p.get("role") in PLAYER_ROLES and p.get("kitFeature"):
+                seen.setdefault(p["id"], []).append(p["kitFeature"])
+    return {t: np.median(np.array(v, float), axis=0) for t, v in seen.items() if len(v) >= 3}
+
+
+def _team_groups(job_id, result):
+    """Up to TEAM_CROPS crops per group, one per track, from the label frames.
+
+    A kit shows the tracks whose colour sits nearest the kit's median: taps on
+    arbitrary players of a kit measured much worse as references. Unsorted
+    players are spread over colour, starting from the densest colour, so a
+    kit the engine missed (and the referee) shows first.
+    """
+    import numpy as np
+
+    from app.vision import balllabels
+
+    frames = result.get("frames") or []
+    tracks = _track_colours(frames)
+    if not tracks or _team_colours(result.get("teams")) is None:
+        raise HTTPException(409, NO_KIT_COLOURS)
+    height = (result.get("video") or {}).get("height") or 0
+    candidates = {0: [], 1: [], -1: []}
+    for i in balllabels.sample_frames(result, seed=_label_seed(job_id)):
+        for p in frames[i].get("players") or []:
+            box = p.get("box") or []
+            if p["id"] in tracks and p.get("role") in PLAYER_ROLES and p.get("kitFeature") and len(box) == 4 and box[3] - box[1] >= CROP_MIN_HEIGHT * height:
+                candidates[p["team"] if p.get("team") in (0, 1) else -1].append((i, p))
+
+    def nearest(members, centre_of):
+        """Each track's crop whose own colour is nearest centre_of(track)."""
+        best = {}
+        for i, p in members:
+            d = float(np.linalg.norm(np.asarray(p["kitFeature"], float) - centre_of(p["id"])))
+            if p["id"] not in best or d < best[p["id"]][0]:
+                best[p["id"]] = (d, i, p)
+        return {t: {"index": i, "id": t, "box": [round(float(v), 1) for v in p["box"]]} for t, (_, i, p) in best.items()}
+
+    groups = {}
+    for team, name in ((0, "A"), (1, "B")):
+        kit = [p["kitFeature"] for f in frames for p in f.get("players") or [] if p.get("team") == team and p.get("role") in PLAYER_ROLES and p.get("kitFeature")]
+        if not kit:
+            groups[name] = []
+            continue
+        median = np.median(np.array(kit, float), axis=0)
+        crops = nearest(candidates[team], lambda t: median)
+        order = sorted(crops, key=lambda t: (float(np.linalg.norm(tracks[t] - median)), t))
+        groups[name] = [crops[t] for t in order[:TEAM_CROPS]]
+    shown = {c["id"] for g in groups.values() for c in g}
+    crops = nearest([(i, p) for i, p in candidates[-1] if p["id"] not in shown], lambda t: tracks[t])
+    ids = sorted(crops)
+    chosen = []
+    if ids:
+        colours = np.array([tracks[t] for t in ids])
+        chosen = [int(np.argmin(np.linalg.norm(colours - np.median(colours, axis=0), axis=1)))]
+        while len(chosen) < min(TEAM_CROPS, len(ids)):
+            spread = np.min(np.linalg.norm(colours[:, None] - colours[chosen][None], axis=2), axis=1)
+            spread[chosen] = -1
+            chosen.append(int(np.argmax(spread)))
+    groups["unsorted"] = [crops[ids[k]] for k in chosen]
+    return groups
+
+
+@app.get("/jobs/{job_id}/teams")
+def team_groups(job_id: str):
+    """Player crops per kit group for the owner's team fix (409 without kit colours or footage)."""
+    from app.vision import balllabels
+
+    directory, path = _finished_result(job_id)
+    if _video_path(directory) is None:
+        raise HTTPException(409, "The footage is no longer kept, so players cannot be shown.")
+    stamp = _stamp(path)
+    key = (job_id, tuple(stamp) if stamp else ())
+    # The browser polls while the frames are prepared: parse the result once per version.
+    with _crops_lock:
+        view = _crops.get(key)
+    if view is None:
+        result = json.loads(path.read_text())
+        video = result.get("video") or {}
+        view = {
+            "colours": _team_colours(result.get("teams")),
+            "teamsSetBy": result.get("teamsSetBy"),
+            "size": [video.get("width"), video.get("height")],
+            "groups": _team_groups(job_id, result),
+        }
+        del result
+        with _crops_lock:
+            _crops[key] = view
+            while len(_crops) > SLIM_CACHE:
+                _crops.popitem(last=False)
+    slim = _slim_result(directory)
+    picks = balllabels.sample_frames(slim, seed=_label_seed(job_id))
+    return {**view, "framesReady": _prepare_label_frames(job_id, directory, slim, picks)}
+
+
+def _clean_pick(value, what):
+    if not isinstance(value, dict) or set(value) != {"index", "id"}:
+        raise HTTPException(400, f"{what} must be a player: {{index, id}}")
+    if not all(isinstance(value[k], int) and not isinstance(value[k], bool) and value[k] >= 0 for k in ("index", "id")):
+        raise HTTPException(400, f"{what} must be a player: {{index, id}}")
+    return {"index": value["index"], "id": value["id"]}
+
+
+def _forget_result(job_id, directory):
+    """Drop everything derived from a result that was rewritten in place (call under post_lock)."""
+    for key in list(_prepared):
+        if key[0] == job_id:
+            del _prepared[key]
+    for cache, guard in ((_slim, _slim_lock), (_crops, _crops_lock)):
+        with guard:
+            for key in list(cache):
+                if key[0] == job_id:
+                    del cache[key]
+    (directory / "analysis.json").unlink(missing_ok=True)
+
+
+def _apply_team_fix(job_id, directory, kits):
+    """Relabel every stored detection from the owner's two references, or restore the engine's labels."""
+    import numpy as np
+
+    from app.vision.engine import align_to_reference, assign_team, lab_hex, vote_teams
+    from app.vision.metrics import derive_metrics
+
+    with post_lock:
+        if not (directory / "status.json").is_file():
+            raise HTTPException(404, "Job not found")  # deleted meanwhile
+        status = _read_json(directory / "status.json", {})
+        with lock:
+            busy = job_id == active
+        path = directory / "result.json"
+        if busy or not isinstance(status, dict) or status.get("status") != "completed" or not path.is_file():
+            raise HTTPException(409, "Teams can be fixed once the analysis has finished")
+        result = json.loads(path.read_text())
+        frames = result.get("frames") or []
+        tracks = _track_colours(frames)
+        if not tracks or _team_colours(result.get("teams")) is None:
+            raise HTTPException(409, NO_KIT_COLOURS)
+        players = [p for f in frames for p in f.get("players") or []]
+        swapped = False
+        if kits is None:
+            if "engineTeams" not in result:
+                return {"swapped": False, "teams": result["teams"], "teamsSetBy": None}
+            for p in players:
+                if "engineTeam" in p:
+                    p["team"] = p.pop("engineTeam")
+            result["teams"] = result.pop("engineTeams")
+            result.pop("teamsSetBy", None)
+        else:
+            refs = []
+            for kit in kits:
+                if kit["index"] >= len(frames):
+                    raise HTTPException(400, "Unknown frame")
+                p = next((q for q in frames[kit["index"]].get("players") or [] if q.get("id") == kit["id"]), None)
+                if p is None:
+                    raise HTTPException(400, "That player is not in this frame")
+                if p.get("role") not in PLAYER_ROLES or not p.get("kitFeature"):
+                    raise HTTPException(400, "Choose an outfield player whose kit colour was measured")
+                if kit["id"] not in tracks:
+                    raise HTTPException(400, "That player was seen too briefly. Choose another.")
+                refs.append(tracks[kit["id"]])
+            # The engine's two-kit threshold, in plain LAB so kits that differ mainly
+            # in lightness can still be told apart when the owner picks them (E22).
+            if np.linalg.norm(refs[0] - refs[1]) < 25:
+                raise HTTPException(400, "These two players look the same. Choose one player from each team.")
+            engine_teams = result.get("engineTeams") or result["teams"]
+            chosen = [lab_hex(r) for r in refs]
+            # Index 0 stays the engine's Kit A: reviewer decisions keep their team
+            # index, so moving indices would move confirmed goals.
+            centres, colours = align_to_reference(np.array(refs), chosen, _team_colours(engine_teams))
+            swapped = list(colours) != chosen
+            if "engineTeams" not in result:
+                result["engineTeams"] = [dict(t) for t in result["teams"]]
+                for p in players:
+                    p["engineTeam"] = p.get("team", -1)
+            role_aware = any(p.get("role") == "player" for p in players)
+            for p in players:
+                feature = p.get("kitFeature")
+                p["team"] = assign_team(np.asarray(feature, float), centres, use_hue=not role_aware) if feature and p.get("role") in PLAYER_ROLES else -1
+            vote_teams(frames, centres, use_hue=not role_aware)
+            result["teams"] = [{**t, "colour": c} for t, c in zip(result["teams"], colours)]
+            result["teamsSetBy"] = "owner"
+        video = result.get("video") or {}
+        metrics = derive_metrics(
+            frames, result["sampleFps"], result.get("analysedDuration", video.get("duration", 0)), start_seconds=result.get("analysedStart") or 0
+        )
+        if result.get("ballSearch") == "none":
+            # The ball was never looked for: possession was not measured (not 0).
+            metrics.update(teamSeconds=None, possessionCoverage=None, possessionShare=[None, None], possessions=None)
+        result["metrics"] = metrics
+        try:
+            _write_json(path, result)
+        except OSError as exc:
+            path.with_suffix(".tmp").unlink(missing_ok=True)
+            raise HTTPException(503, "The team fix could not be saved. Try again later.") from exc
+        _forget_result(job_id, directory)
+        return {"swapped": swapped, "teams": result["teams"], "teamsSetBy": result.get("teamsSetBy")}
+
+
+@app.post("/jobs/{job_id}/teams")
+async def fix_teams(job_id: str, request: Request):
+    """The owner's team fix: {"kitA": {index, id}, "kitB": {index, id}}, one tapped
+    player per kit, or {"reset": true} for the engine's labels again.
+
+    swapped: true means Kit A is the player tapped for Kit B (index 0 stays the
+    engine's Kit A colour); the site then swaps the saved team names.
+    """
+    directory = folder(job_id)
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_TEAMS_BODY:
+            raise HTTPException(400, "The team fix is too large")
+
+    def reject_constant(value):
+        raise ValueError(f"{value} is not allowed")
+
+    try:
+        patch = json.loads(body or b"{}", parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise HTTPException(400, "Invalid JSON") from exc
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    unknown = set(patch) - TEAM_FIX_KEYS
+    if unknown:
+        raise HTTPException(400, f"Unknown key: {sorted(unknown)[0][:40]}")
+    kits = None
+    if "reset" in patch:
+        if patch["reset"] is not True or len(patch) > 1:
+            raise HTTPException(400, "Send {\"reset\": true} on its own")
+    else:
+        kits = [_clean_pick(patch.get("kitA"), "Kit A"), _clean_pick(patch.get("kitB"), "Kit B")]
+        if kits[0]["id"] == kits[1]["id"]:
+            raise HTTPException(400, "Choose a different player for each kit")
+    return await asyncio.to_thread(_apply_team_fix, job_id, directory, kits)
+
+
 training = {"state": "idle"}  # one ball-model training at a time, in this process
 training_lock = threading.Lock()
 # A copy of `training` on the volume: a restart then says the run stopped instead
@@ -2450,13 +2709,7 @@ def delete_job(job_id: str):
                 raise HTTPException(409, "Cancel processing and wait for it to stop before deleting")
             # A concurrent delete may have removed it during the wait.
             shutil.rmtree(directory, ignore_errors=True)
-            for key in list(_prepared):
-                if key[0] == job_id:
-                    del _prepared[key]
-            with _slim_lock:
-                for key in list(_slim):
-                    if key[0] == job_id:
-                        del _slim[key]
+            _forget_result(job_id, directory)
             # Saved venues derived from this match are personal derived data too.
             for path in _venue_dir().glob("*.json"):
                 if (_read_json(path) or {}).get("sourceJob") == job_id:
@@ -2509,7 +2762,10 @@ def retry_job(job_id: str):
 
 def kit_colours(path):
     """A finished result's two kit colours (Kit A first), or None."""
-    teams = (_read_json(path, {}) or {}).get("teams")
+    return _team_colours((_read_json(path, {}) or {}).get("teams"))
+
+
+def _team_colours(teams):
     colours = [t.get("colour") for t in teams if isinstance(t, dict)] if isinstance(teams, list) else []
     if len(colours) == 2 and all(isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c) for c in colours):
         return colours

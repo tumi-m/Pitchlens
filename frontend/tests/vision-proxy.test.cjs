@@ -324,3 +324,26 @@ test('team names, title and match date are saved through the details path, for t
   assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('detailsx'))).status, 404);
   assert.equal(s.calls.length, before);
 });
+
+test('the owner team fix reads crops and relabels through the teams path, for the owner only', async () => {
+  const s = setup();
+  const read = await s.api.GET(s.request({ owner: OWNER }), s.route('teams'));
+  assert.equal(read.status, 200);
+  assert.equal(new URL(s.calls[0].url).pathname, `/jobs/${ID}/teams`);
+  assert.equal(sentOwner(s.calls[0]), OWNER);
+  const fixed = await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('teams'));
+  assert.equal(fixed.status, 200);
+  assert.equal(new URL(s.calls[1].url).pathname, `/jobs/${ID}/teams`);
+  assert.equal(s.calls[1].init.method, 'POST');
+  assert.equal(sentOwner(s.calls[1]), OWNER);
+  // Another browser's key reaches the worker as that key, which answers 404.
+  assert.equal((await s.api.GET(s.request({ owner: OTHER }), s.route('teams'))).status, 404);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OTHER, access: 'fixture-access' }), s.route('teams'))).status, 404);
+  // A relabel is a write: the optional access code still applies when it is set.
+  const before = s.calls.length;
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER }), s.route('teams'))).status, 401);
+  // A look-alike path is never forwarded.
+  assert.equal((await s.api.GET(s.request({ owner: OWNER }), s.route('teamsx'))).status, 404);
+  assert.equal((await s.api.POST(s.request({ method: 'POST', owner: OWNER, access: 'fixture-access' }), s.route('teamsx'))).status, 404);
+  assert.equal(s.calls.length, before);
+});

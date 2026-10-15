@@ -2093,6 +2093,10 @@ test.describe("the score card on a phone", () => {
       const b = await box(page.getByRole("button", { name }));
       expect(Math.min(b.width, b.height)).toBeGreaterThanOrEqual(44);
     }
+    // A mis-tap here credits an added goal to the wrong team.
+    const radios = page.getByRole("radiogroup", { name: "Team for added moment" }).getByRole("radio");
+    await expect(radios).toHaveCount(2);
+    for (const radio of await radios.all()) expect((await box(radio)).height).toBeGreaterThanOrEqual(44);
   });
 
   test("the pitch set-up link in the score card is a 44 px button", async ({ page }) => {
@@ -2145,6 +2149,30 @@ test.describe("the score card on a phone", () => {
     for (const row of await list.getByRole("button").all()) expect((await box(row)).height).toBeGreaterThanOrEqual(44);
     await page.getByRole("button", { name: /Show all moments/ }).tap();
     await expect(list.getByRole("button")).toHaveCount(121);
+  });
+});
+
+test.describe("reviewing on a tablet", () => {
+  test.use({ viewport: { width: 768, height: 1024 }, hasTouch: true });
+
+  test("team choices and review actions are at least 44 px tall", async ({ page }) => {
+    await mockReport(page, { calibrated: true });
+    await page.goto(`/vision/${ID}`);
+    await page.getByRole("button", { name: "Start reviewing" }).tap();
+    const teams = page.getByRole("radiogroup", { name: "Team for added moment" });
+    const radios = teams.getByRole("radio");
+    await expect(radios).toHaveCount(2);
+    // Goal, Shot and Pass sit next to the team choice, in the add-a-moment box.
+    const addMoment = teams.locator("xpath=..");
+    const controls = [
+      ...(await radios.all()),
+      ...[/^Confirm/, /^Reject/, /^Other team/].map((name) => page.getByRole("button", { name })),
+      ...[/^Goal/, /^Shot/, /^Pass/].map((name) => addMoment.getByRole("button", { name })),
+    ];
+    for (const control of controls) {
+      await expect(control).toBeVisible();
+      expect((await box(control)).height).toBeGreaterThanOrEqual(44);
+    }
   });
 });
 
@@ -2554,4 +2582,118 @@ test("the match title and date are edited in the header and shown in Your matche
   await page.goto("/dashboard");
   await expect(page.getByRole("heading", { name: "Tekkerz v PUSHIT, league week 3 · Tekkerz FC v PUSHIT" })).toBeVisible();
   await expect(page.getByTestId("vision-job-span")).toContainText(day);
+});
+
+// ── The owner fixes the teams by tapping one clear player per kit ──
+const PIXEL = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+const crop = (index: number, id: number) => ({ index, id, box: [100 + id, 120, 124 + id, 180] });
+
+/** Kit A is the red team, Kit B the spectators (wrong), and the green team is unsorted. */
+async function mockTeams(page: Page, opts: { swapped?: boolean; status?: number } = {}) {
+  const state = { posts: [] as unknown[], fixed: false };
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/frames/\\d+$`), (r) => r.fulfill({ status: 200, body: PIXEL, headers: { "content-type": "image/png" } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/teams$`), (r) => {
+    if (r.request().method() === "POST") {
+      const body = r.request().postDataJSON();
+      state.posts.push(body);
+      state.fixed = !body.reset;
+      return r.fulfill({ json: { swapped: !!opts.swapped && !body.reset, teams: result().teams, teamsSetBy: state.fixed ? "owner" : null } });
+    }
+    if (opts.status) return r.fulfill({ status: opts.status, json: { detail: "This analysis has no kit colours to fix teams from." } });
+    return r.fulfill({
+      json: {
+        colours: ["#dc2626", "#22c55e"],
+        teamsSetBy: state.fixed ? "owner" : null,
+        framesReady: true,
+        size: [640, 360],
+        groups: { A: [crop(2, 10), crop(5, 190), crop(8, 308), crop(11, 127)], B: [crop(3, 165), crop(6, 212), crop(9, 234), crop(12, 311)], unsorted: [crop(9, 82), crop(4, 115), crop(7, 45), crop(13, 283)] },
+      },
+    });
+  });
+  // The fixed result says who set the teams (the Undo button reads it).
+  await page.route(resultRoute, (r) => r.fulfill({ json: { ...result(), ...(state.fixed ? { teamsSetBy: "owner" } : {}) } }));
+  return state;
+}
+
+test("one tapped player fixes a kit: the worker relabels the match and the report reloads", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const teams = await mockTeams(page);
+  const loads = { result: 0, analysis: 0 };
+  page.on("request", (r) => {
+    if (resultRoute.test(r.url())) loads.result++;
+    if (analysisRoute.test(r.url())) loads.analysis++;
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByText("Unsorted players")).toBeVisible();
+  // The clearest player of each kit stands for it until the owner chooses.
+  await expect(page.getByRole("button", { name: /^Player 10 in Kit A, standing for Kit A/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /^Player 165 in Kit B, standing for Kit B/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Apply team fix" })).toHaveCount(0);
+  await page.getByRole("button", { name: /^Player 82 in unsorted players/ }).click();
+  await page.getByRole("button", { name: "This is Kit B" }).click();
+  await expect(page.getByRole("button", { name: /^Player 82 in unsorted players, standing for Kit B/ })).toBeVisible();
+  const before = { ...loads };
+  await page.getByRole("button", { name: "Apply team fix" }).click();
+  await expect.poll(() => teams.posts).toEqual([{ kitA: { index: 2, id: 10 }, kitB: { index: 9, id: 82 } }]);
+  await expect.poll(() => loads.result).toBeGreaterThan(before.result);
+  await expect.poll(() => loads.analysis).toBeGreaterThan(before.analysis);
+  // A crosswise answer did not happen: the names stay where they were.
+  await expect(page.getByLabel("Name for kit A")).toHaveValue("Kit A");
+  await page.getByRole("button", { name: "Undo team fix" }).click();
+  await expect.poll(() => teams.posts.at(-1)).toEqual({ reset: true });
+  await expect(page.getByRole("button", { name: "Undo team fix" })).toHaveCount(0);
+});
+
+test("a crosswise answer keeps Kit A and swaps the team names so the owner's answer holds", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const teams = await mockTeams(page, { swapped: true });
+  const saved: unknown[] = [];
+  await page.route(jobRoute, (r) => r.fulfill({ json: { ...JOB, teamNames: ["Lions", "Tigers"] } }));
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/details$`), (r) => {
+    saved.push(r.request().postDataJSON());
+    return r.fulfill({ json: { teamNames: ["Tigers", "Lions"], title: null, matchDate: null } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByLabel("Name for kit A")).toHaveValue("Lions");
+  await page.getByRole("button", { name: /^Player 82 in unsorted players/ }).click();
+  await page.getByRole("button", { name: "This is Lions" }).click();
+  await page.getByRole("button", { name: "Apply team fix" }).click();
+  await expect.poll(() => teams.posts).toEqual([{ kitA: { index: 9, id: 82 }, kitB: { index: 3, id: 165 } }]);
+  await expect(page.getByLabel("Name for kit A")).toHaveValue("Tigers");
+  await expect(page.getByLabel("Name for kit B")).toHaveValue("Lions");
+  await expect.poll(() => saved).toContainEqual({ names: ["Tigers", "Lions"] });
+  // Swap names moves the names only.
+  await page.getByRole("button", { name: "Swap names" }).click();
+  await expect(page.getByLabel("Name for kit A")).toHaveValue("Lions");
+  expect(teams.posts).toHaveLength(1);
+});
+
+test("without crops from the worker (an older analysis) the kit groups show only the name fields", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  await mockTeams(page, { status: 409 });
+  await page.goto(`/vision/${ID}`);
+  await expect(page.getByLabel("Name for kit A")).toBeVisible();
+  await expect(page.getByLabel("Name for kit B")).toBeVisible();
+  await expect(page.getByText("Match each automatically discovered colour to the correct team.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /^Player \d+ in / })).toHaveCount(0);
+  await expect(page.getByText("Unsorted players")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Undo team fix" })).toHaveCount(0);
+});
+
+test.describe("fixing the teams on a phone", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+  test("every player crop is at least 44 px each way", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await mockTeams(page);
+    await page.goto(`/vision/${ID}`);
+    const crops = page.getByRole("button", { name: /^Player \d+ in / });
+    await expect(crops).toHaveCount(12);
+    for (const c of await crops.all()) {
+      const b = await box(c);
+      expect(Math.min(b.width, b.height)).toBeGreaterThanOrEqual(44);
+    }
+    await crops.nth(8).tap();
+    for (const name of ["This is Kit A", "This is Kit B"]) expect((await box(page.getByRole("button", { name }))).height).toBeGreaterThanOrEqual(44);
+  });
 });

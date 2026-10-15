@@ -2,7 +2,123 @@
 
 Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked. Lines marked "held-out" (E8-E11,
-E15-E20) are Metrica game 2, run only after tuning on game 1 stopped.
+E15-E20, E22-E23) are Metrica game 2, run only after tuning on game 1 stopped.
+
+## E24 · Owner team fix by tapped crops (2026-10-15)
+- Problem: when kit clustering picks the wrong colour group, the owner could
+  not fix it. The kit panel only took names, and review's "Other team" flips
+  one event at a time and cannot recover events that were never detected.
+  Clustering-failure case, Tryzub on engine 2.7 (k=4, analytics version 12):
+  Kit B #262124 was spectators, so Kit B passed 0 times against 6, possession
+  read 78.7/21.3 and Kit B "ran" 250.7 m (the spectators). E22 fixes Tryzub
+  itself; this is the fallback for clips where clustering still fails (which
+  of the 4 clusters becomes Kit B still depends on cluster size, E22).
+- Change: GET /jobs/{id}/teams offers up to 4 crops per group from the 150
+  ball-label frames (no new image endpoint): per kit, one per track, the tracks
+  whose median colour sits nearest the kit's median, boxes at least 9% of the
+  frame height; unsorted players spread over colour (farthest point), starting
+  from the densest unsorted colour, so a missing kit shows first. The owner
+  taps a crop and says which team. POST /teams takes each tapped track's
+  median kit colour (at least 3 detections) as a reference, refuses two
+  references closer than 25 in plain LAB (E22's gate), and relabels every
+  stored detection with the engine's own assign_team and vote_teams. Index 0
+  stays the engine's Kit A (align_to_reference); a crosswise answer returns
+  `swapped` and the site swaps the names. Metrics are recomputed and
+  result.json rewritten, which invalidates the cached analysis. The engine's
+  labels are kept per detection on the first fix, for undo.
+- Design, on the 2.7 result (analytics version 12, the round's research): one
+  clear crop per kit (track median within 15 of its kit's median) put 97% of
+  green detections in the right team (97.4% at worst over 10 picks), passes
+  [6-7, 4], possession 53.2/46.8, Kit B distance 959.7 m. A tap on any red or
+  green track measured much worse (red 63.5% and spectators 31% correctly
+  unlabelled at worst), so only crops nearest a group median are offered.
+  Not adopted: refining both references on the whole match (green 90.7%);
+  6 colour clusters for the owner to mark (the referee became Kit B 45% of
+  the time); a referee crop (no measured benefit).
+- Through the shipped endpoints (pipeline 2.8 rules, analytics version 13,
+  no pitch setup, label frames extracted from the clip). 2.7 result: crops
+  offered Kit A 4 red players, Kit B 4 spectators, unsorted green, dark, red,
+  yellow referee (checked on a contact sheet). Tapping the first red player
+  and the green one: green detections right 6.8% → 95.8%, red 91.7% → 98.5%,
+  spectators unlabelled 4.5% → 95.6%, referee 100% → 99.8%; passes [4, 0] →
+  [4, 5], interceptions [0, 1] → [1, 1], possession 72.2/27.8 → 57.9/42.1,
+  Kit B distance 250.7 → 960.1 m. 0.5 s per fix on the 3-minute clip; about
+  5.6 s on the owner's 37-minute match, analysis included. 2.8 result
+  (`tz-patched`, clustering right): neutral; green 96.0% → 96.2%, red 99.5% →
+  99.2%, passes [4, 6] → [4, 5], possession 58.8/41.2 → 57.9/42.1, Kit B
+  distance 975.2 → 950.2 m.
+- Faithfulness: relabelling from the engine's own stored kit colours with the
+  same calls reproduces 99.77% of the engine's labels on Tryzub 2.8
+  (10116/10139) and 99.89% on the owner's match (101772/101887); the rest are
+  detections whose role was corrected after the engine labelled them. Undo
+  restores every label (10221/10221).
+- Guards: `tests/test_team_fix.py`; the proxy and report tests.
+- Decision: adopt as the owner's fallback. Persisting the owner's references
+  across reruns is out of scope ("Analyse again" re-clusters).
+
+## E23 · A kit-less player at the ball makes the frame unknown (2026-10-15)
+- Problem: only labelled players could control the ball. When the dribbler's
+  kit label dropped out for a frame or two, the nearest labelled player (often
+  an opponent marking him) took the ball, and gave it back a frame later.
+  Repro (`_kitless_dribble`): tackles by team 1 at 1.2 s and team 0 at 1.6 s,
+  possession 2.8/0.4 s; interceptions instead without a pitch setup.
+- Change: a player or keeper without a kit label still competes for the ball;
+  when he is nearest, the frame's state is unknown, which neither ends nor
+  confirms a control (like an unseen ball). Image-space ambiguity stays
+  "loose". ANALYTICS_VERSION 13.
+- Outcome: the repro has no events and possession 3.2/0.0 s. Real results:
+  Tryzub 16 of 233 control frames become unknown (15 of 211 calibrated), the
+  owner's match 3 of 1252. Tryzub passes 45 → 39, interceptions 23 → 20
+  (calibrated 41 → 35, 20 → 17).
+- Held-out game 2 (verifier, 18 paired configurations): pass F1 +0.018 (better
+  in 18/18), pass recall +1.4 points (18/18), passComplete F1 +0.015, turnover
+  F1 +0.011 (14/18), interception F1 +0.007 (16/18), possession agreement +0.8
+  points (16/18).
+- Rejected: a separate "unlabelled" state (pass recall -1.3 points on the
+  broadcast-style camera).
+- Guards: `test_a_kitless_frame_of_the_player_on_the_ball_does_not_hand_it_to_his_marker`.
+- Decision: adopt.
+
+## E22 · Kit colour compared with lightness down-weighted (2026-10-15)
+- Problem: in plain LAB, lightness decided the team. Owner's match: the light
+  kit reads L 180 in the middle of the picture and ~100 at the edges with a/b
+  nearly unchanged, so 43% of edge light-kit detections went to Kit A and the
+  red centre was pulled to a* ~161. Tryzub: k=4 split mint by lightness and
+  made the spectators Kit B (#262124). And vote_teams gave a decided track's
+  kit to observations whose own colour was neither kit (the referee).
+- Change: KIT_WEIGHTS [0.35, 1, 1] in KMeans and in assignment (nearest kit
+  under 40, margin over 8; rejected = too far from both or the wrong hue);
+  the vote keeps rejected observations unknown. The separation gate stays in
+  plain LAB (≥25): the weighted gate refused white/light grey and green/mint,
+  which the old code labels, and a refusal loses the whole match's team
+  stats. Pipeline local-vision-2.8.
+- Owner's match, re-tracked: tracks 2125 → 1929, interceptions 120 → 111,
+  completed passes 116 → 119, possession 59.7/40.3 → 53.0/47.0, pass share
+  55.9/44.1 → 49.6/50.4. Jersey-chroma check: same-colour interceptions
+  16 → 3, cross-colour passes 8 → 1. Edge light-kit detections labelled Kit A
+  52.7%/51.2% → 0.2%/8.5% (verifier 0%); frames with more than 7 players on
+  one team 382 → 103. The vote rule changed no owner event (511 more unknown
+  detections).
+- Tryzub (replay with real calibration features): Kit B #262124 → #68966f,
+  possession 82.9/17.1 → 55.3/44.7, passes by team [6, 0] → [5, 6]; 11 passes
+  (7 complete) and 4 interceptions, all kit-consistent on contact sheets;
+  yellow-referee detections labelled Kit B 130 → 0.
+- Held-out game 2 with synthetic shading (lightness 1.0 → 0.5 across the
+  pitch): wrong-team detections 4.1% → 0.0%, possession agreement 0.866 →
+  0.889, share error 4.0 → 1.1 points, turnover F1 0.232 → 0.264,
+  interception F1 0.192 → 0.203; white/navy and white/black within 0.15%;
+  white/grey 7.6% → 7.2%.
+- Not adopted: chroma only (cannot separate kits that differ only in
+  lightness); a full-covariance GMM (38% of edge detections still wrong);
+  vote weighting, smoothing or "unknown" for undecided tracks (after the
+  change only 0.41% of labelled detections disagree with their track).
+- Open risk: which of the 4 clusters becomes the second kit still depends on
+  cluster size (Tryzub: mint 87 against spectators 76), and an older 2.1 run
+  of the same clip picked green, so a crowded sideline could still win.
+  Possible follow-up: prefer clusters spread over the pitch. The owner's team
+  fix (E24) is the fallback.
+- Guards: `tests/test_kit_teams.py`.
+- Decision: adopt.
 
 ## E21 · Inference overlapped with tracking; fewer per-frame CPU steps (2026-10-14)
 - Problem: run_video decoded a batch, ran the player and ball models, then did

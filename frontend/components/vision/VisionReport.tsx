@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, ChevronDown } from "lucide-react";
 import { Navbar } from "@/components/ui/Navbar";
@@ -14,6 +14,11 @@ import {
   visionErrorMessage,
   saveVisionDetails,
   matchDateLabel,
+  getTeams,
+  saveTeams,
+  TeamCrop,
+  TeamGroups,
+  TeamPick,
 } from "@/lib/review/vision";
 import { analysedFrameTime, frameIndexAt, nearestFrame, seekTarget } from "@/lib/review/frames";
 import { buildReportExport } from "@/lib/review/reportExport";
@@ -32,6 +37,7 @@ import {
   describeEvent,
   fetchAnalysis,
   fetchCalibration,
+  frameImageUrl,
   isConfirmedGoal,
   pitchLines,
   pitchToImage,
@@ -694,6 +700,13 @@ export function VisionReport({ jobId }: { jobId: string }) {
   function rename(index: number, value: string) {
     const next: [string, string] = [names[0], names[1]];
     next[index] = value;
+    typedNames(next);
+  }
+  /** Swaps the two names only: the kits and every count stay where they are. */
+  function swapNames() {
+    typedNames([names[1], names[0]], 0);
+  }
+  function typedNames(next: [string, string], wait = 800) {
     setNames(next);
     namesFrom.current = "typed";
     try {
@@ -704,7 +717,16 @@ export function VisionReport({ jobId }: { jobId: string }) {
     // Saved on the worker after a pause in typing (and on blur), so they survive this browser's storage.
     unsavedNames.current = next;
     clearTimeout(namesTimer.current);
-    namesTimer.current = setTimeout(flushNames, 800);
+    namesTimer.current = setTimeout(flushNames, wait);
+  }
+  /** After a team fix on the worker: the detections and kit colours changed. */
+  async function reloadResult() {
+    try {
+      setResult(await visionJson<VisionResult>(`jobs/${jobId}/result`));
+    } catch (e) {
+      if (isMatchDeleted(e)) matchGone();
+      else setError("The teams were fixed. Reload the page to see the new kit colours.");
+    }
   }
   /** Saves the title and match date edited in the header. */
   async function saveHeader() {
@@ -1374,34 +1396,21 @@ export function VisionReport({ jobId }: { jobId: string }) {
                       <MiniPitch analysis={analysis} time={frame?.t ?? time} colours={[colour(0), colour(1)]} />
                     </section>
                   )}
-                  <section className="glass-card p-5 space-y-4">
-                    <h2 className="font-semibold">Detected kit groups</h2>
-                    <p className="text-sm text-pitch-muted">
-                      Match each automatically discovered colour to the correct
-                      team.
-                    </p>
-                    {result.teams.map((team, i) => (
-                      <label key={team.id} className="flex gap-3 items-center">
-                        <span
-                          className="w-6 h-6 rounded-full border border-white/40 shrink-0"
-                          style={{ background: team.colour }}
-                        />
-                        <input
-                          aria-label={`Name for kit ${i === 0 ? "A" : "B"}`}
-                          maxLength={80}
-                          value={names[i]}
-                          onChange={(e) => rename(i, e.target.value)}
-                          onBlur={flushNames}
-                          className="pitch-input w-full min-w-0"
-                        />
-                      </label>
-                    ))}
-                    {namesLocalOnly && (
-                      <p className="text-xs text-pitch-muted" data-testid="names-local-only">
-                        Saved on this device only
-                      </p>
-                    )}
-                  </section>
+                  <KitGroups
+                    jobId={jobId}
+                    teams={result.teams}
+                    teamsSetBy={result.teamsSetBy}
+                    names={names}
+                    videoSize={[result.video.width, result.video.height]}
+                    onRename={rename}
+                    onNamesDone={flushNames}
+                    onSwapNames={swapNames}
+                    namesLocalOnly={namesLocalOnly}
+                    onFixed={async () => {
+                      await Promise.all([reloadResult(), loadAnalytics()]);
+                    }}
+                    onDeleted={matchGone}
+                  />
                 </aside>
                 {/* Inside the grid (full width) so a pinned video stays over the review on a phone. */}
                 {analysis && !deleted && (
@@ -1860,6 +1869,242 @@ function DetectionTimeline({
         <span>Click a bar to inspect</span>
         <span>{clockTime((result.analysedStart ?? 0) + result.analysedDuration)}</span>
       </div>
+    </section>
+  );
+}
+
+/** A player crop on screen: at least 44 px each way, so a thumb can tap it. */
+const CROP_W = 44;
+const CROP_H = 64;
+
+/** One player cut from a label frame by the browser: the frame scaled so his box (with a margin) fills the height. */
+function cropStyle(jobId: string, crop: TeamCrop, [width, height]: [number, number]): CSSProperties {
+  const [x1, y1, x2, y2] = crop.box;
+  const margin = 0.15 * (y2 - y1);
+  const scale = CROP_H / (y2 - y1 + 2 * margin);
+  return {
+    width: CROP_W,
+    height: CROP_H,
+    backgroundImage: `url(${frameImageUrl(jobId, crop.index)})`,
+    backgroundSize: `${width * scale}px ${height * scale}px`,
+    backgroundPosition: `${CROP_W / 2 - ((x1 + x2) / 2) * scale}px ${-(y1 - margin) * scale}px`,
+  };
+}
+
+/** The worker takes exactly {index, id} for a tapped player. */
+const pickOf = (crop?: TeamCrop): TeamPick | null => (crop ? { index: crop.index, id: crop.id } : null);
+const samePlayer = (a: TeamPick | null, b: TeamPick | null) => !!a && !!b && a.index === b.index && a.id === b.id;
+
+/**
+ * The detected kits, named by the owner, with a few of each kit's players. When
+ * kit clustering picked the wrong colour group (spectators as a kit, say), the
+ * owner taps one clear player and says which team he plays for; the worker
+ * relabels the match from the stored kit colours, without a new analysis. Kit A
+ * stays the engine's Kit A (confirmed goals keep their team), so a crosswise
+ * choice swaps the names instead. Without crops (an older analysis, footage no
+ * longer kept), only the names are shown.
+ */
+function KitGroups({
+  jobId,
+  teams,
+  teamsSetBy,
+  names,
+  videoSize,
+  onRename,
+  onNamesDone,
+  onSwapNames,
+  namesLocalOnly,
+  onFixed,
+  onDeleted,
+}: {
+  jobId: string;
+  teams: VisionResult["teams"];
+  teamsSetBy?: "owner";
+  names: string[];
+  videoSize: [number, number];
+  onRename: (index: number, value: string) => void;
+  onNamesDone: () => void;
+  onSwapNames: () => void;
+  namesLocalOnly: boolean;
+  /** The worker relabelled the match: load the result and analysis again. */
+  onFixed: () => Promise<void>;
+  onDeleted: () => void;
+}) {
+  const [data, setData] = useState<TeamGroups | null>(null);
+  /** Bumped after a fix or an undo: the groups changed on the worker. */
+  const [version, setVersion] = useState(0);
+  /** The crop tapped last: which team is he in? */
+  const [asking, setAsking] = useState<TeamCrop | null>(null);
+  /** The player standing for each kit: the clearest of each group until the owner chooses. */
+  const [picks, setPicks] = useState<[TeamPick | null, TeamPick | null]>([null, null]);
+  const [changed, setChanged] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const gone = useRef(onDeleted);
+  gone.current = onDeleted;
+  useEffect(() => {
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const load = () =>
+      getTeams(jobId).then(
+        (next) => {
+          if (stop) return;
+          setData(next);
+          // The worker extracts the label frames from the video in one pass first.
+          if (!next.framesReady) timer = setTimeout(load, 3000);
+        },
+        (e) => {
+          if (stop) return;
+          // No kit colours to fix from (an older analysis), no footage, or no worker: names only.
+          setData(null);
+          if (isMatchDeleted(e)) gone.current();
+        },
+      );
+    load();
+    return () => {
+      stop = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [jobId, version]);
+  const groupsKey = data ? JSON.stringify(data.groups) : "";
+  useEffect(() => {
+    setPicks([pickOf(data?.groups.A[0]), pickOf(data?.groups.B[0])]);
+    setChanged(false);
+    setAsking(null);
+    // Only new groups reset the choice, not each poll while the frames are prepared.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupsKey]);
+  const size: [number, number] = [data?.size?.[0] || videoSize[0], data?.size?.[1] || videoSize[1]];
+  const name = (t: number) => names[t]?.trim() || `Kit ${"AB"[t]}`;
+  function choose(team: 0 | 1) {
+    const pick = pickOf(asking ?? undefined);
+    if (!pick) return;
+    setPicks((prev) => {
+      const next: [TeamPick | null, TeamPick | null] = [prev[0], prev[1]];
+      next[team] = pick;
+      // One player cannot stand for both kits.
+      if (next[1 - team]?.id === pick.id) next[1 - team] = null;
+      return next;
+    });
+    setChanged(true);
+    setAsking(null);
+  }
+  async function send(body: Parameters<typeof saveTeams>[1]) {
+    setSaving(true);
+    setError("");
+    try {
+      const reply = await saveTeams(jobId, body);
+      // Kit A stayed the engine's Kit A: the player said to be in a team is in the other kit.
+      if (reply.swapped) onSwapNames();
+      await onFixed();
+      setVersion((v) => v + 1);
+    } catch (e) {
+      if (isMatchDeleted(e)) onDeleted();
+      else setError(visionErrorMessage(e, "The teams could not be changed."));
+    } finally {
+      setSaving(false);
+    }
+  }
+  const row = (crops: TeamCrop[], where: string) =>
+    !data?.framesReady ? (
+      <p className="text-xs text-pitch-muted">Preparing player pictures…</p>
+    ) : crops.length === 0 ? (
+      <p className="text-xs text-pitch-muted">No clear player</p>
+    ) : (
+      <div className="flex flex-wrap gap-2">
+        {crops.map((crop) => {
+          const kit = samePlayer(picks[0], crop) ? 0 : samePlayer(picks[1], crop) ? 1 : null;
+          const tapped = samePlayer(asking, crop);
+          return (
+            <button
+              key={`${crop.index}-${crop.id}`}
+              type="button"
+              aria-label={`Player ${crop.id} in ${where}${kit === null ? "" : `, standing for ${name(kit)}`}`}
+              aria-pressed={tapped}
+              onClick={() => setAsking(tapped ? null : crop)}
+              className={`relative shrink-0 min-h-11 min-w-11 rounded-md border-2 bg-black bg-no-repeat ${tapped ? "border-white" : "border-white/10"}`}
+              style={{ ...cropStyle(jobId, crop, size), ...(kit !== null && !tapped ? { borderColor: teams[kit]?.colour } : {}) }}
+            >
+              {kit !== null && (
+                <span className="absolute -top-2 -right-2 rounded-full border-2 bg-pitch-black px-1 text-[10px] font-bold text-pitch-white" style={{ borderColor: teams[kit]?.colour }}>
+                  {"AB"[kit]}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    );
+  return (
+    <section className="glass-card p-5 space-y-4">
+      <h2 className="font-semibold">Detected kit groups</h2>
+      <p className="text-sm text-pitch-muted">
+        {data
+          ? "Name each team. If a row shows the wrong players, tap one clear player of that team and say which team he plays for."
+          : "Match each automatically discovered colour to the correct team."}
+      </p>
+      {teams.map((team, i) => (
+        <div key={team.id} className="space-y-2">
+          <label className="flex gap-3 items-center">
+            <span className="w-6 h-6 rounded-full border border-white/40 shrink-0" style={{ background: team.colour }} />
+            <input
+              aria-label={`Name for kit ${i === 0 ? "A" : "B"}`}
+              maxLength={80}
+              value={names[i]}
+              onChange={(e) => onRename(i, e.target.value)}
+              onBlur={onNamesDone}
+              className="pitch-input w-full min-w-0"
+            />
+          </label>
+          {data && row(data.groups[i === 0 ? "A" : "B"], name(i))}
+        </div>
+      ))}
+      {data && (
+        <div className="space-y-2">
+          <h3 className="text-sm font-medium">Unsorted players</h3>
+          {row(data.groups.unsorted, "unsorted players")}
+        </div>
+      )}
+      {asking && (
+        <div role="group" aria-label={`Which team is player ${asking.id} in?`} className="grid grid-cols-2 gap-2">
+          {([0, 1] as const).map((t) => (
+            <button key={t} type="button" className="pitch-button-secondary min-h-11" onClick={() => choose(t)}>
+              <span className="w-3 h-3 rounded-full shrink-0" style={{ background: teams[t]?.colour }} />
+              This is {name(t)}
+            </button>
+          ))}
+        </div>
+      )}
+      {data && changed && (
+        <button
+          type="button"
+          className="pitch-button-primary min-h-11 w-full"
+          disabled={saving || !picks[0] || !picks[1]}
+          onClick={() => picks[0] && picks[1] && send({ kitA: picks[0], kitB: picks[1] })}
+        >
+          {saving ? "Fixing teams…" : !picks[0] || !picks[1] ? "Choose a player for each team" : "Apply team fix"}
+        </button>
+      )}
+      {error && (
+        <p role="alert" className="text-sm text-red-300">
+          {error}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        <button type="button" className="pitch-button-ghost min-h-11" onClick={onSwapNames}>
+          Swap names
+        </button>
+        {teamsSetBy === "owner" && (
+          <button type="button" className="pitch-button-ghost min-h-11" disabled={saving} onClick={() => send({ reset: true })}>
+            Undo team fix
+          </button>
+        )}
+      </div>
+      {namesLocalOnly && (
+        <p className="text-xs text-pitch-muted" data-testid="names-local-only">
+          Saved on this device only
+        </p>
+      )}
     </section>
   );
 }

@@ -761,19 +761,24 @@ def test_an_analysis_cached_by_the_previous_version_is_recomputed(tmp_path, monk
     server, client = _client(tmp_path, monkeypatch)
     job_id, directory = make_job(server, build_match())
     first = client.get(f"/jobs/{job_id}/analysis").json()
-    assert first["inputs"][0] == server.ANALYTICS_VERSION == 12 and "teams" in first
+    assert first["inputs"][0] == server.ANALYTICS_VERSION == 13 and "teams" in first
     # A file written by an earlier version for the same inputs, without the newer fields.
     old = {k: v for k, v in first.items() if k not in ("teams", "analysedStart", "analysedDuration", "ballSearch", "ballFrames", "playerLoad")}
     old["inputs"] = [10] + first["inputs"][1:]
     (directory / "analysis.json").write_text(json.dumps(old))
     again = client.get(f"/jobs/{job_id}/analysis").json()
-    assert again["inputs"][0] == 12 and again["analysedDuration"] == first["analysedDuration"]
+    assert again["inputs"][0] == 13 and again["analysedDuration"] == first["analysedDuration"]
     # Version 11 counted control in seconds; its cached file is recomputed too (E20).
     old["inputs"] = [11] + first["inputs"][1:]
     old["params"] = {**first.get("params", {}), "minControlSeconds": 0.3}
     (directory / "analysis.json").write_text(json.dumps(old))
     again = client.get(f"/jobs/{job_id}/analysis").json()
-    assert again["inputs"][0] == 12 and "teams" in again
+    assert again["inputs"][0] == 13 and "teams" in again
+    # Version 12 handed control to a marker when the dribbler lost his kit label (E23).
+    old["inputs"] = [12] + first["inputs"][1:]
+    (directory / "analysis.json").write_text(json.dumps(old))
+    again = client.get(f"/jobs/{job_id}/analysis").json()
+    assert again["inputs"][0] == 13 and "teams" in again
 
 
 def test_calibration_can_be_polled_without_its_frames(tmp_path, monkeypatch):
@@ -1445,3 +1450,40 @@ def test_two_sightings_are_control_at_every_sampling_rate():
     # One sighting with the ball seen loose on both sides is still not control.
     for fps in (5.0, 10.0):
         assert _spells_at(fps, {4}, {"state": "loose", "ball": (14.0, 10.0)}) == [], fps
+
+
+def _kitless_dribble():
+    """Player 1 (team 0) dribbles at 2.5 m/s; his kit label is missing in two frames
+    while an opponent closes to 0.9 m and backs off again."""
+    marker = {4: 1.8, 5: 1.8, 6: 0.9, 7: 0.9, 8: 1.8, 9: 1.8}
+    frames = []
+    for k in range(16):
+        x = 6 + 0.5 * k
+        players = [
+            player(1, -1 if k in (6, 7) else 0, (x, 10)),
+            player(2, 0, (x - 6, 6)),
+            player(3, 0, (x - 3, 15)),
+            player(11, 1, (x + 0.3, 10 + marker.get(k, 2.5))),
+            player(12, 1, (x + 15, 5)),
+            player(13, 1, (x + 12, 15)),
+        ]
+        frames.append(
+            {"t": round(k * 0.2, 2), "scene": 0, "players": players, "ball": ball((x + 0.3, 10)),
+             "camera": [1, 0, 0, 0, 1, 0]}
+        )
+    return frames
+
+
+@pytest.mark.parametrize("calibrated", [True, False])
+def test_a_kitless_frame_of_the_player_on_the_ball_does_not_hand_it_to_his_marker(calibrated):
+    # E23: only labelled players could control the ball, so the marker took it
+    # (two tackles, or two interceptions in image space) whenever the dribbler's
+    # kit label dropped out. Now the frame is unknown control.
+    frames = _kitless_dribble()
+    calibration = calibration_for(frames) if calibrated else None
+    out = analytics.analyse(result_for(frames), calibration)
+    assert [e for e in out["events"] if e["type"] in ("interception", "tackle")] == []
+    assert out["stats"]["teams"][1]["possessionSeconds"] == 0
+    states = analytics.prepare(result_for(_kitless_dribble()), calibration)["states"]
+    for i in (6, 7):
+        assert states[i]["state"] == "unknown" and states[i]["unlabelled"] is True, (i, states[i])

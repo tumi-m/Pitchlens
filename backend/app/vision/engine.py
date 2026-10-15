@@ -90,11 +90,14 @@ def colour_signature(frame):
     return cv2.normalize(hist, hist).astype(np.float32)
 
 
-def vote_teams(frames):
+def vote_teams(frames, centres=None, use_hue=True):
     """Give every observation of a track the team it was assigned most often.
 
     Per-frame colour on a 50-pixel player is noisy; the track as a whole is not.
     Only tracks with at least 3 confident votes and a 60% majority are relabelled.
+    With the kit centres, an observation whose own colour is neither kit (too
+    far from both, or the wrong hue) keeps no team: when a track jumps from a
+    player to the referee, the referee must not inherit the player's kit (E22).
     """
     votes = {}
     for f in frames:
@@ -108,6 +111,12 @@ def vote_teams(frames):
     for f in frames:
         for p in f["players"]:
             if p["id"] in decided and p.get("role") in (None, "person", "player"):
+                if (
+                    p["team"] == -1
+                    and centres is not None
+                    and kit_match(p.get("kitFeature"), centres, use_hue)[1]
+                ):
+                    continue
                 p["team"] = decided[p["id"]]
     return frames
 
@@ -204,25 +213,45 @@ def inside_field(mask, box):
     return 0 <= x < w and 0 <= y < h and bool(mask[y, x]) and y2 - y1 >= 12
 
 
+# Kit colours are compared with LAB lightness down-weighted (E22). Light falls
+# off across an amateur pitch: on the owner's match a light kit reads L 180 in
+# the middle of the picture and ~100 at the edges while its chroma barely moves,
+# so a plain LAB distance gave 43% of edge light-kit detections to the dark red
+# kit. Lightness still counts: white against black or navy stays separable.
+# Same weights as the tracker's appearance cost.
+KIT_WEIGHTS = np.array([0.35, 1.0, 1.0])
+
+
+def kit_distance(a, b):
+    """Lightness-weighted LAB distance between kit colours (broadcasts)."""
+    return np.linalg.norm((np.asarray(a, float) - np.asarray(b, float)) * KIT_WEIGHTS, axis=-1)
+
+
 def train_colours(features, n_clusters=4):
     if len(features) < 15:
         raise ValueError("Too few visible players to identify kits. Choose a clearer match video.")
-    features = np.array(features)
+    features = np.array(features, dtype=float)
     # Tiny kit datasets suffer severe native-thread overhead on some desktop runtimes.
+    # Cluster in the weighted space: a plain LAB fit put the shaded part of
+    # the light kit into the dark kit's cluster and pulled its centre with it.
     with threadpool_limits(limits=1):
-        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit(features)
+        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit(features * KIT_WEIGHTS)
     counts = Counter(km.labels_)
     selected = [i for i, _ in counts.most_common(2)]
     if len(selected) < 2:
         raise ValueError("The two kits could not be separated reliably by colour.")
-    centres = km.cluster_centers_[selected]
+    centres = km.cluster_centers_[selected] / KIT_WEIGHTS
+    # The separation gate stays in plain LAB: kits that differ mainly in
+    # lightness (white and light grey, green and mint) must still separate.
     if np.linalg.norm(centres[0] - centres[1]) < 25:
         raise ValueError("The two kits could not be separated reliably by colour.")
-    colours = []
-    for c in centres:
-        rgb = cv2.cvtColor(np.uint8(c).reshape(1, 1, 3), cv2.COLOR_LAB2RGB).reshape(3)
-        colours.append("#" + "".join(f"{v:02x}" for v in rgb))
-    return centres, colours
+    return centres, [lab_hex(c) for c in centres]
+
+
+def lab_hex(centre):
+    """#rrggbb of an OpenCV LAB kit colour, as the result's teams store it."""
+    rgb = cv2.cvtColor(np.uint8(centre).reshape(1, 1, 3), cv2.COLOR_LAB2RGB).reshape(3)
+    return "#" + "".join(f"{v:02x}" for v in rgb)
 
 
 def align_to_reference(centres, colours, reference_hex):
@@ -245,7 +274,7 @@ def align_to_reference(centres, colours, reference_hex):
     c = np.asarray(centres, dtype=float)
 
     def d(a, b):
-        return float(np.linalg.norm(a - b))
+        return float(kit_distance(a, b))
 
     if d(c[0], reference[1]) + d(c[1], reference[0]) < d(c[0], reference[0]) + d(c[1], reference[1]):
         return np.asarray(centres)[::-1].copy(), list(colours)[::-1]
@@ -253,9 +282,16 @@ def align_to_reference(centres, colours, reference_hex):
 
 
 def assign_team(feature, centres, use_hue=True):
+    return kit_match(feature, centres, use_hue)[0]
+
+
+def kit_match(feature, centres, use_hue=True):
+    """(team or -1, rejected): rejected means the colour is neither kit (too far
+    from both, or the wrong hue), not merely between the two kits."""
     if feature is None:
-        return -1
-    distances = np.linalg.norm(centres - feature, axis=1)
+        return -1, False
+    feature = np.asarray(feature, dtype=float)
+    distances = kit_distance(centres, feature)
     idx = int(np.argmin(distances))
     feature_hsv = cv2.cvtColor(
         cv2.cvtColor(np.uint8(feature).reshape(1, 1, 3), cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2HSV
@@ -267,9 +303,9 @@ def assign_team(feature, centres, use_hue=True):
     hue = min(hue, 180 - hue)
     # Hue is unstable for low-saturation colours, including striped navy/white kits.
     hue_matches = not use_hue or hue <= 16 or (feature_hsv[1] < 80 and centre_hsv[1] < 80)
-    return (
-        idx if distances[idx] < 50 and abs(distances[0] - distances[1]) > 12 and hue_matches else -1
-    )
+    if distances[idx] >= 40 or not hue_matches:
+        return -1, True
+    return (idx if abs(distances[0] - distances[1]) > 8 else -1), False
 
 
 def _fingerprint(frame):
@@ -835,14 +871,14 @@ def _run_video(
     # In decoder time, like every frame's t: the last sample covers one sampling interval.
     analysed_duration = min(duration, max(0.0, last_t - analysed_start + stride / meta["fps"]))
     corrected_roles = stabilise_roles(frames)
-    vote_teams(frames)
+    vote_teams(frames, centres, use_hue=not role_aware)
     metrics = derive_metrics(frames, effective_fps, analysed_duration, start_seconds=analysed_start)
     if ball_detector is None:
         # The ball was never looked for: possession was not measured (not 0).
         metrics.update(teamSeconds=None, possessionCoverage=None, possessionShare=[None, None], possessions=None)
     result = {
         "schemaVersion": 1,
-        "pipelineVersion": "local-vision-2.7",
+        "pipelineVersion": "local-vision-2.8",
         "playerTracking": {"appearance": isinstance(tracker, ByteTracker), "roleCorrections": corrected_roles},
         "profile": profile,
         "performance": {

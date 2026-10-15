@@ -507,6 +507,12 @@ def fragment_positions(projected):
     return tracks
 
 
+def _unlabelled(p):
+    """A player (or keeper) detection without a kit label: still a body at the
+    ball. Referees are not."""
+    return p["team"] not in (0, 1) and p.get("role", "player") in ("player", "person", "goalkeeper")
+
+
 def control_states(projected, player_of, calibration_error=0.0):
     """Per-frame ball state: control (by whom), contested, loose or unknown.
 
@@ -544,7 +550,9 @@ def control_states(projected, player_of, calibration_error=0.0):
                 (
                     (math.dist(p["xy"], bxy), k, p)
                     for k, p in enumerate(f["players"])
-                    if p["team"] in (0, 1) and p["xy"] and math.dist(p["xy"], bxy) <= duel
+                    if (p["team"] in (0, 1) or _unlabelled(p))
+                    and p["xy"]
+                    and math.dist(p["xy"], bxy) <= duel
                 ),
                 key=lambda x: (x[0], x[1]),
             )
@@ -552,6 +560,13 @@ def control_states(projected, player_of, calibration_error=0.0):
                 states.append({"state": "loose", "ball": bxy})
                 continue
             d0, _, p0 = near[0]
+            if p0["team"] not in (0, 1):
+                # The player at the ball has no kit label in this frame: whoever has it,
+                # it is not the next labelled player (often an opponent marking him). Like
+                # an unseen ball, this neither ends nor confirms a control (E23).
+                states.append({"state": "unknown", "unlabelled": True, "ball": bxy})
+                continue
+            near = [x for x in near if x[2]["team"] in (0, 1)]
             rivals = [x for x in near[1:] if x[2]["team"] != p0["team"]]
             if rivals:
                 states.append({"state": "contested", "ball": bxy, "teams": [p0["team"], rivals[0][2]["team"]]})
@@ -584,9 +599,23 @@ def control_states(projected, player_of, calibration_error=0.0):
                 }
             )
         else:
-            owner = image_owner([{"id": p["id"], "team": p["team"], "box": p["box"]} for p in f["players"]], b["raw"])
+            # Unlabelled players compete for the ball too (as a stand-in team): when one
+            # is nearest, the frame says nothing about which team has it (E23).
+            candidates = [
+                {
+                    "id": p["id"],
+                    "team": p["team"] if p["team"] in (0, 1) else 0,
+                    "box": p["box"],
+                    "unlabelled": p["team"] not in (0, 1),
+                }
+                for p in f["players"]
+                if p["team"] in (0, 1) or _unlabelled(p)
+            ]
+            owner = image_owner(candidates, b["raw"])
             if owner is None:
                 states.append({"state": "loose", "image": True})
+            elif owner["unlabelled"]:
+                states.append({"state": "unknown", "unlabelled": True, "image": True})
             else:
                 states.append(
                     {"state": "control", "player": player_of.get(owner["id"], owner["id"]), "fragment": owner["id"], "team": owner["team"], "image": True}

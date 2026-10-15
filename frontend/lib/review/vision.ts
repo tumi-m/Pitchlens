@@ -43,6 +43,31 @@ export const saveVisionDetails = (jobId: string, patch: VisionDetails) =>
     body: JSON.stringify(patch),
   });
 
+/** One player in one of the ball-label frames (GET /frames/{index}), in video pixels. */
+export type TeamCrop = { index: number; id: number; box: [number, number, number, number] };
+export type TeamPick = Pick<TeamCrop, "index" | "id">;
+/** Up to 4 crops per kit group, and spread over colour for players in neither kit. */
+export type TeamGroups = {
+  colours: [string, string] | null;
+  teamsSetBy: "owner" | null;
+  framesReady: boolean;
+  size: [number | null, number | null];
+  groups: { A: TeamCrop[]; B: TeamCrop[]; unsorted: TeamCrop[] };
+};
+export type TeamFix = { kitA: TeamPick; kitB: TeamPick } | { reset: true };
+
+/** Player crops per kit group for the owner's team fix (409: no kit colours or no footage). */
+export const getTeams = (jobId: string) => visionJson<TeamGroups>(`jobs/${jobId}/teams`);
+
+/** Relabels the match from one tapped player per kit (no new analysis), or undoes that.
+ *  swapped: Kit A is the player tapped for Kit B, so the names must swap to stay true. */
+export const saveTeams = (jobId: string, body: TeamFix) =>
+  visionJson<{ swapped: boolean; teams: VisionResult["teams"]; teamsSetBy: "owner" | null }>(`jobs/${jobId}/teams`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
 /** "YYYY-MM-DD" as this browser writes dates, read as a local day (not UTC midnight). */
 export function matchDateLabel(iso: string | null | undefined): string | null {
   const m = iso ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso) : null;
@@ -101,6 +126,8 @@ export type VisionResult = {
   teams: { id: number; label: string; colour: string }[];
   /** A rerun whose Kit A / Kit B were put in this job's order (its team names apply). */
   teamsAlignedTo?: string;
+  /** "owner": the owner fixed the teams from tapped players (POST /teams); undo restores the engine's. */
+  teamsSetBy?: "owner";
   metrics: {
     sampledFrames: number;
     playerFrames: number;

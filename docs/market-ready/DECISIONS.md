@@ -2,6 +2,30 @@
 
 Each entry: the decision, what else was considered, and why. Newest first.
 
+## 2026-10-15 · The owner fixes wrong kits by tapping players; names swap, never indices
+
+- When kit clustering picked the wrong colour group, the owner taps one
+  clear player per kit and the worker relabels the stored kit colours with
+  the engine's own rules (E24). No GPU rerun; "Undo team fix" restores the
+  engine's labels. Considered: flipping events one by one in review (cannot
+  recover events never detected) and a rerun with the owner's colours (paid
+  GPU time for a relabel that needs none).
+- Kit A stays the engine's Kit A (index 0). A crosswise answer (the player
+  tapped for Kit A is nearer the engine's Kit B) swaps the saved team names,
+  never the team indices: reviewer decisions keep their team index, so
+  swapping indices would move confirmed goals to the other team. "Swap names"
+  does the same on request.
+- Only crops nearest each group's median colour are offered (taps on
+  arbitrary players measured much worse as references), and there is no
+  referee marking (no measured benefit).
+- "Analyse again" re-clusters from scratch and drops the owner's fix; only
+  the kit order carries over (the rerun aligns to the result's kit colours).
+  Persisting the owner's references across reruns is out of scope.
+- The crops come from the ball labeller's 150 frames. The report asks for them
+  when it opens, so the first view of a finished match extracts those frames
+  in one pass over the video (kept until the footage expires); an older
+  result or expired footage shows the names only.
+
 ## 2026-10-14 · Stricter possession counts, tackles need the pitch, fewer stitching links
 
 - Possession counts and average possession now need 80% of play followed;

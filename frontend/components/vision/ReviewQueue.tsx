@@ -332,13 +332,13 @@ export function ReviewQueue({
             </button>
           </div>
           <div className="grid grid-cols-3 gap-2">
-            <button className="pitch-button-secondary" disabled={saving} onClick={() => decide([{ action: "accept", eventId: current.id, event: seen(current) }])}>
+            <button className="pitch-button-secondary min-h-11" disabled={saving} onClick={() => decide([{ action: "accept", eventId: current.id, event: seen(current) }])}>
               <Check size={15} /> Confirm <kbd className="text-[10px] opacity-60">A</kbd>
             </button>
-            <button className="pitch-button-secondary" disabled={saving} onClick={() => decide([{ action: "reject", eventId: current.id, event: seen(current) }])}>
+            <button className="pitch-button-secondary min-h-11" disabled={saving} onClick={() => decide([{ action: "reject", eventId: current.id, event: seen(current) }])}>
               <X size={15} /> Reject <kbd className="text-[10px] opacity-60">R</kbd>
             </button>
-            <button className="pitch-button-secondary" disabled={saving || current.team === null} onClick={() => current.team !== null && decide([{ action: "team", eventId: current.id, event: seen(current), value: current.team === 0 ? 1 : 0 }], false)}>
+            <button className="pitch-button-secondary min-h-11" disabled={saving || current.team === null} onClick={() => current.team !== null && decide([{ action: "team", eventId: current.id, event: seen(current), value: current.team === 0 ? 1 : 0 }], false)}>
               <ArrowLeftRight size={15} /> Other team <kbd className="text-[10px] opacity-60">T</kbd>
             </button>
           </div>
@@ -388,19 +388,19 @@ export function ReviewQueue({
         </p>
         <div className="flex gap-2 text-sm" role="radiogroup" aria-label="Team for added moment">
           {([0, 1] as const).map((t) => (
-            <button key={t} role="radio" aria-checked={team === t} onClick={() => setTeam(t)} className={`flex-1 py-1.5 rounded-full border ${team === t ? "font-bold text-[#0b0f1a]" : "border-white/15 text-pitch-muted"}`} style={team === t ? { background: colours[t], borderColor: colours[t] } : undefined}>
+            <button key={t} role="radio" aria-checked={team === t} onClick={() => setTeam(t)} className={`flex-1 py-2.5 min-h-11 rounded-full border ${team === t ? "font-bold text-[#0b0f1a]" : "border-white/15 text-pitch-muted"}`} style={team === t ? { background: colours[t], borderColor: colours[t] } : undefined}>
               {names[t]} <kbd className="text-[10px] opacity-60">{t + 1}</kbd>
             </button>
           ))}
         </div>
         <div className="grid grid-cols-3 gap-2">
-          <button className="pitch-button-secondary" disabled={saving} onClick={() => add("goal")}>
+          <button className="pitch-button-secondary min-h-11" disabled={saving} onClick={() => add("goal")}>
             Goal <kbd className="text-[10px] opacity-60">G</kbd>
           </button>
-          <button className="pitch-button-secondary" disabled={saving} onClick={() => add("shot", "on-target")}>
+          <button className="pitch-button-secondary min-h-11" disabled={saving} onClick={() => add("shot", "on-target")}>
             Shot <kbd className="text-[10px] opacity-60">S</kbd>
           </button>
-          <button className="pitch-button-secondary" disabled={saving} onClick={() => add("pass", "complete")}>
+          <button className="pitch-button-secondary min-h-11" disabled={saving} onClick={() => add("pass", "complete")}>
             Pass
           </button>
         </div>

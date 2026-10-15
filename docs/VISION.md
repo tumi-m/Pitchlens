@@ -224,6 +224,15 @@ date the owner sets after the upload. Kept in `details.json` beside the job
 (never in `status.json`, which a running analysis rewrites) and returned with
 the job to its owner only; reruns start without them.
 
+**Team fix (`/jobs/{id}/teams`).** When kit clustering picked the wrong
+colour group, the owner taps one clear player per kit among a few crops of
+each group (cut from the ball-label frames) and the worker relabels every
+stored detection from those two players' kit colours with the engine's own
+rules, then recomputes the metrics: no new analysis (E24). Kit A stays the
+engine's Kit A; a crosswise answer swaps the team names instead. The engine's
+labels are kept in result.json, so `{"reset": true}` undoes the fix.
+"Analyse again" re-clusters and drops it.
+
 **Tracking.** Default tracker since pipeline 2.2 is ByteTrack-style (Kalman,
 two-pass association, 3.5 s lost buffer, two-sighting confirmation);
 `VISION_TRACKER=legacy` restores the previous one. Track IDs remain short-term
