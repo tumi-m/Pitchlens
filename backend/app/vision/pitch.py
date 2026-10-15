@@ -146,6 +146,12 @@ def landmarks(t):
     return points
 
 
+# Fixed by the Laws of the Game whatever the pitch's size (metres).
+GOAL_AREA_DEPTH = 5.5
+GOAL_AREA_WIDTH = 18.32
+PENALTY_ARC_RADIUS = 9.15
+
+
 def line_segments(t, step=0.25):
     """Painted lines as sampled polylines (metres), for drawing and alignment."""
     L, W = t["length"], t["width"]
@@ -173,6 +179,23 @@ def line_segments(t, step=0.25):
             lines.append(segment((x0, W / 2 - b / 2), (x1, W / 2 - b / 2)))
             lines.append(segment((x1, W / 2 - b / 2), (x1, W / 2 + b / 2)))
             lines.append(segment((x1, W / 2 + b / 2), (x0, W / 2 + b / 2)))
+        if d >= 13 and b >= 35:
+            # A law-standard box: its goal area and penalty arc are painted too (Laws
+            # of the Game, fixed sizes). Without them the re-alignment pulls a correct
+            # view's faint goal line onto the boards behind it (E26). Derived from the
+            # box, so UI templates, stored calibrations and venues all get them; never
+            # on seven-a-side (9 x 18). Mirrored in frontend pitchLines().
+            for x0, x1 in ((0, GOAL_AREA_DEPTH), (L, L - GOAL_AREA_DEPTH)):
+                half = GOAL_AREA_WIDTH / 2
+                lines.append(segment((x0, W / 2 - half), (x1, W / 2 - half)))
+                lines.append(segment((x1, W / 2 - half), (x1, W / 2 + half)))
+                lines.append(segment((x1, W / 2 + half), (x0, W / 2 + half)))
+            p = t.get("penaltySpot")
+            if p and p + PENALTY_ARC_RADIUS > d:
+                # Only the part outside the box.
+                a = math.acos(max(-1.0, (d - p) / PENALTY_ARC_RADIUS))
+                lines.append(arc(p, W / 2, PENALTY_ARC_RADIUS, -a, a))
+                lines.append(arc(L - p, W / 2, PENALTY_ARC_RADIUS, math.pi - a, math.pi + a))
     elif t.get("areaRadius"):
         r = min(t["areaRadius"], W / 2)
         lines.append(arc(0, W / 2, r, -math.pi / 2, math.pi / 2))

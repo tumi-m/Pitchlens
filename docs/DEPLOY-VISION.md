@@ -266,6 +266,49 @@ is set; when no GPU ran, neither the daily start nor the attempt is charged.
 crash on the GPU is not re-run on the CPU. `VISION_USE_MODAL=0` switches the
 GPU off. Set a spend limit in Modal → Settings → Usage & billing.
 
+### Daily GPU budget (`VISION_DAILY_GPU_BUDGET_USD`)
+
+Every GPU run (analyses, re-runs, sections and ball-model training) is timed on
+the worker from the Modal call until the app stops, together with the GPU's own
+phases (container start, imports, weight copy, video download, engine,
+result compression, CPU and memory use, the card). Its estimated cost, from
+the price table in [COST.md](COST.md), is kept in `gpu-spend.json` on the
+volume and in the job's `status.json` (`gpuRuns`). Neither is ever shown to
+owners: the job's page and its downloadable result carry no cost. `/ops`
+shows `gpuSpend`: the budget, the last 24 hours, per-day totals for the last
+week and the latest runs. Failed, timed-out, cancelled and CPU-takeover runs
+count what they ran; a run Modal refused before the call counts $0. Recording
+is best-effort: a full volume or an unreadable ledger never stops a run (an
+unreadable ledger counts as empty, with a warning in the log).
+
+`VISION_GPU_PRICES` overrides the price table per card, in dollars per hour,
+for example `L4=0.80,H100=3.95` (card names as in `VISION_MODAL_GPU`, any
+case). A card the table does not know is priced as the dearest one it does.
+
+Set `VISION_DAILY_GPU_BUDGET_USD` (for example `5`) to stop runaway spend: once
+the estimated spend of the last 24 hours reaches it, no new GPU run starts.
+An upload that completes meanwhile stays saved and its match says "This
+server has reached its GPU spending limit for today. Your upload is saved;
+press Retry in about N hours." (the start and the attempt are given back).
+Retry, full re-runs and training answer 429 with
+`{"detail": ..., "code": "gpu-budget", "resetsAt": ...}`, and the site shows
+the detail. Uploads themselves are never refused for it. 20-second tests and
+section re-runs still run on the CPU. `/ops` shows `gpuSpend.refusing` and
+when it lifts. Runs already going finish, and a run that was going when the
+worker died counts up to its last heartbeat plus five minutes. Unset, `0` or
+an invalid value means no budget (an invalid value is logged).
+
+The guard checks before each start, so the spend can pass the budget by at
+most one analysis plus one training run that were already going, each at
+most its Modal time limit times the card's price. A section run's limit is
+now 30 minutes plus about 1 s per 2 MB of upload (the GPU downloads the whole
+original); a full match keeps a floor of 3 hours and gets longer for a long or
+detailed video (up to Modal's 24 h); training stops at 2 hours. On an L4 that
+is about $0.45 for a section of a small upload and $2.71 for a 3-hour run.
+The figures are estimates, not Modal's invoice: reconcile them as COST.md
+explains, and keep Modal's own workspace spend limit (Settings → Usage &
+billing) as the backstop.
+
 ### Faster or cheaper GPU runs
 
 - `VISION_MODAL_GPU` on Railway picks the card: `L4` (default, good value),

@@ -1075,6 +1075,7 @@ export function VisionReport({ jobId }: { jobId: string }) {
                   videoAvailable={footage}
                   playerLoad={playerLoad}
                   ballTracked={ballTracked}
+                  pitchVenue={calibration?.state === "ready" && calibration.venue ? { name: calibration.venue.name, auto: calibration.auto } : null}
                   afterHero={
                     // A test section is not the match: its steps would be done on the full run.
                     diagnosticSpan ? null : (

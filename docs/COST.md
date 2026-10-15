@@ -36,7 +36,8 @@ L4's dense FP16 tensor peak (121 TFLOPS). The rest, about 305 s of per-frame
 CPU work and about 25 s of setup and ball recovery, ran while the GPU waited:
 before round 6 the engine ran these stages one after the other.
 
-Not in the engine total (billed, not yet recorded per job): container start
+Not in the engine total (billed, and recorded per run since round 9; see the
+last section): container start
 and imports, copying weights from the volume, downloading the video from the
 worker, compressing the result. Estimated at 20 s for a 90 MB 360p file
 (imports 3.3 s and the yolo11s load 1.4 s *measured* on a CPU here; the
@@ -176,13 +177,48 @@ Modal run confirms it.
 
 ## Measuring real cost per job
 
-Tag each ephemeral app with the job ID (`app.set_tags({"job": job_id})` inside
-`app.run()`, Modal SDK 1.5.5). Then `modal billing report --tag-names job`
-(or `modal.billing.workspace_billing_report`) gives dollars per analysis. The
-GPU function should also return its own timings: weight copy, download seconds
-and bytes, engine seconds and the GPU name; the worker records the time to the
-first item. For round 6, compare `performance.totalSeconds` with the summed
-inference seconds of one real L4 run: with the overlap working, the total
-approaches the inference seconds plus setup. If the gain is clearly smaller
-than projected, consider reserving `cpu=2` on the Modal function. Together
-these turn the projections above into measurements.
+Since round 9 every GPU run records what it cost (E27). Analyses, re-runs,
+sections and ball-model training all count, including runs that failed, timed
+out, were cancelled or handed over to the CPU; a run Modal refused before the
+call counts $0.
+
+- **What is recorded.** The worker times each run with a monotonic clock from
+  the Modal call until the ephemeral app has stopped (`wallSeconds` to the
+  last item, `appExitSeconds` to the exit, `firstItemSeconds`). The GPU
+  function reports its own phases on its last item, never in the result:
+  container uptime at entry, imports, weight copy, video download (seconds and
+  bytes), engine, result compression, CPU seconds, peak memory, its total
+  seconds and the card's name. The record also carries the Modal app id.
+- **Where.** The job's `status.json` (`gpuRuns`, the last five; operator only,
+  stripped from the owner's view), `gpu-spend.json` in the data folder (every
+  run of the last 8 days, written when the run starts, refreshed every 30 s,
+  closed with the record; a run open when the worker died is closed at its
+  last heartbeat plus 300 s) and `/ops` → `gpuSpend` (budget, last 24 hours,
+  per-day totals for 7 days, latest runs). The log gets one line per run:
+  `event=gpu-run gpu=… seconds=… usd=… outcome=…`. Training also puts
+  `gpuSeconds` and `gpuUsd` in the training state shown on `/ops`.
+- **The estimate.** Billed seconds = from the call to the app's exit, less
+  queueing (the wait for the first item beyond the container's own uptime and
+  time to its first item). Dollars = seconds × the card's price (the table
+  above) + CPU at $0.0000131 per physical core-second, counted as the GPU's
+  vCPU-seconds ÷ 2 but at least 0.125 cores, + memory at $0.00000222 per
+  GiB-second of peak use + $0.05 per GB of video downloaded (Railway egress).
+  Without the GPU's report (a crash before its last item, training), it
+  assumes 1.5 cores and 4 GiB and counts the whole wait. GPU strings follow
+  Modal's rules (any case, an optional `:count`, a trailing `!`); a card the
+  table does not know is priced as the dearest one it does (`priceKnown:
+  false`). `VISION_GPU_PRICES` overrides the table in dollars per hour, for
+  example `L4=0.80,H100=3.95`.
+- **Budget.** `VISION_DAILY_GPU_BUDGET_USD` refuses new GPU starts once the
+  last 24 hours' estimate reaches it ([DEPLOY-VISION.md](DEPLOY-VISION.md)).
+
+These are estimates until checked against Modal's invoice. Each Modal app
+is tagged `pitchlens-job` (the job id, or `ball-model` for training) and
+`pitchlens-kind` (`analysis` or `training`). To reconcile, run `modal billing report --tag-names
+pitchlens-job` (`--for "last month"` and similar ranges work), or from Python
+`modal.Workspace.from_context().billing.report(start=..., resolution="h",
+tag_names=["pitchlens-job"])` (Modal SDK 1.5.5), and match its rows to the
+recorded runs by tag or by `modalAppId`. `billing.rates()` on the same
+workspace object returns the rates Modal actually charges, to check the price
+table above. The first real L4 full match measured this way replaces the
+projections on this page.

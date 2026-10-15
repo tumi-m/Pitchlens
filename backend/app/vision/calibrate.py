@@ -368,6 +368,67 @@ def build(result, request, video_path=None, progress=None, stride_seconds=1.0):
 # calibration once and reuse it, checked against the painted lines each time.
 
 
+def venue_search(size):
+    """How far (pixels) a saved venue's view is looked for around its saved
+    position in a later match's painted lines: a camera that drifts further
+    than this from the clicked view does not re-apply."""
+    return int(min(size) * 0.05)
+
+
+def venue_reapplies(calibration):
+    """Can a venue saved from this calibration line up with a later match?
+
+    A venue keeps only the clicked (anchor) frame's view, and build_from_venue
+    finds it within venue_search() pixels on sampled frames, needing at least
+    half of them. A panning camera is that close to its clicked view for a small
+    share of the match (a real indoor pan: 3.5%), so its venue is refused even
+    on the same footage. Judged on where the template's landmarks and lines fall
+    in each frame compared with the anchor view; an unmapped frame is not near.
+    Not static_camera(): a fixed camera shaken by a ball reads as moving, yet its
+    venue re-applies. Returns (ok, share of frames near the anchor view).
+    """
+    frames = calibration.get("frames") or []
+    anchor = calibration.get("anchorFrame")
+    entry = frames[anchor] if isinstance(anchor, int) and 0 <= anchor < len(frames) else None
+    if not entry:
+        return False, 0.0
+    size = list(calibration["size"])
+    cal = {"k1": calibration.get("k1", 0.0), "size": size}
+    template = calibration["template"]
+    points = np.array(
+        list(pitchlib.landmarks(template).values()) + [p for line in pitchlib.line_segments(template, step=1.0) for p in line],
+        float,
+    )
+
+    def project(H):
+        try:
+            return pitchlib.pitch_to_image(cal, points, np.asarray(H, float).reshape(3, 3))
+        except np.linalg.LinAlgError:
+            return np.full(points.shape, np.nan)
+
+    base = project(entry["H"])
+    w, h = size
+    inside = np.isfinite(base).all(axis=1) & (base[:, 0] >= 0) & (base[:, 0] < w) & (base[:, 1] >= 0) & (base[:, 1] < h)
+    if not inside.any():
+        return False, 0.0
+    base = base[inside]
+    radius = venue_search(size)
+    seen = {}  # a fixed camera repeats one homography for whole stretches
+    near = 0
+    for f in frames:
+        if not f:
+            continue
+        H = np.asarray(f["H"], float).reshape(3, 3)
+        key = H.tobytes()
+        if key not in seen:
+            shift = np.hypot(*(project(H)[inside] - base).T)
+            # A point behind this frame's camera is as far as it gets.
+            seen[key] = float(np.median(np.where(np.isfinite(shift), shift, np.inf))) <= radius
+        near += seen[key]
+    share = near / len(frames)
+    return share >= 0.5, round(share, 3)
+
+
 def venue_from_calibration(calibration, name):
     frames = calibration.get("frames") or []
     anchor = calibration.get("anchorFrame")
@@ -420,7 +481,7 @@ def build_from_venue(result, venue, video_path=None, progress=None, samples=12):
         masks = line_masks(video_path, frames, sorted(set(picks) | set(breaks)), progress=(lambda p: progress(p * 0.8)) if progress else None)
         scores = []
         for i, png in masks.items():
-            refined, score = _align(png, cal, H, template, search=int(min(size) * 0.05))
+            refined, score = _align(png, cal, H, template, search=venue_search(size))
             if i in picks:
                 scores.append(score)
             if refined is not None and score >= needed:

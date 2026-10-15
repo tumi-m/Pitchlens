@@ -74,6 +74,11 @@ export function landmarks(t: PitchTemplate): Landmark[] {
   return out;
 }
 
+// Fixed by the Laws of the Game whatever the pitch's size (metres); as in pitch.py.
+const GOAL_AREA_DEPTH = 5.5;
+const GOAL_AREA_WIDTH = 18.32;
+const PENALTY_ARC_RADIUS = 9.15;
+
 /** Painted lines as polylines in metres (for the mini pitch and the video overlay). */
 export function pitchLines(t: PitchTemplate, step = 0.5): [number, number][][] {
   const { length: L, width: W } = t;
@@ -95,6 +100,19 @@ export function pitchLines(t: PitchTemplate, step = 0.5): [number, number][][] {
     const b = t.areaWidth;
     for (const [x0, x1] of [[0, d], [L, L - d]]) {
       lines.push(seg([x0, W / 2 - b / 2], [x1, W / 2 - b / 2]), seg([x1, W / 2 - b / 2], [x1, W / 2 + b / 2]), seg([x1, W / 2 + b / 2], [x0, W / 2 + b / 2]));
+    }
+    if (d >= 13 && b >= 35) {
+      // A law-standard box also has the fixed-size goal area (5.5 x 18.32 m) and the
+      // penalty arc (9.15 m) outside it; never seven-a-side. Mirrors pitch.line_segments.
+      const half = GOAL_AREA_WIDTH / 2;
+      for (const [x0, x1] of [[0, GOAL_AREA_DEPTH], [L, L - GOAL_AREA_DEPTH]]) {
+        lines.push(seg([x0, W / 2 - half], [x1, W / 2 - half]), seg([x1, W / 2 - half], [x1, W / 2 + half]), seg([x1, W / 2 + half], [x0, W / 2 + half]));
+      }
+      const p = t.penaltySpot;
+      if (p && p + PENALTY_ARC_RADIUS > d) {
+        const a = Math.acos(Math.max(-1, (d - p) / PENALTY_ARC_RADIUS));
+        lines.push(arc(p, W / 2, PENALTY_ARC_RADIUS, -a, a), arc(L - p, W / 2, PENALTY_ARC_RADIUS, Math.PI - a, Math.PI + a));
+      }
     }
   } else if (t.areaRadius) {
     const r = Math.min(t.areaRadius, W / 2);

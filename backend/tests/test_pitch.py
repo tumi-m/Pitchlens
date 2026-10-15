@@ -742,3 +742,60 @@ def test_a_mirrored_setup_is_refused_with_the_reason():
     result = {"frames": frames, "sampleFps": 3, "video": {"width": SIZE[0], "height": SIZE[1], "fps": 30}}
     with pytest.raises(ValueError, match="are swapped"):
         calibrate.build(result, {"template": "five-a-side", "points": points, "t": 0})
+
+
+# The markings line_segments draws before the goal areas and arcs (round 9), per template:
+# (polyline count, each polyline's first and last point). Only law-standard boxes gain lines.
+BEFORE_GOAL_AREAS = {
+    "five-a-side": (7, [((0, 0), (36, 0)), ((36, 0), (36, 24)), ((36, 24), (0, 24)), ((0, 24), (0, 0)),
+                        ((18, 0), (18, 24)), ((0, 6), (0, 18)), ((36, 18), (36, 6))]),
+    "futsal": (8, [((0, 0), (40, 0)), ((40, 0), (40, 20)), ((40, 20), (0, 20)), ((0, 20), (0, 0)),
+                   ((20, 0), (20, 20)), ((23, 10), (23, 10)), ((0, 4), (0, 16)), ((40, 16), (40, 4))]),
+    "seven-a-side": (12, [((0, 0), (55, 0)), ((55, 0), (55, 37)), ((55, 37), (0, 37)), ((0, 37), (0, 0)),
+                          ((27.5, 0), (27.5, 37)), ((33, 18.5), (33, 18.5)), ((0, 9.5), (9, 9.5)), ((9, 9.5), (9, 27.5)),
+                          ((9, 27.5), (0, 27.5)), ((55, 9.5), (46, 9.5)), ((46, 9.5), (46, 27.5)), ((46, 27.5), (55, 27.5))]),
+    # A court with a small rectangular box (8.5 m deep, 5 m wide) and a spot: no goal area, no arc.
+    "court": (12, [((0, 0), (30, 0)), ((30, 0), (30, 18)), ((30, 18), (0, 18)), ((0, 18), (0, 0)),
+                   ((15, 0), (15, 18)), ((18, 9), (18, 9)), ((0, 6.5), (8.5, 6.5)), ((8.5, 6.5), (8.5, 11.5)),
+                   ((8.5, 11.5), (0, 11.5)), ((30, 6.5), (21.5, 6.5)), ((21.5, 6.5), (21.5, 11.5)), ((21.5, 11.5), (30, 11.5))]),
+}
+COURT = {"length": 30, "width": 18, "goalWidth": 3, "centreRadius": 3, "areaDepth": 8.5, "areaWidth": 5, "penaltySpot": 6}
+CUSTOM_FULL_SIZE = {"length": 100, "width": 64, "goalWidth": 7.32, "centreRadius": 9.15, "areaDepth": 16.5,
+                    "areaWidth": 40.32, "penaltySpot": 11}
+
+
+@pytest.mark.parametrize("spec", ["eleven-a-side", CUSTOM_FULL_SIZE])
+def test_a_law_standard_box_also_paints_its_goal_area_and_penalty_arc(spec):
+    t = pitch.normalise_template(spec)
+    L, W, d, spot = t["length"], t["width"], t["areaDepth"], t["penaltySpot"]
+    lines = pitch.line_segments(t)
+    # The 12 markings drawn before stay first, unchanged; 3 goal-area sides per end and 2 arcs follow.
+    assert len(lines) == 20
+    for x in (5.5, L - 5.5):
+        # The goal area's front line, 5.5 m out, 18.32 m wide (centred).
+        assert any(np.allclose([p[0] for p in line], x) and np.isclose(min(p[1] for p in line), W / 2 - 9.16)
+                   and np.isclose(max(p[1] for p in line), W / 2 + 9.16) for line in lines)
+    for x0, x1 in ((0, 5.5), (L, L - 5.5)):
+        for y in (W / 2 - 9.16, W / 2 + 9.16):  # its sides meet the goal line
+            assert any(np.allclose([p[1] for p in line], y) and {round(line[0][0], 6), round(line[-1][0], 6)} == {x0, x1}
+                       for line in lines)
+    arcs = lines[-2:]
+    for line, cx, outside in ((arcs[0], spot, lambda x: x >= d - 1e-9), (arcs[1], L - spot, lambda x: x <= L - d + 1e-9)):
+        assert len(line) > 8
+        assert all(abs(math.hypot(x - cx, y - W / 2) - 9.15) <= 0.01 for x, y in line)
+        assert all(outside(x) for x, _ in line)
+        # The whole part outside the box: it starts and ends on the box's front line.
+        assert np.isclose(line[0][0], line[-1][0]) and np.isclose(abs(line[0][0] - cx), d - spot)
+
+
+@pytest.mark.parametrize("name", ["five-a-side", "futsal", "seven-a-side", "court"])
+def test_other_templates_draw_exactly_the_markings_they_drew_before(name):
+    t = pitch.normalise_template(COURT if name == "court" else name)
+    count, ends = BEFORE_GOAL_AREAS[name]
+    lines = pitch.line_segments(t)
+    assert len(lines) == count
+    for line, (first, last) in zip(lines, ends):
+        assert np.allclose(line[0], first, atol=1e-9) and np.allclose(line[-1], last, atol=1e-9)
+    # Seven-a-side has a box and a spot, but a 9 x 18 box: no goal area and no phantom 9.15 m arc.
+    assert not any(all(abs(math.hypot(x - t["penaltySpot"], y - t["width"] / 2) - 9.15) < 0.01 for x, y in line)
+                   for line in lines if t.get("penaltySpot"))

@@ -989,6 +989,53 @@ test("changing the pitch type drops clicks the new pitch has no landmark for", a
   await expect(page.getByText(/Unknown landmark/)).toHaveCount(0);
 });
 
+test("a custom pitch can paint a rectangular box: its corners can be clicked and the unused box keys are sent as null", async ({ page }) => {
+  await mockReport(page, { calibrated: false });
+  const previews: { template: Record<string, number | null> }[] = [];
+  await page.route(new RegExp(`/api/vision/jobs/${ID}/calibration/preview$`), (r) => {
+    previews.push(r.request().postDataJSON());
+    return r.fulfill({ json: { template: analysis(true).template, lines: [], fit: { H: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], k1: 0, size: [640, 360], rms: 0.2, rmsPixels: 1.1, quality: "good", warnings: [], fieldOfView: null, cameraHeight: null, lineResiduals: [], residuals: [] } } });
+  });
+  await page.goto(`/vision/${ID}`);
+  await page.getByRole("button", { name: "Set up the pitch" }).first().click();
+  const overlay = page.getByTestId("calibration-overlay");
+  await expect(overlay).toBeVisible();
+  for (const [x, y] of [[20, 20], [620, 20], [620, 320], [20, 320]]) {
+    const o = await box(overlay);
+    await overlay.click({ position: { x: (x / 640) * o.width, y: (y / 360) * o.height } });
+  }
+  await expect(page.getByText("4 landmarks ·")).toBeVisible();
+  const boxCorner = page.getByLabel("Landmark to place").locator("option", { hasText: "Left box, far corner" });
+  await expect(boxCorner).toHaveCount(0);
+  await page.getByLabel("Pitch type").selectOption("custom");
+  const shape = page.getByLabel("Box", { exact: true });
+  await expect(shape).toHaveValue("arc");
+  await shape.selectOption("rect");
+  await page.getByLabel("Box depth (m)").fill("8.5");
+  await page.getByLabel("Box width (m)").fill("5");
+  for (const label of ["Box", "Box depth (m)", "Box width (m)"]) expect((await box(page.getByLabel(label, { exact: true }))).height).toBeGreaterThanOrEqual(44);
+  await expect(boxCorner).toHaveCount(1);
+  await expect(page.getByText("4 landmarks ·")).toBeVisible();
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await expect.poll(() => previews.length).toBe(1);
+  expect(previews[0].template).toMatchObject({ areaRadius: null, areaDepth: 8.5, areaWidth: 5 });
+  // A D: the rectangle's keys go as null, so the worker's base cannot bring them back either.
+  await shape.selectOption("arc");
+  await expect(page.getByLabel("Box depth (m)")).toHaveCount(0);
+  await expect(page.getByLabel("Box radius (m)")).toHaveValue("6");
+  await expect(boxCorner).toHaveCount(0);
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await expect.poll(() => previews.length).toBe(2);
+  expect(previews[1].template).toMatchObject({ areaDepth: null, areaWidth: null, areaRadius: 6 });
+  // Switching back restores the box that was typed.
+  await shape.selectOption("rect");
+  await expect(page.getByLabel("Box depth (m)")).toHaveValue("8.5");
+  await shape.selectOption("none");
+  await page.getByRole("button", { name: "Check fit" }).click();
+  await expect.poll(() => previews.length).toBe(3);
+  expect(previews[2].template).toMatchObject({ areaDepth: null, areaWidth: null, areaRadius: null });
+});
+
 test("the dashboard stops asking for its list after a refusal, but keeps checking through a worker restart", async ({ page }) => {
   await page.clock.install();
   let status = 401;
@@ -1172,6 +1219,26 @@ const JOB = { id: ID, title: "Friday 5s", status: "completed", stage: "Analysis 
 const jobRoute = new RegExp(`/api/vision/jobs/${ID}$`);
 const resultRoute = new RegExp(`/api/vision/jobs/${ID}/result$`);
 const analysisRoute = new RegExp(`/api/vision/jobs/${ID}/analysis(\\?.*)?$`);
+const calibrationRoute = new RegExp(`/api/vision/jobs/${ID}/calibration(\\?.*)?$`);
+/** A saved venue of the owner's, as GET /venues lists it (id: one hex digit repeated). */
+const savedVenue = (digit: string, name: string, size: [number, number], createdAt: number) => ({
+  id: digit.repeat(32),
+  name,
+  template: analysis(true).template,
+  size,
+  static: true,
+  createdAt,
+});
+const readyCalibration = () => ({
+  state: "ready",
+  template: analysis(true).template,
+  k1: 0,
+  size: [640, 360],
+  coverage: 100,
+  static: true,
+  frames: Array(20).fill({ H: [1 / 15, 0, -20 / 15, 0, 1 / 15, -20 / 15, 0, 0, 1], d: 0 }),
+  job: { state: "done", progress: 100 },
+});
 
 /** A player-load job: the ball model was not run, so the engine wrote no ball timing. */
 export function playerLoadResult() {
@@ -1389,6 +1456,127 @@ test.describe("on a phone", () => {
     expect(await scrollWidth(page)).toBeLessThanOrEqual(390);
     await page.getByRole("button", { name: "Save", exact: true }).tap();
     await expect.poll(() => saved).toEqual([{ jobId: ID, name: longName }]);
+    await expect(page.getByText("Future matches filmed from this same fixed camera position can use it without clicks.", { exact: false })).toBeVisible();
+  });
+
+  const banner = (page: Page) => page.locator("section", { hasText: "Unlock shots, heatmaps and positions" }).getByRole("button", { name: "Set up the pitch" });
+
+  test("the report banner opens the pitch setup with the saved venue above the landmarks, and applying it closes the panel", async ({ page }) => {
+    const state = await mockReport(page, { calibrated: false });
+    const applied: unknown[] = [];
+    await page.route("**/api/vision/venues", (r) => r.fulfill({ json: [savedVenue("e", "Tekkerz Court 2", [640, 360], 1)] }));
+    await page.route(calibrationRoute, (r) => {
+      if (r.request().method() !== "POST") return r.fallback();
+      applied.push(r.request().postDataJSON());
+      state.calibrated = true;
+      return r.fulfill({ json: { state: "processing" } });
+    });
+    await page.goto(`/vision/${ID}`);
+    const panel = page.getByRole("region", { name: "Pitch setup" });
+    await expect(panel.getByLabel("Saved venue")).toBeVisible();
+    await banner(page).tap();
+    const picker = panel.getByLabel("Landmark to place");
+    await expect(picker).toBeVisible();
+    const select = panel.getByLabel("Saved venue");
+    await expect(select).toBeVisible();
+    const s = await box(select);
+    expect(s.y + s.height).toBeLessThanOrEqual((await box(picker)).y);
+    await panel.getByRole("button", { name: "Apply", exact: true }).tap();
+    await expect.poll(() => applied).toEqual([{ venue: "e".repeat(32) }]);
+    await expect(picker).toBeHidden({ timeout: 15_000 });
+    await expect(panel.getByText("Calibrated · 100% of frames")).toBeVisible();
+    await expect(page.getByTestId("calibration-next")).toHaveCount(0);
+  });
+
+  test("only venues filmed at this video size are offered, newest first", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.route("**/api/vision/venues", (r) =>
+      r.fulfill({ json: [savedVenue("c", "Older court", [640, 360], 1), savedVenue("d", "HD court", [1280, 720], 3), savedVenue("e", "Newer court", [640, 360], 2)] }),
+    );
+    await page.goto(`/vision/${ID}`);
+    const select = page.getByLabel("Saved venue");
+    await expect(select).toBeVisible();
+    await expect(select.locator("option")).toHaveText([/^Newer court/, /^Older court/]);
+    await expect(select).toHaveValue("e".repeat(32));
+  });
+
+  test("with no venue of this video size the saved-venue card is left out", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.route("**/api/vision/venues", (r) => r.fulfill({ json: [savedVenue("d", "HD court", [1280, 720], 3)] }));
+    const listed = page.waitForResponse("**/api/vision/venues");
+    await page.goto(`/vision/${ID}`);
+    await listed;
+    await expect(page.getByRole("region", { name: "Pitch setup" }).getByRole("button", { name: /Set up the pitch/ })).toBeVisible();
+    await expect(page.getByLabel("Saved venue")).toHaveCount(0);
+  });
+
+  test("the pitch setup cannot be opened while a saved venue is being applied", async ({ page }) => {
+    const state = await mockReport(page, { calibrated: false });
+    await page.route("**/api/vision/venues", (r) => r.fulfill({ json: [savedVenue("e", "Tekkerz Court 2", [640, 360], 1)] }));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route(calibrationRoute, async (r) => {
+      if (r.request().method() !== "POST") return r.fallback();
+      await held;
+      state.calibrated = true;
+      return r.fulfill({ json: { state: "processing" } });
+    });
+    await page.goto(`/vision/${ID}`);
+    const panel = page.getByRole("region", { name: "Pitch setup" });
+    const setUp = panel.getByRole("button", { name: /Set up the pitch/ });
+    await expect(setUp).toBeEnabled();
+    await panel.getByRole("button", { name: "Apply", exact: true }).tap();
+    await expect(setUp).toBeDisabled();
+    release();
+    await expect(panel.getByText("Calibrated · 100% of frames")).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("a pitch set up from a saved venue says so on the score card, and another saved court can replace it", async ({ page }) => {
+    await mockReport(page, { calibrated: true });
+    let venues = [savedVenue("a", "Tryzub court", [640, 360], 1), savedVenue("f", "Court next door", [640, 360], 2)];
+    const applied: unknown[] = [];
+    await page.route("**/api/vision/venues", (r) => r.fulfill({ json: venues }));
+    await page.route(calibrationRoute, (r) => {
+      if (r.request().method() === "POST") {
+        applied.push(r.request().postDataJSON());
+        return r.fulfill({ json: { state: "processing" } });
+      }
+      return r.fulfill({ json: { ...readyCalibration(), venue: { id: "a".repeat(32), name: "Tryzub court", lineScore: 0.78 }, auto: true } });
+    });
+    await page.goto(`/vision/${ID}`);
+    const card = page.getByTestId("score-card");
+    await expect(card).toContainText('from saved venue "Tryzub court"');
+    await expect(card).toContainText("(automatic)");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    const panel = page.getByRole("region", { name: "Pitch setup" });
+    await expect(panel.getByText("Use a different saved venue")).toBeVisible();
+    await expect(panel.getByLabel("Saved venue").locator("option")).toHaveText([/^Court next door/]);
+    await panel.getByRole("button", { name: "Apply", exact: true }).tap();
+    await expect.poll(() => applied).toEqual([{ venue: "f".repeat(32) }]);
+    // Only the venue already in use: nothing else to switch to.
+    venues = [venues[0]];
+    await page.reload();
+    await expect(panel.getByText(/Set up automatically from saved venue "Tryzub court"/)).toBeVisible();
+    await expect(panel.getByRole("button", { name: /Adjust pitch setup/ })).toBeVisible();
+    await expect(panel.getByText("Use a different saved venue")).toHaveCount(0);
+    await expect(panel.getByLabel("Saved venue")).toHaveCount(0);
+  });
+
+  test("the pitch-setup controls are at least 44 px tall and the page does not scroll sideways", async ({ page }) => {
+    await mockReport(page, { calibrated: false });
+    await page.goto(`/vision/${ID}`);
+    const panel = page.getByRole("region", { name: "Pitch setup" });
+    for (const control of [banner(page), panel.getByRole("button", { name: /Set up the pitch/ })]) expect((await box(control)).height).toBeGreaterThanOrEqual(44);
+    await banner(page).tap();
+    await expect(page.getByTestId("calibration-next")).toBeVisible();
+    const controls = [
+      ...["−5 s", "◀ frame", "frame ▶", "+5 s", "Clear", "Check fit"].map((name) => panel.getByRole("button", { name, exact: true })),
+      ...["Landmarks", "Points on a line"].map((name) => panel.getByRole("tab", { name })),
+      panel.locator("summary", { hasText: "Lens (advanced)" }),
+      panel.locator("label", { hasText: "Walled cage" }),
+    ];
+    for (const control of controls) expect((await box(control)).height).toBeGreaterThanOrEqual(44);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   });
 
   test("why a stat is withheld can be read without hovering", async ({ page }) => {

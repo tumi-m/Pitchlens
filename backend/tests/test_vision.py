@@ -3825,8 +3825,15 @@ def test_the_gpu_time_limit_follows_the_videos_length_size_and_rate():
     assert limit(hd, 10, "exhaustive") > 54_000 * 0.28
     assert limit({**hd, "duration": 4 * 3600}, 10, "none") < limit({**hd, "duration": 4 * 3600}, 10, "exhaustive")
     assert limit({**hd, "width": 3840, "height": 2160, "duration": 4 * 3600}, 15, "exhaustive") == 86400  # Modal's ceiling
-    # A 20-second section of a long video needs no more than 3 h.
-    assert limit({**small, "duration": 4 * 3600}, 10, "exhaustive", max_seconds=20, start_seconds=600) == 10800
+    # A 20-second section gets 30 minutes, not 3 h (a stalled one held the GPU and billed for 3 h)...
+    assert limit({**small, "duration": 4 * 3600}, 10, "exhaustive", max_seconds=20, start_seconds=600) == 1800
+    assert limit({**hd, "duration": 4 * 3600}, 10, "exhaustive", max_seconds=20, file_size=50_000_000) == 1800 + 25
+    # ...plus the whole original's download (every GPU run fetches it all), never past Modal's ceiling.
+    from app.vision.gpu import MODAL_MAX_TIMEOUT
+
+    big = limit({**hd, "duration": 4 * 3600}, 10, "exhaustive", max_seconds=20, file_size=2 * 1024**3)
+    assert 2700 < big <= MODAL_MAX_TIMEOUT
+    assert limit({**hd, "duration": 4 * 3600}, 10, "exhaustive", max_seconds=20, file_size=10**12) == MODAL_MAX_TIMEOUT
     for video in (None, {}, {"duration": 60}, {**small, "duration": None}, {**small, "fps": 0, "duration": 60}):
         assert limit(video, 6, "exhaustive") is None
 
@@ -3848,6 +3855,10 @@ def test_a_long_gpu_run_asks_modal_for_a_longer_time_limit(service, monkeypatch,
         gpu.run_on_modal("e" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 10,
                          timeout_seconds=timeout)
     assert limits == [{"timeout": 25362}] and (tmp_path / "r.json").read_text() == '{"frames": []}'
+    # A section asks for its shorter limit instead of analyse's own 3 h.
+    gpu.run_on_modal("e" * 32, tmp_path / "r.json", "tok", lambda **kw: None, lambda: False, "general", 10,
+                     max_seconds=20, timeout_seconds=1800)
+    assert limits[-1] == {"timeout": 1800}
     # The worker computes the limit from the upload's metadata and the job's options.
     server, _ = service
     directory = server.ROOT / ("4" * 32)
@@ -3859,6 +3870,10 @@ def test_a_long_gpu_run_asks_modal_for_a_longer_time_limit(service, monkeypatch,
     monkeypatch.setattr(server.gpu, "run_on_modal", lambda *a, **kw: seen.update(kw))
     server.work(directory, status, threading.Event())
     assert seen["timeout_seconds"] == gpu.gpu_timeout_seconds(video, 10, "exhaustive") > 10800
+    # A section's limit counts the upload's size (the GPU downloads all of it).
+    status.update(status="processing", maxSeconds=20, startSeconds=60, fileSize=900_000_000)
+    server.work(directory, status, threading.Event())
+    assert seen["timeout_seconds"] == gpu.gpu_timeout_seconds(video, 10, "exhaustive", 20, 60, 900_000_000) == 1800 + 450
 
 
 def test_a_gpu_run_stopped_at_its_time_limit_is_not_retried_or_rerun_on_the_cpu(worker, monkeypatch):
@@ -3879,6 +3894,30 @@ def test_a_gpu_run_stopped_at_its_time_limit_is_not_retried_or_rerun_on_the_cpu(
         assert saved["status"] == "failed" and "too long" in saved["stage"] and "retry" not in saved["stage"].lower()
         assert "refusedBy" not in saved and saved["error"].startswith("GPUTimeout")  # billed: the attempt counts
     assert not cpu
+
+
+def test_a_section_stopped_at_its_time_limit_runs_on_the_cpu_and_a_full_match_still_fails(worker, monkeypatch):
+    server, _ = worker
+    _hosted_gpu(monkeypatch)
+    timed_out = type("FunctionTimeoutError", (Exception,), {"__module__": "modal.exception"})
+    cpu = []
+    monkeypatch.setattr(server, "run_video", lambda *a, **k: cpu.append(1))
+    fake = _FakeModal([{"stage": "Detecting players", "progress": 40}], error=timed_out("Function timed out after 1800s"))
+    monkeypatch.setitem(sys.modules, "app.vision.modal_app", fake)
+    # A 20-second section: minutes of limit, so the CPU takes over (it is never GPU-only).
+    directory, status = _queued_job(server, "1" * 32, maxSeconds=20)
+    server.work(directory, status, threading.Event())
+    saved = _disk(directory)
+    assert cpu == [1] and (saved["status"], saved["engine"]) == ("completed", "cpu")
+    assert "section hit its time limit" in server.gpu_errors[-1]["error"]
+    # The GPU time it used is still recorded.
+    assert saved["gpuRuns"][-1]["outcome"] == "GPUUnavailable"
+    # A hosted full match keeps the GPUTimeout and its message.
+    directory, status = _queued_job(server, "2" * 32)
+    server.work(directory, status, threading.Event())
+    saved = _disk(directory)
+    assert cpu == [1] and saved["status"] == "failed" and "too long for one GPU run" in saved["stage"]
+    assert saved["gpuRuns"][-1]["outcome"] == "GPUTimeout"
 
 
 def test_weights_the_gpu_cannot_copy_still_fall_back_to_the_cpu(worker, monkeypatch):
@@ -4382,7 +4421,7 @@ def test_the_operator_view_needs_the_token_and_reveals_no_owner_keys(worker, mon
     server.work(directory, status, threading.Event())
     body = client.get("/ops").json()
     assert set(body) == {"active", "dailyStarts", "trainingStarts", "training", "storage", "jobs", "gpu",
-                         "recentProblems", "release"}
+                         "recentProblems", "release", "gpuSpend"}
     assert body["active"] is None and body["jobs"] == 1 and body["dailyStarts"]["cap"] == 30
     assert set(body["storage"]) == {"freeBytes", "totalBytes", "low"}
     assert body["gpu"]["enabled"] and body["gpu"]["publicUrl"]

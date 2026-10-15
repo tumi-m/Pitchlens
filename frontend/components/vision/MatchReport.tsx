@@ -177,6 +177,7 @@ export function MatchReport({
   playerLoad,
   ballTracked = true,
   afterHero,
+  pitchVenue = null,
 }: {
   analysis: Analysis;
   names: string[];
@@ -195,6 +196,8 @@ export function MatchReport({
   ballTracked?: boolean;
   /** Shown directly under the score card (the next steps). */
   afterHero?: React.ReactNode;
+  /** The saved venue the pitch setup came from; auto when the worker applied it by itself. */
+  pitchVenue?: { name: string; auto?: boolean } | null;
 }) {
   const [heatTeam, setHeatTeam] = useState<0 | 1>(0);
   // The timeline shows key moments; unreviewed won balls (often over a hundred) on request.
@@ -359,7 +362,10 @@ export function MatchReport({
             <span>Ball not tracked (player-load job)</span>
           )}
           {cov.calibratedPercent > 0 ? (
-            <span>Pitch mapped {cov.calibratedPercent}%</span>
+            <span className="max-w-full break-words">
+              Pitch mapped {cov.calibratedPercent}%
+              {pitchVenue ? ` · from saved venue "${pitchVenue.name}"${pitchVenue.auto ? " (automatic)" : ""}` : ""}
+            </span>
           ) : videoAvailable ? (
             <button className="underline text-pitch-green min-h-11 py-3 px-1" onClick={onCalibrate}>
               Pitch not set up · set it up
@@ -392,7 +398,7 @@ export function MatchReport({
             </p>
           </div>
           {videoAvailable && (
-            <button className="pitch-button-primary" onClick={onCalibrate}>
+            <button className="pitch-button-primary min-h-11" onClick={onCalibrate}>
               <Crosshair size={16} /> Set up the pitch
             </button>
           )}

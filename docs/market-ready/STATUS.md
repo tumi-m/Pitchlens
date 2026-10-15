@@ -26,6 +26,12 @@ A match now produces a Sofascore-style report:
 - **Highlights:** goals, possible goals and shots played back to back.
 - **Open test site:** the access code is optional (unset = open to anyone with
   the link); the worker caps analyses at `VISION_MAX_JOBS_PER_DAY` (30).
+- **GPU spend:** every GPU run (analysis, re-run, section, training) now
+  records an estimated cost, for the operator only (`gpuRuns` in the job's
+  status, `gpu-spend.json`, `/ops` → `gpuSpend`), and the optional
+  `VISION_DAILY_GPU_BUDGET_USD` refuses new GPU starts once the last 24 hours
+  reach it (E27). The figures are list-price estimates: the measured cost of a
+  full match on an L4 is still open.
 - **Original recordings:** uploads up to `VISION_MAX_BYTES` /
   `VISION_MAX_UPLOAD_MB` (2 GB); YouTube links step down 1080p → 720p → 480p
   to fit. Size the Railway volume to match.

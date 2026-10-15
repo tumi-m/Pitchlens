@@ -42,6 +42,26 @@ const QUALITY: Record<string, { label: string; colour: string }> = {
   unverified: { label: "Cannot be checked yet", colour: "#94a3b8" },
 };
 
+type BoxShape = "rect" | "arc" | "none";
+/** The goal box a template paints: a rectangle wins over a D, as in pitchLines() and landmarks(). */
+const boxOf = (t: PitchTemplate): BoxShape => (t.areaDepth && t.areaWidth ? "rect" : t.areaRadius ? "arc" : "none");
+/** The worker merges a template onto the 5-a-side base, whose 6 m D would come back for an
+ *  omitted key: the box keys a shape does not use are always sent as null. */
+const UNUSED_BOX: Record<BoxShape, Partial<PitchTemplate>> = {
+  rect: { areaRadius: null },
+  arc: { areaDepth: null, areaWidth: null },
+  none: { areaRadius: null, areaDepth: null, areaWidth: null },
+};
+type Dim = "length" | "width" | "goalWidth" | "centreRadius" | "areaRadius" | "areaDepth" | "areaWidth";
+const BOX_FIELDS: Record<BoxShape, readonly (readonly [Dim, string])[]> = {
+  rect: [
+    ["areaDepth", "Box depth (m)"],
+    ["areaWidth", "Box width (m)"],
+  ],
+  arc: [["areaRadius", "Box radius (m)"]],
+  none: [],
+};
+
 export function PitchCalibration({
   jobId,
   videoSize,
@@ -80,6 +100,9 @@ export function PitchCalibration({
   const saved = calibration?.request;
   const [presetKey, setPresetKey] = useState<string>("five-a-side");
   const [template, setTemplate] = useState<PitchTemplate>(PITCH_PRESETS["five-a-side"].template);
+  const [box, setBox] = useState<BoxShape>(boxOf(PITCH_PRESETS["five-a-side"].template));
+  /** The box sizes last typed for each shape, so switching the shape back restores them. */
+  const boxSizes = useRef<Pick<PitchTemplate, "areaRadius" | "areaDepth" | "areaWidth">>({ areaRadius: 6, areaDepth: null, areaWidth: null });
   const [walls, setWalls] = useState(true);
   const [distortion, setDistortion] = useState<"auto" | "none" | "on">("auto");
   const [mode, setMode] = useState<"landmark" | "line">("landmark");
@@ -111,14 +134,25 @@ export function PitchCalibration({
   const [venueId, setVenueId] = useState("");
   const [venueName, setVenueName] = useState("");
   const [venueNote, setVenueNote] = useState("");
+  const [videoWidth, videoHeight] = videoSize;
   useEffect(() => {
     fetchVenues()
-      .then((list) => {
+      .then((all) => {
+        // A venue fits only footage of its own size; newest first. Whether one can
+        // re-apply (a fixed camera) is the worker's call, not filtered here.
+        const list = all
+          .filter((v) => v.size?.[0] === videoWidth && v.size?.[1] === videoHeight)
+          .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
         setVenues(list);
-        if (list.length) setVenueId(list[0].id);
+        setVenueId(list[0]?.id ?? "");
       })
       .catch(() => setVenues([]));
-  }, []);
+  }, [videoWidth, videoHeight]);
+  // Once a saved venue set the match up, the other saved courts stay offered: a
+  // neighbouring court of the same size may have been the one picked.
+  const currentVenue = calibration?.state === "ready" ? calibration.venue : undefined;
+  const offered = calibration?.state !== "ready" ? venues : currentVenue ? venues.filter((v) => v.id !== currentVenue.id) : [];
+  const chosenVenue = offered.some((v) => v.id === venueId) ? venueId : (offered[0]?.id ?? "");
 
   /** Follows the run on the worker. Re-aligning a moving camera through a full
    *  match can take half an hour on a CPU, so there is no fixed limit: it gives up
@@ -159,10 +193,11 @@ export function PitchCalibration({
     setBusy("save");
     setError("");
     try {
-      await applyVenue(jobId, venueId);
+      await applyVenue(jobId, chosenVenue);
       setProgress(0);
       await waitForCalibration();
       setProgress(null);
+      onActive(false);
       onApplied();
     } catch (e) {
       if (!mounted.current) return;
@@ -179,7 +214,7 @@ export function PitchCalibration({
     try {
       const venue = await saveVenue(jobId, venueName.trim());
       setVenues((list) => [venue, ...list.filter((v) => v.id !== venue.id)]);
-      setVenueNote(`Saved as "${venue.name}". Future matches from this camera can use it without clicks.`);
+      setVenueNote(`Saved as "${venue.name}". Future matches filmed from this same fixed camera position can use it without clicks.`);
       setVenueName("");
     } catch (e) {
       fail(e, e instanceof Error ? e.message : "The venue could not be saved");
@@ -189,7 +224,9 @@ export function PitchCalibration({
   // Start from the saved calibration so a correction does not mean starting over.
   useEffect(() => {
     if (!saved) return;
-    setTemplate({ ...PITCH_PRESETS["five-a-side"].template, ...saved.template });
+    const restored = { ...PITCH_PRESETS["five-a-side"].template, ...saved.template };
+    setTemplate(restored);
+    setBox(boxOf(restored));
     setPresetKey("custom");
     setWalls(!!saved.walls);
     if (saved.distortion) setDistortion(saved.distortion);
@@ -264,18 +301,34 @@ export function PitchCalibration({
 
   function choosePreset(key: string) {
     setPresetKey(key);
-    if (PITCH_PRESETS[key]) changeTemplate(PITCH_PRESETS[key].template);
-    else setPreview(null);
+    if (PITCH_PRESETS[key]) {
+      changeTemplate(PITCH_PRESETS[key].template);
+      setBox(boxOf(PITCH_PRESETS[key].template));
+    } else setPreview(null);
   }
 
-  function setDim(key: keyof PitchTemplate, value: string) {
+  function setDim(key: Dim, value: string) {
     const n = Number(value);
     changeTemplate({ ...template, [key]: value === "" ? null : Number.isFinite(n) ? n : template[key] });
     setPresetKey("custom");
   }
 
+  /** A painted rectangle (its corners become landmarks), a D, or no box. */
+  function chooseBox(shape: BoxShape) {
+    for (const key of ["areaRadius", "areaDepth", "areaWidth"] as const) if (template[key]) boxSizes.current[key] = template[key];
+    const sizes = boxSizes.current;
+    setBox(shape);
+    changeTemplate({
+      ...template,
+      areaRadius: shape === "arc" ? sizes.areaRadius : null,
+      areaDepth: shape === "rect" ? sizes.areaDepth : null,
+      areaWidth: shape === "rect" ? sizes.areaWidth : null,
+    });
+    setPresetKey("custom");
+  }
+
   const request = () => ({
-    template: { ...template, walls },
+    template: { ...template, ...UNUSED_BOX[box], walls },
     points,
     lines: linePoints,
     t: frameTime ?? time,
@@ -329,6 +382,31 @@ export function PitchCalibration({
   const ready = calibration?.state === "ready";
   // A setup applied before a reload (or set up from a saved venue) still running on the worker.
   const running = calibration?.job?.state === "processing" && busy !== "save";
+  const showVenues = offered.length > 0 && videoAvailable;
+  const venueCard = (
+    <div className="rounded-xl border border-white/10 p-3 space-y-2" data-testid="venue-card">
+      <p className="text-sm font-semibold">{ready ? "Use a different saved venue" : "Use a saved venue"}</p>
+      <p className="text-xs text-pitch-muted">
+        {ready
+          ? "Wrong court? Apply another saved setup for footage of this size instead; it is checked against the painted lines."
+          : "Same fixed camera as before? Apply its pitch setup without clicking; it is checked against the painted lines."}
+      </p>
+      <div className="flex gap-2">
+        {/* min-w-0: a long venue name must not widen the page past a phone screen. */}
+        <select aria-label="Saved venue" className="pitch-input flex-1 min-w-0 w-full" value={chosenVenue} onChange={(e) => setVenueId(e.target.value)}>
+          {offered.map((v) => (
+            <option key={v.id} value={v.id}>
+              {v.name} · {v.template.length}×{v.template.width} m
+            </option>
+          ))}
+        </select>
+        <button className="pitch-button-secondary min-h-11" disabled={!chosenVenue || !!busy || running} onClick={useVenue}>
+          {busy === "save" ? <Loader2 size={15} className="animate-spin" /> : null}
+          {busy === "save" && progress !== null ? `${Math.round(progress)}%` : "Apply"}
+        </button>
+      </div>
+    </div>
+  );
 
   if (!active)
     return (
@@ -366,26 +444,7 @@ export function PitchCalibration({
             {calibration.venue.lineScore !== null ? ` · lines matched ${Math.round(calibration.venue.lineScore * 100)}%` : ""}
           </p>
         )}
-        {!ready && venues.length > 0 && videoAvailable && (
-          <div className="rounded-xl border border-white/10 p-3 space-y-2">
-            <p className="text-sm font-semibold">Use a saved venue</p>
-            <p className="text-xs text-pitch-muted">Same fixed camera as before? Apply its pitch setup without clicking; it is checked against the painted lines.</p>
-            <div className="flex gap-2">
-              {/* min-w-0: a long venue name must not widen the page past a phone screen. */}
-              <select aria-label="Saved venue" className="pitch-input flex-1 min-w-0 w-full" value={venueId} onChange={(e) => setVenueId(e.target.value)}>
-                {venues.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {v.name} · {v.template.length}×{v.template.width} m
-                  </option>
-                ))}
-              </select>
-              <button className="pitch-button-secondary" disabled={!venueId || !!busy || running} onClick={useVenue}>
-                {busy === "save" ? <Loader2 size={15} className="animate-spin" /> : null}
-                {busy === "save" && progress !== null ? `${Math.round(progress)}%` : "Apply"}
-              </button>
-            </div>
-          </div>
-        )}
+        {showVenues && venueCard}
         {ready && !calibration?.venue && (
           <div className="rounded-xl border border-white/10 p-3 space-y-2">
             <p className="text-sm font-semibold">Save as a venue</p>
@@ -409,9 +468,10 @@ export function PitchCalibration({
             Pitch setup needs the footage, which was deleted after the retention period.
           </p>
         )}
+        {/* Not while a saved venue is being applied either: the click flow would race it. */}
         <button
-          className="pitch-button-secondary w-full"
-          disabled={running || !videoAvailable}
+          className="pitch-button-secondary w-full min-h-11"
+          disabled={running || busy === "save" || !videoAvailable}
           aria-describedby={videoAvailable ? undefined : "pitch-setup-unavailable"}
           onClick={() => onActive(true)}
         >
@@ -427,6 +487,20 @@ export function PitchCalibration({
     if (mode === "line" && linePoints.length) setLinePoints((l) => l.slice(0, -1));
     else setPoints((p) => p.slice(0, -1));
   };
+  const dimField = ([key, label]: readonly [Dim, string]) => (
+    <label key={key}>
+      {label}
+      <input
+        aria-label={label}
+        type="number"
+        step="0.1"
+        min="0"
+        className="pitch-input w-full mt-1 min-h-11"
+        value={template[key] ?? ""}
+        onChange={(e) => setDim(key, e.target.value)}
+      />
+    </label>
+  );
   return (
     <section className="glass-card p-5 space-y-4" aria-label="Pitch setup">
       {/* First in the panel, and data-reveal: on a phone the page scrolls this strip to
@@ -450,6 +524,8 @@ export function PitchCalibration({
           Close
         </button>
       </div>
+      {/* Every way into the setup lands here: a saved venue comes before any clicking. */}
+      {showVenues && venueCard}
       <h2 className="font-semibold">Pitch setup</h2>
       <div className="flex flex-wrap items-center gap-1 text-sm" role="group" aria-label="Choose the frame">
         <span className="text-pitch-muted mr-1">Frame {clockTime(time)}</span>
@@ -463,7 +539,7 @@ export function PitchCalibration({
         ).map(([delta, label]) => (
           <button
             key={label}
-            className="px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 disabled:opacity-40"
+            className="min-h-11 px-3 py-1 rounded-md bg-white/5 hover:bg-white/10 disabled:opacity-40"
             disabled={frameTime !== null}
             title={frameTime !== null ? "Clear the clicks to choose another frame" : `Move ${delta} s`}
             onClick={() => onStep(delta)}
@@ -484,7 +560,7 @@ export function PitchCalibration({
             role="tab"
             aria-selected={mode === key}
             onClick={() => setMode(key)}
-            className={`flex-1 py-1.5 rounded-md ${mode === key ? "bg-pitch-indigo-soft/50" : "text-pitch-muted"}`}
+            className={`flex-1 min-h-11 py-1.5 rounded-md ${mode === key ? "bg-pitch-indigo-soft/50" : "text-pitch-muted"}`}
           >
             {label}
           </button>
@@ -543,7 +619,7 @@ export function PitchCalibration({
         </p>
       )}
       <button
-        className="pitch-button-secondary w-full"
+        className="pitch-button-secondary w-full min-h-11"
         onClick={() => {
           setPoints([]);
           setLinePoints([]);
@@ -580,21 +656,17 @@ export function PitchCalibration({
             ["goalWidth", "Goal width (m)"],
             ["centreRadius", "Centre circle radius (m)"],
           ] as const
-        ).map(([key, label]) => (
-          <label key={key}>
-            {label}
-            <input
-              aria-label={label}
-              type="number"
-              step="0.1"
-              min="0"
-              className="pitch-input w-full mt-1"
-              value={template[key] ?? ""}
-              onChange={(e) => setDim(key, e.target.value)}
-            />
-          </label>
-        ))}
-        <label className="col-span-2 flex gap-2 items-center">
+        ).map(dimField)}
+        <label className="col-span-2">
+          Box
+          <select aria-label="Box" className="pitch-input w-full mt-1" value={box} onChange={(e) => chooseBox(e.target.value as BoxShape)}>
+            <option value="rect">Rectangle</option>
+            <option value="arc">D (arc)</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+        {BOX_FIELDS[box].map(dimField)}
+        <label className="col-span-2 flex gap-2 items-center min-h-11">
           <input type="checkbox" checked={walls} onChange={(e) => setWalls(e.target.checked)} />
           Walled cage (the ball cannot go out of play)
         </label>
@@ -603,7 +675,7 @@ export function PitchCalibration({
         </p>
       </div>
       <details className="text-sm">
-        <summary className="cursor-pointer text-pitch-muted">Lens (advanced)</summary>
+        <summary className="cursor-pointer text-pitch-muted min-h-11 flex items-center">Lens (advanced)</summary>
         <select aria-label="Lens distortion" className="pitch-input w-full mt-2" value={distortion} onChange={(e) => setDistortion(e.target.value as typeof distortion)}>
           <option value="auto">Detect wide-angle distortion automatically</option>
           <option value="none">Straight lens (no distortion)</option>
@@ -615,7 +687,7 @@ export function PitchCalibration({
           {error}
         </p>
       )}
-      <button className="pitch-button-secondary w-full" disabled={points.length < 4 || !!busy} onClick={check}>
+      <button className="pitch-button-secondary w-full min-h-11" disabled={points.length < 4 || !!busy} onClick={check}>
         {busy === "preview" ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />} Check fit
       </button>
       {preview && quality && (

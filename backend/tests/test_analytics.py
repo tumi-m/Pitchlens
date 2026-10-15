@@ -815,6 +815,95 @@ def test_an_unverifiable_venue_is_refused_for_a_moving_camera():
         calibrate.build_from_venue(result, venue, None)
 
 
+def _shifted(dx):
+    """Image->pitch homography of the test camera with the picture moved dx pixels."""
+    return np.linalg.inv(np.array([[1, 0, dx], [0, 1, 0], [0, 0, 1.0]]) @ TO_IMAGE).reshape(-1).tolist()
+
+
+def _ready_calibration(directory, shifts, static, anchor=0):
+    """A ready calibration whose frame k is the test camera moved shifts[k] pixels (None: unmapped)."""
+    import json
+
+    frames = [None if dx is None else {"H": _shifted(dx), "d": 0} for dx in shifts]
+    cal = {"schemaVersion": 1, "state": "ready", "template": TEMPLATE, "k1": 0.0, "size": [640, 360], "rms": 0.2,
+           "static": static, "anchorFrame": anchor, "selfScore": 0.8, "frames": frames}
+    (directory / "calibration.json").write_text(json.dumps(cal))
+    return cal
+
+
+def test_a_venue_is_refused_when_the_camera_pans_away_from_the_clicked_view(tmp_path, monkeypatch):
+    from app.vision import calibrate
+
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, directory = make_job(server, build_match())
+    # Panning: unmapped most of the match, elsewhere 10% of the frame away from the clicked view.
+    far = int(min(640, 360) * 0.1)
+    _ready_calibration(directory, [None] * 12 + [far] * 14 + [0] * 4, static=False, anchor=27)
+    response = client.post("/venues", json={"name": "Court 1", "jobId": job_id})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "This camera moves during the match; saved venues work for fixed cameras only."
+    assert list(server._venue_dir().glob("*.json")) == []
+    # The line is the search build_from_venue makes: a view just inside it re-applies, just outside not.
+    radius = calibrate.venue_search((640, 360))
+    assert calibrate.venue_reapplies(_ready_calibration(directory, [0] + [radius - 1] * 9, static=False)) == (True, 1.0)
+    assert calibrate.venue_reapplies(_ready_calibration(directory, [0] + [radius + 2] * 9, static=False)) == (False, 0.1)
+
+
+def test_a_shaken_fixed_camera_can_still_save_its_venue(tmp_path, monkeypatch):
+    import json
+
+    server, client = _client(tmp_path, monkeypatch)
+    job_id, directory = make_job(server, build_match())
+    # static_camera() reads a bumped fixed camera as moving; its view never left the clicked one.
+    _ready_calibration(directory, [0] * 30, static=False, anchor=5)
+    response = client.post("/venues", json={"name": "Cage 3", "jobId": job_id})
+    assert response.status_code == 200 and response.json()["static"] is False
+    stored = json.loads((server._venue_dir() / f"{response.json()['id']}.json").read_text())
+    assert stored["reapplies"] is True and stored["static"] is False
+
+
+def _write_venue(server, vid, created, owner="a" * 32, **extra):
+    import json
+
+    venue = {"id": vid, "name": f"Court {created}", "owner": owner, "size": [640, 360], "createdAt": created,
+             "template": TEMPLATE, "H": np.linalg.inv(TO_IMAGE).reshape(-1).tolist(), "k1": 0.0, **extra}
+    (server._venue_dir() / f"{vid}.json").write_text(json.dumps(venue))
+
+
+def test_venues_are_listed_newest_first_without_legacy_moving_camera_saves(tmp_path, monkeypatch):
+    server, client = _client(tmp_path, monkeypatch)
+    owner = "a" * 32
+    # File names sort a, b, c, d; saved in the order d, a, c, b.
+    for vid, created in (("d" * 32, 1), ("a" * 32, 2), ("c" * 32, 3)):
+        _write_venue(server, vid, created, static=True, reapplies=True)
+    _write_venue(server, "b" * 32, 4, static=False, reapplies=True)  # a shaken fixed camera
+    # Saved from a panning camera before saving checked it: it can never line up.
+    _write_venue(server, "e" * 32, 5, static=False)
+    listed = client.get(f"/venues?owner={owner}").json()
+    assert [v["createdAt"] for v in listed] == [4, 3, 2, 1]
+    assert set(listed[0]) == {"id", "name", "template", "size", "static", "createdAt", "sourceJob"}
+
+
+def test_automatic_venue_setup_skips_legacy_moving_camera_venues(tmp_path, monkeypatch):
+    from app.vision import calibrate
+
+    server, _ = _client(tmp_path, monkeypatch)
+    owner = "a" * 32
+    job, directory = make_job(server, build_match())
+    (directory / "video").write_bytes(b"footage")
+    _write_venue(server, "1" * 32, 1, static=True)
+    _write_venue(server, "2" * 32, 2, static=False)  # legacy, newest
+    tried = []
+
+    def fake(result, venue, video):
+        tried.append(venue["id"])
+        raise ValueError("The painted lines in this match do not line up with the saved venue")
+
+    monkeypatch.setattr(calibrate, "build_from_venue", fake)
+    assert server._auto_venue(directory, {"owner": owner}) is None
+    assert tried == ["1" * 32]
+
+
 def test_a_stale_accept_never_confirms_a_goal_the_reviewer_did_not_see():
     from app.vision.analytics import apply_review, confirmed_goals
 

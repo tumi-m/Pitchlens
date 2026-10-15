@@ -4,6 +4,135 @@ Hypothesis, data, configuration, outcome, decision. Newest first.
 Development data only unless marked. Lines marked "held-out" (E8-E11,
 E15-E20, E22-E23) are Metrica game 2, run only after tuning on game 1 stopped.
 
+## E27 · GPU spend recorded per run and an optional daily budget (2026-10-15)
+- Problem: a GPU run left no cost trace. `status.json` had no duration, card or
+  cost, and the result's `performance.totalSeconds` leaves out container start,
+  imports, the weight copy, the download and compression. Failed, timed-out,
+  cancelled and CPU-takeover runs, and training, were invisible although Modal
+  billed them (three reproductions against the round-8 worker). The only
+  spend controls were `VISION_MAX_JOBS_PER_DAY` starts, one analysis at a time
+  and Modal time limits of 3-24 h per run.
+- Worst case under those controls (`worst_case.py`, COST.md prices with the
+  assumed 1.5 cores and 4 GiB; estimates): one analysis at a time all day
+  costs $21.65/day on an L4, $49.29 on an L40S and $97.25 on an H100, plus
+  training (2 site runs of up to 2 h on an L4: $3.61; operator runs uncapped).
+  Per run: a 20-second section could bill up to $2.71 on an L4 or $12.16 on an
+  H100 (the 3 h floor); 90 minutes at 1080p 10 fps up to $6.35 / $28.55.
+- Change: `modal_app.analyse` reports its phases on its last item (never in
+  result.json); `gpu.run_on_modal` times the run from the call to the app's
+  exit and hands a record (seconds, queueing, phases, estimated dollars, Modal
+  app id) to the worker however the run ends. The record goes to the job's
+  `status.json` (`gpuRuns`, stripped from the owner's view), to
+  `gpu-spend.json` (opened before the call, heartbeat every 30 s, closed with
+  the record, 8 days kept, a run open at a restart closed at its last
+  heartbeat plus 300 s) and to `/ops` → `gpuSpend`. Training is timed and
+  priced with `VISION_MODAL_TRAIN_GPU`. Apps are tagged `pitchlens-job` and
+  `pitchlens-kind` for Modal's billing report. `VISION_DAILY_GPU_BUDGET_USD`
+  refuses new GPU starts (a GPU-only analysis keeps its upload and its start;
+  sections fall back to the CPU; Retry, full re-runs and training answer 429
+  `gpu-budget`); uploads are never refused for it. Recording is best-effort:
+  a full volume or an unreadable ledger never stops a run (the budget then
+  fails open, with a warning). Estimate formula and reconciliation: COST.md.
+- Measured, locally on the CPU: `modal_app.analyse` run in-process through
+  `run_on_modal` on the 3-minute Tryzub clip (20-second section, 6 fps, no
+  ball model; `e2e_cost.py`): worker wall 29.5 s, imports 1.34 s, download
+  0.02 s for 7,378,217 B, engine 28.14 s, 72.6 vCPU-s, peak memory 1.23 GB.
+  A re-run of the shipped code on a busier machine: 37.2 s wall, engine
+  34.8 s, 87.8 vCPU-s, and no cost field in result.json. The queueing split assumes `/proc/uptime` inside Modal's sandbox is
+  the container's uptime; locally it is the host's, so queueing reads 0.
+- Not yet known: every dollar figure here is an estimate from list prices,
+  not reconciled with a Modal invoice, and no real L4 full match has been
+  recorded yet. Guards: `tests/test_gpu_cost.py`, the `/ops` key test.
+- Decision: adopt. Keep Modal's workspace spend limit as the backstop; the
+  daily budget can overshoot by at most one analysis plus one training run.
+
+## E26 · Goal areas and penalty arcs anchor line re-alignment on full-size pitches (2026-10-15)
+- Problem: `pitch.line_segments` drew the touchlines, goal lines, halfway
+  line, centre circle and penalty box, not the goal areas (5.5 x 18.32 m) and
+  penalty arcs painted on every full-size pitch. The line mask barely sees a
+  broadcast goal line (7-11% of its samples hit), so `align_to_lines` started
+  exactly at a correct manual calibration rotated the goal line onto the bright
+  board edge behind it and scored 0.52-0.62, above calibrate.build's 0.45 for
+  the once-a-second re-alignment on a moving camera.
+- Data: my manual calibrations of 4 broadcast frames from 2 clips (messi_00000,
+  iniesta_00000, _00072, _00144), at full resolution and at 640x360.
+  `align_hold.py` starts at the manual view; `align_test.py` applies 6 small
+  simulated camera moves per frame and resolution (48 trials).
+- Change: a law-standard box (at least 13 m deep and 35 m wide, never
+  seven-a-side's 9 x 18) also draws both goal areas and, when the spot plus
+  9.15 m reaches past the box, the arc's part outside it. Derived from the box,
+  so UI templates, stored calibrations and venues get them; every other
+  template draws exactly what it drew. The report overlay (`pitchLines`)
+  mirrors the rule. No new landmark names (31 would pass the 30-click limit).
+- Hold, counting a move as accepted when its score reaches 0.45: before, 4 of
+  8 cases moved more than 0.3 m (messi full 0.53 m; iniesta_00000 360p 0.51 m,
+  max 6.89; iniesta_00072 1.84 m, max 8.06, and at 360p 2.13 m, max 9.74).
+  After, 7 of 8 are declined or move at most 0.26 m; iniesta_00072 at 360p
+  still moves 1.68 m (max 8.15) at score 0.46. It is bistable: over 12
+  sub-sample placements of the arc samples it was accepted at 1.60-1.73 m in
+  6 (score 0.46-0.47) and declined in the rest. iniesta_00000 at 360p moves
+  0.53 m but at 0.39, which build declines.
+- Perturbations: median error 0.73 → 0.83 m before, 0.73 → 0.40 m after (p90
+  2.36 → 1.65 m; refinements worse than their start 22 → 12). Accepted
+  refinements 30 → 26, of which more than 1 m off 16 → 9; good corrections
+  (better than the start and within 1 m) 11 → 14. Wrong locks that remain:
+  at 360p iniesta_00000 4/6 accepted at 1.63-1.69 m and iniesta_00072 4/6 at
+  1.49-1.66 m; at full resolution one messi_00000 trial at 8.51 m (8.65 m
+  before).
+- Guard in build's non-strict branch, measured and not adopted. A tighter
+  `max_shift` for search 0 (14 px x height/360 instead of 60 px) cut the
+  accepted wrong locks 9 → 2 with all 14 good corrections kept, but the
+  simulated moves (4 px sigma, 2% zoom, 0.01 rad) cap the start error by
+  construction: the cost of refusing a larger genuine correction on a real
+  moving camera (the view then drifts until the next shot start or motion
+  gap) is unmeasured. Requiring the refined score to beat the start by up to
+  0.15 removed no wrong lock (they gain 0.2-0.3). calibrate.py is unchanged.
+- A synthetic regression (rendered penalty area, faint goal line, board edge
+  1.5-3 m behind) was tried and not committed: the old lines drifted more than
+  1 m in few views and the new ones did not reliably hold within 0.3 m.
+- Saved 11-a-side venues' `selfScore` was computed with the old lines, so a
+  venue check may now refuse one and ask for a new setup (fails safe).
+- Guards: `tests/test_pitch.py` (goal areas and arcs on law-standard boxes,
+  other templates unchanged), `frontend/tests/pitch-lines.test.cjs`.
+- Decision: adopt. The evidence is 4 broadcast frames from 2 clips; an
+  11-a-side moving-camera match with ground truth would settle the 360p cases.
+
+## E25 · Learned pitch keypoints as a suggested setup (2026-10-15)
+- Roboflow's 32-point pitch model (`football-pitch-detection.pt`, Drive id
+  1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf from roboflow/sports
+  examples/soccer/setup.sh) could not be fetched because Google Drive is
+  blocked, so no SHA-256 is pinned. Stand-in: NBJW HRNet-W48 keypoints
+  (GPL-2.0, evaluation only, SV_kp SHA-256 7ea78fa7…5113).
+- Ground truth: my own manual calibrations of 4 UEFA broadcast frames
+  (residual 0.02-0.27 m; one, iniesta_00072, has a 7.16 px residual and
+  quality 'check').
+- RANSAC from confident keypoints plus gates: suggestions on 27/27 broadcast
+  frames at full resolution and 19/27 at 640x360 JPEG q60. Accuracy was
+  measured only on the 4 manual frames (6 with their 360p copies): median
+  0.12-0.34 m, p90 ≤0.71 m, max ≤1.61 m. The other 23 suggestions are
+  unverified.
+- Indoor Tryzub court, 98 frames: 0 suggestions at every threshold (never 6
+  agreeing keypoints).
+- Worst case, a small court labelled with standard ids (synthetic views):
+  naive gates accepted 34/40 seven-a-side, 29/40 futsal and 9/40 five-a-side
+  views, all 1.7-3.4x too large. With per-line paint evidence (at most 1
+  predicted line without paint, at least 2 lines of one penalty-area structure
+  painted) and the players' median height within 1.2-2.5 m: 0/600. Fitting
+  the lens term on 6-15 keypoints gave k1 from -0.13 to +0.12 and 3.7 m
+  players, so suggestions use no distortion.
+- CPU: 4.6 s per frame (HRNet-W48 at 960x540, 4 threads).
+- Decision: not adopted (licence, weights unavailable, no gain on small-sided
+  courts). The prototype is not committed. Before adopting: (1) download the
+  Roboflow weights where Drive works and pin the SHA-256 in
+  setup_football.MODELS; (2) check the real model on frames with known
+  calibration, including what indices 10/11/18/19 mean; (3) offer it only for
+  law-standard boxes (areaDepth about 16.5 and areaWidth about 40.32, or
+  length ≥ 90 m), never seven-a-side; (4) make backend validate_request and
+  the frontend landmarks() mirror accept goal-area names, so a suggestion
+  carries at least 4 clickable points (today 2-6 per frame); (5) get legal
+  review if any GPL code or ideas are involved. Only ever offer it as a
+  suggestion the owner confirms.
+
 ## E24 · Owner team fix by tapped crops (2026-10-15)
 - Problem: when kit clustering picks the wrong colour group, the owner could
   not fix it. The kit panel only took names, and review's "Other team" flips

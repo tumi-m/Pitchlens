@@ -10,6 +10,7 @@ import time
 import zlib
 from pathlib import Path
 
+from app.vision import gpucost
 from app.vision.access import MAX_GRANT_SECONDS, model_grant, video_grant
 
 
@@ -23,8 +24,8 @@ class GPUEngineError(RuntimeError):
 
 
 class GPUTimeout(ValueError):
-    """Modal stopped the run at its time limit. Not GPUUnavailable: the GPU time was
-    billed, a retry would hit the same limit and the CPU would take many hours."""
+    """Modal stopped a full match at its time limit. Not GPUUnavailable: the GPU time
+    was billed, a retry would hit the same limit and the CPU would take many hours."""
 
 
 # modal_app.analyse's own timeout, and Modal's ceiling for one function call.
@@ -32,10 +33,16 @@ MODAL_TIMEOUT = 3 * 3600
 MODAL_MAX_TIMEOUT = 24 * 3600
 
 
-def gpu_timeout_seconds(video, sample_fps, ball_search, max_seconds=None, start_seconds=0):
+def gpu_timeout_seconds(video, sample_fps, ball_search, max_seconds=None, start_seconds=0, file_size=None):
     """Time limit for one GPU run: 1.5x its expected L4 cost plus 15 minutes for
     scheduling and the video download, between MODAL_TIMEOUT and MODAL_MAX_TIMEOUT.
     None without the upload's metadata (analyse's own 3 h then applies).
+
+    A section (max_seconds) gets at least 30 minutes instead of 3 h, plus a second
+    per 2 MB of file_size on top: every GPU run downloads the whole original, and
+    Modal's limit includes the container's start. A full match keeps the 3 h
+    floor, since the per-frame cost is an L4's and a slower VISION_MODAL_GPU
+    takes longer.
 
     Per analysed frame: 0.06 s, 0.0135 s per ball tile (tile_layout) and 0.08 s
     more above 720p. 640x360 (2 tiles) gives 0.087 s, against 87.8 ms measured on
@@ -60,6 +67,9 @@ def gpu_timeout_seconds(video, sample_fps, ball_search, max_seconds=None, start_
         _, cols, rows = tile_layout(width, height)
         tiles = cols * rows
     per_frame = 0.06 + 0.0135 * tiles + (0.08 if width * height > 1280 * 720 else 0)
+    if max_seconds != math.inf:
+        download = int(file_size) // 2_000_000 if isinstance(file_size, int) and file_size > 0 else 0
+        return min(MODAL_MAX_TIMEOUT, max(1800, int(1.5 * frames * per_frame + 900)) + download)
     return min(MODAL_MAX_TIMEOUT, max(MODAL_TIMEOUT, int(1.5 * frames * per_frame + 900)))
 
 
@@ -133,6 +143,8 @@ def run_on_modal(
     reference_colours=None,
     reference_job=None,
     timeout_seconds=None,
+    on_run=None,
+    tick=None,
 ):
     """Stream progress from the GPU function and write its result to `output`.
 
@@ -144,9 +156,15 @@ def run_on_modal(
 
     Only Modal and transport failures are GPUUnavailable (the CPU may take over):
     an engine crash is GPUEngineError, a footage problem ValueError, Modal's time
-    limit GPUTimeout, and errors from progress() or from writing the result
-    locally propagate unchanged. timeout_seconds (gpu_timeout_seconds) raises
-    that limit above analyse's own 3 h for a long or detailed run.
+    limit GPUTimeout (GPUUnavailable for a section, which the CPU can still
+    run), and errors from progress() or from writing the result locally
+    propagate unchanged. timeout_seconds (gpu_timeout_seconds) replaces
+    analyse's own 3 h: longer for a long or detailed run, shorter for a section.
+
+    on_run(record) is called once, however the run ends, with what it cost once
+    the GPU was asked (gpu_record); tick() every 30 s while the GPU is asked.
+    Both are best-effort, and the record never reaches result.json (the owner
+    can download that).
     """
     base = public_base()
     if not base:
@@ -161,8 +179,18 @@ def run_on_modal(
     ball_name = active_ball_name()
     names = run_model_names(profile, ball_search, ball_name)
     inner = None
+    clock = {}  # monotonic: called, first, last (items), exit (app stopped)
+    timings = {}
+    recorder = _recorded(clock, timings, on_run, os.getenv("VISION_MODAL_GPU", "L4"))
     try:
-        with app.run():
+        with recorder, app.run():
+            # Tagged so Modal's billing report (`modal billing report --tag-names
+            # pitchlens-job`) gives the invoiced dollars of this very run (docs/COST.md).
+            recorder.app_id = getattr(app, "app_id", None)
+            try:
+                app.set_tags({"pitchlens-job": job_id, "pitchlens-kind": "analysis"})
+            except Exception as exc:  # reporting only: never stops a run
+                logging.info("Could not tag the Modal app: %s", _reason(exc))
             # Grants last up to four hours, so that Modal re-running a preempted
             # generator input can fetch again; the worker revokes them as soon as
             # this run is no longer on the GPU (engines[job] == "gpu", server.gpu_grant).
@@ -183,10 +211,10 @@ def run_on_modal(
             )
             # A Modal refusal here is GPUUnavailable, like entering the app.
             fn = analyse
-            if timeout_seconds and timeout_seconds > MODAL_TIMEOUT:
+            if timeout_seconds and int(timeout_seconds) != MODAL_TIMEOUT:
                 fn = analyse.with_options(timeout=int(timeout_seconds))
             try:
-                payload = _receive(fn, args, progress, cancelled)
+                payload = _receive(fn, args, progress, cancelled, clock, timings, tick, section=bool(max_seconds))
             except BaseException as exc:
                 inner = exc
                 raise
@@ -217,7 +245,70 @@ def run_on_modal(
         raise
 
 
-def _receive(analyse, args, progress, cancelled):
+class _recorded:
+    """Times the GPU run (from the Modal call to the app's exit) and hands on_run its record."""
+
+    def __init__(self, clock, timings, on_run, gpu):
+        self.clock, self.timings, self.on_run, self.gpu = clock, timings, on_run, gpu
+        self.record = None
+        self.app_id = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        if "called" not in self.clock:
+            return False
+        try:
+            self.clock["exit"] = time.monotonic()
+            self.record = gpu_record(self.gpu, self.clock, self.timings, exc)
+            if self.app_id:
+                self.record["modalAppId"] = self.app_id
+            if self.on_run:
+                self.on_run(self.record)
+        except Exception:  # reporting only: never changes how the run ends
+            logging.exception("Could not record the GPU run's cost")
+        return False
+
+
+def gpu_record(gpu, clock, timings, exc=None):
+    """What one GPU run cost: worker-side times, the GPU's own phases, an estimate.
+
+    Billed seconds run from the container's start to the app's exit: the time to
+    the first item less the GPU's own time before that item is queueing, which
+    Modal does not bill. Without the GPU's report the whole wait is counted.
+    """
+    called = clock["called"]
+    end = clock.get("exit", time.monotonic())
+    first, last = clock.get("first"), clock.get("last")
+    queue_seconds = 0.0
+    if first is not None and timings.get("firstYieldSeconds") is not None:
+        before_first = float(timings.get("containerUptimeSeconds") or 0) + float(timings["firstYieldSeconds"])
+        queue_seconds = max(0.0, first - called - before_first)
+    billed = max(0.0, end - called - queue_seconds)
+    usd, known = gpucost.estimate(
+        gpu, billed, timings.get("cpuSeconds"), timings.get("maxRssBytes"),
+        timings.get("downloadBytes") or 0,
+    )
+    outcome = "completed" if exc is None else type(exc).__name__
+    record = {
+        "gpu": gpu, "gpuName": timings.get("gpuName"), "outcome": outcome,
+        "wallSeconds": round((last if last is not None else end) - called, 1),
+        "appExitSeconds": round(end - called, 1),
+        "firstItemSeconds": None if first is None else round(first - called, 1),
+        "queueSeconds": round(queue_seconds, 1), "seconds": round(billed, 1),
+        "usd": usd, "priceKnown": known, "estimated": True,
+    }
+    phases = {k: timings[k] for k in (
+        "containerUptimeSeconds", "importSeconds", "modelCopySeconds", "downloadSeconds", "downloadBytes",
+        "engineSeconds", "compressSeconds", "cpuSeconds", "maxRssBytes", "functionSeconds",
+    ) if k in timings}
+    if phases:
+        record["phases"] = phases
+    return record
+
+
+def _receive(analyse, args, progress, cancelled, clock=None, timings=None, tick=None, section=False):
     """Read analyse.remote_gen(*args) on a daemon thread; return the gzip result.
 
     The job thread never touches the generator: leaving app.run() stops the app,
@@ -233,11 +324,19 @@ def _receive(analyse, args, progress, cancelled):
         except BaseException as exc:  # handed to the job thread (if it is still listening)
             items.put(("error", exc))
 
+    clock = {} if clock is None else clock
     limit = start_seconds_limit()
-    began = time.monotonic()
+    began = clock["called"] = time.monotonic()
+    ticked = began
     threading.Thread(target=pump, name="gpu-stream", daemon=True).start()
     arrived = False
     while True:
+        if tick and time.monotonic() - ticked >= gpucost.HEARTBEAT_SECONDS:
+            ticked = time.monotonic()
+            try:
+                tick()
+            except (OSError, ValueError) as exc:  # the spend ledger: never stops a run
+                logging.warning("Could not record the GPU run's heartbeat: %s", _reason(exc))
         if cancelled():
             raise InterruptedError("Analysis cancelled")
         try:
@@ -253,6 +352,9 @@ def _receive(analyse, args, progress, cancelled):
             # by name, since modal is imported only when a GPU run starts.
             kind_of = type(value)
             if kind_of.__module__.startswith("modal") and "Timeout" in kind_of.__name__:
+                if section:
+                    # Its limit is minutes, not the full match's hours: the CPU can run it.
+                    raise GPUUnavailable("The GPU run for this section hit its time limit.") from value
                 raise GPUTimeout(
                     "This video is too long for one GPU run at this detail level. "
                     "Choose 6 frames/second or analyse a section."
@@ -262,6 +364,10 @@ def _receive(analyse, args, progress, cancelled):
             raise GPUUnavailable(_reason(value)) from value
         arrived = True
         item = value
+        clock.setdefault("first", time.monotonic())
+        clock["last"] = time.monotonic()
+        if isinstance(item.get("timings"), dict) and timings is not None:
+            timings.update(item.pop("timings"))
         if "error" in item:
             if item.get("user"):
                 raise ValueError(item["error"])

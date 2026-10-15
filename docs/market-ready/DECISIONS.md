@@ -118,6 +118,10 @@ The brief (prepared by another assistant) was treated as input, not a script.
   Roboflow's 32-point model). All use full-size 105x68 m templates and assume
   little distortion; none has keypoints for 5-a-side cages. Revisit by
   training a small-sided keypoint model on frames from calibrated matches.
+  - 2026-10-15 (E25): tested as a suggested setup; accurate on broadcast
+    11-a-side frames, 0/98 on the indoor Tryzub court, and unsafe on small
+    courts without paint and player-height gates. Not adopted; prerequisites
+    listed in E25.
 - Why lines as well as points: low venue cameras rarely see the near
   corners; points on lines keep the fit well-posed and make distortion
   observable (research simulation: ignoring a 120-150° fisheye costs 0.8-2.3 m

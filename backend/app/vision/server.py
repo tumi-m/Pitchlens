@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from app.vision import billing, gpu
+from app.vision import billing, gpu, gpucost
 from app.vision.access import model_grant_job, valid_video_grant
 from app.vision.engine import probe, run_video
 from app.vision.profiles import available_profiles, player_load_profiles
@@ -270,6 +270,50 @@ def refund_training_start(stamp):
             logging.exception("Could not give back the training start at %s", stamp)
 
 
+class GPUBudgetReached(Exception):
+    """The estimated GPU spend of the last 24 hours reached VISION_DAILY_GPU_BUDGET_USD."""
+
+    def __init__(self, budget, resets_at):
+        super().__init__(budget)
+        self.budget, self.resets_at = budget, resets_at
+
+
+def spend_ledger():
+    return gpucost.Ledger(ROOT)
+
+
+def gpu_budget_state(now=None):
+    """(budget or None, dollars spent in the last 24 hours, when spending frees up or None)."""
+    budget = gpucost.daily_budget()
+    ledger = spend_ledger()
+    spent, _ = ledger.spent(now)
+    resets = ledger.resets_at(budget, now) if budget and spent >= budget else None
+    return budget, spent, resets
+
+
+def check_gpu_budget():
+    """Refuse a new GPU start once the last 24 hours' estimated spend reached the budget."""
+    if not gpu.modal_enabled():
+        return
+    budget, spent, resets = gpu_budget_state()
+    if budget and spent >= budget:
+        raise GPUBudgetReached(budget, resets)
+
+
+def budget_wait_text(resets_at):
+    if not resets_at:
+        return "later"
+    hours = max(0.0, (resets_at - time.time()) / 3600)
+    if hours < 1:
+        return f"in about {max(1, round(hours * 60))} minutes"
+    return f"in about {round(hours)} hour{'' if round(hours) == 1 else 's'}"
+
+
+def budget_message(resets_at, saved=True):
+    saved_text = "Your upload is saved; press Retry " if saved else "Try again "
+    return f"This server has reached its GPU spending limit for today. {saved_text}{budget_wait_text(resets_at)}."
+
+
 # Re-entrant: stale-upload release runs while create() already holds the lock.
 lock = threading.RLock()
 active = None
@@ -387,6 +431,16 @@ async def daily_limit(request: Request, exc: DailyLimit):
     )
 
 
+@app.exception_handler(GPUBudgetReached)
+async def gpu_budget_reached(request: Request, exc: GPUBudgetReached):
+    # A code, so clients do not retry it like a transient 429.
+    return JSONResponse(
+        status_code=429,
+        content={"detail": budget_message(exc.resets_at, saved=False), "code": "gpu-budget",
+                 "resetsAt": round(exc.resets_at) if exc.resets_at else None},
+    )
+
+
 @app.exception_handler(StorageFull)
 async def storage_full(request: Request, exc: StorageFull):
     # A code, so clients show the out-of-storage message instead of retrying the upload.
@@ -453,7 +507,7 @@ def public(data):
     """Owner keys are listing capabilities; never echo them back (nor operator-only details)."""
     return {k: v for k, v in data.items() if k not in (
         "owner", "uploadRequestId", "uploadRequestDigest", "rerunRequestId", "rerunDigest",
-        "countedAt", "deployment", "error",
+        "countedAt", "deployment", "error", "gpuRuns",
     )}
 
 
@@ -520,7 +574,8 @@ def work(directory, status, event):
     began = time.monotonic()
     engine = "gpu" if gpu.modal_enabled() else "cpu"
     gpu_sent = {"item": False}  # whether the GPU sent anything (it then cost compute)
-    refused = None  # "gpu" or "config": a hosted refusal that cost no compute
+    refused = None  # "gpu", "config" or "budget": a hosted refusal that cost no compute
+    spend = {}  # this run's GPU ledger entry, once the GPU is asked
 
     def update(**kw):
         # stop_jobs records a shutdown before this thread notices it: keep that
@@ -559,18 +614,50 @@ def work(directory, status, event):
                 gpu_sent["item"] = True
                 update(**kw)
 
+            # The spend ledger is best-effort throughout: a full volume or an unreadable
+            # ledger never stops, fails or re-routes the run (gpucost).
+            def opened():
+                try:
+                    spend["id"] = spend_ledger().open("analysis", job_id, os.getenv("VISION_MODAL_GPU", "L4"))
+                except (OSError, ValueError) as exc:
+                    logging.warning("Could not open job %s's GPU spend entry: %s", job_id, exc)
+
+            def recorded(record):
+                if "id" in spend:
+                    try:
+                        spend_ledger().close(spend["id"], record)
+                    except (OSError, ValueError) as exc:
+                        logging.warning("Could not close job %s's GPU spend entry: %s", job_id, exc)
+                with status_lock:
+                    runs = status.setdefault("gpuRuns", [])
+                    runs.append({"startedAt": round(time.time() - record["appExitSeconds"], 3), **record})
+                    del runs[:-5]
+                    write_status(directory, status)
+                ops_log.info("job=%s event=gpu-run gpu=%s seconds=%s usd=%.4f outcome=%s",
+                             job_id, record["gpu"], record["seconds"], record["usd"], record["outcome"])
+
             try:
                 update(stage="Starting a GPU", progress=0)
-                # A long or detailed run gets more than the GPU function's static 3 h.
+                # A long or detailed run gets more than the GPU function's static 3 h, a
+                # section less (its download counted).
                 timeout = gpu.gpu_timeout_seconds(
                     status.get("video"), options["sample_fps"], options["ball_search"],
-                    options["max_seconds"], options["start_seconds"],
+                    options["max_seconds"], options["start_seconds"], status.get("fileSize"),
                 )
+                # Spend since the upload began (training, another run) may have reached the budget.
+                check_gpu_budget()
+                opened()
                 gpu.run_on_modal(
                     job_id, directory / "result.json", TOKEN, **{**options, "progress": gpu_progress},
-                    timeout_seconds=timeout,
+                    timeout_seconds=timeout, on_run=recorded,
+                    tick=lambda: spend_ledger().heartbeat(spend["id"]) if "id" in spend else None,
                 )
                 ran_on_gpu = True
+            except GPUBudgetReached as exc:
+                if _gpu_only(status):
+                    refused = "budget"
+                    raise ValueError(budget_message(exc.resets_at)) from exc
+                update(stage="GPU spending limit reached; analysing on the CPU (slower)", progress=0)
             except gpu.GPUUnavailable as exc:
                 gpu_errors.append({"job": job_id, "at": round(time.time(), 3), "error": str(exc)[:300]})
                 # A redeploy cuts the GPU's video download before it cancels the job.
@@ -632,6 +719,15 @@ def work(directory, status, event):
         with status_lock:
             running.pop(job_id, None)
         engines.pop(job_id, None)
+        spend_id = spend.get("id")
+        if spend_id:
+            # run_on_modal records the run when the GPU was asked; one that never got that far cost nothing.
+            try:
+                entry = next((e for e in spend_ledger()._read() if e.get("id") == spend_id), None)
+                if entry and entry.get("open"):
+                    spend_ledger().close(spend_id, {"seconds": 0.0, "usd": 0.0, "outcome": "not-started"})
+            except (OSError, ValueError) as exc:
+                logging.warning("Could not close job %s's GPU spend entry: %s", job_id, exc)
         with lock:
             if active == job_id:
                 active = None
@@ -711,6 +807,11 @@ def recover_after_restart():
     shutil.rmtree(ROOT / "training" / "dataset", ignore_errors=True)
     shutil.rmtree(ROOT / "training" / "runs", ignore_errors=True)
     _recover_training()
+    try:
+        # GPU runs this process was paying for when it died still count against the budget.
+        spend_ledger().recover()
+    except (OSError, ValueError) as exc:
+        logging.warning("Could not close the GPU runs left open by the restart: %s", exc)
     # A job a previous deployment was running stopped for a redeploy (even one
     # killed before it could record that); a crash restarts the same deployment.
     deployment = os.getenv("RAILWAY_DEPLOYMENT_ID", "")
@@ -1063,8 +1164,16 @@ def ops():
     state = dict(training)
     if "run" in state:
         state["run"] = _private_run(state["run"])
+    budget, spent, resets = gpu_budget_state(now)
+    ledger = spend_ledger()
     return {
         "active": current,
+        "gpuSpend": {
+            # Estimates from docs/COST.md prices (VISION_GPU_PRICES overrides), not Modal's invoice.
+            "budgetUsd": budget, "last24hUsd": spent,
+            "refusing": bool(budget and spent >= budget and gpu.modal_enabled()), "resetsAt": resets,
+            "days": ledger.days(now), "recentRuns": ledger.recent(),
+        },
         "dailyStarts": {
             "used": len(starts), "cap": cap,
             # When the next start frees up (rolling 24 hours), as in the 429 answer.
@@ -1913,14 +2022,9 @@ def _auto_venue(directory, status, limit=5, margin=0.1):
         size = [result["video"]["width"], result["video"]["height"]]
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    owner = status.get("owner", "")
-    venues = [
-        v for v in (_read_json(p) for p in _venue_dir().glob("*.json"))
-        if isinstance(v, dict) and v.get("id") and v.get("owner", "") == owner and list(v.get("size") or []) == size
-    ]
+    venues = [v for v in _venues(status.get("owner", "")) if list(v.get("size") or []) == size]
     if not venues:
         return None
-    venues.sort(key=lambda v: -(v.get("createdAt") or 0))
     with calibrating_lock:
         if directory.name in calibrating:
             return None
@@ -2666,7 +2770,8 @@ def ball_model():
     from app.vision import balltrain
 
     registry = balltrain.registry(_models_dir())
-    state = dict(training)
+    # The site shows this; what the run cost is for the operator (/ops).
+    state = {k: v for k, v in training.items() if k not in ("gpuSeconds", "gpuUsd")}
     if "run" in state:
         state["run"] = _private_run(state["run"])
     return {
@@ -2715,6 +2820,8 @@ async def train_ball_model(request: Request):
             raise HTTPException(409, "A training run is already in progress")
         if from_site:
             check_training_budget()
+        if gpu.modal_enabled():
+            check_gpu_budget()  # training on the GPU counts against the same daily budget
         _set_training(clear=True, state="running", stage="Starting", startedAt=round(time.time(), 3))
     use_remote = gpu.modal_enabled()
     counted = {}  # the site start this run used, and whether Modal accepted the run
@@ -2729,9 +2836,51 @@ async def train_ball_model(request: Request):
     def remote(dataset_zip, base_bytes, n):
         from app.vision.modal_train import app as modal_app, train_ball
 
+        card = os.getenv("VISION_MODAL_TRAIN_GPU", "L4")
         with modal_app.run():
             counted["accepted"] = True  # past auth, quota and the image build
-            return train_ball.remote(dataset_zip, base_bytes, n)
+            try:
+                modal_app.set_tags({"pitchlens-job": "ball-model", "pitchlens-kind": "training"})
+            except Exception as exc:  # reporting only: never stops a run
+                logging.info("Could not tag the Modal training app: %s", exc)
+            # The spend ledger is best-effort: it never stops or fails the training run.
+            ledger = spend_ledger()
+            try:
+                run_id = ledger.open("training", "ball-model", card)
+            except (OSError, ValueError) as exc:
+                logging.warning("Could not open the training run's GPU spend entry: %s", exc)
+                run_id = None
+            began = time.monotonic()
+            done = threading.Event()
+
+            def beat():
+                while not done.wait(gpucost.HEARTBEAT_SECONDS):
+                    try:
+                        ledger.heartbeat(run_id)
+                    except (OSError, ValueError) as exc:
+                        logging.warning("Could not record the training run's heartbeat: %s", exc)
+
+            if run_id:
+                threading.Thread(target=beat, daemon=True).start()
+            outcome = "failed"
+            try:
+                out = train_ball.remote(dataset_zip, base_bytes, n)
+                outcome = "completed"
+                return out
+            finally:
+                done.set()
+                seconds = time.monotonic() - began
+                usd, known = gpucost.estimate(card, seconds)
+                if run_id:
+                    try:
+                        ledger.close(run_id, {"seconds": round(seconds, 1), "usd": usd, "priceKnown": known,
+                                              "outcome": outcome})
+                    except (OSError, ValueError) as exc:
+                        logging.warning("Could not close the training run's GPU spend entry: %s", exc)
+                ops_log.info("event=gpu-run kind=training gpu=%s seconds=%.1f usd=%.4f outcome=%s",
+                             card, seconds, usd, outcome)
+                # Operator-only (/ops): GET /ball-model leaves these out.
+                _set_training(gpuSeconds=round(seconds, 1), gpuUsd=usd)
 
     def run():
         try:
@@ -2784,6 +2933,18 @@ def _venue_dir():
     return directory
 
 
+def _venues(owner):
+    """The owner's saved venues, newest first. One saved from a moving camera
+    before saving checked that it re-applies (static false, no `reapplies`)
+    can never line up with another match: left out."""
+    venues = [
+        v for v in (_read_json(p) for p in _venue_dir().glob("*.json"))
+        if isinstance(v, dict) and v.get("id") and v.get("owner", "") == owner
+        and (v.get("static") is not False or v.get("reapplies"))
+    ]
+    return sorted(venues, key=lambda v: -(v.get("createdAt") or 0))
+
+
 def _owner(request):
     owner = request.headers.get("x-pitchlens-owner") or request.query_params.get("owner", "")
     if require_owner(request) and not OWNER.fullmatch(owner):
@@ -2794,20 +2955,16 @@ def _owner(request):
 @app.get("/venues")
 def venues(request: Request):
     """Venues saved from this browser (owner key); a local worker without keys sees all."""
-    owner = _owner(request)
-    out = []
-    for path in sorted(_venue_dir().glob("*.json")):
-        data = _read_json(path) or {}
-        if data.get("id") and (data.get("owner", "") == owner):
-            # sourceJob: deleting that match deletes this venue (the page names it first).
-            # The listing is this owner's own, so no other browser's job ids appear.
-            out.append({k: data.get(k) for k in ("id", "name", "template", "size", "static", "createdAt", "sourceJob")})
-    return out
+    # Newest first: the page preselects the first. sourceJob: deleting that
+    # match deletes this venue (the page names it first). The listing is this
+    # owner's own, so no other browser's job ids appear.
+    keys = ("id", "name", "template", "size", "static", "createdAt", "sourceJob")
+    return [{k: data.get(k) for k in keys} for data in _venues(_owner(request))]
 
 
 @app.post("/venues")
 async def create_venue(request: Request):
-    from app.vision.calibrate import venue_from_calibration
+    from app.vision.calibrate import venue_from_calibration, venue_reapplies
 
     body = await _json_body(request)
     name = body.get("name")
@@ -2824,6 +2981,13 @@ async def create_venue(request: Request):
         venue = venue_from_calibration(calibration, name.strip())
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # A venue keeps one view: a camera that pans away from it would be offered
+    # on every later match and refused there after a long check. (Seconds for
+    # a long panning match: off the event loop.)
+    reapplies, _ = await asyncio.to_thread(venue_reapplies, calibration)
+    if not reapplies:
+        raise HTTPException(409, "This camera moves during the match; saved venues work for fixed cameras only.")
+    venue["reapplies"] = True
     owner = _owner(request)
     mine = [p for p in _venue_dir().glob("*.json") if (_read_json(p) or {}).get("owner", "") == owner]
     if len(mine) >= 50:
@@ -2888,6 +3052,8 @@ def retry_job(job_id: str):
         if status.get("attempts", 1) >= 3 and not free:
             raise HTTPException(409, "This video has stopped three times. Upload it again, or test a shorter section first.")
         check_daily_budget()
+        if _gpu_only(status):
+            check_gpu_budget()  # a section or a local worker may still run on the CPU
         check_models(status.get("profile", "general"), status.get("ballSearch", "exhaustive"))
         event = threading.Event()
         for key in ("interruptedBy", "refusedBy", "error"):
@@ -2970,6 +3136,8 @@ def rerun_job(job_id: str, request: Request):
         if mode == "section" and sections >= SECTION_RERUNS_PER_MATCH:
             raise HTTPException(409, f"This match already has {sections} test sections. Delete some before testing another.")
         check_daily_budget()
+        if mode == "full" and not local_full_match_ok():
+            check_gpu_budget()  # a section may still run on the CPU
         metadata = previous.get("video")
         if not metadata or not (source / "video").is_file() or expired(previous):
             raise HTTPException(409, "Saved footage is no longer available. Upload the video again.")

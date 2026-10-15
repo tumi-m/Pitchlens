@@ -85,22 +85,35 @@ def analyse(
     reference_colours=None,
     reference_job=None,
 ):
-    """Generator: yields progress dicts, then {"result_gz": bytes}."""
+    """Generator: yields progress dicts, then {"result_gz": bytes, "timings": {...}}.
+
+    timings are this container's own phases (seconds), for the worker's cost record.
+    """
     import gzip
     import queue
+    import resource
     import threading
     import time
 
+    entered = time.monotonic()
+    timings = {"containerUptimeSeconds": _uptime()}
     import requests
 
     from app.vision.engine import run_video
     from app.vision.profiles import CUSTOM_BALL, missing_models
 
+    timings["importSeconds"] = round(time.monotonic() - entered, 2)
+    first = {}
+
+    def mark(item):
+        first.setdefault("at", time.monotonic())
+        return item
+
     if ball_weights and ball_search != "none":
         # The worker's fine-tuned ball model: copied below like any other weights.
         # Player load never loads a ball model, so it is not fetched for one.
         if not CUSTOM_BALL.fullmatch(ball_weights):
-            yield {"error": "Unknown ball model", "user": False}
+            yield mark({"error": "Unknown ball model", "user": False})
             return
         os.environ["VISION_BALL_WEIGHTS"] = f"/root/models/{ball_weights}"
 
@@ -108,19 +121,23 @@ def analyse(
     missing = missing_models(profile, ball_search)
     if missing:
         base = video_url.split("/jobs/")[0]
+        copying = time.monotonic()
         try:
             for path in missing:
-                yield {"stage": "GPU: preparing football models", "progress": 1}
+                yield mark({"stage": "GPU: preparing football models", "progress": 1})
                 ensure_model(path, base, (model_grants or {}).get(path.name, ""))
         except Exception as exc:
             yield {"error": f"Model unavailable on GPU: {exc}", "user": False}
             return
+        timings["modelCopySeconds"] = round(time.monotonic() - copying, 2)
 
     # VISION_GPU_WORKDIR: tests run this function locally.
     workdir = Path(os.getenv("VISION_GPU_WORKDIR", "/tmp/job"))
     workdir.mkdir(parents=True, exist_ok=True)
     video = workdir / "video"
-    yield {"stage": "GPU: fetching the video", "progress": 1}
+    yield mark({"stage": "GPU: fetching the video", "progress": 1})
+    timings["firstYieldSeconds"] = round(first["at"] - entered, 2)
+    fetching = time.monotonic()
     with requests.get(
         video_url, headers={"x-pitchlens-video-grant": video_grant}, stream=True, timeout=120
     ) as response:
@@ -133,6 +150,8 @@ def analyse(
                 if said is None or time.monotonic() - said >= 1:  # at most once a second
                     said = time.monotonic()
                     yield {"stage": f"GPU: fetching the video ({received // (1024 * 1024)} MB)", "progress": 1}
+    timings["downloadSeconds"] = round(time.monotonic() - fetching, 2)
+    timings["downloadBytes"] = received
 
     updates = queue.Queue()
     outcome = {}
@@ -160,13 +179,45 @@ def analyse(
         finally:
             updates.put(None)
 
+    running = time.monotonic()
     threading.Thread(target=run, daemon=True).start()
     while (update := updates.get()) is not None:
         yield update
+    timings["engineSeconds"] = round(time.monotonic() - running, 2)
     if "error" in outcome:
-        yield {"error": outcome["error"], "user": outcome.get("user", False), "engine": outcome.get("engine", False)}
+        yield {"error": outcome["error"], "user": outcome.get("user", False), "engine": outcome.get("engine", False),
+               "timings": _finish(timings, entered, resource)}
         return
-    yield {"result_gz": gzip.compress((workdir / "result.json").read_bytes())}
+    compressing = time.monotonic()
+    payload = gzip.compress((workdir / "result.json").read_bytes())
+    timings["compressSeconds"] = round(time.monotonic() - compressing, 2)
+    yield {"result_gz": payload, "timings": _finish(timings, entered, resource)}
+
+
+def _uptime():
+    """Seconds since this container started (its sandbox's uptime), or None."""
+    try:
+        return round(float(Path("/proc/uptime").read_text().split()[0]), 2)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _finish(timings, entered, resource):
+    import time
+
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    timings.update(
+        cpuSeconds=round(usage.ru_utime + usage.ru_stime, 1),
+        maxRssBytes=int(usage.ru_maxrss) * 1024,
+        functionSeconds=round(time.monotonic() - entered, 2),
+    )
+    try:
+        import torch
+
+        timings["gpuName"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    except Exception:
+        timings["gpuName"] = None
+    return timings
 
 
 def ensure_model(path, base, grant):
